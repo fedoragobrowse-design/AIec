@@ -1,0 +1,20 @@
+[Unit]
+Description=AgentForge API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentforge
+Group=agentforge
+EnvironmentFile=/etc/agentforge/agentforge.env
+ExecStart=/usr/local/bin/agentforge server
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agentforge
+
+[Install]
+WantedBy=multi-user.target

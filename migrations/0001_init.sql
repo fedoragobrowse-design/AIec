@@ -1,0 +1,16 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE tenants (id uuid PRIMARY KEY, name text NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE api_keys (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id), digest bytea NOT NULL UNIQUE CHECK(octet_length(digest)=32), scopes jsonb NOT NULL, expires_at timestamptz, revoked_at timestamptz, created_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX api_keys_tenant_idx ON api_keys(tenant_id);
+CREATE TABLE nodes (id uuid PRIMARY KEY, name text NOT NULL UNIQUE, available_vcpus integer NOT NULL CHECK(available_vcpus>=0), available_memory_bytes bigint NOT NULL CHECK(available_memory_bytes>=0), available_disk_bytes bigint NOT NULL CHECK(available_disk_bytes>=0), sandbox_count integer NOT NULL DEFAULT 0, healthy boolean NOT NULL DEFAULT false, last_heartbeat timestamptz NOT NULL DEFAULT now());
+CREATE INDEX nodes_healthy_idx ON nodes(healthy,last_heartbeat);
+CREATE TABLE sandboxes (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id), node_id uuid REFERENCES nodes(id), image_id text NOT NULL, state text NOT NULL, runtime text NOT NULL, cpu integer NOT NULL CHECK(cpu>0), memory_mb integer NOT NULL CHECK(memory_mb>0), disk_mb integer NOT NULL CHECK(disk_mb>0), timeout_seconds bigint NOT NULL CHECK(timeout_seconds>0), network jsonb NOT NULL, runtime_path text, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+CREATE INDEX sandboxes_tenant_created_idx ON sandboxes(tenant_id,created_at DESC);
+CREATE INDEX sandboxes_node_state_idx ON sandboxes(node_id,state);
+CREATE TABLE sandbox_events (id uuid PRIMARY KEY, sandbox_id uuid NOT NULL REFERENCES sandboxes(id), tenant_id uuid NOT NULL REFERENCES tenants(id), from_state text, to_state text NOT NULL, reason text, occurred_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX sandbox_events_sandbox_idx ON sandbox_events(sandbox_id,occurred_at);
+CREATE TABLE snapshots (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id), sandbox_id uuid NOT NULL REFERENCES sandboxes(id), object_key text NOT NULL UNIQUE, size_bytes bigint NOT NULL CHECK(size_bytes>=0), image_id text NOT NULL, created_at timestamptz NOT NULL);
+CREATE INDEX snapshots_tenant_sandbox_idx ON snapshots(tenant_id,sandbox_id,created_at);
+CREATE TABLE usage_events (id uuid PRIMARY KEY, tenant_id uuid NOT NULL REFERENCES tenants(id), sandbox_id uuid REFERENCES sandboxes(id), metric text NOT NULL, quantity bigint NOT NULL, occurred_at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX usage_tenant_time_idx ON usage_events(tenant_id,occurred_at);
+CREATE TABLE images (id text PRIMARY KEY, reference text NOT NULL UNIQUE, rootfs text NOT NULL, size_bytes bigint NOT NULL CHECK(size_bytes>=0), created_at timestamptz NOT NULL DEFAULT now());

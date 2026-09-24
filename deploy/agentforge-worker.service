@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentForge Firecracker worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentforge
+Group=agentforge
+EnvironmentFile=/etc/agentforge/agentforge.env
+ExecStart=/usr/local/bin/agentforge worker
+Restart=on-failure
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/agentforge /dev/kvm
+
+[Install]
+WantedBy=multi-user.target
