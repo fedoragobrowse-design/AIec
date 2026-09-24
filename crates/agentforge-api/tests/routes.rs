@@ -1,7 +1,12 @@
-use agentforge_api::{AppState, app};
+use agentforge_api::{AppState, DefaultPolicy, DevelopmentScheduler, app};
 use agentforge_core::*;
-use agentforge_runtime::{RuntimeError, SandboxRuntime};
-use agentforge_storage::{MemoryRepository, Repository};
+use agentforge_core::{
+    platform::Platform,
+    runtime::{RuntimeCapabilities, RuntimeHealth, SandboxRuntime},
+    snapshots::SnapshotProvider,
+    storage::MetadataStore,
+};
+use agentforge_storage::MemoryRepository;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -14,16 +19,16 @@ use uuid::Uuid;
 struct MockRuntime;
 #[async_trait]
 impl SandboxRuntime for MockRuntime {
-    async fn create(&self, _: &Sandbox) -> Result<(), RuntimeError> {
+    async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn start(&self, _: &Sandbox) -> Result<(), RuntimeError> {
+    async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn stop(&self, _: &Sandbox) -> Result<(), RuntimeError> {
+    async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn exec(&self, _: &Sandbox, r: ExecRequest) -> Result<ExecResult, RuntimeError> {
+    async fn exec(&self, _: &Sandbox, r: ExecRequest) -> Result<ExecResult, CoreError> {
         Ok(ExecResult {
             exit_code: 0,
             stdout: r.command.join(" "),
@@ -32,37 +37,57 @@ impl SandboxRuntime for MockRuntime {
             timed_out: false,
         })
     }
-    async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), RuntimeError> {
+    async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn get_file(&self, _: &Sandbox, p: &str) -> Result<FileContent, RuntimeError> {
+    async fn get_file(&self, _: &Sandbox, p: &str) -> Result<FileContent, CoreError> {
         Ok(FileContent {
             path: p.into(),
             content_base64: "aGk=".into(),
         })
     }
-    async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, RuntimeError> {
+    async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
         Ok(vec![])
     }
-    async fn delete_file(&self, _: &Sandbox, _: &str) -> Result<(), RuntimeError> {
+    async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn make_directory(&self, _: &Sandbox, _: &str) -> Result<(), RuntimeError> {
+    async fn make_directory(
+        &self,
+        _: &Sandbox,
+        _: MakeDirectoryRequest,
+    ) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn snapshot(&self, _: &Sandbox, k: &str) -> Result<u64, RuntimeError> {
-        Ok(k.len() as u64)
-    }
-    async fn restore(&self, _: &Sandbox, _: &str) -> Result<(), RuntimeError> {
+    async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
         Ok(())
     }
-    async fn destroy(&self, _: &Sandbox) -> Result<(), RuntimeError> {
-        Ok(())
+    async fn health(&self) -> RuntimeHealth {
+        RuntimeHealth::healthy()
     }
-    fn health(&self) -> bool {
-        true
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::default()
     }
 }
+
+fn development_platform(
+    runtime: Arc<dyn SandboxRuntime>,
+    metadata: Arc<dyn MetadataStore>,
+    snapshots: Option<Arc<dyn SnapshotProvider>>,
+) -> Platform {
+    let builder = Platform::builder()
+        .runtime(runtime)
+        .metadata_store(metadata)
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy));
+    let builder = if let Some(snapshots) = snapshots {
+        builder.snapshots(snapshots)
+    } else {
+        builder
+    };
+    builder.build().expect("valid development platform")
+}
+
 fn setup() -> (axum::Router, String, String) {
     let repo = MemoryRepository::new();
     let a = generate_api_key();
@@ -96,7 +121,12 @@ fn setup() -> (axum::Router, String, String) {
         .await
         .unwrap();
     });
-    (app(AppState::new(repo, Arc::new(MockRuntime))), a, b)
+    let platform = development_platform(
+        Arc::new(MockRuntime),
+        repo,
+        None,
+    );
+    (app(AppState::development(platform)), a, b)
 }
 #[tokio::test]
 async fn lifecycle_exec_and_typed_error() {
@@ -177,7 +207,9 @@ async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
     })
     .await
     .unwrap();
-    let router = app(AppState::new(repo, Arc::new(BubblewrapRuntime::new(&root))));
+    let bubblewrap = Arc::new(BubblewrapRuntime::new(&root));
+    let platform = development_platform(bubblewrap.clone(), repo, Some(bubblewrap));
+    let router = app(AppState::development(platform));
     let auth = format!("Bearer {key}");
     let create = router
         .clone()

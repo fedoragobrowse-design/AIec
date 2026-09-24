@@ -4,6 +4,7 @@ members = [
   "crates/agentforge-core",
   "crates/agentforge-storage",
   "crates/agentforge-runtime",
+  "crates/agentforge-network-linux",
   "crates/agentforge-api",
   "crates/agentforge-client",
   "crates/agentforge-cli",
@@ -20,6 +21,7 @@ rust-version = "1.88"
 agentforge-core = { path = "crates/agentforge-core" }
 agentforge-storage = { path = "crates/agentforge-storage" }
 agentforge-runtime = { path = "crates/agentforge-runtime" }
+agentforge-network-linux = { path = "crates/agentforge-network-linux" }
 agentforge-client = { path = "crates/agentforge-client" }
 agentforge-api = { path = "crates/agentforge-api" }
 anyhow = "1.0"

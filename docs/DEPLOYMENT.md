@@ -45,6 +45,8 @@ agentforge-server
 
 There is no production bubblewrap, Docker, in-memory, or local-object-store fallback. Put TLS in front of the private API listener.
 
+The systemd API unit starts `agentforge-server`. The shorter `agentforge server` command remains the explicit single-process `bwrap-dev` distribution and is not a production fallback.
+
 ## Firecracker workers
 
 ```bash

@@ -1,12 +1,16 @@
 use crate::{
-    NODE_HEARTBEAT_TTL_SECONDS, PostgresRepository, ReconciliationAction, Repository, SandboxEvent,
-    SandboxOperation, ScheduledSandbox, Scheduler, StoreError, StoredSnapshot, TenantRecord,
-    WorkerAssignment, WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
-    database_error,
+    NODE_HEARTBEAT_TTL_SECONDS, PostgresRepository, StoreError, core_error, database_error,
 };
 use agentforge_core::{
-    ApiKeyRecord, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope, Snapshot,
-    UsageEvent, UsageSummary, new_id,
+    ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
+    Snapshot, UsageEvent, UsageSummary,
+    scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
+    storage::{
+        ReconciliationAction, SandboxEvent, SandboxOperation, StoredSnapshot, TenantRecord,
+        WorkerAssignment, WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
+        MetadataStore,
+    },
+    new_id,
 };
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -362,7 +366,7 @@ async fn update_state_transaction(
     Ok(value)
 }
 
-fn fingerprint(value: &Sandbox) -> Result<Vec<u8>, StoreError> {
+fn sandbox_fingerprint(value: &Sandbox) -> Result<Vec<u8>, StoreError> {
     let semantic = json!({
         "tenant_id": value.tenant_id,
         "image_id": value.image_id,
@@ -373,6 +377,19 @@ fn fingerprint(value: &Sandbox) -> Result<Vec<u8>, StoreError> {
         "disk_mb": value.disk_mb,
         "timeout_seconds": value.timeout_seconds,
         "network": value.network,
+    });
+    Ok(Sha256::digest(serde_json::to_vec(&semantic)?).to_vec())
+}
+
+fn schedule_fingerprint(
+    value: &Sandbox,
+    preferred_node: Option<Uuid>,
+    lease_ttl_seconds: u64,
+) -> Result<Vec<u8>, StoreError> {
+    let semantic = json!({
+        "sandbox": sandbox_fingerprint(value)?,
+        "preferred_node": preferred_node,
+        "lease_ttl_seconds": lease_ttl_seconds,
     });
     Ok(Sha256::digest(serde_json::to_vec(&semantic)?).to_vec())
 }
@@ -405,9 +422,8 @@ impl PostgresScheduler {
     }
 }
 
-#[async_trait]
-impl Scheduler for PostgresScheduler {
-    async fn schedule_sandbox_on_node(
+impl PostgresScheduler {
+    async fn schedule_on_node(
         &self,
         tenant: Uuid,
         request_id: Uuid,
@@ -439,7 +455,9 @@ impl Scheduler for PostgresScheduler {
         let mut lease_generation = 1_i64;
         if let Some(row) = existing_request {
             let existing_fingerprint: Vec<u8> = row.try_get("fingerprint")?;
-            if existing_fingerprint != fingerprint(&sandbox)? {
+            if existing_fingerprint
+                != schedule_fingerprint(&sandbox, preferred_node, lease_ttl_seconds)?
+            {
                 return Err(StoreError::Conflict(
                     "sandbox idempotency key was reused".into(),
                 ));
@@ -455,10 +473,20 @@ impl Scheduler for PostgresScheduler {
             let existing_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox_id).await?;
             let existing_lease = fetch_lease_for_sandbox(&mut tx, tenant, sandbox_id).await?;
             if existing_lease.status == "active" || existing_sandbox.node_id.is_some() {
+                let worker_endpoint: String = sqlx::query_scalar(
+                    "SELECT control_endpoint FROM nodes WHERE id = $1",
+                )
+                .bind(existing_lease.node_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(database_error)?;
                 tx.commit().await.map_err(database_error)?;
                 return Ok(ScheduledSandbox {
                     sandbox: existing_sandbox,
-                    lease: existing_lease,
+                    worker_id: existing_lease.node_id,
+                    worker_endpoint,
+                    lease_id: existing_lease.id,
+                    lease_generation: existing_lease.generation,
                 });
             }
             if existing_sandbox.state == SandboxState::Destroyed {
@@ -481,7 +509,11 @@ impl Scheduler for PostgresScheduler {
             .bind(tenant)
             .bind(request_id)
             .bind(sandbox.id)
-            .bind(fingerprint(&sandbox)?)
+            .bind(schedule_fingerprint(
+                &sandbox,
+                preferred_node,
+                lease_ttl_seconds,
+            )?)
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
@@ -518,6 +550,7 @@ impl Scheduler for PostgresScheduler {
         .await
         .map_err(database_error)?
         .ok_or_else(|| StoreError::Conflict("no healthy worker has capacity".into()))?;
+        let worker_endpoint: String = node.try_get("control_endpoint")?;
         let node_id: Uuid = node.try_get("id")?;
         sqlx::query(
             "UPDATE nodes SET available_vcpus = available_vcpus - $1, \
@@ -615,8 +648,74 @@ impl Scheduler for PostgresScheduler {
         tx.commit().await.map_err(database_error)?;
         Ok(ScheduledSandbox {
             sandbox: assigned_sandbox,
-            lease,
+            worker_id: node_id,
+            worker_endpoint,
+            lease_id,
+            lease_generation: lease.generation,
         })
+    }
+}
+
+#[async_trait]
+impl Scheduler for PostgresScheduler {
+    async fn schedule(&self, request: ScheduleRequest) -> Result<ScheduledSandbox, CoreError> {
+        self.schedule_on_node(
+            request.tenant_id,
+            request.request_id,
+            request.sandbox,
+            request.lease_ttl.as_secs(),
+            request.preferred_worker,
+        )
+        .await
+        .map_err(core_error)
+    }
+
+    async fn worker_endpoint(
+        &self,
+        tenant_id: Uuid,
+        sandbox_id: Uuid,
+    ) -> Result<String, CoreError> {
+        sqlx::query_scalar(
+            "SELECT nodes.control_endpoint FROM sandbox_leases \
+             JOIN nodes ON nodes.id = sandbox_leases.node_id \
+             WHERE sandbox_leases.tenant_id = $1 AND sandbox_leases.sandbox_id = $2 \
+             AND sandbox_leases.status = 'active'",
+        )
+        .bind(tenant_id)
+        .bind(sandbox_id)
+        .fetch_optional(&self.repository.pool)
+        .await
+        .map_err(|error| core_error(database_error(error)))?
+        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))
+    }
+
+    async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), CoreError> {
+        let lease = sqlx::query(
+            "SELECT id, generation FROM sandbox_leases \
+             WHERE tenant_id = $1 AND sandbox_id = $2 AND status = 'active' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(sandbox_id)
+        .fetch_optional(&self.repository.pool)
+        .await
+        .map_err(|error| core_error(database_error(error)))?
+        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))?;
+        let lease_id = lease
+            .try_get("id")
+            .map_err(|error| core_error(error.into()))?;
+        let generation = lease
+            .try_get("generation")
+            .map_err(|error| core_error(error.into()))?;
+        self.repository.release_worker_lease(
+            tenant_id,
+            lease_id,
+            generation,
+            "released through scheduler",
+        )
+        .await
+        .map(|_| ())
+        .map_err(core_error)
     }
 }
 
@@ -638,30 +737,7 @@ async fn fetch_lease_for_sandbox(
     lease_from_row(&row)
 }
 
-#[async_trait]
-impl Scheduler for PostgresRepository {
-    async fn schedule_sandbox_on_node(
-        &self,
-        tenant: Uuid,
-        request_id: Uuid,
-        sandbox: Sandbox,
-        lease_ttl_seconds: u64,
-        preferred_node: Option<Uuid>,
-    ) -> Result<ScheduledSandbox, StoreError> {
-        PostgresScheduler::new(self.clone())
-            .schedule_sandbox_on_node(
-                tenant,
-                request_id,
-                sandbox,
-                lease_ttl_seconds,
-                preferred_node,
-            )
-            .await
-    }
-}
-
-#[async_trait]
-impl Repository for PostgresRepository {
+impl PostgresRepository {
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         insert_sandbox(&mut tx, &value).await?;
@@ -1121,7 +1197,7 @@ impl Repository for PostgresRepository {
         .map_err(database_error)?;
         if let Some(row) = existing {
             let existing_fingerprint: Vec<u8> = row.try_get("fingerprint")?;
-            if existing_fingerprint != fingerprint(&sandbox)? {
+            if existing_fingerprint != sandbox_fingerprint(&sandbox)? {
                 return Err(StoreError::Conflict(
                     "sandbox idempotency key was reused".into(),
                 ));
@@ -1139,7 +1215,7 @@ impl Repository for PostgresRepository {
         .bind(tenant)
         .bind(request_id)
         .bind(sandbox.id)
-        .bind(fingerprint(&sandbox)?)
+        .bind(sandbox_fingerprint(&sandbox)?)
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
@@ -1799,6 +1875,143 @@ impl Repository for PostgresRepository {
     }
 }
 
+#[async_trait]
+impl MetadataStore for PostgresRepository {
+    async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError> {
+        Self::create_sandbox(self, value).await.map_err(core_error)
+    }
+    async fn get_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<Sandbox, CoreError> {
+        Self::get_sandbox(self, tenant, id).await.map_err(core_error)
+    }
+    async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, CoreError> {
+        Self::list_sandboxes(self, tenant).await.map_err(core_error)
+    }
+    async fn update_state(&self, tenant: Uuid, id: Uuid, expected: SandboxState, next: SandboxState, runtime_path: Option<String>) -> Result<Sandbox, CoreError> {
+        Self::update_state(self, tenant, id, expected, next, runtime_path).await.map_err(core_error)
+    }
+    async fn delete_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
+        Self::delete_sandbox(self, tenant, id).await.map_err(core_error)
+    }
+    async fn put_key(&self, value: ApiKeyRecord) -> Result<(), CoreError> {
+        Self::put_key(self, value).await.map_err(core_error)
+    }
+    async fn revoke_key(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
+        Self::revoke_key(self, tenant, id).await.map_err(core_error)
+    }
+    async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {
+        Self::find_key(self, digest).await.map_err(core_error)
+    }
+    async fn put_snapshot(&self, value: Snapshot) -> Result<(), CoreError> {
+        Self::put_snapshot(self, value).await.map_err(core_error)
+    }
+    async fn get_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<Snapshot, CoreError> {
+        Self::get_snapshot(self, tenant, id).await.map_err(core_error)
+    }
+    async fn list_snapshots(&self, tenant: Uuid, sandbox: Uuid) -> Result<Vec<Snapshot>, CoreError> {
+        Self::list_snapshots(self, tenant, sandbox).await.map_err(core_error)
+    }
+    async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
+        Self::delete_snapshot(self, tenant, id).await.map_err(core_error)
+    }
+    async fn append_usage(&self, value: UsageEvent) -> Result<(), CoreError> {
+        Self::append_usage(self, value).await.map_err(core_error)
+    }
+    async fn usage(&self, tenant: Uuid) -> Result<Vec<UsageSummary>, CoreError> {
+        Self::usage(self, tenant).await.map_err(core_error)
+    }
+    async fn register_node(&self, value: Node) -> Result<(), CoreError> {
+        Self::register_node(self, value).await.map_err(core_error)
+    }
+    async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError> {
+        Self::heartbeat(self, id).await.map_err(core_error)
+    }
+    async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
+        Self::list_nodes(self).await.map_err(core_error)
+    }
+    async fn put_tenant(&self, value: TenantRecord) -> Result<(), CoreError> {
+        Self::put_tenant(self, value).await.map_err(core_error)
+    }
+    async fn get_tenant(&self, id: Uuid) -> Result<TenantRecord, CoreError> {
+        Self::get_tenant(self, id).await.map_err(core_error)
+    }
+    async fn list_sandbox_events(&self, tenant: Uuid, sandbox: Uuid, limit: u32) -> Result<Vec<SandboxEvent>, CoreError> {
+        Self::list_sandbox_events(self, tenant, sandbox, limit).await.map_err(core_error)
+    }
+    async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), CoreError> {
+        Self::put_stored_snapshot(self, value).await.map_err(core_error)
+    }
+    async fn get_stored_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<StoredSnapshot, CoreError> {
+        Self::get_stored_snapshot(self, tenant, id).await.map_err(core_error)
+    }
+    async fn list_stored_snapshots(&self, tenant: Uuid, sandbox: Uuid) -> Result<Vec<StoredSnapshot>, CoreError> {
+        Self::list_stored_snapshots(self, tenant, sandbox).await.map_err(core_error)
+    }
+    async fn create_sandbox_idempotent(&self, tenant: Uuid, request_id: Uuid, sandbox: Sandbox) -> Result<Sandbox, CoreError> {
+        Self::create_sandbox_idempotent(self, tenant, request_id, sandbox).await.map_err(core_error)
+    }
+    async fn register_worker(&self, value: WorkerRegistration) -> Result<(), CoreError> {
+        Self::register_worker(self, value).await.map_err(core_error)
+    }
+    async fn heartbeat_worker(&self, heartbeat: WorkerHeartbeat) -> Result<WorkerStatus, CoreError> {
+        Self::heartbeat_worker(self, heartbeat).await.map_err(core_error)
+    }
+    async fn get_worker(&self, node_id: Uuid) -> Result<WorkerStatus, CoreError> {
+        Self::get_worker(self, node_id).await.map_err(core_error)
+    }
+    async fn list_workers(&self, include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> {
+        Self::list_workers(self, include_unhealthy).await.map_err(core_error)
+    }
+    async fn claim_worker_assignments(&self, node_id: Uuid, limit: u32, lease_ttl_seconds: u64) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::claim_worker_assignments(self, node_id, limit, lease_ttl_seconds).await.map_err(core_error)
+    }
+    async fn list_worker_assignments(&self, tenant: Uuid, node_id: Uuid, status: Option<&str>, limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::list_worker_assignments(self, tenant, node_id, status, limit).await.map_err(core_error)
+    }
+    async fn list_worker_assignments_for_node(&self, node_id: Uuid, status: Option<&str>, limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::list_worker_assignments_for_node(self, node_id, status, limit).await.map_err(core_error)
+    }
+    async fn get_worker_lease(&self, tenant: Uuid, lease_id: Uuid) -> Result<WorkerLease, CoreError> {
+        Self::get_worker_lease(self, tenant, lease_id).await.map_err(core_error)
+    }
+    async fn get_active_worker_lease(&self, tenant: Uuid, sandbox: Uuid) -> Result<WorkerLease, CoreError> {
+        Self::get_active_worker_lease(self, tenant, sandbox).await.map_err(core_error)
+    }
+    async fn renew_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, ttl_seconds: u64) -> Result<WorkerLease, CoreError> {
+        Self::renew_worker_lease(self, tenant, lease_id, generation, ttl_seconds).await.map_err(core_error)
+    }
+    async fn complete_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, result: Value) -> Result<WorkerLease, CoreError> {
+        Self::complete_worker_lease(self, tenant, lease_id, generation, result).await.map_err(core_error)
+    }
+    async fn release_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, reason: &str) -> Result<WorkerLease, CoreError> {
+        Self::release_worker_lease(self, tenant, lease_id, generation, reason).await.map_err(core_error)
+    }
+    async fn reconcile_expired_leases(&self, limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Self::reconcile_expired_leases(self, limit).await.map_err(core_error)
+    }
+    async fn list_reconciliation_actions(&self, tenant: Uuid, limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Self::list_reconciliation_actions(self, tenant, limit).await.map_err(core_error)
+    }
+    async fn begin_sandbox_operation(&self, value: SandboxOperation) -> Result<SandboxOperation, CoreError> {
+        Self::begin_sandbox_operation(self, value).await.map_err(core_error)
+    }
+    async fn complete_sandbox_operation(&self, tenant: Uuid, request_id: Uuid, result: Value) -> Result<SandboxOperation, CoreError> {
+        Self::complete_sandbox_operation(self, tenant, request_id, result).await.map_err(core_error)
+    }
+    async fn fail_sandbox_operation(&self, tenant: Uuid, request_id: Uuid, error: Value) -> Result<SandboxOperation, CoreError> {
+        Self::fail_sandbox_operation(self, tenant, request_id, error).await.map_err(core_error)
+    }
+    async fn get_sandbox_operation(&self, tenant: Uuid, request_id: Uuid) -> Result<SandboxOperation, CoreError> {
+        Self::get_sandbox_operation(self, tenant, request_id).await.map_err(core_error)
+    }
+    async fn put_image(&self, value: ImageRecord) -> Result<(), CoreError> {
+        Self::put_image(self, value).await.map_err(core_error)
+    }
+    async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError> {
+        Self::get_image(self, id).await.map_err(core_error)
+    }
+}
+
+
 async fn update_operation(
     repository: &PostgresRepository,
     tenant: Uuid,
@@ -1951,6 +2164,23 @@ mod tests {
         }
     }
 
+    async fn schedule_test_sandbox(
+        repository: &PostgresRepository,
+        tenant: Uuid,
+        request_id: Uuid,
+        sandbox: Sandbox,
+    ) -> Result<ScheduledSandbox, CoreError> {
+        PostgresScheduler::new(repository.clone())
+            .schedule(ScheduleRequest {
+                tenant_id: tenant,
+                request_id,
+                sandbox,
+                preferred_worker: None,
+                lease_ttl: Duration::from_secs(60),
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn concurrent_schedulers_reserve_capacity_once() {
         let Ok(database_url) = std::env::var("DATABASE_URL") else {
@@ -1993,17 +2223,13 @@ mod tests {
         let left = tokio::spawn({
             let repository = repository.clone();
             async move {
-                repository
-                    .schedule_sandbox(tenant, new_id(), first, 60)
-                    .await
+                schedule_test_sandbox(&repository, tenant, new_id(), first).await
             }
         });
         let right = tokio::spawn({
             let repository = repository.clone();
             async move {
-                repository
-                    .schedule_sandbox(tenant, new_id(), second, 60)
-                    .await
+                schedule_test_sandbox(&repository, tenant, new_id(), second).await
             }
         });
         let mut successes = 0;
@@ -2066,8 +2292,7 @@ mod tests {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
-        let _scheduled = repository
-            .schedule_sandbox(tenant, new_id(), sandbox(tenant), 60)
+        let _scheduled = schedule_test_sandbox(&repository, tenant, new_id(), sandbox(tenant))
             .await
             .unwrap();
         let before = repository.get_worker(node_id).await.unwrap();
@@ -2116,8 +2341,7 @@ mod tests {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
-        let scheduled = repository
-            .schedule_sandbox(tenant, new_id(), sandbox(tenant), 60)
+        let scheduled = schedule_test_sandbox(&repository, tenant, new_id(), sandbox(tenant))
             .await
             .unwrap();
         let claimed = repository
@@ -2128,7 +2352,7 @@ mod tests {
             .get_active_worker_lease(tenant, scheduled.sandbox.id)
             .await
             .unwrap();
-        assert_eq!(current.id, scheduled.lease.id);
+        assert_eq!(current.id, scheduled.lease_id);
         assert_eq!(current.generation, claimed[0].lease.generation);
         let renewed = repository
             .renew_worker_lease(tenant, current.id, current.generation, 120)

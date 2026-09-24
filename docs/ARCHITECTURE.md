@@ -1,22 +1,37 @@
 # Production architecture
 
 ```text
-SDK/CLI -> versioned Axum API -> PostgreSQL Scheduler -> authenticated worker RPC
-               |                       | fenced lease          |
-               | S3 snapshot metadata  | capacity reservation FirecrackerRuntime
-               ` append-only usage     ` node heartbeats       | Firecracker API + vsock
-                                                               ` guest agent in guest Linux
+                    AgentForge Core
+       domain + runtime/scheduler/storage/network
+       image/snapshot/policy contracts + Platform
+                              ^
+                              |
+        +---------------------+---------------------+
+        |                                           |
+AgentForge API / worker / CLI              custom Core products
+        |
+        +-- WorkerRuntime ---------------------- Core SandboxRuntime
+        +-- PostgreSQL scheduler/metadata ----- Core Scheduler/MetadataStore
+        +-- S3 artifacts ---------------------- Core ArtifactStore
+        +-- Linux network --------------------- Core NetworkBackend
+        +-- standard images ------------------- Core ImageResolver
+        +-- Firecracker snapshot capabilities - Core SnapshotProvider
+        +-- default policy -------------------- Core Policy
 ```
+
+The dependency direction is acyclic. Core contains generic sandbox, worker, resource, storage, network, image, snapshot, and policy contracts. Backend crates depend on Core; AgentForge's API, worker, and CLI select and consume those backends. Core does not import SQLx, Firecracker, Axum, AWS, or Linux implementation types.
 
 ## Control plane
 
-`agentforge-server` has no local production runtime fallback. It requires `AGENTFORGE_RUNTIME=firecracker`, `DATABASE_URL`, tenant/API credentials, worker credentials, and private S3-compatible storage. PostgreSQL is authoritative for tenants, keys, sandboxes, transition events, worker capacity, sandbox assignments, fenced leases, operation idempotency, snapshots, images, and usage.
+`agentforge-server` builds an AgentForge `Platform` from `Arc<dyn Core ...>` values before constructing API state. Its production defaults are the worker RPC runtime, storage-backed scheduler, PostgreSQL metadata, S3 artifacts, Linux networking, standard image resolution, Firecracker snapshot capabilities, and default policy. API and worker launchers do not retain a second private composition architecture.
+
+The server has no local production runtime fallback. It requires `AGENTFORGE_RUNTIME=firecracker`, `DATABASE_URL`, tenant/API credentials, worker credentials, and private S3-compatible storage. PostgreSQL is authoritative for tenants, keys, sandboxes, transition events, worker capacity, sandbox assignments, fenced leases, operation idempotency, snapshots, images, and usage.
 
 The scheduler filters healthy, non-expired, runtime-compatible workers with enough CPU, RAM, and disk. `SELECT ... FOR UPDATE SKIP LOCKED` and one transaction reserve capacity, create the lease, and assign the sandbox. Lease generations fence stale workers. Heartbeats carry monotonic worker versions; expired leases enter explicit reconciliation history.
 
 ## Worker data plane
 
-`agentforge worker --runtime firecracker` is an independent authenticated HTTP service. The API sends typed, request-ID-bearing lifecycle and I/O operations. Responses are capped and idempotently replayed by request ID. Workers register capacity, heartbeat, claim durable assignments, renew leases, and reconcile state after restart.
+`agentforge worker --runtime firecracker` is an independent authenticated HTTP service. The API sends typed, request-ID-bearing lifecycle and I/O operations. Responses are capped and idempotently replayed by request ID. Workers register capacity, heartbeat, claim durable assignments, renew leases, and reconcile state after restart. The worker and the explicit `agentforge server` development path both store their selected backend as a Core runtime trait object.
 
 ## Firecracker and guest control
 

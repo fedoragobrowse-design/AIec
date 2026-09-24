@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 agentforge-core.workspace = true
+agentforge-network-linux = { path = "../agentforge-network-linux" }
 async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true

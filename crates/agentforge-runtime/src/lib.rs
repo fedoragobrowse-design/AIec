@@ -1,7 +1,16 @@
 use agentforge_core::protocol::{
     self, Operation, Request, RequestPayload, Response, ResponsePayload,
 };
-use agentforge_core::*;
+use agentforge_core::{
+    network::{NetworkAttachment, NetworkBackend},
+    runtime::{RuntimeCapabilities, RuntimeHealth},
+    snapshots::{
+        CapturedSnapshot, SnapshotCapabilities, SnapshotKind, SnapshotMetadata, SnapshotProvider,
+        SnapshotRequest,
+    },
+    *,
+};
+use agentforge_network_linux::LinuxNetworkManager;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,33 +43,32 @@ pub enum RuntimeError {
     FirecrackerApi(String),
 }
 
-#[async_trait]
-pub trait SandboxRuntime: Send + Sync {
-    async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError>;
-    async fn start(&self, sandbox: &Sandbox) -> Result<(), RuntimeError>;
-    async fn stop(&self, sandbox: &Sandbox) -> Result<(), RuntimeError>;
-    async fn exec(
-        &self,
-        sandbox: &Sandbox,
-        request: ExecRequest,
-    ) -> Result<ExecResult, RuntimeError>;
-    async fn put_file(
-        &self,
-        sandbox: &Sandbox,
-        request: PutFileRequest,
-    ) -> Result<(), RuntimeError>;
-    async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, RuntimeError>;
-    async fn list_files(
-        &self,
-        sandbox: &Sandbox,
-        path: &str,
-    ) -> Result<Vec<FileEntry>, RuntimeError>;
-    async fn delete_file(&self, sandbox: &Sandbox, path: &str) -> Result<(), RuntimeError>;
-    async fn make_directory(&self, sandbox: &Sandbox, path: &str) -> Result<(), RuntimeError>;
-    async fn snapshot(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError>;
-    async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError>;
-    async fn destroy(&self, sandbox: &Sandbox) -> Result<(), RuntimeError>;
-    fn health(&self) -> bool;
+pub use agentforge_core::runtime::SandboxRuntime;
+
+fn into_core(error: RuntimeError) -> CoreError {
+    match error {
+        RuntimeError::Core(error) => error,
+        other => CoreError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
+fn bwrap_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        network_policy: true,
+        workspace_snapshot: true,
+        ..RuntimeCapabilities::default()
+    }
+}
+
+fn firecracker_capabilities(_network: &dyn NetworkBackend) -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        vm_snapshot: true,
+        memory_resume: true,
+        network_policy: true,
+        pause: true,
+        vsock: true,
+        ..RuntimeCapabilities::default()
+    }
 }
 
 #[derive(Clone)]
@@ -168,8 +176,7 @@ impl BubblewrapRuntime {
         })
     }
 }
-#[async_trait]
-impl SandboxRuntime for BubblewrapRuntime {
+impl BubblewrapRuntime {
     async fn create(&self, s: &Sandbox) -> Result<(), RuntimeError> {
         let root = self.base(s);
         if root.exists() {
@@ -228,7 +235,7 @@ impl SandboxRuntime for BubblewrapRuntime {
             .arg("PATH")
             .arg("/usr/local/bin:/usr/bin:/bin")
             .arg("--die-with-parent");
-        if !s.network.enabled {
+        if !s.network.is_enabled() {
             cmd.arg("--unshare-net");
         }
         for (k, v) in &r.environment {
@@ -319,7 +326,7 @@ impl SandboxRuntime for BubblewrapRuntime {
         tokio::fs::create_dir_all(self.path_for(s, path)?).await?;
         Ok(())
     }
-    async fn snapshot(&self, s: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
+    pub async fn snapshot(&self, s: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
         let root = self.base(s).join("workspace");
         let out = self.root.join("snapshots").join(format!("{key}.tar"));
         if let Some(p) = out.parent() {
@@ -343,7 +350,7 @@ impl SandboxRuntime for BubblewrapRuntime {
         }
         Ok(tokio::fs::metadata(out).await?.len())
     }
-    async fn restore(&self, s: &Sandbox, key: &str) -> Result<(), RuntimeError> {
+    pub async fn restore(&self, s: &Sandbox, key: &str) -> Result<(), RuntimeError> {
         let archive = self.root.join("snapshots").join(format!("{key}.tar"));
         let root = self.base(s).join("workspace");
         let output = Command::new("tar")
@@ -372,6 +379,92 @@ impl SandboxRuntime for BubblewrapRuntime {
     }
     fn health(&self) -> bool {
         self.bwrap.exists()
+    }
+}
+
+#[async_trait]
+impl SandboxRuntime for BubblewrapRuntime {
+    async fn create(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::create(self, sandbox).await.map_err(into_core)
+    }
+    async fn start(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::start(self, sandbox).await.map_err(into_core)
+    }
+    async fn stop(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::stop(self, sandbox).await.map_err(into_core)
+    }
+    async fn exec(
+        &self,
+        sandbox: &Sandbox,
+        request: ExecRequest,
+    ) -> Result<ExecResult, CoreError> {
+        Self::exec(self, sandbox, request).await.map_err(into_core)
+    }
+    async fn put_file(
+        &self,
+        sandbox: &Sandbox,
+        request: PutFileRequest,
+    ) -> Result<(), CoreError> {
+        Self::put_file(self, sandbox, request).await.map_err(into_core)
+    }
+    async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
+        Self::get_file(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn list_files(
+        &self,
+        sandbox: &Sandbox,
+        path: &str,
+    ) -> Result<Vec<FileEntry>, CoreError> {
+        Self::list_files(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn delete_file(
+        &self,
+        sandbox: &Sandbox,
+        request: DeleteFileRequest,
+    ) -> Result<(), CoreError> {
+        Self::delete_file(self, sandbox, &request.path).await.map_err(into_core)
+    }
+    async fn make_directory(
+        &self,
+        sandbox: &Sandbox,
+        request: MakeDirectoryRequest,
+    ) -> Result<(), CoreError> {
+        Self::make_directory(self, sandbox, &request.path)
+            .await
+            .map_err(into_core)
+    }
+    async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::destroy(self, sandbox).await.map_err(into_core)
+    }
+    async fn health(&self) -> RuntimeHealth {
+        if Self::health(self) {
+            RuntimeHealth::healthy()
+        } else {
+            RuntimeHealth::unhealthy("bubblewrap executable is unavailable")
+        }
+    }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        bwrap_capabilities()
+    }
+}
+
+#[async_trait]
+impl SnapshotProvider for BubblewrapRuntime {
+    fn capabilities(&self) -> SnapshotCapabilities {
+        SnapshotCapabilities { workspace: true, ..SnapshotCapabilities::default() }
+    }
+    async fn capture(&self, sandbox: &Sandbox, request: &SnapshotRequest) -> Result<CapturedSnapshot, CoreError> {
+        if request.kind != SnapshotKind::Workspace {
+            return Err(CoreError::Unsupported("bubblewrap supports workspace snapshots only".into()));
+        }
+        let size = Self::snapshot(self, sandbox, &request.object_key).await.map_err(into_core)?;
+        Ok(CapturedSnapshot {
+            id: Uuid::now_v7(), kind: request.kind, object_key: request.object_key.clone(), size_bytes: size,
+            checksum_sha256: hex::encode(Sha256::digest(request.object_key.as_bytes())),
+        })
+    }
+    async fn restore(&self, sandbox: &Sandbox, metadata: &SnapshotMetadata) -> Result<(), CoreError> {
+        Self::restore(self, sandbox, &metadata.object_key).await.map_err(into_core)
     }
 }
 
@@ -471,16 +564,10 @@ impl FirecrackerConfig {
     }
 }
 
-#[derive(Clone)]
-struct NetworkDevice {
-    tap: String,
-    table: String,
-}
-
 struct FirecrackerVm {
     child: tokio::process::Child,
     api_socket: PathBuf,
-    network_device: Option<NetworkDevice>,
+    network: Option<NetworkAttachment>,
     vsock_socket: PathBuf,
     rootfs: PathBuf,
     start_token: Uuid,
@@ -490,15 +577,25 @@ struct FirecrackerVm {
 pub struct FirecrackerRuntime {
     pub config: FirecrackerConfig,
     vms: Arc<Mutex<HashMap<Uuid, FirecrackerVm>>>,
+    network: Arc<dyn NetworkBackend>,
 }
 
 impl FirecrackerRuntime {
     pub fn new(config: FirecrackerConfig) -> Self {
+        Self::with_network_backend(config, Arc::new(LinuxNetworkManager::new()))
+    }
+
+    pub fn with_network_backend(
+        config: FirecrackerConfig,
+        network: Arc<dyn NetworkBackend>,
+    ) -> Self {
         Self {
             config,
             vms: Arc::new(Mutex::new(HashMap::new())),
+            network,
         }
     }
+
     async fn api(
         &self,
         socket: &Path,
@@ -764,7 +861,7 @@ impl FirecrackerRuntime {
             child,
             api_socket,
             vsock_socket,
-            network_device: None,
+            network: None,
             rootfs: self.config.rootfs(id),
             start_token: Uuid::now_v7(),
         })
@@ -775,35 +872,22 @@ impl FirecrackerRuntime {
         sandbox: &Sandbox,
         vm: &mut FirecrackerVm,
     ) -> Result<(), RuntimeError> {
-        vm.network_device = self.prepare_network(sandbox).await?;
-        if let Some(network) = &vm.network_device {
-            self.api(&vm.api_socket, "PUT", "/network-interfaces/eth0", Some(serde_json::json!({"iface_id":"eth0", "guest_mac":"06:00:AC:10:00:02", "host_dev_name":network.tap}))).await?;
+        vm.network = if sandbox.network.is_enabled() {
+            Some(self.network.prepare(sandbox, &sandbox.network).await?)
+        } else {
+            None
+        };
+        if let Some(network) = &vm.network {
+            self.api(&vm.api_socket, "PUT", "/network-interfaces/eth0", Some(serde_json::json!({"iface_id":"eth0", "guest_mac":"06:00:AC:10:00:02", "host_dev_name":network.resource}))).await?;
         }
         self.api(&vm.api_socket, "PUT", "/boot-source", Some(serde_json::json!({"kernel_image_path": self.config.kernel, "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"}))).await?;
         self.api(&vm.api_socket, "PUT", "/drives/rootfs", Some(serde_json::json!({"drive_id":"rootfs", "path_on_host":vm.rootfs, "is_root_device":true, "is_read_only":false}))).await?;
         self.api(&vm.api_socket, "PUT", "/machine-config", Some(serde_json::json!({"vcpu_count":sandbox.cpu, "mem_size_mib":sandbox.memory_mb, "smt":false}))).await?;
-        self.api(
-            &vm.api_socket,
-            "PUT",
-            "/vsock",
-            Some(
-                serde_json::json!({"guest_cid":self.config.guest_cid, "uds_path":vm.vsock_socket}),
-            ),
-        )
-        .await?;
-        self.api(
-            &vm.api_socket,
-            "PUT",
-            "/actions",
-            Some(serde_json::json!({"action_type":"InstanceStart"})),
-        )
-        .await?;
+        self.api(&vm.api_socket, "PUT", "/vsock", Some(serde_json::json!({"guest_cid":self.config.guest_cid, "uds_path":vm.vsock_socket}))).await?;
+        self.api(&vm.api_socket, "PUT", "/actions", Some(serde_json::json!({"action_type":"InstanceStart"}))).await?;
         let deadline = tokio::time::Instant::now() + self.config.readiness_timeout;
         loop {
-            match self
-                .guest_call(sandbox.id, Operation::Health, RequestPayload::None)
-                .await
-            {
+            match self.guest_call(sandbox.id, Operation::Health, RequestPayload::None).await {
                 Ok(ResponsePayload::Health { ready: true }) => return Ok(()),
                 Ok(_) => {}
                 Err(error) if tokio::time::Instant::now() < deadline => {
@@ -815,126 +899,6 @@ impl FirecrackerRuntime {
         }
     }
 
-    async fn cleanup_network(&self, device: &Option<NetworkDevice>) {
-        if let Some(device) = device {
-            let _ = Command::new("nft")
-                .args(["delete", "table", "inet", &device.table])
-                .status()
-                .await;
-            let _ = Command::new("ip")
-                .args(["link", "del", &device.tap])
-                .status()
-                .await;
-        }
-    }
-
-    async fn prepare_network(
-        &self,
-        sandbox: &Sandbox,
-    ) -> Result<Option<NetworkDevice>, RuntimeError> {
-        if !sandbox.network.enabled {
-            return Ok(None);
-        }
-        let suffix = sandbox.id.simple().to_string();
-        let suffix = &suffix[..12];
-        let tap = format!("af{suffix}");
-        let table = format!("agentforge_{suffix}");
-        let device = NetworkDevice {
-            tap: tap.clone(),
-            table: table.clone(),
-        };
-        let host_ip = format!("172.30.0.{}", ((sandbox.id.as_u128() & 0x3f) + 2) as u8);
-        let mut tap_created = false;
-        let commands = [
-            vec![
-                "tuntap".into(),
-                "add".into(),
-                "dev".into(),
-                tap.clone(),
-                "mode".into(),
-                "tap".into(),
-            ],
-            vec![
-                "addr".into(),
-                "add".into(),
-                format!("{host_ip}/30"),
-                "dev".into(),
-                tap.clone(),
-            ],
-            vec![
-                "link".into(),
-                "set".into(),
-                "dev".into(),
-                tap.clone(),
-                "up".into(),
-            ],
-        ];
-        for (index, args) in commands.iter().enumerate() {
-            let output = match Command::new("ip").args(args).output().await {
-                Ok(output) => output,
-                Err(error) => {
-                    if tap_created {
-                        self.cleanup_network(&Some(device.clone())).await;
-                    }
-                    return Err(error.into());
-                }
-            };
-            if !output.status.success() {
-                if tap_created {
-                    self.cleanup_network(&Some(device.clone())).await;
-                }
-                return Err(RuntimeError::Unavailable(format!(
-                    "TAP setup failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
-            tap_created = true;
-            if index == commands.len() - 1 {
-                break;
-            }
-        }
-        let rules = firewall_rules(&table, &tap);
-        let mut child = match Command::new("nft")
-            .arg("-f")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                self.cleanup_network(&Some(device.clone())).await;
-                return Err(error.into());
-            }
-        };
-        let write_result = match child.stdin.as_mut() {
-            Some(stdin) => stdin.write_all(rules.as_bytes()).await,
-            None => Err(std::io::Error::other("nft stdin unavailable")),
-        };
-        if let Err(error) = write_result {
-            drop(child.stdin.take());
-            let _ = child.wait().await;
-            self.cleanup_network(&Some(device.clone())).await;
-            return Err(error.into());
-        }
-        drop(child.stdin.take());
-        let output = match child.wait_with_output().await {
-            Ok(output) => output,
-            Err(error) => {
-                self.cleanup_network(&Some(device.clone())).await;
-                return Err(error.into());
-            }
-        };
-        if !output.status.success() {
-            self.cleanup_network(&Some(device)).await;
-            return Err(RuntimeError::Unavailable(format!(
-                "nft isolation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        Ok(Some(device))
-    }
 
     fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
         let runtime = self.clone();
@@ -951,7 +915,9 @@ impl FirecrackerRuntime {
             .await;
         let _ = vm.child.start_kill();
         let _ = vm.child.wait().await;
-        self.cleanup_network(&vm.network_device).await;
+        if let Some(network) = &vm.network {
+            let _ = self.network.release(sandbox, network).await;
+        }
     }
 
     async fn stop_if_token(&self, sandbox: &Sandbox, token: Uuid) {
@@ -968,23 +934,6 @@ impl FirecrackerRuntime {
     }
 }
 
-fn firewall_rules(table: &str, tap: &str) -> String {
-    format!(
-        "add table inet {table}; \
-add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}; \
-add chain inet {table} forward {{ type filter hook forward priority -10; policy accept; }}; \
-add rule inet {table} input iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
-add rule inet {table} input iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
-add rule inet {table} input iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
-add rule inet {table} input iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
-add rule inet {table} input iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip daddr 127.0.0.0/8 drop"
-    )
-}
 fn frame_bytes(secret: &[u8], body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(42 + body.len());
     frame.extend_from_slice(b"AFG1");
@@ -1038,8 +987,7 @@ fn which(program: &str) -> Option<PathBuf> {
     })
 }
 
-#[async_trait]
-impl SandboxRuntime for FirecrackerRuntime {
+impl FirecrackerRuntime {
     async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         self.config.check()?;
         let dir = self.config.vm_dir(sandbox.id);
@@ -1097,7 +1045,9 @@ impl SandboxRuntime for FirecrackerRuntime {
         self.config.check()?;
         let mut vm = self.spawn(sandbox.id).await?;
         if let Err(error) = self.configure_and_start(sandbox, &mut vm).await {
-            let _ = self.cleanup_network(&vm.network_device).await;
+            if let Some(network) = &vm.network {
+                let _ = self.network.release(sandbox, network).await;
+            }
             let _ = vm.child.start_kill();
             let _ = vm.child.wait().await;
             return Err(error);
@@ -1253,7 +1203,7 @@ impl SandboxRuntime for FirecrackerRuntime {
         Ok(())
     }
 
-    async fn snapshot(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
+    pub async fn snapshot(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
         self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
             .await?;
         let vms = self.vms.lock().await;
@@ -1332,7 +1282,7 @@ impl SandboxRuntime for FirecrackerRuntime {
         }
     }
 
-    async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError> {
+    pub async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError> {
         let source = self.config.snapshot_dir(object_key);
         let manifest: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(source.join("manifest.json")).await?)?;
@@ -1400,6 +1350,66 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
 }
 
+#[async_trait]
+impl SandboxRuntime for FirecrackerRuntime {
+    async fn create(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::create(self, sandbox).await.map_err(into_core)
+    }
+    async fn start(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::start(self, sandbox).await.map_err(into_core)
+    }
+    async fn stop(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::stop(self, sandbox).await.map_err(into_core)
+    }
+    async fn exec(&self, sandbox: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
+        Self::exec(self, sandbox, request).await.map_err(into_core)
+    }
+    async fn put_file(&self, sandbox: &Sandbox, request: PutFileRequest) -> Result<(), CoreError> {
+        Self::put_file(self, sandbox, request).await.map_err(into_core)
+    }
+    async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
+        Self::get_file(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
+        Self::list_files(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn delete_file(&self, sandbox: &Sandbox, request: DeleteFileRequest) -> Result<(), CoreError> {
+        Self::delete_file(self, sandbox, &request.path).await.map_err(into_core)
+    }
+    async fn make_directory(&self, sandbox: &Sandbox, request: MakeDirectoryRequest) -> Result<(), CoreError> {
+        Self::make_directory(self, sandbox, &request.path).await.map_err(into_core)
+    }
+    async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::destroy(self, sandbox).await.map_err(into_core)
+    }
+    async fn health(&self) -> RuntimeHealth {
+        if Self::health(self) { RuntimeHealth::healthy() } else { RuntimeHealth::unhealthy("Firecracker prerequisites unavailable") }
+    }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        firecracker_capabilities(self.network.as_ref())
+    }
+}
+
+#[async_trait]
+impl SnapshotProvider for FirecrackerRuntime {
+    fn capabilities(&self) -> SnapshotCapabilities {
+        SnapshotCapabilities { virtual_machine: true, memory: true, workspace: false, cross_instance_restore: true }
+    }
+    async fn capture(&self, sandbox: &Sandbox, request: &SnapshotRequest) -> Result<CapturedSnapshot, CoreError> {
+        if request.kind == SnapshotKind::Workspace {
+            return Err(CoreError::Unsupported("Firecracker snapshots include VM state".into()));
+        }
+        let size = Self::snapshot(self, sandbox, &request.object_key).await.map_err(into_core)?;
+        Ok(CapturedSnapshot {
+            id: Uuid::now_v7(), kind: request.kind, object_key: request.object_key.clone(), size_bytes: size,
+            checksum_sha256: hex::encode(Sha256::digest(request.object_key.as_bytes())),
+        })
+    }
+    async fn restore(&self, sandbox: &Sandbox, metadata: &SnapshotMetadata) -> Result<(), CoreError> {
+        Self::restore(self, sandbox, &metadata.object_key).await.map_err(into_core)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1453,23 +1463,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn firewall_rules_are_scoped_to_tap_without_output_hook() {
-        let rules = firewall_rules("agentforge_0123456789ab", "af0123456789ab");
-        assert!(rules.contains("hook input"));
-        assert!(rules.contains("hook forward"));
-        assert!(!rules.contains("hook output"));
-        assert!(rules.contains("iifname \"af0123456789ab\""));
-        for destination in [
-            "169.254.169.254",
-            "10.0.0.0/8",
-            "172.16.0.0/12",
-            "192.168.0.0/16",
-            "127.0.0.0/8",
-        ] {
-            assert!(rules.contains(destination));
-        }
-    }
 
     #[test]
     fn repeated_non_idempotent_requests_get_fresh_ids() {
@@ -1537,7 +1530,7 @@ mod tests {
             FirecrackerVm {
                 child,
                 api_socket: PathBuf::from("/unused/api.sock"),
-                network_device: None,
+            network: None,
                 vsock_socket: PathBuf::from("/unused/vsock.sock"),
                 rootfs: PathBuf::from("/unused/rootfs.ext4"),
                 start_token: token,
@@ -1570,7 +1563,7 @@ mod tests {
             FirecrackerVm {
                 child,
                 api_socket: PathBuf::from("/unused/api.sock"),
-                network_device: None,
+            network: None,
                 vsock_socket: PathBuf::from("/unused/vsock.sock"),
                 rootfs: PathBuf::from("/unused/rootfs.ext4"),
                 start_token: token,

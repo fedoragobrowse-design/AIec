@@ -1,9 +1,13 @@
 use agentforge_api::{WorkerHeartbeat, WorkerRegistration, WorkerService, WorkerStatus};
 use agentforge_client::AgentForgeClient;
 use agentforge_core::*;
-use agentforge_runtime::{
-    BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime, SandboxRuntime,
+use agentforge_core::{
+    platform::Platform,
+    runtime::SandboxRuntime,
+    snapshots::SnapshotProvider,
+    storage::MetadataStore,
 };
+use agentforge_runtime::{BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
@@ -198,15 +202,28 @@ async fn server(args: ServerArgs) -> Result<()> {
         anyhow::bail!("server only supports explicit bwrap-dev; production uses agentforge-server")
     }
     std::fs::create_dir_all(&args.state_dir)?;
-    let runtime: Arc<dyn SandboxRuntime> = Arc::new(BubblewrapRuntime::new(&args.state_dir));
+    let bubblewrap = Arc::new(BubblewrapRuntime::new(&args.state_dir));
+    let runtime: Arc<dyn SandboxRuntime> = bubblewrap.clone();
+    let snapshots: Arc<dyn SnapshotProvider> = bubblewrap;
+    let metadata_store: Arc<dyn MetadataStore> =
+        agentforge_storage::MemoryRepository::new();
+    let scheduler: Arc<dyn agentforge_core::scheduler::Scheduler> =
+        Arc::new(agentforge_api::DevelopmentScheduler);
+    let platform = Platform::builder()
+        .runtime(runtime)
+        .metadata_store(metadata_store)
+        .scheduler(scheduler)
+        .snapshots(snapshots)
+        .policy(Arc::new(agentforge_api::DefaultPolicy))
+        .build()?;
     let worker_token =
         std::env::var("AGENTFORGE_WORKER_TOKEN").unwrap_or_else(|_| generate_api_key());
-    let state =
-        agentforge_api::AppState::in_memory(runtime).with_worker_token(worker_token.clone());
+    let state = agentforge_api::AppState::development(platform)
+        .with_worker_token(worker_token.clone());
     let addr = args.bind.parse().context("invalid bind address")?;
     let key = std::env::var("AGENTFORGE_API_KEY").unwrap_or_else(|_| generate_api_key());
     agentforge_api::bootstrap_api_key(
-        state.repository.as_ref(),
+        state.repository().as_ref(),
         &key,
         Uuid::nil(),
         &[Scope::Admin],
@@ -251,25 +268,31 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     }
     let advertise_url = advertised.as_str().trim_end_matches('/').to_owned();
     let node_id = args.node_id.unwrap_or_else(Uuid::now_v7);
-    let (runtime, runtime_kind): (Arc<dyn SandboxRuntime>, RuntimeKind) = match args
-        .runtime
-        .as_str()
-    {
-        "bwrap-dev" => (
-            Arc::new(BubblewrapRuntime::new(&args.state_dir)),
-            RuntimeKind::BwrapDev,
-        ),
+    let (runtime, snapshots, runtime_kind): (
+        Arc<dyn SandboxRuntime>,
+        Arc<dyn SnapshotProvider>,
+        RuntimeKind,
+    ) = match args.runtime.as_str() {
+        "bwrap-dev" => {
+            let backend = Arc::new(BubblewrapRuntime::new(&args.state_dir));
+            (backend.clone(), backend, RuntimeKind::BwrapDev)
+        }
         "firecracker" => {
             let config = FirecrackerConfig::from_env()
                 .map_err(|error| anyhow::anyhow!("invalid Firecracker configuration: {error}"))?;
-            (
-                Arc::new(FirecrackerRuntime::new(config)),
-                RuntimeKind::Firecracker,
-            )
+            let backend = Arc::new(FirecrackerRuntime::new(config));
+            (backend.clone(), backend, RuntimeKind::Firecracker)
         }
         other => anyhow::bail!("unsupported worker runtime {other}; use bwrap-dev or firecracker"),
     };
-    let service = WorkerService::new(runtime, runtime_kind, token.clone(), node_id, args.capacity);
+    let service = WorkerService::new(
+        runtime,
+        runtime_kind,
+        Some(snapshots),
+        token.clone(),
+        node_id,
+        args.capacity,
+    );
     let client = reqwest::Client::new();
     let control = control_url.trim_end_matches('/').to_owned();
     let now = chrono::Utc::now();
@@ -455,7 +478,11 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
                 memory_mb,
                 disk_mb,
                 timeout_seconds,
-                network: NetworkPolicy { enabled: network },
+                network: if network {
+                    NetworkPolicy::Internet
+                } else {
+                    NetworkPolicy::Disabled
+                },
             };
             let sandbox = if runtime == "firecracker" {
                 let api_key = raw_key.context("set --api-key or AGENTFORGE_API_KEY")?;

@@ -6,6 +6,29 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod images;
+pub mod network;
+pub mod platform;
+pub mod policy;
+pub mod runtime;
+pub mod scheduler;
+pub mod snapshots;
+pub mod storage;
+
+/// Stable sandbox identifier.
+pub type SandboxId = Uuid;
+/// Stable tenant identifier.
+pub type TenantId = Uuid;
+/// Stable worker identifier.
+pub type WorkerId = Uuid;
+/// Stable lease identifier.
+pub type LeaseId = Uuid;
+/// Stable snapshot identifier.
+pub type SnapshotId = Uuid;
+/// Stable idempotency request identifier.
+pub type RequestId = Uuid;
+
+pub use network::NetworkPolicy;
 pub mod protocol;
 
 pub const MAX_STDOUT: usize = 1_048_576;
@@ -29,6 +52,12 @@ pub enum CoreError {
     Forbidden(String),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    #[error("backend unavailable: {0}")]
+    Unavailable(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
+    #[error("backend error: {0}")]
+    Backend(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -97,12 +126,8 @@ impl SandboxState {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct NetworkPolicy {
-    pub enabled: bool,
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateSandboxRequest {
     pub image: String,
     #[serde(default = "default_cpu")]
@@ -129,7 +154,7 @@ fn default_timeout() -> u64 {
     900
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Sandbox {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -214,7 +239,7 @@ pub struct Snapshot {
     pub image_id: String,
     pub created_at: DateTime<Utc>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RestoreSnapshotRequest {
     pub image: Option<String>,
     pub cpu: Option<u32>,

@@ -1,6 +1,12 @@
 use agentforge_core::*;
-use agentforge_runtime::{RuntimeError, SandboxRuntime};
-use agentforge_storage::{MemoryRepository, ObjectStore, Repository};
+use agentforge_core::{
+    platform::Platform,
+    policy::PolicyOperation,
+    runtime::SandboxRuntime,
+    snapshots::{SnapshotKind, SnapshotMetadata, SnapshotRequest},
+    storage::{ArtifactStore, MetadataStore},
+};
+mod composition;
 mod worker;
 use axum::{
     Json, Router,
@@ -21,49 +27,62 @@ use std::{
     },
 };
 use uuid::Uuid;
+pub use composition::{DefaultPolicy, DevelopmentScheduler};
 pub use worker::{
-    HttpWorkerClient, ScheduledSandbox, Scheduler, SchedulerError, StorageScheduler, WorkerClient,
-    WorkerClientError, WorkerError, WorkerHeartbeat, WorkerOperation, WorkerRegistration,
-    WorkerRequest, WorkerResponse, WorkerRuntime, WorkerService, WorkerStatus, WorkerValue,
+    HttpWorkerClient, WorkerClient, WorkerClientError, WorkerError, WorkerHeartbeat,
+    WorkerOperation, WorkerRegistration, WorkerRequest, WorkerResponse, WorkerRuntime, WorkerService,
+    WorkerStatus, WorkerValue,
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub runtime: Arc<dyn SandboxRuntime>,
-    pub repository: Arc<dyn Repository>,
+    pub platform: Platform,
+    production: bool,
     requests: Arc<AtomicU64>,
-    scheduler: Option<Arc<dyn Scheduler>>,
     worker_token: Option<Arc<str>>,
-    object_store: Option<Arc<dyn ObjectStore>>,
+    lease_ttl_seconds: u64,
 }
 impl AppState {
-    pub fn new(repository: Arc<dyn Repository>, runtime: Arc<dyn SandboxRuntime>) -> Self {
+    pub fn new(platform: Platform) -> Self {
         Self {
-            worker_token: None,
-            runtime,
-            repository,
-            scheduler: None,
+            lease_ttl_seconds: 300,
+            platform,
+            production: true,
             requests: Arc::new(AtomicU64::new(0)),
-            object_store: None,
+            worker_token: None,
+        }
+    }
+    pub fn development(platform: Platform) -> Self {
+        Self {
+            platform,
+            production: false,
+            requests: Arc::new(AtomicU64::new(0)),
+            lease_ttl_seconds: 300,
+            worker_token: None,
         }
     }
     pub fn with_worker_token(mut self, token: impl Into<String>) -> Self {
         self.worker_token = Some(Arc::from(token.into().as_str()));
         self
     }
-    pub fn in_memory(runtime: Arc<dyn SandboxRuntime>) -> Self {
-        Self::new(MemoryRepository::new(), runtime)
-    }
-    pub fn with_scheduler(mut self, scheduler: Arc<dyn Scheduler>) -> Self {
-        self.scheduler = Some(scheduler);
+    pub fn with_lease_ttl(mut self, seconds: u64) -> Self {
+        self.lease_ttl_seconds = seconds.clamp(1, 3600);
         self
     }
-    pub fn scheduler(&self) -> Option<Arc<dyn Scheduler>> {
-        self.scheduler.clone()
+    pub fn runtime(&self) -> Arc<dyn SandboxRuntime> {
+        self.platform.runtime()
     }
-    pub fn with_object_store(mut self, object_store: Arc<dyn ObjectStore>) -> Self {
-        self.object_store = Some(object_store);
-        self
+    pub fn repository(&self) -> Arc<dyn MetadataStore> {
+        self.platform.metadata_store()
+    }
+    pub fn scheduler(&self) -> Arc<dyn agentforge_core::scheduler::Scheduler> {
+        self.platform.scheduler()
+    }
+    pub fn artifact_store(&self) -> Option<Arc<dyn ArtifactStore>> {
+        self.platform.artifact_store()
+    }
+    pub fn is_production(&self) -> bool {
+        self.production
     }
 }
 #[derive(Debug)]
@@ -110,105 +129,50 @@ impl From<CoreError> for ApiFailure {
             CoreError::LimitExceeded(m) => {
                 Self::new(StatusCode::PAYLOAD_TOO_LARGE, "limit_exceeded", m)
             }
+            CoreError::Unavailable(m) => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", m)
+            }
+            CoreError::Unsupported(m) => {
+                Self::new(StatusCode::NOT_IMPLEMENTED, "unsupported", m)
+            }
+            CoreError::Backend(m) => {
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "backend", m)
+            }
             CoreError::Io(e) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
             }
         }
     }
 }
-impl From<RuntimeError> for ApiFailure {
-    fn from(e: RuntimeError) -> Self {
-        match e {
-            RuntimeError::Core(e) => e.into(),
-            RuntimeError::Unavailable(m) => {
-                Self::new(StatusCode::SERVICE_UNAVAILABLE, "runtime_unavailable", m)
-            }
-            RuntimeError::Io(e) => {
-                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
-            }
-            RuntimeError::Json(e) => {
-                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
-            }
-            RuntimeError::Archive(m) => {
-                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "snapshot_failed", m)
-            }
-            RuntimeError::Protocol(error) => {
-                Self::new(StatusCode::BAD_GATEWAY, "guest_protocol", error.to_string())
-            }
-            RuntimeError::FirecrackerApi(message) => {
-                Self::new(StatusCode::BAD_GATEWAY, "firecracker_api", message)
-            }
-        }
-    }
-}
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
-fn store(error: agentforge_storage::StoreError) -> ApiFailure {
-    use agentforge_storage::StoreError;
-    match error {
-        StoreError::Core(error) => error.into(),
-        StoreError::NotFound => ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "not found"),
-        StoreError::Conflict(message) => ApiFailure::new(StatusCode::CONFLICT, "conflict", message),
-        StoreError::ObjectStore(message) => {
-            ApiFailure::new(StatusCode::BAD_GATEWAY, "object_store", message)
-        }
-        StoreError::Unsupported(operation) => ApiFailure::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "storage_unsupported",
-            format!("storage operation is unsupported: {operation}"),
-        ),
-        StoreError::Database(error) => ApiFailure::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage",
-            error.to_string(),
-        ),
-        StoreError::Migration(error) => ApiFailure::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage",
-            error.to_string(),
-        ),
-        StoreError::Io(error) => ApiFailure::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage",
-            error.to_string(),
-        ),
-        StoreError::Json(error) => ApiFailure::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage",
-            error.to_string(),
-        ),
-        StoreError::InvalidObjectKey(message) => {
-            ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "storage", message)
-        }
-    }
-}
+
 
 pub async fn bootstrap_api_key(
-    repository: &dyn Repository,
+    repository: &dyn MetadataStore,
     raw_key: &str,
-    tenant_id: Uuid,
+    tenant_id: TenantId,
     scopes: &[Scope],
-) -> Result<Uuid, agentforge_storage::StoreError> {
+) -> Result<Uuid, CoreError> {
     validate_api_key(raw_key)?;
     let digest = key_digest(raw_key);
-    let validate_existing =
-        |existing: ApiKeyRecord| -> Result<Uuid, agentforge_storage::StoreError> {
-            if existing.tenant_id != tenant_id
-                || existing.revoked_at.is_some()
-                || existing
-                    .expires_at
-                    .is_some_and(|expires_at| expires_at <= Utc::now())
-                || scopes.iter().any(|scope| !existing.scopes.contains(scope))
-            {
-                return Err(agentforge_storage::StoreError::Conflict(
+    let validate_existing = |existing: ApiKeyRecord| -> Result<Uuid, CoreError> {
+        if existing.tenant_id != tenant_id
+            || existing.revoked_at.is_some()
+            || existing
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+            || scopes.iter().any(|scope| !existing.scopes.contains(scope))
+        {
+            return Err(CoreError::Conflict(
                 "bootstrap API key already exists with different ownership, lifecycle, or scopes"
                     .into(),
             ));
-            }
-            Ok(existing.id)
-        };
+        }
+        Ok(existing.id)
+    };
     match repository.find_key(&digest).await {
         Ok(existing) => validate_existing(existing),
-        Err(agentforge_storage::StoreError::NotFound) => {
+        Err(CoreError::NotFound(_)) => {
             let candidate = ApiKeyRecord {
                 id: new_id(),
                 tenant_id,
@@ -220,7 +184,7 @@ pub async fn bootstrap_api_key(
             let candidate_id = candidate.id;
             match repository.put_key(candidate).await {
                 Ok(()) => Ok(candidate_id),
-                Err(agentforge_storage::StoreError::Conflict(_)) => repository
+                Err(CoreError::Conflict(_)) => repository
                     .find_key(&digest)
                     .await
                     .and_then(validate_existing),
@@ -295,20 +259,18 @@ async fn claim_worker_assignments(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<WorkerClaimQuery>,
-) -> ApiResult<Vec<agentforge_storage::WorkerAssignment>> {
-    match state
-        .repository
-        .claim_worker_assignments(
-            id,
-            query.limit.min(128),
-            query.lease_ttl_seconds.clamp(1, 3600),
-        )
-        .await
-    {
-        Ok(assignments) => Ok(Json(assignments)),
-        Err(agentforge_storage::StoreError::Unsupported(_)) => Ok(Json(Vec::new())),
-        Err(error) => Err(store(error)),
-    }
+) -> ApiResult<Vec<agentforge_core::storage::WorkerAssignment>> {
+    Ok(Json(
+        state
+            .repository()
+            .claim_worker_assignments(
+                id,
+                query.limit.min(128),
+                query.lease_ttl_seconds.clamp(1, 3600),
+            )
+            .await
+            .map_err(ApiFailure::from)?,
+    ))
 }
 
 async fn worker_auth(
@@ -341,8 +303,9 @@ async fn worker_auth(
 async fn register_worker(
     State(state): State<AppState>,
     Json(registration): Json<WorkerRegistration>,
-) -> ApiResult<agentforge_storage::WorkerRegistration> {
-    let record = agentforge_storage::WorkerRegistration {
+) -> ApiResult<agentforge_core::storage::WorkerRegistration> {
+    let now = Utc::now();
+    let record = agentforge_core::storage::WorkerRegistration {
         node_id: registration.node_id,
         name: registration.name,
         runtime: registration.runtime,
@@ -356,30 +319,15 @@ async fn register_worker(
         healthy: registration.healthy,
         version: registration.version,
         metadata: registration.metadata,
-        started_at: Utc::now(),
-        last_heartbeat: Utc::now(),
+        started_at: now,
+        last_heartbeat: now,
     };
-    match state.repository.register_worker(record.clone()).await {
-        Ok(()) => Ok(Json(record)),
-        Err(agentforge_storage::StoreError::Unsupported(_)) => {
-            state
-                .repository
-                .register_node(Node {
-                    id: record.node_id,
-                    name: record.name.clone(),
-                    available_vcpus: record.available_vcpus,
-                    available_memory_bytes: record.available_memory_bytes,
-                    available_disk_bytes: record.available_disk_bytes,
-                    sandbox_count: 0,
-                    healthy: record.healthy,
-                    last_heartbeat: record.last_heartbeat,
-                })
-                .await
-                .map_err(store)?;
-            Ok(Json(record))
-        }
-        Err(error) => Err(store(error)),
-    }
+    state
+        .repository()
+        .register_worker(record.clone())
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(record))
 }
 
 async fn heartbeat_worker(
@@ -394,113 +342,44 @@ async fn heartbeat_worker(
             "worker heartbeat id mismatch",
         ));
     }
-    let value = agentforge_storage::WorkerHeartbeat {
-        node_id: heartbeat.node_id,
-        available_vcpus: heartbeat.available_vcpus,
-        available_memory_bytes: heartbeat.available_memory_bytes,
-        available_disk_bytes: heartbeat.available_disk_bytes,
-        sandbox_count: heartbeat.sandbox_count,
-        healthy: heartbeat.healthy,
-        version: heartbeat.version,
-        metadata: heartbeat.metadata,
-        last_error: heartbeat.last_error,
-    };
-    match state.repository.heartbeat_worker(value).await {
-        Ok(status) => Ok(Json(json!(status))),
-        Err(agentforge_storage::StoreError::Unsupported(_)) => {
-            let Some(mut node) = state
-                .repository
-                .list_nodes()
-                .await
-                .map_err(store)?
-                .into_iter()
-                .find(|node| node.id == id)
-            else {
-                return Err(ApiFailure::new(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "worker is not registered",
-                ));
-            };
-            node.available_vcpus = heartbeat.available_vcpus;
-            node.available_memory_bytes = heartbeat.available_memory_bytes;
-            node.available_disk_bytes = heartbeat.available_disk_bytes;
-            node.sandbox_count = heartbeat.sandbox_count;
-            node.healthy = heartbeat.healthy;
-            node.last_heartbeat = Utc::now();
-            state
-                .repository
-                .register_node(node.clone())
-                .await
-                .map_err(store)?;
-            state.repository.heartbeat(id).await.map_err(store)?;
-            Ok(Json(json!(node)))
-        }
-        Err(error) => Err(store(error)),
-    }
+    let status = state
+        .repository()
+        .heartbeat_worker(agentforge_core::storage::WorkerHeartbeat {
+            node_id: heartbeat.node_id,
+            available_vcpus: heartbeat.available_vcpus,
+            available_memory_bytes: heartbeat.available_memory_bytes,
+            available_disk_bytes: heartbeat.available_disk_bytes,
+            sandbox_count: heartbeat.sandbox_count,
+            healthy: heartbeat.healthy,
+            version: heartbeat.version,
+            metadata: heartbeat.metadata,
+            last_error: heartbeat.last_error,
+        })
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(json!(status)))
 }
 
 async fn worker_status(State(state): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Value> {
-    match state.repository.get_worker(id).await {
-        Ok(status) => Ok(Json(json!(status))),
-        Err(agentforge_storage::StoreError::Unsupported(_)) => state
-            .repository
-            .list_nodes()
-            .await
-            .map_err(store)?
-            .into_iter()
-            .find(|node| node.id == id)
-            .map(|node| Json(json!(node)))
-            .ok_or_else(|| {
-                ApiFailure::new(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "worker is not registered",
-                )
-            }),
-        Err(error) => Err(store(error)),
-    }
+    let status = state
+        .repository()
+        .get_worker(id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(json!(status)))
 }
 
 async fn reconcile_workers(State(state): State<AppState>) -> ApiResult<Value> {
-    let actions = match state.repository.reconcile_expired_leases(100).await {
-        Ok(actions) => actions,
-        Err(agentforge_storage::StoreError::Unsupported(_)) => Vec::new(),
-        Err(error) => return Err(store(error)),
-    };
-    let workers = match state.repository.list_workers(true).await {
-        Ok(workers) => workers,
-        Err(agentforge_storage::StoreError::Unsupported(_)) => state
-            .repository
-            .list_nodes()
-            .await
-            .map_err(store)?
-            .into_iter()
-            .map(|node| agentforge_storage::WorkerStatus {
-                registration: agentforge_storage::WorkerRegistration {
-                    node_id: node.id,
-                    name: node.name,
-                    runtime: RuntimeKind::BwrapDev,
-                    control_endpoint: String::new(),
-                    total_vcpus: node.available_vcpus,
-                    total_memory_bytes: node.available_memory_bytes,
-                    total_disk_bytes: node.available_disk_bytes,
-                    available_vcpus: node.available_vcpus,
-                    available_memory_bytes: node.available_memory_bytes,
-                    available_disk_bytes: node.available_disk_bytes,
-                    healthy: node.healthy,
-                    version: 0,
-                    metadata: json!({}),
-                    started_at: node.last_heartbeat,
-                    last_heartbeat: node.last_heartbeat,
-                },
-                sandbox_count: node.sandbox_count,
-                observed_sandbox_count: node.sandbox_count,
-                last_error: None,
-            })
-            .collect(),
-        Err(error) => return Err(store(error)),
-    };
+    let actions = state
+        .repository()
+        .reconcile_expired_leases(100)
+        .await
+        .map_err(ApiFailure::from)?;
+    let workers = state
+        .repository()
+        .list_workers(true)
+        .await
+        .map_err(ApiFailure::from)?;
     Ok(Json(json!({"actions": actions, "workers": workers})))
 }
 async fn auth(
@@ -523,8 +402,7 @@ async fn auth(
     validate_api_key(raw).map_err(|_| {
         ApiFailure::new(StatusCode::UNAUTHORIZED, "unauthorized", "invalid API key")
     })?;
-    let key = state
-        .repository
+    let key = state.repository()
         .find_key(&key_digest(raw))
         .await
         .map_err(|_| {
@@ -552,8 +430,7 @@ async fn ready() -> Json<Value> {
     Json(json!({"status":"ready"}))
 }
 async fn metrics(State(state): State<AppState>) -> Response {
-    let count = state
-        .repository
+    let count = state.repository()
         .list_nodes()
         .await
         .map(|nodes| nodes.len())
@@ -587,14 +464,14 @@ async fn create_sandbox(
         }
         None => None,
     };
-    if requested_runtime == Some(RuntimeKind::Firecracker) && s.scheduler().is_none() {
+    if requested_runtime == Some(RuntimeKind::Firecracker) && !s.is_production() {
         return Err(ApiFailure::new(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "firecracker requests require the production server",
         ));
     }
-    if requested_runtime == Some(RuntimeKind::BwrapDev) && s.scheduler().is_some() {
+    if requested_runtime == Some(RuntimeKind::BwrapDev) && s.is_production() {
         return Err(ApiFailure::new(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -602,7 +479,28 @@ async fn create_sandbox(
         ));
     }
     let r = body.request;
-    validate_create(&r, 86400).map_err(ApiFailure::from)?;
+    validate_create(&r, MAX_LIFETIME_SECONDS).map_err(ApiFailure::from)?;
+    if let Some(policy) = s.platform.policy() {
+        let decision = policy.evaluate(PolicyOperation::CreateSandbox(&r));
+        if !decision.allowed {
+            return Err(ApiFailure::new(
+                StatusCode::BAD_REQUEST,
+                "policy_denied",
+                decision.reason.unwrap_or_else(|| "request denied by policy".into()),
+            ));
+        }
+    }
+    let resolved_image_id = if let Some(images) = s.platform.images() {
+        let reference = agentforge_core::images::ImageReference::new(&r.image)
+            .map_err(ApiFailure::from)?;
+        images
+            .resolve(&reference)
+            .await
+            .map_err(ApiFailure::from)?
+            .image_id
+    } else {
+        image_id(&r.image)
+    };
     let request_id = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -617,12 +515,12 @@ async fn create_sandbox(
         id: request_id,
         tenant_id: p.tenant_id,
         node_id: None,
-        runtime: if s.scheduler().is_some() {
+        runtime: if s.is_production() {
             RuntimeKind::Firecracker
         } else {
             RuntimeKind::BwrapDev
         },
-        image_id: image_id(&r.image),
+        image_id: resolved_image_id,
         state: SandboxState::Creating,
         cpu: r.cpu,
         memory_mb: r.memory_mb,
@@ -633,9 +531,16 @@ async fn create_sandbox(
         updated_at: now,
         runtime_path: None,
     };
-    if let Some(scheduler) = s.scheduler() {
-        x = scheduler
-            .schedule(p.tenant_id, request_id, x)
+    if s.is_production() {
+        x = s
+            .scheduler()
+            .schedule(agentforge_core::scheduler::ScheduleRequest {
+                tenant_id: p.tenant_id,
+                request_id,
+                sandbox: x,
+                preferred_worker: None,
+                lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
+            })
             .await
             .map_err(|error| {
                 ApiFailure::new(
@@ -646,17 +551,16 @@ async fn create_sandbox(
             })?
             .sandbox;
     } else {
-        s.repository
+        s.repository()
             .create_sandbox(x.clone())
-            .await
-            .map_err(store)?;
+            .await.map_err(ApiFailure::from)?;
     }
     if x.state != SandboxState::Creating {
         return Ok(Json(x));
     }
-    s.runtime.create(&x).await.map_err(ApiFailure::from)?;
+    s.runtime().create(&x).await.map_err(ApiFailure::from)?;
     x.state = SandboxState::Starting;
-    s.repository
+    s.repository()
         .update_state(
             p.tenant_id,
             x.id,
@@ -664,11 +568,10 @@ async fn create_sandbox(
             SandboxState::Starting,
             None,
         )
-        .await
-        .map_err(store)?;
-    s.runtime.start(&x).await.map_err(ApiFailure::from)?;
+        .await.map_err(ApiFailure::from)?;
+    s.runtime().start(&x).await.map_err(ApiFailure::from)?;
     x.state = SandboxState::Running;
-    s.repository
+    s.repository()
         .update_state(
             p.tenant_id,
             x.id,
@@ -676,8 +579,7 @@ async fn create_sandbox(
             SandboxState::Running,
             None,
         )
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(x))
 }
 async fn list_sandboxes(
@@ -687,10 +589,9 @@ async fn list_sandboxes(
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
     Ok(Json(
-        s.repository
+        s.repository()
             .list_sandboxes(p.tenant_id)
-            .await
-            .map_err(store)?,
+            .await.map_err(ApiFailure::from)?,
     ))
 }
 async fn get_sandbox(
@@ -701,10 +602,9 @@ async fn get_sandbox(
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
     Ok(Json(
-        s.repository
+        s.repository()
             .get_sandbox(p.tenant_id, id)
-            .await
-            .map_err(store)?,
+            .await.map_err(ApiFailure::from)?,
     ))
 }
 async fn delete_sandbox(
@@ -714,14 +614,12 @@ async fn delete_sandbox(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
-    s.runtime.destroy(&x).await.map_err(ApiFailure::from)?;
-    if let Some(scheduler) = s.scheduler() {
-        scheduler.release(p.tenant_id, id).await.map_err(|error| {
+        .await.map_err(ApiFailure::from)?;
+    s.runtime().destroy(&x).await.map_err(ApiFailure::from)?;
+    if s.is_production() {
+        s.scheduler().release(p.tenant_id, id).await.map_err(|error| {
             ApiFailure::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "scheduler_unavailable",
@@ -729,10 +627,9 @@ async fn delete_sandbox(
             )
         })?;
     }
-    s.repository
+    s.repository()
         .delete_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"destroyed"})))
 }
 async fn start_sandbox(
@@ -742,20 +639,17 @@ async fn start_sandbox(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let mut x = s
-        .repository
+    let mut x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     let old = x.state;
     x.state = SandboxState::Starting;
-    s.runtime.start(&x).await.map_err(ApiFailure::from)?;
-    s.repository
+    s.runtime().start(&x).await.map_err(ApiFailure::from)?;
+    s.repository()
         .update_state(p.tenant_id, id, old, SandboxState::Starting, None)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     x.state = SandboxState::Running;
-    s.repository
+    s.repository()
         .update_state(
             p.tenant_id,
             id,
@@ -763,8 +657,7 @@ async fn start_sandbox(
             SandboxState::Running,
             None,
         )
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(x))
 }
 async fn stop_sandbox(
@@ -774,20 +667,17 @@ async fn stop_sandbox(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let mut x = s
-        .repository
+    let mut x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     let old = x.state;
     x.state = SandboxState::Stopping;
-    s.runtime.stop(&x).await.map_err(ApiFailure::from)?;
-    s.repository
+    s.runtime().stop(&x).await.map_err(ApiFailure::from)?;
+    s.repository()
         .update_state(p.tenant_id, id, old, SandboxState::Stopping, None)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     x.state = SandboxState::Stopped;
-    s.repository
+    s.repository()
         .update_state(
             p.tenant_id,
             id,
@@ -795,8 +685,7 @@ async fn stop_sandbox(
             SandboxState::Stopped,
             None,
         )
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(x))
 }
 async fn resume_sandbox(
@@ -814,11 +703,9 @@ async fn exec_sandbox(
 ) -> ApiResult<ExecResult> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     if x.state != SandboxState::Running {
         return Err(ApiFailure::from(CoreError::Conflict(
             "sandbox is not running".into(),
@@ -826,7 +713,7 @@ async fn exec_sandbox(
     }
     let r = b.into_request()?;
     validate_exec(&r).map_err(ApiFailure::from)?;
-    Ok(Json(s.runtime.exec(&x, r).await.map_err(ApiFailure::from)?))
+    Ok(Json(s.runtime().exec(&x, r).await.map_err(ApiFailure::from)?))
 }
 #[derive(Deserialize)]
 struct ExecBody {
@@ -881,12 +768,10 @@ async fn put_file(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
-    s.runtime.put_file(&x, r).await.map_err(ApiFailure::from)?;
+        .await.map_err(ApiFailure::from)?;
+    s.runtime().put_file(&x, r).await.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"written"})))
 }
 async fn get_file(
@@ -897,13 +782,11 @@ async fn get_file(
 ) -> ApiResult<FileContent> {
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(
-        s.runtime
+        s.runtime()
             .get_file(&x, &q.path)
             .await
             .map_err(ApiFailure::from)?,
@@ -917,13 +800,11 @@ async fn list_files(
 ) -> ApiResult<Vec<FileEntry>> {
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(
-        s.runtime
+        s.runtime()
             .list_files(&x, &q.path)
             .await
             .map_err(ApiFailure::from)?,
@@ -938,13 +819,11 @@ async fn delete_file(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
-    s.runtime
-        .delete_file(&x, &q.path)
+        .await.map_err(ApiFailure::from)?;
+    s.runtime()
+        .delete_file(&x, DeleteFileRequest { path: q.path })
         .await
         .map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"deleted"})))
@@ -957,17 +836,36 @@ async fn make_directory(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository
+    let x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
-    s.runtime
-        .make_directory(&x, &r.path)
+        .await.map_err(ApiFailure::from)?;
+    s.runtime()
+        .make_directory(&x, r)
         .await
         .map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"created"})))
 }
+fn snapshot_kind_name(kind: SnapshotKind) -> &'static str {
+    match kind {
+        SnapshotKind::VirtualMachine => "virtual_machine",
+        SnapshotKind::Memory => "memory",
+        SnapshotKind::Workspace => "workspace",
+    }
+}
+
+fn snapshot_kind(value: &str) -> Result<SnapshotKind, ApiFailure> {
+    match value {
+        "virtual_machine" => Ok(SnapshotKind::VirtualMachine),
+        "memory" => Ok(SnapshotKind::Memory),
+        "workspace" => Ok(SnapshotKind::Workspace),
+        other => Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "snapshot_kind",
+            format!("unsupported snapshot kind {other}"),
+        )),
+    }
+}
+
 async fn create_snapshot(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -975,37 +873,68 @@ async fn create_snapshot(
 ) -> ApiResult<Snapshot> {
     p.authorize(Scope::SnapshotsWrite)
         .map_err(ApiFailure::from)?;
-    let mut x = s
-        .repository
+    let mut x = s.repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     let old = x.state;
     x.state = SandboxState::Snapshotting;
-    s.repository
+    s.repository()
         .update_state(p.tenant_id, id, old, SandboxState::Snapshotting, None)
-        .await
-        .map_err(store)?;
-    let key = format!("{id}/{}", new_id());
-    let size = s
-        .runtime
-        .snapshot(&x, &key)
+        .await.map_err(ApiFailure::from)?;
+    let provider = s.platform.snapshots().ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "snapshots_unavailable",
+            "the configured runtime does not provide snapshots",
+        )
+    })?;
+    let kind = if provider.capabilities().virtual_machine {
+        SnapshotKind::VirtualMachine
+    } else {
+        SnapshotKind::Workspace
+    };
+    let captured = provider
+        .capture(
+            &x,
+            &SnapshotRequest {
+                kind,
+                object_key: format!("{id}/{}", new_id()),
+            },
+        )
         .await
         .map_err(ApiFailure::from)?;
     let snap = Snapshot {
-        id: new_id(),
+        id: captured.id,
         tenant_id: p.tenant_id,
         sandbox_id: id,
-        object_key: key,
-        size_bytes: size,
+        object_key: captured.object_key.clone(),
+        size_bytes: captured.size_bytes,
         image_id: x.image_id.clone(),
         created_at: Utc::now(),
     };
-    s.repository
+    s.repository()
         .put_snapshot(snap.clone())
-        .await
-        .map_err(store)?;
-    s.repository
+        .await.map_err(ApiFailure::from)?;
+    s.repository()
+        .put_stored_snapshot(agentforge_core::storage::StoredSnapshot {
+            id: snap.id,
+            tenant_id: p.tenant_id,
+            sandbox_id: id,
+            object_key: captured.object_key,
+            manifest_object_key: format!("{}.manifest.json", snap.object_key),
+            memory_object_key: None,
+            disk_object_key: None,
+            workspace_object_key: None,
+            size_bytes: captured.size_bytes,
+            image_id: snap.image_id.clone(),
+            checksum_sha256: captured.checksum_sha256,
+            kind: snapshot_kind_name(captured.kind).into(),
+            complete: true,
+            manifest: json!({"kind": snapshot_kind_name(captured.kind)}),
+            created_at: snap.created_at,
+        })
+        .await.map_err(ApiFailure::from)?;
+    s.repository()
         .update_state(
             p.tenant_id,
             id,
@@ -1013,8 +942,7 @@ async fn create_snapshot(
             SandboxState::Running,
             None,
         )
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(snap))
 }
 async fn list_snapshots(
@@ -1025,10 +953,9 @@ async fn list_snapshots(
     p.authorize(Scope::SnapshotsRead)
         .map_err(ApiFailure::from)?;
     Ok(Json(
-        s.repository
+        s.repository()
             .list_snapshots(p.tenant_id, id)
-            .await
-            .map_err(store)?,
+            .await.map_err(ApiFailure::from)?,
     ))
 }
 async fn restore_snapshot(
@@ -1039,19 +966,28 @@ async fn restore_snapshot(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SnapshotsWrite)
         .map_err(ApiFailure::from)?;
-    let snap = s
-        .repository
-        .get_snapshot(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+    if let Some(policy) = s.platform.policy() {
+        let decision = policy.evaluate(PolicyOperation::RestoreSnapshot(&r));
+        if !decision.allowed {
+            return Err(ApiFailure::new(
+                StatusCode::BAD_REQUEST,
+                "policy_denied",
+                decision.reason.unwrap_or_else(|| "restore denied by policy".into()),
+            ));
+        }
+    }
+    let stored = s.repository()
+        .get_stored_snapshot(p.tenant_id, id)
+        .await.map_err(ApiFailure::from)?;
+    let kind = snapshot_kind(&stored.kind)?;
     let now = Utc::now();
     let mut x = Sandbox {
         id: new_id(),
         tenant_id: p.tenant_id,
         node_id: None,
-        image_id: r.image.unwrap_or(snap.image_id),
+        image_id: r.image.unwrap_or(stored.image_id.clone()),
         state: SandboxState::Restoring,
-        runtime: if s.scheduler().is_some() {
+        runtime: if s.is_production() {
             RuntimeKind::Firecracker
         } else {
             RuntimeKind::BwrapDev
@@ -1065,9 +1001,16 @@ async fn restore_snapshot(
         updated_at: now,
         runtime_path: None,
     };
-    if let Some(scheduler) = s.scheduler() {
-        x = scheduler
-            .schedule(p.tenant_id, new_id(), x)
+    if s.is_production() {
+        x = s
+            .scheduler()
+            .schedule(agentforge_core::scheduler::ScheduleRequest {
+                tenant_id: p.tenant_id,
+                request_id: new_id(),
+                sandbox: x,
+                preferred_worker: None,
+                lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
+            })
             .await
             .map_err(|error| {
                 ApiFailure::new(
@@ -1078,17 +1021,26 @@ async fn restore_snapshot(
             })?
             .sandbox;
     } else {
-        s.repository
+        s.repository()
             .create_sandbox(x.clone())
-            .await
-            .map_err(store)?;
+            .await.map_err(ApiFailure::from)?;
     }
-    s.runtime.create(&x).await.map_err(ApiFailure::from)?;
-    s.runtime
-        .restore(&x, &snap.object_key)
+    s.runtime().create(&x).await.map_err(ApiFailure::from)?;
+    s.platform
+        .snapshots()
+        .ok_or_else(|| ApiFailure::from(CoreError::Conflict("snapshots are not configured".into())))?
+        .restore(
+            &x,
+            &SnapshotMetadata {
+                id: stored.id,
+                kind,
+                object_key: stored.object_key.clone(),
+                checksum_sha256: stored.checksum_sha256.clone(),
+            },
+        )
         .await
         .map_err(ApiFailure::from)?;
-    s.repository
+    s.repository()
         .update_state(
             p.tenant_id,
             x.id,
@@ -1096,8 +1048,7 @@ async fn restore_snapshot(
             SandboxState::Running,
             None,
         )
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     x.state = SandboxState::Running;
     Ok(Json(x))
 }
@@ -1108,27 +1059,18 @@ async fn delete_snapshot(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SnapshotsWrite)
         .map_err(ApiFailure::from)?;
-    let snapshot = s
-        .repository
+    let snapshot = s.repository()
         .get_snapshot(p.tenant_id, id)
-        .await
-        .map_err(store)?;
-    if let Some(object_store) = &s.object_store {
-        object_store
+        .await.map_err(ApiFailure::from)?;
+    if let Some(artifact_store) = s.artifact_store() {
+        artifact_store
             .delete(&snapshot.object_key)
             .await
-            .map_err(|error| {
-                ApiFailure::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "object_store",
-                    error.to_string(),
-                )
-            })?;
+            .map_err(ApiFailure::from)?;
     }
-    s.repository
+    s.repository()
         .delete_snapshot(p.tenant_id, id)
-        .await
-        .map_err(store)?;
+        .await.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"deleted"})))
 }
 async fn usage(
@@ -1137,7 +1079,7 @@ async fn usage(
 ) -> ApiResult<Vec<UsageSummary>> {
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
-    let events = s.repository.usage(p.tenant_id).await.map_err(store)?;
+    let events = s.repository().usage(p.tenant_id).await.map_err(ApiFailure::from)?;
     let mut out = std::collections::HashMap::<String, i64>::new();
     for e in events {
         *out.entry(e.metric).or_default() += e.quantity

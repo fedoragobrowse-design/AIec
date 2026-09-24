@@ -40,14 +40,20 @@ The development runtime is intentionally separate. Production uses an independen
 
 ## Components
 
-- `agentforge-core`: domain state, limits, paths, API keys, tenant identities.
-- `agentforge-runtime`: Firecracker lifecycle/config and explicit bubblewrap development backend.
-- `agentforge-storage`: tenant-scoped repository, append-only usage, PostgreSQL, node state, object storage boundary.
-- `agentforge-api`: Axum API, lifecycle orchestration, health and metrics.
-- `agentforge-client` and `agentforge-cli`: Rust SDK and command-line UX.
+- `agentforge-core`: dependency-light domain contracts and `Platform` composition for runtimes, scheduling, metadata, artifacts, networking, images, snapshots, and policy.
+- `agentforge-runtime`: Firecracker lifecycle/config and explicit bubblewrap development backend; both implement the Core runtime contract.
+- `agentforge-storage`: PostgreSQL metadata/scheduling and S3/filesystem artifacts, adapted to Core storage contracts.
+- `agentforge-api`: Axum API, worker RPC, lifecycle orchestration, health, and metrics; production and development launchers compose a Core `Platform` first.
+- `agentforge-client` and `agentforge-cli`: Rust SDK and command-line UX over AgentForge's versioned HTTP API.
 - `guest/agentforge-guest`: minimal framed guest control agent.
 
-See `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, and `docs/DEPLOYMENT.md` before production use.
+AgentForge is the batteries-included distribution over AgentForge Core. The default server therefore consumes the same public trait objects available to custom systems rather than bypassing Core with a private composition path. See `docs/ARCHITECTURE.md` for the dependency graph, `docs/EXTENDING.md` for compile-time extension boundaries, and `docs/DEPLOYMENT.md` for production configuration.
+
+The runnable `custom_core_platform` example composes the real bubblewrap runtime and filesystem artifact store with custom scheduler, policy, and network implementations. It performs platform validation without starting a server:
+
+```bash
+cargo run -p agentforge-api --example custom_core_platform
+```
 
 ## Development infrastructure
 

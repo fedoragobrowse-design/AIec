@@ -1,11 +1,14 @@
-use crate::StoreError;
+use crate::{StoreError, core_error};
+use agentforge_core::{
+    CoreError,
+    storage::{ArtifactStore, GetObjectOptions, ObjectMetadata},
+};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::{Method, Url, header};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
@@ -17,32 +20,6 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ObjectMetadata {
-    pub key: String,
-    pub size_bytes: u64,
-    pub checksum_sha256: String,
-    pub etag: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GetObjectOptions {
-    pub if_match: Option<String>,
-    pub expected_checksum_sha256: Option<String>,
-}
-
-#[async_trait]
-pub trait ObjectStore: Send + Sync {
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError>;
-    async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
-    async fn get_checked(
-        &self,
-        key: &str,
-        options: &GetObjectOptions,
-    ) -> Result<Vec<u8>, StoreError>;
-    async fn delete(&self, key: &str) -> Result<(), StoreError>;
-    async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StoreError>;
-}
 
 fn validate_object_key(key: &str) -> Result<(), StoreError> {
     if key.is_empty() || key.len() > 1024 {
@@ -92,29 +69,6 @@ impl FilesystemObjectStore {
         }
     }
 
-    pub async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
-        <Self as ObjectStore>::put(self, key, bytes).await
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
-        <Self as ObjectStore>::get(self, key).await
-    }
-
-    pub async fn get_checked(
-        &self,
-        key: &str,
-        options: &GetObjectOptions,
-    ) -> Result<Vec<u8>, StoreError> {
-        <Self as ObjectStore>::get_checked(self, key, options).await
-    }
-
-    pub async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        <Self as ObjectStore>::delete(self, key).await
-    }
-
-    pub async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StoreError> {
-        <Self as ObjectStore>::delete_if_match(self, key, etag).await
-    }
 
     async fn root(&self) -> Result<PathBuf, StoreError> {
         tokio::fs::create_dir_all(&self.root).await?;
@@ -228,8 +182,7 @@ impl FilesystemObjectStore {
     }
 }
 
-#[async_trait]
-impl ObjectStore for FilesystemObjectStore {
+impl FilesystemObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let path = self.safe_path(key, true).await?;
@@ -284,6 +237,13 @@ impl ObjectStore for FilesystemObjectStore {
                 "stored object checksum mismatch".into(),
             ));
         }
+        if let Some(expected) = &options.if_match
+            && !actual_checksum(&bytes, expected.trim_matches('"'))?
+        {
+            return Err(StoreError::ObjectStore(
+                "filesystem ETag precondition failed".into(),
+            ));
+        }
         Ok(bytes)
     }
 
@@ -311,6 +271,37 @@ impl ObjectStore for FilesystemObjectStore {
                 "filesystem ETag precondition failed".into(),
             ))
         }
+    }
+}
+
+#[async_trait]
+impl ArtifactStore for FilesystemObjectStore {
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
+        Self::put(self, key, bytes).await.map_err(core_error)
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError> {
+        Self::get(self, key).await.map_err(core_error)
+    }
+
+    async fn get_checked(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+    ) -> Result<Vec<u8>, CoreError> {
+        Self::get_checked(self, key, options)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), CoreError> {
+        Self::delete(self, key).await.map_err(core_error)
+    }
+
+    async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), CoreError> {
+        Self::delete_if_match(self, key, etag)
+            .await
+            .map_err(core_error)
     }
 }
 
@@ -415,29 +406,6 @@ impl S3ObjectStore {
         Ok(Self { client, config })
     }
 
-    pub async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
-        <Self as ObjectStore>::put(self, key, bytes).await
-    }
-
-    pub async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
-        <Self as ObjectStore>::get(self, key).await
-    }
-
-    pub async fn get_checked(
-        &self,
-        key: &str,
-        options: &GetObjectOptions,
-    ) -> Result<Vec<u8>, StoreError> {
-        <Self as ObjectStore>::get_checked(self, key, options).await
-    }
-
-    pub async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        <Self as ObjectStore>::delete(self, key).await
-    }
-
-    pub async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StoreError> {
-        <Self as ObjectStore>::delete_if_match(self, key, etag).await
-    }
 
     fn full_key(&self, key: &str) -> Result<String, StoreError> {
         validate_object_key(key)?;
@@ -551,8 +519,7 @@ impl S3ObjectStore {
     }
 }
 
-#[async_trait]
-impl ObjectStore for S3ObjectStore {
+impl S3ObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
         let full_key = self.full_key(key)?;
         let digest = Sha256::digest(bytes);
@@ -694,6 +661,37 @@ impl ObjectStore for S3ObjectStore {
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
         require_success(response).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl ArtifactStore for S3ObjectStore {
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
+        Self::put(self, key, bytes).await.map_err(core_error)
+    }
+
+    async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError> {
+        Self::get(self, key).await.map_err(core_error)
+    }
+
+    async fn get_checked(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+    ) -> Result<Vec<u8>, CoreError> {
+        Self::get_checked(self, key, options)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), CoreError> {
+        Self::delete(self, key).await.map_err(core_error)
+    }
+
+    async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), CoreError> {
+        Self::delete_if_match(self, key, etag)
+            .await
+            .map_err(core_error)
     }
 }
 

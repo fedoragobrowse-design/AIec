@@ -1,5 +1,8 @@
+use agentforge_core::{
+    runtime::{RuntimeCapabilities, RuntimeHealth, SandboxRuntime},
+    snapshots::{SnapshotCapabilities, SnapshotMetadata, SnapshotProvider, SnapshotRequest},
+};
 use agentforge_core::*;
-use agentforge_runtime::{RuntimeError, SandboxRuntime};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -169,11 +172,11 @@ pub enum WorkerOperation {
     },
     Snapshot {
         sandbox: Sandbox,
-        object_key: String,
+        request: SnapshotRequest,
     },
     Restore {
         sandbox: Sandbox,
-        object_key: String,
+        snapshot: SnapshotMetadata,
     },
 }
 
@@ -184,7 +187,7 @@ pub enum WorkerValue {
     Exec(ExecResult),
     File(FileContent),
     Files(Vec<FileEntry>),
-    Size(u64),
+    Snapshot(agentforge_core::snapshots::CapturedSnapshot),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,25 +197,28 @@ pub struct WorkerError {
 }
 
 impl WorkerError {
-    fn from_runtime(error: RuntimeError) -> Self {
+    fn from_runtime(error: CoreError) -> Self {
         let (code, message) = match error {
-            RuntimeError::Core(CoreError::InvalidRequest(message)) => ("invalid_request", message),
-            RuntimeError::Core(CoreError::Forbidden(message)) => ("forbidden", message),
-            RuntimeError::Core(CoreError::NotFound(message)) => ("not_found", message),
-            RuntimeError::Core(CoreError::Conflict(message)) => ("conflict", message),
-            RuntimeError::Core(CoreError::LimitExceeded(message)) => ("limit_exceeded", message),
-            RuntimeError::Unavailable(message) => ("runtime_unavailable", message),
-            RuntimeError::Archive(message) => ("snapshot_failed", message),
-            RuntimeError::Io(error) => ("internal", error.to_string()),
-            RuntimeError::Protocol(error) => ("guest_protocol", error.to_string()),
-            RuntimeError::FirecrackerApi(message) => ("firecracker_api", message),
-            RuntimeError::Json(error) => ("internal", error.to_string()),
-            RuntimeError::Core(CoreError::Io(error)) => ("internal", error.to_string()),
+            CoreError::InvalidRequest(message) => ("invalid_request", message),
+            CoreError::Forbidden(message) => ("forbidden", message),
+            CoreError::NotFound(message) => ("not_found", message),
+            CoreError::Conflict(message) => ("conflict", message),
+            CoreError::LimitExceeded(message) => ("limit_exceeded", message),
+            CoreError::Unavailable(message) => ("runtime_unavailable", message),
+            CoreError::Unsupported(message) => ("unsupported", message),
+            CoreError::Backend(message) => ("internal", message),
+            CoreError::Io(error) => ("internal", error.to_string()),
         };
         Self {
             code: code.into(),
             message,
         }
+    }
+}
+
+impl From<CoreError> for WorkerError {
+    fn from(error: CoreError) -> Self {
+        Self::from_runtime(error)
     }
 }
 
@@ -270,136 +276,18 @@ pub struct WorkerHeartbeat {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct ScheduledSandbox {
-    pub sandbox: Sandbox,
-    pub worker_endpoint: String,
-    pub lease_id: Uuid,
-}
-
-#[derive(Debug, Error)]
-pub enum SchedulerError {
-    #[error("scheduler unavailable: {0}")]
-    Unavailable(String),
-    #[error("scheduler rejected request: {0}")]
-    Rejected(String),
-}
-
-#[async_trait]
-pub trait Scheduler: Send + Sync {
-    async fn schedule(
-        &self,
-        tenant_id: Uuid,
-        request_id: Uuid,
-        sandbox: Sandbox,
-    ) -> Result<ScheduledSandbox, SchedulerError>;
-    async fn worker_endpoint(
-        &self,
-        tenant_id: Uuid,
-        sandbox_id: Uuid,
-    ) -> Result<String, SchedulerError>;
-    async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), SchedulerError>;
-}
-
-pub struct StorageScheduler {
-    repository: Arc<dyn agentforge_storage::Repository>,
-    scheduler: Arc<dyn agentforge_storage::Scheduler>,
-    lease_ttl_seconds: u64,
-}
-
-impl StorageScheduler {
-    pub fn new(
-        repository: Arc<dyn agentforge_storage::Repository>,
-        scheduler: Arc<dyn agentforge_storage::Scheduler>,
-        lease_ttl_seconds: u64,
-    ) -> Self {
-        Self {
-            repository,
-            scheduler,
-            lease_ttl_seconds,
-        }
-    }
-}
-
-#[async_trait]
-impl Scheduler for StorageScheduler {
-    async fn schedule(
-        &self,
-        tenant_id: Uuid,
-        request_id: Uuid,
-        sandbox: Sandbox,
-    ) -> Result<ScheduledSandbox, SchedulerError> {
-        let scheduled = self
-            .scheduler
-            .schedule_sandbox(
-                tenant_id,
-                request_id,
-                sandbox.clone(),
-                self.lease_ttl_seconds,
-            )
-            .await
-            .map_err(|error| SchedulerError::Rejected(error.to_string()))?;
-        let worker = self
-            .repository
-            .get_worker(scheduled.lease.node_id)
-            .await
-            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-        Ok(ScheduledSandbox {
-            sandbox: scheduled.sandbox,
-            worker_endpoint: worker.registration.control_endpoint,
-            lease_id: scheduled.lease.id,
-        })
-    }
-
-    async fn worker_endpoint(
-        &self,
-        tenant_id: Uuid,
-        sandbox_id: Uuid,
-    ) -> Result<String, SchedulerError> {
-        let lease = self
-            .repository
-            .get_active_worker_lease(tenant_id, sandbox_id)
-            .await
-            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-        let renewed = self
-            .repository
-            .renew_worker_lease(
-                tenant_id,
-                lease.id,
-                lease.generation,
-                self.lease_ttl_seconds,
-            )
-            .await
-            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-        self.repository
-            .get_worker(renewed.node_id)
-            .await
-            .map(|worker| worker.registration.control_endpoint)
-            .map_err(|error| SchedulerError::Unavailable(error.to_string()))
-    }
-
-    async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), SchedulerError> {
-        let lease = self
-            .repository
-            .get_active_worker_lease(tenant_id, sandbox_id)
-            .await
-            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-        self.repository
-            .release_worker_lease(tenant_id, lease.id, lease.generation, "sandbox deleted")
-            .await
-            .map(|_| ())
-            .map_err(|error| SchedulerError::Rejected(error.to_string()))
-    }
-}
 
 #[derive(Clone)]
 pub struct WorkerRuntime {
     client: Arc<dyn WorkerClient>,
-    scheduler: Arc<dyn Scheduler>,
+    scheduler: Arc<dyn agentforge_core::scheduler::Scheduler>,
 }
 
 impl WorkerRuntime {
-    pub fn new(client: Arc<dyn WorkerClient>, scheduler: Arc<dyn Scheduler>) -> Self {
+    pub fn new(
+        client: Arc<dyn WorkerClient>,
+        scheduler: Arc<dyn agentforge_core::scheduler::Scheduler>,
+    ) -> Self {
         Self { client, scheduler }
     }
 
@@ -407,12 +295,11 @@ impl WorkerRuntime {
         &self,
         sandbox: &Sandbox,
         operation: WorkerOperation,
-    ) -> Result<WorkerValue, RuntimeError> {
+    ) -> Result<WorkerValue, CoreError> {
         let endpoint = self
             .scheduler
             .worker_endpoint(sandbox.tenant_id, sandbox.id)
-            .await
-            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            .await?;
         let response = self
             .client
             .invoke(
@@ -430,29 +317,18 @@ impl WorkerRuntime {
 
 #[async_trait]
 impl SandboxRuntime for WorkerRuntime {
-    async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
-        let endpoint = self
-            .scheduler
-            .worker_endpoint(sandbox.tenant_id, sandbox.id)
-            .await
-            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
-        let response = self
-            .client
-            .invoke(
-                &endpoint,
-                WorkerRequest {
-                    request_id: new_id(),
-                    operation: WorkerOperation::Create {
-                        sandbox: sandbox.clone(),
-                    },
-                },
-            )
-            .await
-            .map_err(runtime_client_error)?;
-        response.result.map_err(runtime_worker_error)?;
-        Ok(())
+    async fn create(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        self.call(
+            sandbox,
+            WorkerOperation::Create {
+                sandbox: sandbox.clone(),
+            },
+        )
+        .await
+        .map(|_| ())
     }
-    async fn start(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+
+    async fn start(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::Start {
@@ -462,7 +338,8 @@ impl SandboxRuntime for WorkerRuntime {
         .await
         .map(|_| ())
     }
-    async fn stop(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+
+    async fn stop(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::Stop {
@@ -472,7 +349,8 @@ impl SandboxRuntime for WorkerRuntime {
         .await
         .map(|_| ())
     }
-    async fn destroy(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+
+    async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::Destroy {
@@ -482,11 +360,12 @@ impl SandboxRuntime for WorkerRuntime {
         .await
         .map(|_| ())
     }
+
     async fn exec(
         &self,
         sandbox: &Sandbox,
         request: ExecRequest,
-    ) -> Result<ExecResult, RuntimeError> {
+    ) -> Result<ExecResult, CoreError> {
         match self
             .call(
                 sandbox,
@@ -498,16 +377,15 @@ impl SandboxRuntime for WorkerRuntime {
             .await?
         {
             WorkerValue::Exec(result) => Ok(result),
-            _ => Err(RuntimeError::Unavailable(
-                "invalid worker exec response".into(),
-            )),
+            _ => Err(CoreError::Conflict("invalid worker exec response".into())),
         }
     }
+
     async fn put_file(
         &self,
         sandbox: &Sandbox,
         request: PutFileRequest,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::PutFile {
@@ -518,7 +396,8 @@ impl SandboxRuntime for WorkerRuntime {
         .await
         .map(|_| ())
     }
-    async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, RuntimeError> {
+
+    async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         match self
             .call(
                 sandbox,
@@ -530,16 +409,15 @@ impl SandboxRuntime for WorkerRuntime {
             .await?
         {
             WorkerValue::File(result) => Ok(result),
-            _ => Err(RuntimeError::Unavailable(
-                "invalid worker file response".into(),
-            )),
+            _ => Err(CoreError::Conflict("invalid worker file response".into())),
         }
     }
+
     async fn list_files(
         &self,
         sandbox: &Sandbox,
         path: &str,
-    ) -> Result<Vec<FileEntry>, RuntimeError> {
+    ) -> Result<Vec<FileEntry>, CoreError> {
         match self
             .call(
                 sandbox,
@@ -551,90 +429,131 @@ impl SandboxRuntime for WorkerRuntime {
             .await?
         {
             WorkerValue::Files(result) => Ok(result),
-            _ => Err(RuntimeError::Unavailable(
-                "invalid worker listing response".into(),
-            )),
+            _ => Err(CoreError::Conflict("invalid worker listing response".into())),
         }
     }
-    async fn delete_file(&self, sandbox: &Sandbox, path: &str) -> Result<(), RuntimeError> {
+
+    async fn delete_file(
+        &self,
+        sandbox: &Sandbox,
+        request: DeleteFileRequest,
+    ) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::DeleteFile {
                 sandbox: sandbox.clone(),
-                path: path.into(),
+                path: request.path,
             },
         )
         .await
         .map(|_| ())
     }
-    async fn make_directory(&self, sandbox: &Sandbox, path: &str) -> Result<(), RuntimeError> {
+
+    async fn make_directory(
+        &self,
+        sandbox: &Sandbox,
+        request: MakeDirectoryRequest,
+    ) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::MakeDirectory {
                 sandbox: sandbox.clone(),
-                path: path.into(),
+                path: request.path,
             },
         )
         .await
         .map(|_| ())
     }
-    async fn snapshot(&self, sandbox: &Sandbox, object_key: &str) -> Result<u64, RuntimeError> {
+
+    async fn health(&self) -> RuntimeHealth {
+        RuntimeHealth::healthy()
+    }
+
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            vm_snapshot: true,
+            memory_resume: true,
+            network_policy: true,
+            pause: true,
+            workspace_snapshot: true,
+            vsock: true,
+            ..RuntimeCapabilities::default()
+        }
+    }
+}
+
+#[async_trait]
+impl SnapshotProvider for WorkerRuntime {
+    fn capabilities(&self) -> SnapshotCapabilities {
+        SnapshotCapabilities {
+            virtual_machine: true,
+            memory: true,
+            workspace: true,
+            cross_instance_restore: true,
+        }
+    }
+
+    async fn capture(
+        &self,
+        sandbox: &Sandbox,
+        request: &SnapshotRequest,
+    ) -> Result<agentforge_core::snapshots::CapturedSnapshot, CoreError> {
         match self
             .call(
                 sandbox,
                 WorkerOperation::Snapshot {
                     sandbox: sandbox.clone(),
-                    object_key: object_key.into(),
+                    request: request.clone(),
                 },
             )
             .await?
         {
-            WorkerValue::Size(size) => Ok(size),
-            _ => Err(RuntimeError::Unavailable(
-                "invalid worker snapshot response".into(),
-            )),
+            WorkerValue::Snapshot(captured) => Ok(captured),
+            _ => Err(CoreError::Conflict("invalid worker snapshot response".into())),
         }
     }
-    async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError> {
+
+    async fn restore(
+        &self,
+        sandbox: &Sandbox,
+        snapshot: &SnapshotMetadata,
+    ) -> Result<(), CoreError> {
         self.call(
             sandbox,
             WorkerOperation::Restore {
                 sandbox: sandbox.clone(),
-                object_key: object_key.into(),
+                snapshot: snapshot.clone(),
             },
         )
         .await
         .map(|_| ())
     }
-    fn health(&self) -> bool {
-        true
-    }
 }
 
-fn runtime_worker_error(error: WorkerError) -> RuntimeError {
+fn runtime_worker_error(error: WorkerError) -> CoreError {
     match error.code.as_str() {
-        "invalid_request" => RuntimeError::Core(CoreError::InvalidRequest(error.message)),
-        "forbidden" => RuntimeError::Core(CoreError::Forbidden(error.message)),
-        "not_found" => RuntimeError::Core(CoreError::NotFound(error.message)),
-        "conflict" => RuntimeError::Core(CoreError::Conflict(error.message)),
-        "limit_exceeded" => RuntimeError::Core(CoreError::LimitExceeded(error.message)),
-        "runtime_unavailable" => RuntimeError::Unavailable(error.message),
-        "snapshot_failed" => RuntimeError::Archive(error.message),
+        "invalid_request" => CoreError::InvalidRequest(error.message),
+        "forbidden" => CoreError::Forbidden(error.message),
+        "not_found" => CoreError::NotFound(error.message),
+        "limit_exceeded" => CoreError::LimitExceeded(error.message),
+        "runtime_unavailable" => CoreError::Unavailable(error.message),
+        "unsupported" => CoreError::Unsupported(error.message),
+        "snapshot_failed" | "conflict" => CoreError::Conflict(error.message),
         "guest_protocol" | "firecracker_api" | "internal" => {
-            RuntimeError::FirecrackerApi(error.message)
+            CoreError::Backend(error.message)
         }
-        _ => RuntimeError::FirecrackerApi(error.message),
+        _ => CoreError::Backend(error.message),
     }
 }
 
-fn runtime_client_error(error: WorkerClientError) -> RuntimeError {
+fn runtime_client_error(error: WorkerClientError) -> CoreError {
     match error {
-        WorkerClientError::Unavailable(message) => RuntimeError::Unavailable(message),
+        WorkerClientError::Unavailable(message) => CoreError::Unavailable(message),
         WorkerClientError::Transport(message) => {
-            RuntimeError::FirecrackerApi(format!("worker transport: {message}"))
+            CoreError::Backend(format!("worker transport: {message}"))
         }
         WorkerClientError::Response(message) => {
-            RuntimeError::FirecrackerApi(format!("worker protocol: {message}"))
+            CoreError::Backend(format!("worker protocol: {message}"))
         }
     }
 }
@@ -732,6 +651,7 @@ impl WorkerClient for HttpWorkerClient {
 #[derive(Clone)]
 pub struct WorkerService {
     runtime: Arc<dyn SandboxRuntime>,
+    snapshots: Option<Arc<dyn SnapshotProvider>>,
     runtime_kind: RuntimeKind,
     node_id: Uuid,
     capacity: u32,
@@ -745,12 +665,14 @@ impl WorkerService {
     pub fn new(
         runtime: Arc<dyn SandboxRuntime>,
         runtime_kind: RuntimeKind,
+        snapshots: Option<Arc<dyn SnapshotProvider>>,
         token: impl Into<String>,
         node_id: Uuid,
         capacity: u32,
     ) -> Self {
         Self {
             runtime,
+            snapshots,
             runtime_kind,
             node_id,
             capacity,
@@ -819,30 +741,32 @@ impl WorkerService {
                 .map(WorkerValue::Files),
             WorkerOperation::DeleteFile { sandbox, path } => self
                 .runtime
-                .delete_file(&sandbox, &path)
+                .delete_file(&sandbox, DeleteFileRequest { path })
                 .await
                 .map(|_| WorkerValue::Unit),
             WorkerOperation::MakeDirectory { sandbox, path } => self
                 .runtime
-                .make_directory(&sandbox, &path)
+                .make_directory(&sandbox, MakeDirectoryRequest { path })
                 .await
                 .map(|_| WorkerValue::Unit),
-            WorkerOperation::Snapshot {
-                sandbox,
-                object_key,
-            } => self
-                .runtime
-                .snapshot(&sandbox, &object_key)
-                .await
-                .map(WorkerValue::Size),
-            WorkerOperation::Restore {
-                sandbox,
-                object_key,
-            } => self
-                .runtime
-                .restore(&sandbox, &object_key)
-                .await
-                .map(|_| WorkerValue::Unit),
+            WorkerOperation::Snapshot { sandbox, request } => {
+                let provider = self.snapshots.as_ref().ok_or_else(|| {
+                    CoreError::Conflict("worker runtime does not support snapshots".into())
+                })?;
+                provider
+                    .capture(&sandbox, &request)
+                    .await
+                    .map(WorkerValue::Snapshot)
+            }
+            WorkerOperation::Restore { sandbox, snapshot } => {
+                let provider = self.snapshots.as_ref().ok_or_else(|| {
+                    CoreError::Conflict("worker runtime does not support snapshots".into())
+                })?;
+                provider
+                    .restore(&sandbox, &snapshot)
+                    .await
+                    .map(|_| WorkerValue::Unit)
+            }
         };
         result.map_err(WorkerError::from_runtime)
     }
@@ -876,7 +800,7 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
 async fn status(State(state): State<WorkerService>) -> Json<WorkerStatus> {
     Json(WorkerStatus {
         node_id: state.node_id,
-        healthy: state.runtime.health(),
+        healthy: state.runtime.health().await.healthy,
         runtime: state.runtime_kind,
         sandbox_count: state.sandboxes.lock().await.len(),
         in_flight: state.in_flight.load(Ordering::Relaxed),

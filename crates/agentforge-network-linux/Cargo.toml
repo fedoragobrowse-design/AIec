@@ -1,0 +1,10 @@
+[package]
+name = "agentforge-network-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agentforge-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
