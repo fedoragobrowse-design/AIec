@@ -11,13 +11,122 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub const WORKER_TOKEN_HEADER: &str = "authorization";
 const MAX_WORKER_RESPONSE: usize = 2 * 1024 * 1024;
+const MAX_WORKER_RESPONSE_CACHE_ENTRIES: usize = 4_096;
+const MAX_WORKER_RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct ResponseEntry {
+    response: Arc<Mutex<Option<WorkerResponse>>>,
+    encoded_size: usize,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct ResponseCache {
+    entries: HashMap<Uuid, ResponseEntry>,
+    insertion_order: VecDeque<Uuid>,
+    encoded_bytes: usize,
+}
+
+impl ResponseCache {
+    fn get(&self, request_id: Uuid) -> Option<WorkerResponse> {
+        self.entries
+            .get(&request_id)
+            .and_then(|entry| entry.response.try_lock().ok())
+            .and_then(|response| response.clone())
+    }
+
+    fn entry(&mut self, request_id: Uuid) -> Arc<Mutex<Option<WorkerResponse>>> {
+        if let Some(entry) = self.entries.get(&request_id) {
+            return entry.response.clone();
+        }
+        let response = Arc::new(Mutex::new(None));
+        self.entries.insert(
+            request_id,
+            ResponseEntry {
+                response: response.clone(),
+                encoded_size: 0,
+                complete: false,
+            },
+        );
+        response
+    }
+
+    async fn complete(&mut self, request_id: Uuid, response: WorkerResponse) {
+        let encoded_size = serde_json::to_vec(&response).map_or(0, |bytes| bytes.len());
+        if encoded_size > MAX_WORKER_RESPONSE_CACHE_BYTES {
+            if let Some(entry) = self.entries.get_mut(&request_id) {
+                *entry.response.lock().await = Some(response);
+                entry.complete = true;
+            }
+            self.remove(request_id);
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(&request_id) {
+            self.encoded_bytes = self.encoded_bytes.saturating_sub(entry.encoded_size);
+            entry.encoded_size = encoded_size;
+            entry.complete = true;
+            *entry.response.lock().await = Some(response);
+        } else {
+            let response_slot = Arc::new(Mutex::new(Some(response)));
+            self.entries.insert(
+                request_id,
+                ResponseEntry {
+                    response: response_slot,
+                    encoded_size,
+                    complete: true,
+                },
+            );
+        }
+        self.insertion_order
+            .retain(|entry_id| *entry_id != request_id);
+        let mut examined = 0;
+        while (self.entries.len() > MAX_WORKER_RESPONSE_CACHE_ENTRIES
+            || self.encoded_bytes.saturating_add(encoded_size) > MAX_WORKER_RESPONSE_CACHE_BYTES)
+            && examined < self.insertion_order.len()
+        {
+            let Some(candidate) = self.insertion_order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&candidate)
+                .is_some_and(|entry| entry.complete)
+            {
+                if let Some(evicted) = self.entries.remove(&candidate) {
+                    self.encoded_bytes = self.encoded_bytes.saturating_sub(evicted.encoded_size);
+                }
+            } else {
+                self.insertion_order.push_back(candidate);
+            }
+            examined += 1;
+        }
+        self.encoded_bytes = self.encoded_bytes.saturating_add(encoded_size);
+        if self.insertion_order.back() != Some(&request_id) {
+            self.insertion_order.push_back(request_id);
+        }
+    }
+
+    fn remove(&mut self, request_id: Uuid) {
+        if let Some(entry) = self.entries.remove(&request_id) {
+            self.encoded_bytes = self.encoded_bytes.saturating_sub(entry.encoded_size);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -192,14 +301,10 @@ pub trait Scheduler: Send + Sync {
     async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), SchedulerError>;
 }
 
-type LeaseCacheKey = (Uuid, Uuid);
-type LeaseCacheValue = (Uuid, Uuid, i64);
-
 pub struct StorageScheduler {
     repository: Arc<dyn agentforge_storage::Repository>,
     scheduler: Arc<dyn agentforge_storage::Scheduler>,
     lease_ttl_seconds: u64,
-    leases: Arc<Mutex<HashMap<LeaseCacheKey, LeaseCacheValue>>>,
 }
 
 impl StorageScheduler {
@@ -212,7 +317,6 @@ impl StorageScheduler {
             repository,
             scheduler,
             lease_ttl_seconds,
-            leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -240,14 +344,6 @@ impl Scheduler for StorageScheduler {
             .get_worker(scheduled.lease.node_id)
             .await
             .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-        self.leases.lock().await.insert(
-            (tenant_id, scheduled.sandbox.id),
-            (
-                scheduled.lease.id,
-                scheduled.lease.node_id,
-                scheduled.lease.generation,
-            ),
-        );
         Ok(ScheduledSandbox {
             sandbox: scheduled.sandbox,
             worker_endpoint: worker.registration.control_endpoint,
@@ -261,50 +357,35 @@ impl Scheduler for StorageScheduler {
         sandbox_id: Uuid,
     ) -> Result<String, SchedulerError> {
         let lease = self
-            .leases
-            .lock()
+            .repository
+            .get_active_worker_lease(tenant_id, sandbox_id)
             .await
-            .get(&(tenant_id, sandbox_id))
-            .copied();
-        let node_id = if let Some((lease_id, node_id, generation)) = lease {
-            let renewed = self
-                .repository
-                .renew_worker_lease(tenant_id, lease_id, generation, self.lease_ttl_seconds)
-                .await
-                .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
-            if let Some((_, _, current_generation)) =
-                self.leases.lock().await.get_mut(&(tenant_id, sandbox_id))
-            {
-                *current_generation = renewed.generation;
-            }
-            node_id
-        } else {
-            self.repository
-                .list_sandboxes(tenant_id)
-                .await
-                .map_err(|error| SchedulerError::Unavailable(error.to_string()))?
-                .into_iter()
-                .find(|sandbox| sandbox.id == sandbox_id)
-                .and_then(|sandbox| sandbox.node_id)
-                .ok_or_else(|| {
-                    SchedulerError::Rejected("sandbox has no worker assignment".into())
-                })?
-        };
+            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
+        let renewed = self
+            .repository
+            .renew_worker_lease(
+                tenant_id,
+                lease.id,
+                lease.generation,
+                self.lease_ttl_seconds,
+            )
+            .await
+            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
         self.repository
-            .get_worker(node_id)
+            .get_worker(renewed.node_id)
             .await
             .map(|worker| worker.registration.control_endpoint)
             .map_err(|error| SchedulerError::Unavailable(error.to_string()))
     }
 
     async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), SchedulerError> {
-        let Some((lease_id, _node_id, generation)) =
-            self.leases.lock().await.remove(&(tenant_id, sandbox_id))
-        else {
-            return Ok(());
-        };
+        let lease = self
+            .repository
+            .get_active_worker_lease(tenant_id, sandbox_id)
+            .await
+            .map_err(|error| SchedulerError::Unavailable(error.to_string()))?;
         self.repository
-            .release_worker_lease(tenant_id, lease_id, generation, "sandbox deleted")
+            .release_worker_lease(tenant_id, lease.id, lease.generation, "sandbox deleted")
             .await
             .map(|_| ())
             .map_err(|error| SchedulerError::Rejected(error.to_string()))
@@ -315,25 +396,11 @@ impl Scheduler for StorageScheduler {
 pub struct WorkerRuntime {
     client: Arc<dyn WorkerClient>,
     scheduler: Arc<dyn Scheduler>,
-    create_request_ids: Arc<Mutex<HashMap<Uuid, Uuid>>>,
-    operation_request_ids: Arc<Mutex<HashMap<String, Uuid>>>,
 }
 
 impl WorkerRuntime {
     pub fn new(client: Arc<dyn WorkerClient>, scheduler: Arc<dyn Scheduler>) -> Self {
-        Self {
-            client,
-            scheduler,
-            create_request_ids: Arc::new(Mutex::new(HashMap::new())),
-            operation_request_ids: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub async fn prepare_create(&self, sandbox_id: Uuid, request_id: Uuid) {
-        self.create_request_ids
-            .lock()
-            .await
-            .insert(sandbox_id, request_id);
+        Self { client, scheduler }
     }
 
     async fn call(
@@ -346,23 +413,17 @@ impl WorkerRuntime {
             .worker_endpoint(sandbox.tenant_id, sandbox.id)
             .await
             .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
-        let request_id = {
-            let key =
-                serde_json::to_string(&operation).unwrap_or_else(|_| format!("{operation:?}"));
-            let mut ids = self.operation_request_ids.lock().await;
-            *ids.entry(key).or_insert_with(new_id)
-        };
         let response = self
             .client
             .invoke(
                 &endpoint,
                 WorkerRequest {
-                    request_id,
+                    request_id: new_id(),
                     operation,
                 },
             )
             .await
-            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            .map_err(runtime_client_error)?;
         response.result.map_err(runtime_worker_error)
     }
 }
@@ -370,10 +431,6 @@ impl WorkerRuntime {
 #[async_trait]
 impl SandboxRuntime for WorkerRuntime {
     async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
-        let request_id = {
-            let mut ids = self.create_request_ids.lock().await;
-            *ids.entry(sandbox.id).or_insert_with(new_id)
-        };
         let endpoint = self
             .scheduler
             .worker_endpoint(sandbox.tenant_id, sandbox.id)
@@ -384,14 +441,14 @@ impl SandboxRuntime for WorkerRuntime {
             .invoke(
                 &endpoint,
                 WorkerRequest {
-                    request_id,
+                    request_id: new_id(),
                     operation: WorkerOperation::Create {
                         sandbox: sandbox.clone(),
                     },
                 },
             )
             .await
-            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            .map_err(runtime_client_error)?;
         response.result.map_err(runtime_worker_error)?;
         Ok(())
     }
@@ -563,7 +620,22 @@ fn runtime_worker_error(error: WorkerError) -> RuntimeError {
         "limit_exceeded" => RuntimeError::Core(CoreError::LimitExceeded(error.message)),
         "runtime_unavailable" => RuntimeError::Unavailable(error.message),
         "snapshot_failed" => RuntimeError::Archive(error.message),
-        _ => RuntimeError::Unavailable(error.message),
+        "guest_protocol" | "firecracker_api" | "internal" => {
+            RuntimeError::FirecrackerApi(error.message)
+        }
+        _ => RuntimeError::FirecrackerApi(error.message),
+    }
+}
+
+fn runtime_client_error(error: WorkerClientError) -> RuntimeError {
+    match error {
+        WorkerClientError::Unavailable(message) => RuntimeError::Unavailable(message),
+        WorkerClientError::Transport(message) => {
+            RuntimeError::FirecrackerApi(format!("worker transport: {message}"))
+        }
+        WorkerClientError::Response(message) => {
+            RuntimeError::FirecrackerApi(format!("worker protocol: {message}"))
+        }
     }
 }
 
@@ -664,8 +736,8 @@ pub struct WorkerService {
     node_id: Uuid,
     capacity: u32,
     token: Arc<str>,
-    cache: Arc<Mutex<HashMap<Uuid, WorkerResponse>>>,
-    in_flight: Arc<Mutex<usize>>,
+    cache: Arc<Mutex<ResponseCache>>,
+    in_flight: Arc<AtomicUsize>,
     sandboxes: Arc<Mutex<std::collections::HashSet<Uuid>>>,
 }
 
@@ -683,8 +755,8 @@ impl WorkerService {
             node_id,
             capacity,
             token: Arc::from(token.into().as_str()),
-            cache: Arc::new(Mutex::new(HashMap::new())),
-            in_flight: Arc::new(Mutex::new(0)),
+            cache: Arc::new(Mutex::new(ResponseCache::default())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             sandboxes: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -807,7 +879,7 @@ async fn status(State(state): State<WorkerService>) -> Json<WorkerStatus> {
         healthy: state.runtime.health(),
         runtime: state.runtime_kind,
         sandbox_count: state.sandboxes.lock().await.len(),
-        in_flight: 0,
+        in_flight: state.in_flight.load(Ordering::Relaxed),
         capacity: state.capacity,
     })
 }
@@ -816,21 +888,22 @@ async fn operation(
     State(state): State<WorkerService>,
     Json(request): Json<WorkerRequest>,
 ) -> Response {
-    if let Some(response) = state.cache.lock().await.get(&request.request_id).cloned() {
+    if let Some(response) = state.cache.lock().await.get(request.request_id) {
         return (StatusCode::OK, Json(response)).into_response();
     }
-    let mut in_flight = state.in_flight.lock().await;
-    *in_flight = in_flight.saturating_add(1);
-    drop(in_flight);
+    let response_slot = state.cache.lock().await.entry(request.request_id);
+    let mut response_slot = response_slot.lock().await;
+    if let Some(response) = response_slot.clone() {
+        return (StatusCode::OK, Json(response)).into_response();
+    }
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
     let sandbox_event = match &request.operation {
         WorkerOperation::Create { sandbox } => Some((sandbox.id, true)),
         WorkerOperation::Destroy { sandbox } => Some((sandbox.id, false)),
         _ => None,
     };
     let result = state.execute(request.operation).await;
-    let mut flight = state.in_flight.lock().await;
-    *flight = flight.saturating_sub(1);
-    drop(flight);
+    state.in_flight.fetch_sub(1, Ordering::Relaxed);
     if result.is_ok()
         && let Some((sandbox_id, create)) = sandbox_event
     {
@@ -845,11 +918,14 @@ async fn operation(
         request_id: request.request_id,
         result,
     };
+    *response_slot = Some(response.clone());
+    drop(response_slot);
     state
         .cache
         .lock()
         .await
-        .insert(request.request_id, response.clone());
+        .complete(request.request_id, response.clone())
+        .await;
     (StatusCode::OK, Json(response)).into_response()
 }
 

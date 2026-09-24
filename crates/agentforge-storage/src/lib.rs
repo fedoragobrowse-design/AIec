@@ -128,6 +128,7 @@ pub struct WorkerHeartbeat {
 pub struct WorkerStatus {
     pub registration: WorkerRegistration,
     pub sandbox_count: u32,
+    pub observed_sandbox_count: u32,
     pub last_error: Option<String>,
 }
 
@@ -295,12 +296,28 @@ pub trait Repository: Send + Sync {
     ) -> Result<Vec<WorkerAssignment>, StoreError> {
         Err(StoreError::Unsupported("list_worker_assignments"))
     }
+    async fn list_worker_assignments_for_node(
+        &self,
+        _node_id: Uuid,
+        _status: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, StoreError> {
+        Err(StoreError::Unsupported("list_worker_assignments_for_node"))
+    }
     async fn get_worker_lease(
         &self,
         _tenant: Uuid,
         _lease_id: Uuid,
     ) -> Result<WorkerLease, StoreError> {
         Err(StoreError::Unsupported("get_worker_lease"))
+    }
+
+    async fn get_active_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _sandbox: Uuid,
+    ) -> Result<WorkerLease, StoreError> {
+        Err(StoreError::Unsupported("get_active_worker_lease"))
     }
     async fn renew_worker_lease(
         &self,
@@ -388,6 +405,18 @@ pub trait Scheduler: Send + Sync {
         request_id: Uuid,
         sandbox: Sandbox,
         lease_ttl_seconds: u64,
+    ) -> Result<ScheduledSandbox, StoreError> {
+        self.schedule_sandbox_on_node(tenant, request_id, sandbox, lease_ttl_seconds, None)
+            .await
+    }
+
+    async fn schedule_sandbox_on_node(
+        &self,
+        tenant: Uuid,
+        request_id: Uuid,
+        sandbox: Sandbox,
+        lease_ttl_seconds: u64,
+        preferred_node: Option<Uuid>,
     ) -> Result<ScheduledSandbox, StoreError>;
 }
 

@@ -53,6 +53,34 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         .await
         .expect("exec in guest");
     assert_eq!(result.stdout, "hello-from-firecracker");
+    let environment = runtime
+        .exec(
+            &sandbox,
+            ExecRequest {
+                command: vec!["/bin/busybox".into(), "env".into()],
+                working_directory: Some("/workspace".into()),
+                environment: BTreeMap::new(),
+                timeout_seconds: 10,
+                stdin: None,
+            },
+        )
+        .await
+        .expect("exec env in guest");
+    assert!(!environment.stdout.contains("AGENTFORGE_GUEST_SECRET="));
+    let stdin_result = runtime
+        .exec(
+            &sandbox,
+            ExecRequest {
+                command: vec!["/bin/busybox".into(), "cat".into()],
+                working_directory: Some("/workspace".into()),
+                environment: BTreeMap::new(),
+                timeout_seconds: 10,
+                stdin: Some("guest-stdin\n".into()),
+            },
+        )
+        .await
+        .expect("exec stdin in guest");
+    assert_eq!(stdin_result.stdout, "guest-stdin\n");
     runtime
         .put_file(
             &sandbox,

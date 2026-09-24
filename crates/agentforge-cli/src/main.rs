@@ -6,7 +6,15 @@ use agentforge_runtime::{
 };
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -45,7 +53,7 @@ enum Command {
 }
 #[derive(Args)]
 struct ServerArgs {
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    #[arg(long, env = "AGENTFORGE_BIND", default_value = "127.0.0.1:8080")]
     bind: String,
     #[arg(long, env = "AGENTFORGE_RUNTIME", default_value = "bwrap-dev")]
     runtime: String,
@@ -59,6 +67,8 @@ struct WorkerArgs {
     runtime: String,
     #[arg(long, default_value = ".agentforge")]
     state_dir: PathBuf,
+    #[arg(long, env = "AGENTFORGE_WORKER_ADVERTISE_URL")]
+    advertise_url: String,
     #[arg(long, env = "AGENTFORGE_WORKER_BIND", default_value = "127.0.0.1:9090")]
     bind: String,
     #[arg(long, env = "AGENTFORGE_WORKER_NAME", default_value = "worker")]
@@ -195,17 +205,13 @@ async fn server(args: ServerArgs) -> Result<()> {
         agentforge_api::AppState::in_memory(runtime).with_worker_token(worker_token.clone());
     let addr = args.bind.parse().context("invalid bind address")?;
     let key = std::env::var("AGENTFORGE_API_KEY").unwrap_or_else(|_| generate_api_key());
-    state
-        .repository
-        .put_key(ApiKeyRecord {
-            id: new_id(),
-            tenant_id: Uuid::nil(),
-            digest: key_digest(&key),
-            scopes: vec![Scope::Admin],
-            expires_at: None,
-            revoked_at: None,
-        })
-        .await?;
+    agentforge_api::bootstrap_api_key(
+        state.repository.as_ref(),
+        &key,
+        Uuid::nil(),
+        &[Scope::Admin],
+    )
+    .await?;
     println!(
         "agentforge server listening on {addr}\nbootstrap API key: {key}\nworker token: {worker_token}"
     );
@@ -226,6 +232,24 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         .token
         .or_else(|| std::env::var("AGENTFORGE_WORKER_TOKEN").ok())
         .context("set --token or AGENTFORGE_WORKER_TOKEN")?;
+    if args.capacity == 0 {
+        anyhow::bail!("--capacity must be greater than zero");
+    }
+    let advertised = reqwest::Url::parse(&args.advertise_url)
+        .context("--advertise-url must be an absolute HTTP(S) URL")?;
+    if !matches!(advertised.scheme(), "http" | "https")
+        || advertised.host_str().is_none()
+        || !advertised.username().is_empty()
+        || advertised.password().is_some()
+        || advertised.query().is_some()
+        || advertised.fragment().is_some()
+        || !matches!(advertised.path(), "" | "/")
+    {
+        anyhow::bail!(
+            "--advertise-url must be an HTTP(S) origin without credentials, path, query, or fragment"
+        );
+    }
+    let advertise_url = advertised.as_str().trim_end_matches('/').to_owned();
     let node_id = args.node_id.unwrap_or_else(Uuid::now_v7);
     let (runtime, runtime_kind): (Arc<dyn SandboxRuntime>, RuntimeKind) = match args
         .runtime
@@ -255,7 +279,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         node_id,
         name: args.name,
         runtime: runtime_kind,
-        control_endpoint: format!("http://{}", args.bind),
+        control_endpoint: advertise_url.clone(),
         total_vcpus: args.capacity,
         total_memory_bytes,
         total_disk_bytes,
@@ -277,6 +301,8 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         .context("register worker")?
         .error_for_status()
         .context("worker registration rejected")?;
+    let heartbeat_version = Arc::new(AtomicU64::new(1));
+    let loop_heartbeat_version = heartbeat_version.clone();
     let heartbeat_token = token.clone();
     let heartbeat_client = client.clone();
     let heartbeat_url = control.clone();
@@ -305,16 +331,20 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 available_disk_bytes: u64::from(available) * 10 * 1024 * 1024 * 1024,
                 sandbox_count: active,
                 healthy: status.healthy,
-                version: 1,
+                version: loop_heartbeat_version.fetch_add(1, Ordering::Relaxed) + 1,
                 metadata: serde_json::json!({}),
                 last_error: None,
             };
-            let _ = heartbeat_client
+            if let Err(error) = heartbeat_client
                 .post(format!("{heartbeat_url}/v1/workers/{node_id}/heartbeat"))
                 .bearer_auth(&heartbeat_token)
                 .json(&heartbeat)
                 .send()
-                .await;
+                .await
+                .and_then(|response| response.error_for_status())
+            {
+                tracing::warn!(%error, "worker heartbeat failed");
+            }
             let _ = heartbeat_client
                 .post(format!("{heartbeat_url}/v1/workers/reconcile"))
                 .bearer_auth(&heartbeat_token)
@@ -368,7 +398,16 @@ async fn doctor() -> Result<()> {
     Ok(())
 }
 async fn migrate() -> Result<()> {
-    println!("AgentForge uses repository migrations at startup; no destructive migration was run.");
+    let database_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL is required for `agentforge migrate`")?;
+    let repository = agentforge_storage::PostgresRepository::connect(&database_url)
+        .await
+        .context("connect to PostgreSQL")?;
+    repository
+        .migrate()
+        .await
+        .context("apply AgentForge database migrations")?;
+    println!("AgentForge database migrations are current.");
     Ok(())
 }
 fn key_command(command: KeyCommand) -> Result<()> {

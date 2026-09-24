@@ -81,11 +81,15 @@ fn is_within(root: &Path, path: &Path) -> bool {
 #[derive(Clone, Default)]
 pub struct FilesystemObjectStore {
     pub root: PathBuf,
+    mutation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FilesystemObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     pub async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
@@ -169,8 +173,53 @@ impl FilesystemObjectStore {
         Ok(current)
     }
 
+    async fn existing_path(&self, key: &str) -> Result<PathBuf, StoreError> {
+        validate_object_key(key)?;
+        let root = self.root().await?;
+        let mut current = root.clone();
+        let components: Vec<&str> = key.split('/').collect();
+        let last = components.len().saturating_sub(1);
+        for (index, component) in components.iter().enumerate() {
+            current.push(component);
+            match tokio::fs::symlink_metadata(&current).await {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let resolved = tokio::fs::canonicalize(&current).await?;
+                    if !is_within(&root, &resolved) {
+                        return Err(StoreError::InvalidObjectKey(
+                            "symlink escapes object-store root".into(),
+                        ));
+                    }
+                    if !tokio::fs::metadata(&current).await?.is_dir() {
+                        return Err(StoreError::InvalidObjectKey(
+                            "symlink leaf is not a directory".into(),
+                        ));
+                    }
+                    current = resolved;
+                }
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) if index < last => {
+                    return Err(StoreError::InvalidObjectKey(
+                        "a parent component is not a directory".into(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if current.exists() {
+            let resolved = tokio::fs::canonicalize(&current).await?;
+            if !is_within(&root, &resolved) {
+                return Err(StoreError::InvalidObjectKey(
+                    "object path escapes object-store root".into(),
+                ));
+            }
+        }
+        Ok(current)
+    }
+
     async fn delete_path(&self, key: &str) -> Result<(), StoreError> {
-        let path = self.safe_path(key, false).await?;
+        let path = self.existing_path(key).await?;
         match tokio::fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -182,6 +231,7 @@ impl FilesystemObjectStore {
 #[async_trait]
 impl ObjectStore for FilesystemObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let path = self.safe_path(key, true).await?;
         let parent = path
             .parent()
@@ -204,11 +254,12 @@ impl ObjectStore for FilesystemObjectStore {
             let _ = tokio::fs::remove_file(&temporary).await;
         }
         result?;
+        let content_checksum = checksum(bytes);
         Ok(ObjectMetadata {
             key: key.to_owned(),
             size_bytes: bytes.len() as u64,
-            checksum_sha256: checksum(bytes),
-            etag: None,
+            checksum_sha256: content_checksum.clone(),
+            etag: Some(content_checksum),
         })
     }
 
@@ -240,8 +291,26 @@ impl ObjectStore for FilesystemObjectStore {
         self.delete_path(key).await
     }
 
-    async fn delete_if_match(&self, key: &str, _etag: &str) -> Result<(), StoreError> {
-        self.delete_path(key).await
+    async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StoreError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let path = self.existing_path(key).await?;
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let actual = checksum(&bytes);
+        if actual.eq_ignore_ascii_case(etag.trim_matches('"')) {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        } else {
+            Err(StoreError::ObjectStore(
+                "filesystem ETag precondition failed".into(),
+            ))
+        }
     }
 }
 
@@ -731,6 +800,37 @@ mod tests {
         assert!(runtime.block_on(store.delete("escape/file")).is_err());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn filesystem_delete_is_idempotent_and_enforces_etag() {
+        let root = std::env::temp_dir().join(format!("agentforge-store-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let metadata = store.put("nested/object", b"payload").await.unwrap();
+            let etag = metadata.etag.unwrap();
+            assert!(store.delete("nested/object").await.is_ok());
+            assert!(store.delete("nested/object").await.is_ok());
+            assert!(store.delete("missing/nested/object").await.is_ok());
+            assert!(!root.join("missing").exists());
+
+            let metadata = store.put("conditional/object", b"payload").await.unwrap();
+            assert!(
+                store
+                    .delete_if_match("conditional/object", "wrong-etag")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.get("conditional/object").await.unwrap(), b"payload");
+            store
+                .delete_if_match("conditional/object", &etag)
+                .await
+                .unwrap();
+            assert!(store.delete("conditional/object").await.is_ok());
+            assert_eq!(metadata.checksum_sha256.len(), 64);
+        });
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

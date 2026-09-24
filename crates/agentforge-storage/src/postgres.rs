@@ -187,6 +187,10 @@ fn worker_status_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkerStatus, S
             last_heartbeat: row.try_get("last_heartbeat")?,
         },
         sandbox_count: stored_u32(row.try_get("sandbox_count")?, "worker sandbox_count")?,
+        observed_sandbox_count: stored_u32(
+            row.try_get("observed_sandbox_count")?,
+            "worker observed_sandbox_count",
+        )?,
         last_error: row.try_get("last_error")?,
     })
 }
@@ -403,12 +407,13 @@ impl PostgresScheduler {
 
 #[async_trait]
 impl Scheduler for PostgresScheduler {
-    async fn schedule_sandbox(
+    async fn schedule_sandbox_on_node(
         &self,
         tenant: Uuid,
         request_id: Uuid,
         mut sandbox: Sandbox,
         lease_ttl_seconds: u64,
+        preferred_node: Option<Uuid>,
     ) -> Result<ScheduledSandbox, StoreError> {
         if !(1..=3_600).contains(&lease_ttl_seconds) {
             return Err(StoreError::Conflict(
@@ -495,6 +500,7 @@ impl Scheduler for PostgresScheduler {
                AND available_vcpus >= $2 \
                AND available_memory_bytes >= $3 \
                AND available_disk_bytes >= $4 AND runtime = $5 \
+               AND ($6::uuid IS NULL OR id = $6) \
              ORDER BY \
                (1.0 / GREATEST(available_vcpus, 1)) + \
                (1.0 / GREATEST(available_memory_bytes::numeric / 1073741824, 0.25)) + \
@@ -507,6 +513,7 @@ impl Scheduler for PostgresScheduler {
         .bind(i64::try_from(memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
         .bind(i64::try_from(disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
         .bind(sandbox.runtime.as_str())
+        .bind(preferred_node)
         .fetch_optional(&mut *tx)
         .await
         .map_err(database_error)?
@@ -633,15 +640,22 @@ async fn fetch_lease_for_sandbox(
 
 #[async_trait]
 impl Scheduler for PostgresRepository {
-    async fn schedule_sandbox(
+    async fn schedule_sandbox_on_node(
         &self,
         tenant: Uuid,
         request_id: Uuid,
         sandbox: Sandbox,
         lease_ttl_seconds: u64,
+        preferred_node: Option<Uuid>,
     ) -> Result<ScheduledSandbox, StoreError> {
         PostgresScheduler::new(self.clone())
-            .schedule_sandbox(tenant, request_id, sandbox, lease_ttl_seconds)
+            .schedule_sandbox_on_node(
+                tenant,
+                request_id,
+                sandbox,
+                lease_ttl_seconds,
+                preferred_node,
+            )
             .await
     }
 }
@@ -1169,9 +1183,7 @@ impl Repository for PostgresRepository {
              ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, runtime=EXCLUDED.runtime, \
              control_endpoint=EXCLUDED.control_endpoint, total_vcpus=EXCLUDED.total_vcpus, \
              total_memory_bytes=EXCLUDED.total_memory_bytes, total_disk_bytes=EXCLUDED.total_disk_bytes, \
-             available_vcpus=EXCLUDED.available_vcpus, \
-             available_memory_bytes=EXCLUDED.available_memory_bytes, \
-             available_disk_bytes=EXCLUDED.available_disk_bytes, healthy=EXCLUDED.healthy, \
+             sandbox_count=nodes.sandbox_count, healthy=EXCLUDED.healthy, \
              version=EXCLUDED.version, metadata=EXCLUDED.metadata, started_at=EXCLUDED.started_at, \
              last_heartbeat=EXCLUDED.last_heartbeat WHERE nodes.version < EXCLUDED.version",
         )
@@ -1201,9 +1213,6 @@ impl Repository for PostgresRepository {
                 && current.registration.total_vcpus == value.total_vcpus
                 && current.registration.total_memory_bytes == value.total_memory_bytes
                 && current.registration.total_disk_bytes == value.total_disk_bytes
-                && current.registration.available_vcpus == value.available_vcpus
-                && current.registration.available_memory_bytes == value.available_memory_bytes
-                && current.registration.available_disk_bytes == value.available_disk_bytes
                 && current.registration.healthy == value.healthy
                 && current.registration.metadata == value.metadata;
             if current.registration.version != value.version || !same_registration {
@@ -1220,26 +1229,9 @@ impl Repository for PostgresRepository {
         heartbeat: WorkerHeartbeat,
     ) -> Result<WorkerStatus, StoreError> {
         let result = sqlx::query(
-            "UPDATE nodes SET available_vcpus=$1, available_memory_bytes=$2, \
-             available_disk_bytes=$3, sandbox_count=$4, healthy=$5, version=$6, metadata=$7, \
-             last_error=$8, last_heartbeat=now() \
-             WHERE id=$9 AND version < $6",
-        )
-        .bind(
-            i32::try_from(heartbeat.available_vcpus)
-                .map_err(|error| StoreError::Conflict(error.to_string()))?,
-        )
-        .bind(
-            i64::try_from(heartbeat.available_memory_bytes)
-                .map_err(|error| StoreError::Conflict(error.to_string()))?,
-        )
-        .bind(
-            i64::try_from(heartbeat.available_disk_bytes)
-                .map_err(|error| StoreError::Conflict(error.to_string()))?,
-        )
-        .bind(
-            i32::try_from(heartbeat.sandbox_count)
-                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+            "UPDATE nodes SET healthy=$1, version=$2, metadata=$3, last_error=$4, \
+             observed_sandbox_count=$5, last_heartbeat=now() \
+             WHERE id=$6 AND version <= $2",
         )
         .bind(heartbeat.healthy)
         .bind(
@@ -1248,6 +1240,10 @@ impl Repository for PostgresRepository {
         )
         .bind(&heartbeat.metadata)
         .bind(&heartbeat.last_error)
+        .bind(
+            i32::try_from(heartbeat.sandbox_count)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
         .bind(heartbeat.node_id)
         .execute(&self.pool)
         .await
@@ -1259,19 +1255,9 @@ impl Repository for PostgresRepository {
                     "worker heartbeat version is stale".into(),
                 ));
             }
-            let same_payload = current.registration.available_vcpus == heartbeat.available_vcpus
-                && current.registration.available_memory_bytes == heartbeat.available_memory_bytes
-                && current.registration.available_disk_bytes == heartbeat.available_disk_bytes
-                && current.sandbox_count == heartbeat.sandbox_count
-                && current.registration.healthy == heartbeat.healthy
-                && current.registration.metadata == heartbeat.metadata
-                && current.last_error == heartbeat.last_error;
-            if current.registration.version != heartbeat.version || !same_payload {
-                return Err(StoreError::Conflict(
-                    "worker heartbeat version was reused with different state".into(),
-                ));
-            }
-            return Ok(current);
+            return Err(StoreError::Conflict(
+                "worker heartbeat version is stale".into(),
+            ));
         }
         self.get_worker(heartbeat.node_id).await
     }
@@ -1417,6 +1403,48 @@ impl Repository for PostgresRepository {
         Ok(assignments)
     }
 
+    async fn list_worker_assignments_for_node(
+        &self,
+        node_id: Uuid,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, StoreError> {
+        if status.is_some_and(|value| {
+            !matches!(
+                value,
+                "reserved" | "assigned" | "completed" | "released" | "expired"
+            )
+        }) {
+            return Err(StoreError::Conflict("unknown assignment status".into()));
+        }
+        let rows = sqlx::query(
+            "SELECT * FROM sandbox_assignments \
+             WHERE node_id=$1 AND ($2::text IS NULL OR status=$2) \
+             ORDER BY created_at DESC LIMIT $3",
+        )
+        .bind(node_id)
+        .bind(status)
+        .bind(i64::from(limit.clamp(1, 1_000)))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let mut assignments = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tenant_id: Uuid = row.try_get("tenant_id")?;
+            let request_id: Uuid = row.try_get("request_id")?;
+            let sandbox_id: Uuid = row.try_get("sandbox_id")?;
+            let lease_id: Uuid = row.try_get("lease_id")?;
+            assignments.push(WorkerAssignment {
+                tenant_id,
+                request_id,
+                sandbox: fetch_sandbox(&self.pool, tenant_id, sandbox_id).await?,
+                lease: self.get_worker_lease(tenant_id, lease_id).await?,
+                status: row.try_get("status")?,
+            });
+        }
+        Ok(assignments)
+    }
+
     async fn get_worker_lease(
         &self,
         tenant: Uuid,
@@ -1429,6 +1457,25 @@ impl Repository for PostgresRepository {
             .await
             .map_err(database_error)?
             .ok_or(StoreError::NotFound)?;
+        lease_from_row(&row)
+    }
+
+    async fn get_active_worker_lease(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<WorkerLease, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM sandbox_leases WHERE tenant_id=$1 AND sandbox_id=$2 \
+             AND status='active' AND expires_at > now() \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant)
+        .bind(sandbox)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
         lease_from_row(&row)
     }
 
@@ -1494,6 +1541,9 @@ impl Repository for PostgresRepository {
             }
             tx.commit().await.map_err(database_error)?;
             return Ok(lease);
+        }
+        if lease.expires_at <= Utc::now() {
+            return Err(StoreError::Conflict("worker lease has expired".into()));
         }
         if lease.status != "active" || lease.generation != generation {
             return Err(StoreError::Conflict(
@@ -1966,6 +2016,169 @@ mod tests {
         let workers = repository.get_worker(node_id).await.unwrap();
         assert_eq!(workers.registration.available_vcpus, 0);
         assert_eq!(workers.sandbox_count, 1);
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    async fn repository_and_tenant() -> Option<(Arc<PostgresRepository>, Uuid)> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        repository.migrate().await.unwrap();
+        let tenant = new_id();
+        repository
+            .put_tenant(TenantRecord {
+                id: tenant,
+                name: format!("storage-invariant-{}", tenant),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        Some((repository, tenant))
+    }
+
+    async fn register_test_worker(repository: &PostgresRepository, tenant: Uuid) -> Uuid {
+        let node_id = new_id();
+        repository
+            .register_worker(WorkerRegistration {
+                node_id,
+                name: format!("node-{}-{node_id}", tenant),
+                runtime: RuntimeKind::Firecracker,
+                control_endpoint: "http://127.0.0.1:9000".into(),
+                total_vcpus: 2,
+                total_memory_bytes: 128 * 1_048_576,
+                total_disk_bytes: 1024 * 1_048_576,
+                available_vcpus: 2,
+                available_memory_bytes: 128 * 1_048_576,
+                available_disk_bytes: 1024 * 1_048_576,
+                healthy: true,
+                version: 1,
+                metadata: json!({}),
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+            })
+            .await
+            .unwrap();
+        node_id
+    }
+
+    #[tokio::test]
+    async fn heartbeat_preserves_scheduler_capacity_and_refreshes_same_version() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let _scheduled = repository
+            .schedule_sandbox(tenant, new_id(), sandbox(tenant), 60)
+            .await
+            .unwrap();
+        let before = repository.get_worker(node_id).await.unwrap();
+        sqlx::query("UPDATE nodes SET last_heartbeat=now()-interval '1 minute' WHERE id=$1")
+            .bind(node_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let heartbeat = WorkerHeartbeat {
+            node_id,
+            available_vcpus: 2,
+            available_memory_bytes: 128 * 1_048_576,
+            available_disk_bytes: 1024 * 1_048_576,
+            sandbox_count: 7,
+            healthy: true,
+            version: 1,
+            metadata: json!({}),
+            last_error: None,
+        };
+        let after = repository
+            .heartbeat_worker(heartbeat.clone())
+            .await
+            .unwrap();
+        assert_eq!(after.registration.available_vcpus, 1);
+        assert_eq!(
+            after.registration.available_memory_bytes,
+            before.registration.available_memory_bytes
+        );
+        assert_eq!(after.sandbox_count, 1);
+        assert_eq!(after.observed_sandbox_count, 7);
+        assert!(after.registration.last_heartbeat > before.registration.last_heartbeat);
+
+        sqlx::query("UPDATE nodes SET last_heartbeat=now()-interval '1 minute' WHERE id=$1")
+            .bind(node_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let refreshed = repository.heartbeat_worker(heartbeat).await.unwrap();
+        assert!(refreshed.registration.last_heartbeat > Utc::now() - chrono::Duration::seconds(5));
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn active_lease_lookup_and_renewal_are_durable_but_expiry_blocks_completion() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = repository
+            .schedule_sandbox(tenant, new_id(), sandbox(tenant), 60)
+            .await
+            .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        let current = repository
+            .get_active_worker_lease(tenant, scheduled.sandbox.id)
+            .await
+            .unwrap();
+        assert_eq!(current.id, scheduled.lease.id);
+        assert_eq!(current.generation, claimed[0].lease.generation);
+        let renewed = repository
+            .renew_worker_lease(tenant, current.id, current.generation, 120)
+            .await
+            .unwrap();
+        let reopened = PostgresRepository::connect(&database_url()).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_worker_lease(tenant, renewed.id)
+                .await
+                .unwrap()
+                .generation,
+            renewed.generation
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), reopened.pool.close()).await;
+        sqlx::query("UPDATE sandbox_leases SET expires_at=now()-interval '1 second' WHERE id=$1")
+            .bind(renewed.id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .complete_worker_lease(tenant, renewed.id, renewed.generation, json!({"ok": true}))
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .get_active_worker_lease(tenant, scheduled.sandbox.id)
+                .await
+                .is_err()
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL").unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_events_reject_truncate() {
+        let Some((repository, _tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        assert!(
+            sqlx::query("TRUNCATE usage_events")
+                .execute(&repository.pool)
+                .await
+                .is_err()
+        );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 }

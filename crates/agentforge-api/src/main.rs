@@ -1,7 +1,8 @@
 use agentforge_api::{
-    AppState, HttpWorkerClient, Scheduler, StorageScheduler, WorkerClient, WorkerRuntime, serve,
+    AppState, HttpWorkerClient, Scheduler, StorageScheduler, WorkerClient, WorkerRuntime,
+    bootstrap_api_key, serve,
 };
-use agentforge_core::{ApiKeyRecord, Scope, key_digest, new_id};
+use agentforge_core::Scope;
 use agentforge_runtime::{FirecrackerConfig, SandboxRuntime};
 use agentforge_storage::{
     ObjectStore, PostgresRepository, PostgresScheduler, Repository, S3Config, S3ObjectStore,
@@ -74,22 +75,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_scheduler(scheduler)
         .with_worker_token(worker_token)
         .with_object_store(object_store);
-    repository
-        .put_key(ApiKeyRecord {
-            id: new_id(),
-            tenant_id,
-            digest: key_digest(&api_key),
-            scopes: vec![
-                Scope::SandboxesRead,
-                Scope::SandboxesWrite,
-                Scope::SnapshotsRead,
-                Scope::SnapshotsWrite,
-                Scope::Admin,
-            ],
-            expires_at: None,
-            revoked_at: None,
-        })
-        .await?;
+    bootstrap_api_key(
+        repository.as_ref(),
+        &api_key,
+        tenant_id,
+        &[
+            Scope::SandboxesRead,
+            Scope::SandboxesWrite,
+            Scope::SnapshotsRead,
+            Scope::SnapshotsWrite,
+            Scope::Admin,
+        ],
+    )
+    .await?;
     println!("agentforge production server listening on {bind}");
     serve(state, bind).await?;
     Ok(())

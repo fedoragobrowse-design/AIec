@@ -1,7 +1,8 @@
 use agentforge_core::{MAX_FILE, protocol::*};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -124,6 +125,7 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
         env,
         timeout_ms,
         output_limit,
+        stdin,
     } = payload
     else {
         return Err("exec payload required".into());
@@ -131,13 +133,25 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
     if argv.is_empty() {
         return Err("argv cannot be empty".into());
     }
-    let limit = output_limit.clamp(1, MAX_FRAME - 4096);
+    if stdin.len() > MAX_FILE {
+        return Err("stdin too large".into());
+    }
+    let limit = output_limit.clamp(1, MAX_FILE.min(MAX_FRAME - 4096));
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("HOME", "/workspace")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     if let Some(path) = cwd {
         command.current_dir(safe_path(&path)?);
     }
@@ -145,6 +159,10 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
         command.env(key, value);
     }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    if let Some(mut pipe) = child.stdin.take() {
+        pipe.write_all(&stdin).map_err(|error| error.to_string())?;
+    }
+    let pid = child.id() as i32;
     let stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("stderr unavailable")?;
     let out_rx = bounded_reader(stdout, limit);
@@ -157,7 +175,9 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
             break status;
         }
         if started.elapsed() >= deadline {
-            let _ = child.kill();
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
             let _ = child.wait();
             timed_out = true;
             break child.wait().map_err(|error| error.to_string())?;
@@ -235,9 +255,16 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
             }),
             Operation::Exec => run_command(request.payload),
             Operation::ReadFile => match request.payload {
-                RequestPayload::Path { path } => fs::read(safe_path(&path)?)
-                    .map(|content| ResponsePayload::ReadFile { content })
-                    .map_err(|error| error.to_string()),
+                RequestPayload::Path { path } => {
+                    let path = safe_path(&path)?;
+                    let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+                    if !metadata.is_file() || metadata.len() > MAX_FILE as u64 {
+                        return Err("file too large or not regular".into());
+                    }
+                    fs::read(path)
+                        .map(|content| ResponsePayload::ReadFile { content })
+                        .map_err(|error| error.to_string())
+                }
                 _ => Err("path payload required".into()),
             },
             Operation::WriteFile => match request.payload {

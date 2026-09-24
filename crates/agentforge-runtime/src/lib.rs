@@ -471,12 +471,19 @@ impl FirecrackerConfig {
     }
 }
 
+#[derive(Clone)]
+struct NetworkDevice {
+    tap: String,
+    table: String,
+}
+
 struct FirecrackerVm {
     child: tokio::process::Child,
     api_socket: PathBuf,
-    network_device: Option<String>,
+    network_device: Option<NetworkDevice>,
     vsock_socket: PathBuf,
     rootfs: PathBuf,
+    start_token: Uuid,
 }
 
 #[derive(Clone)]
@@ -569,51 +576,127 @@ impl FirecrackerRuntime {
         let path = self.config.vsock_socket(id);
         let deadline = tokio::time::Instant::now() + self.config.readiness_timeout;
         loop {
-            match tokio::net::UnixStream::connect(&path).await {
-                Ok(mut stream) => {
-                    stream
-                        .write_all(
-                            format!("CONNECT {}\n", protocol::DEFAULT_CONTROL_PORT).as_bytes(),
-                        )
-                        .await?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RuntimeError::Unavailable(
+                    "guest vsock readiness timed out".into(),
+                ));
+            }
+            match tokio::time::timeout(remaining, tokio::net::UnixStream::connect(&path)).await {
+                Ok(Ok(mut stream)) => {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(RuntimeError::Unavailable(
+                            "guest vsock CONNECT timed out".into(),
+                        ));
+                    }
+                    let connect = format!("CONNECT {}\n", protocol::DEFAULT_CONTROL_PORT);
+                    match tokio::time::timeout(remaining, stream.write_all(connect.as_bytes()))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error.into()),
+                        Err(_) => {
+                            return Err(RuntimeError::Unavailable(
+                                "guest vsock CONNECT timed out".into(),
+                            ));
+                        }
+                    }
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
-                    reader.read_line(&mut line).await?;
-                    if line.starts_with("OK ") {
-                        return Ok(reader.into_inner());
+                    match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
+                        Ok(Ok(_)) if line.starts_with("OK ") => {
+                            return Ok(reader.into_inner());
+                        }
+                        Ok(Ok(_)) => {
+                            return Err(RuntimeError::Unavailable(format!(
+                                "guest vsock CONNECT rejected: {}",
+                                line.trim()
+                            )));
+                        }
+                        Ok(Err(error)) => return Err(error.into()),
+                        Err(_) => {
+                            return Err(RuntimeError::Unavailable(
+                                "guest vsock CONNECT timed out".into(),
+                            ));
+                        }
                     }
                 }
-                Err(error) if tokio::time::Instant::now() < deadline => {
+                Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
                     let _ = error;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if !remaining.is_zero() {
+                        let _ = tokio::time::timeout(
+                            remaining,
+                            tokio::time::sleep(Duration::from_millis(50)),
+                        )
+                        .await;
+                    }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     return Err(RuntimeError::Unavailable(format!(
                         "guest vsock readiness failed: {error}"
                     )));
+                }
+                Err(_) => {
+                    return Err(RuntimeError::Unavailable(
+                        "guest vsock readiness timed out".into(),
+                    ));
                 }
             }
         }
     }
 
-    async fn guest_call(
-        &self,
-        id: Uuid,
-        operation: Operation,
-        payload: RequestPayload,
-    ) -> Result<ResponsePayload, RuntimeError> {
-        let request = Request {
+    fn guest_call_timeout(&self, request: &Request) -> Duration {
+        let timeout = match (&request.operation, &request.payload) {
+            (Operation::Exec, RequestPayload::Exec { timeout_ms, .. }) => {
+                Duration::from_millis(timeout_ms.saturating_add(5_000))
+            }
+            _ => self.config.readiness_timeout,
+        };
+        timeout.max(self.config.readiness_timeout)
+    }
+
+    fn fresh_request(operation: Operation, payload: RequestPayload) -> Request {
+        Request {
             version: protocol::PROTOCOL_VERSION,
             request_id: Uuid::now_v7(),
             operation,
             payload,
-        };
+        }
+    }
+
+    async fn guest_call_inner(
+        &self,
+        id: Uuid,
+        request: Request,
+    ) -> Result<ResponsePayload, RuntimeError> {
         let mut stream = self.connect_guest(id).await?;
         let body = serde_json::to_vec(&request)?;
-        stream
-            .write_all(&frame_bytes(&self.config.guest_secret, &body))
-            .await?;
-        let response = read_frame_async(&mut stream, &self.config.guest_secret).await?;
+        let frame = frame_bytes(&self.config.guest_secret, &body);
+        let remaining = self.guest_call_timeout(&request);
+        match tokio::time::timeout(remaining, stream.write_all(&frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "guest vsock write timed out".into(),
+                ));
+            }
+        }
+        let response = match tokio::time::timeout(
+            remaining,
+            read_frame_async(&mut stream, &self.config.guest_secret),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(RuntimeError::Unavailable(
+                    "guest vsock read timed out".into(),
+                ));
+            }
+        };
         let response: Response = serde_json::from_slice(&response)?;
         if response.request_id != request.request_id {
             return Err(RuntimeError::Protocol(protocol::ProtocolError::Malformed(
@@ -623,6 +706,26 @@ impl FirecrackerRuntime {
         match response.payload {
             ResponsePayload::Error { message, .. } => Err(RuntimeError::Unavailable(message)),
             payload => Ok(payload),
+        }
+    }
+
+    async fn guest_call(
+        &self,
+        id: Uuid,
+        operation: Operation,
+        payload: RequestPayload,
+    ) -> Result<ResponsePayload, RuntimeError> {
+        let request = Self::fresh_request(operation, payload);
+        match tokio::time::timeout(
+            self.guest_call_timeout(&request),
+            self.guest_call_inner(id, request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::Unavailable(
+                "guest vsock call timed out".into(),
+            )),
         }
     }
 
@@ -663,6 +766,7 @@ impl FirecrackerRuntime {
             vsock_socket,
             network_device: None,
             rootfs: self.config.rootfs(id),
+            start_token: Uuid::now_v7(),
         })
     }
 
@@ -672,8 +776,8 @@ impl FirecrackerRuntime {
         vm: &mut FirecrackerVm,
     ) -> Result<(), RuntimeError> {
         vm.network_device = self.prepare_network(sandbox).await?;
-        if let Some(tap) = &vm.network_device {
-            self.api(&vm.api_socket, "PUT", "/network-interfaces/eth0", Some(serde_json::json!({"iface_id":"eth0", "guest_mac":"06:00:AC:10:00:02", "host_dev_name":tap}))).await?;
+        if let Some(network) = &vm.network_device {
+            self.api(&vm.api_socket, "PUT", "/network-interfaces/eth0", Some(serde_json::json!({"iface_id":"eth0", "guest_mac":"06:00:AC:10:00:02", "host_dev_name":network.tap}))).await?;
         }
         self.api(&vm.api_socket, "PUT", "/boot-source", Some(serde_json::json!({"kernel_image_path": self.config.kernel, "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"}))).await?;
         self.api(&vm.api_socket, "PUT", "/drives/rootfs", Some(serde_json::json!({"drive_id":"rootfs", "path_on_host":vm.rootfs, "is_root_device":true, "is_read_only":false}))).await?;
@@ -711,70 +815,175 @@ impl FirecrackerRuntime {
         }
     }
 
-    async fn cleanup_network(&self, device: &Option<String>) {
-        if let Some(name) = device {
+    async fn cleanup_network(&self, device: &Option<NetworkDevice>) {
+        if let Some(device) = device {
+            let _ = Command::new("nft")
+                .args(["delete", "table", "inet", &device.table])
+                .status()
+                .await;
             let _ = Command::new("ip")
-                .args(["link", "del", name])
+                .args(["link", "del", &device.tap])
                 .status()
                 .await;
         }
     }
 
-    async fn prepare_network(&self, sandbox: &Sandbox) -> Result<Option<String>, RuntimeError> {
+    async fn prepare_network(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<NetworkDevice>, RuntimeError> {
         if !sandbox.network.enabled {
             return Ok(None);
         }
-        let suffix = &sandbox.id.simple().to_string()[..12];
+        let suffix = sandbox.id.simple().to_string();
+        let suffix = &suffix[..12];
         let tap = format!("af{suffix}");
-        let octet = ((sandbox.id.as_u128() & 0x3f) + 2) as u8;
-        let host_ip = format!("172.30.0.{octet}");
-        for args in [
-            vec!["tuntap", "add", "dev", &tap, "mode", "tap"],
-            vec!["addr", "add", &format!("{host_ip}/30"), "dev", &tap],
-            vec!["link", "set", "dev", &tap, "up"],
-        ] {
-            let output = Command::new("ip")
-                .args(&args)
-                .output()
-                .await
-                .map_err(RuntimeError::from)?;
+        let table = format!("agentforge_{suffix}");
+        let device = NetworkDevice {
+            tap: tap.clone(),
+            table: table.clone(),
+        };
+        let host_ip = format!("172.30.0.{}", ((sandbox.id.as_u128() & 0x3f) + 2) as u8);
+        let mut tap_created = false;
+        let commands = [
+            vec![
+                "tuntap".into(),
+                "add".into(),
+                "dev".into(),
+                tap.clone(),
+                "mode".into(),
+                "tap".into(),
+            ],
+            vec![
+                "addr".into(),
+                "add".into(),
+                format!("{host_ip}/30"),
+                "dev".into(),
+                tap.clone(),
+            ],
+            vec![
+                "link".into(),
+                "set".into(),
+                "dev".into(),
+                tap.clone(),
+                "up".into(),
+            ],
+        ];
+        for (index, args) in commands.iter().enumerate() {
+            let output = match Command::new("ip").args(args).output().await {
+                Ok(output) => output,
+                Err(error) => {
+                    if tap_created {
+                        self.cleanup_network(&Some(device.clone())).await;
+                    }
+                    return Err(error.into());
+                }
+            };
             if !output.status.success() {
+                if tap_created {
+                    self.cleanup_network(&Some(device.clone())).await;
+                }
                 return Err(RuntimeError::Unavailable(format!(
                     "TAP setup failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
+            tap_created = true;
+            if index == commands.len() - 1 {
+                break;
+            }
         }
-        let table = format!("agentforge_{suffix}");
-        let rules = format!(
-            "add table inet {table}; add chain inet {table} output {{ type filter hook output priority -10; policy accept; }}; add rule inet {table} output ip daddr 169.254.169.254 drop; add rule inet {table} output ip daddr 10.0.0.0/8 drop; add rule inet {table} output ip daddr 172.16.0.0/12 drop; add rule inet {table} output ip daddr 192.168.0.0/16 drop; add rule inet {table} output ip daddr 127.0.0.0/8 drop"
-        );
-        let mut child = Command::new("nft")
+        let rules = firewall_rules(&table, &tap);
+        let mut child = match Command::new("nft")
             .arg("-f")
             .arg("-")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Unavailable("nft stdin unavailable".into()))?
-            .write_all(rules.as_bytes())
-            .await?;
-        let output = child.wait_with_output().await?;
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                self.cleanup_network(&Some(device.clone())).await;
+                return Err(error.into());
+            }
+        };
+        let write_result = match child.stdin.as_mut() {
+            Some(stdin) => stdin.write_all(rules.as_bytes()).await,
+            None => Err(std::io::Error::other("nft stdin unavailable")),
+        };
+        if let Err(error) = write_result {
+            drop(child.stdin.take());
+            let _ = child.wait().await;
+            self.cleanup_network(&Some(device.clone())).await;
+            return Err(error.into());
+        }
+        drop(child.stdin.take());
+        let output = match child.wait_with_output().await {
+            Ok(output) => output,
+            Err(error) => {
+                self.cleanup_network(&Some(device.clone())).await;
+                return Err(error.into());
+            }
+        };
         if !output.status.success() {
-            let _ = Command::new("ip")
-                .args(["link", "del", &tap])
-                .status()
-                .await;
+            self.cleanup_network(&Some(device)).await;
             return Err(RuntimeError::Unavailable(format!(
                 "nft isolation failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
-        Ok(Some(tap))
+        Ok(Some(device))
     }
+
+    fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
+        let runtime = self.clone();
+        let lifetime = sandbox.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(lifetime.timeout_seconds)).await;
+            runtime.stop_if_token(&lifetime, token).await;
+        });
+    }
+
+    async fn terminate_vm(&self, sandbox: &Sandbox, mut vm: FirecrackerVm) {
+        let _ = self
+            .guest_call(sandbox.id, Operation::Shutdown, RequestPayload::None)
+            .await;
+        let _ = vm.child.start_kill();
+        let _ = vm.child.wait().await;
+        self.cleanup_network(&vm.network_device).await;
+    }
+
+    async fn stop_if_token(&self, sandbox: &Sandbox, token: Uuid) {
+        let vm = {
+            let mut vms = self.vms.lock().await;
+            if vms.get(&sandbox.id).map(|vm| vm.start_token) != Some(token) {
+                return;
+            }
+            vms.remove(&sandbox.id)
+        };
+        if let Some(vm) = vm {
+            self.terminate_vm(sandbox, vm).await;
+        }
+    }
+}
+
+fn firewall_rules(table: &str, tap: &str) -> String {
+    format!(
+        "add table inet {table}; \
+add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}; \
+add chain inet {table} forward {{ type filter hook forward priority -10; policy accept; }}; \
+add rule inet {table} input iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
+add rule inet {table} input iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
+add rule inet {table} input iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
+add rule inet {table} input iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
+add rule inet {table} input iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip daddr 127.0.0.0/8 drop"
+    )
 }
 fn frame_bytes(secret: &[u8], body: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(42 + body.len());
@@ -890,28 +1099,19 @@ impl SandboxRuntime for FirecrackerRuntime {
         if let Err(error) = self.configure_and_start(sandbox, &mut vm).await {
             let _ = self.cleanup_network(&vm.network_device).await;
             let _ = vm.child.start_kill();
+            let _ = vm.child.wait().await;
             return Err(error);
         }
+        let token = vm.start_token;
         self.vms.lock().await.insert(sandbox.id, vm);
-        let runtime = self.clone();
-        let lifetime = sandbox.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(lifetime.timeout_seconds)).await;
-            let _ = runtime.stop(&lifetime).await;
-        });
+        self.schedule_lifetime(sandbox, token);
         Ok(())
     }
 
     async fn stop(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
-        if self.vms.lock().await.contains_key(&sandbox.id) {
-            let _ = self
-                .guest_call(sandbox.id, Operation::Shutdown, RequestPayload::None)
-                .await;
-        }
-        if let Some(mut vm) = self.vms.lock().await.remove(&sandbox.id) {
-            let _ = vm.child.start_kill();
-            let _ = vm.child.wait().await;
-            self.cleanup_network(&vm.network_device).await;
+        let vm = self.vms.lock().await.remove(&sandbox.id);
+        if let Some(vm) = vm {
+            self.terminate_vm(sandbox, vm).await;
         }
         Ok(())
     }
@@ -932,6 +1132,7 @@ impl SandboxRuntime for FirecrackerRuntime {
                     env: request.environment,
                     timeout_ms: request.timeout_seconds.saturating_mul(1000),
                     output_limit: MAX_STDOUT.min(MAX_STDERR),
+                    stdin: request.stdin.unwrap_or_default().into_bytes(),
                 },
             )
             .await?;
@@ -1063,19 +1264,56 @@ impl SandboxRuntime for FirecrackerRuntime {
             (vm.api_socket.clone(), vm.rootfs.clone())
         };
         drop(vms);
-        self.api(
-            &socket,
-            "PATCH",
-            "/vm",
-            Some(serde_json::json!({"state":"Paused"})),
-        )
-        .await?;
-        let destination = self.config.snapshot_dir(key);
-        tokio::fs::create_dir_all(&destination).await?;
-        let state = destination.join("vmstate");
-        let memory = destination.join("memory");
-        let create = self.api(&socket, "PUT", "/snapshot/create", Some(serde_json::json!({"snapshot_type":"Full", "snapshot_path":state, "mem_file_path":memory, "sync_snapshot_files":true}))).await;
-        let copy = tokio::fs::copy(&source_disk, destination.join("rootfs.ext4")).await;
+        let pause = self
+            .api(
+                &socket,
+                "PATCH",
+                "/vm",
+                Some(serde_json::json!({"state":"Paused"})),
+            )
+            .await;
+        if let Err(error) = pause {
+            let _ = self
+                .api(
+                    &socket,
+                    "PATCH",
+                    "/vm",
+                    Some(serde_json::json!({"state":"Resumed"})),
+                )
+                .await;
+            return Err(error);
+        }
+        let snapshot_result: Result<u64, RuntimeError> = async {
+            let destination = self.config.snapshot_dir(key);
+            tokio::fs::create_dir_all(&destination).await?;
+            let state = destination.join("vmstate");
+            let memory = destination.join("memory");
+            self.api(
+                &socket,
+                "PUT",
+                "/snapshot/create",
+                Some(serde_json::json!({"snapshot_type":"Full", "snapshot_path":&state, "mem_file_path":&memory, "sync_snapshot_files":true})),
+            )
+            .await?;
+            let snapshot_disk = destination.join("rootfs.ext4");
+            tokio::fs::copy(&source_disk, &snapshot_disk).await?;
+            let manifest = serde_json::json!({
+                "schema": 1,
+                "source_disk": source_disk,
+                "rootfs_sha256": hex::encode(Sha256::digest(tokio::fs::read(&snapshot_disk).await?)),
+            });
+            tokio::fs::write(
+                destination.join("manifest.json"),
+                serde_json::to_vec(&manifest)?,
+            )
+            .await?;
+            let mut size = 0;
+            for file in [state, memory, snapshot_disk] {
+                size += tokio::fs::metadata(file).await?.len();
+            }
+            Ok(size)
+        }
+        .await;
         let resume = self
             .api(
                 &socket,
@@ -1084,21 +1322,14 @@ impl SandboxRuntime for FirecrackerRuntime {
                 Some(serde_json::json!({"state":"Resumed"})),
             )
             .await;
-        let manifest = serde_json::json!({"schema":1,"source_disk":source_disk,"rootfs_sha256":hex::encode(Sha256::digest(tokio::fs::read(destination.join("rootfs.ext4")).await?))});
-        let manifest_result = tokio::fs::write(
-            destination.join("manifest.json"),
-            serde_json::to_vec(&manifest)?,
-        )
-        .await;
-        create?;
-        copy?;
-        manifest_result?;
-        resume?;
-        let mut size = 0;
-        for file in [state, memory, destination.join("rootfs.ext4")] {
-            size += tokio::fs::metadata(file).await?.len();
+        match (snapshot_result, resume) {
+            (Ok(size), Ok(())) => Ok(size),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(resume_error)) => Err(RuntimeError::Unavailable(format!(
+                "snapshot failed: {error}; resume failed: {resume_error}"
+            ))),
         }
-        Ok(size)
     }
 
     async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError> {
@@ -1150,7 +1381,9 @@ impl SandboxRuntime for FirecrackerRuntime {
                 Err(error) => return Err(error),
             }
         }
+        let token = vm.start_token;
         self.vms.lock().await.insert(sandbox.id, vm);
+        self.schedule_lifetime(sandbox, token);
         Ok(())
     }
 
@@ -1198,5 +1431,153 @@ mod tests {
             config.snapshot_dir("tenant/a"),
             config.snapshot_dir("tenant/b")
         );
+    }
+
+    fn sandbox(id: Uuid, timeout_seconds: u64) -> Sandbox {
+        let now = chrono::Utc::now();
+        Sandbox {
+            id,
+            tenant_id: Uuid::now_v7(),
+            node_id: None,
+            image_id: "test".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Firecracker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 128,
+            timeout_seconds,
+            network: NetworkPolicy::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        }
+    }
+
+    #[test]
+    fn firewall_rules_are_scoped_to_tap_without_output_hook() {
+        let rules = firewall_rules("agentforge_0123456789ab", "af0123456789ab");
+        assert!(rules.contains("hook input"));
+        assert!(rules.contains("hook forward"));
+        assert!(!rules.contains("hook output"));
+        assert!(rules.contains("iifname \"af0123456789ab\""));
+        for destination in [
+            "169.254.169.254",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+        ] {
+            assert!(rules.contains(destination));
+        }
+    }
+
+    #[test]
+    fn repeated_non_idempotent_requests_get_fresh_ids() {
+        let first = FirecrackerRuntime::fresh_request(
+            Operation::WriteFile,
+            RequestPayload::Path {
+                path: "/workspace/file".into(),
+            },
+        );
+        let second = FirecrackerRuntime::fresh_request(
+            Operation::WriteFile,
+            RequestPayload::Path {
+                path: "/workspace/file".into(),
+            },
+        );
+        assert_ne!(first.request_id, second.request_id);
+    }
+
+    #[tokio::test]
+    async fn half_open_guest_vsock_read_is_bounded() {
+        let mut config = config();
+        let state_token = Uuid::now_v7().simple().to_string();
+        config.state_dir = std::env::temp_dir().join(format!("af-{}", &state_token[..8]));
+        config.readiness_timeout = Duration::from_millis(40);
+        let id = Uuid::now_v7();
+        let socket = config.vsock_socket(id);
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            let _ = stream.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let runtime = FirecrackerRuntime::new(config);
+        let started = Instant::now();
+        let result = runtime
+            .guest_call(id, Operation::Health, RequestPayload::None)
+            .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.abort();
+        let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
+    }
+
+    #[tokio::test]
+    async fn stale_timer_token_cannot_stop_restarted_vm() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let runtime = FirecrackerRuntime::new(config);
+        let sandbox = sandbox(Uuid::now_v7(), 60);
+        let token = Uuid::now_v7();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        runtime.vms.lock().await.insert(
+            sandbox.id,
+            FirecrackerVm {
+                child,
+                api_socket: PathBuf::from("/unused/api.sock"),
+                network_device: None,
+                vsock_socket: PathBuf::from("/unused/vsock.sock"),
+                rootfs: PathBuf::from("/unused/rootfs.ext4"),
+                start_token: token,
+            },
+        );
+        runtime.stop_if_token(&sandbox, Uuid::now_v7()).await;
+        assert!(runtime.vms.lock().await.contains_key(&sandbox.id));
+        let mut vm = runtime.vms.lock().await.remove(&sandbox.id).unwrap();
+        let _ = vm.child.start_kill();
+        let _ = vm.child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn matching_lifetime_schedule_expires_vm() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let runtime = FirecrackerRuntime::new(config);
+        let sandbox = sandbox(Uuid::now_v7(), 0);
+        let token = Uuid::now_v7();
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        runtime.vms.lock().await.insert(
+            sandbox.id,
+            FirecrackerVm {
+                child,
+                api_socket: PathBuf::from("/unused/api.sock"),
+                network_device: None,
+                vsock_socket: PathBuf::from("/unused/vsock.sock"),
+                rootfs: PathBuf::from("/unused/rootfs.ext4"),
+                start_token: token,
+            },
+        );
+        runtime.schedule_lifetime(&sandbox, token);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
     }
 }

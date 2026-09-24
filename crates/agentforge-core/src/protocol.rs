@@ -68,6 +68,8 @@ pub enum RequestPayload {
         timeout_ms: u64,
         #[serde(default = "default_output_limit")]
         output_limit: usize,
+        #[serde(default, with = "base64_bytes")]
+        stdin: Vec<u8>,
     },
     Path {
         path: String,

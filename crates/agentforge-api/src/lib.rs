@@ -142,8 +142,93 @@ impl From<RuntimeError> for ApiFailure {
     }
 }
 type ApiResult<T> = Result<Json<T>, ApiFailure>;
-fn store(e: agentforge_storage::StoreError) -> ApiFailure {
-    ApiFailure::new(StatusCode::NOT_FOUND, "not_found", e.to_string())
+fn store(error: agentforge_storage::StoreError) -> ApiFailure {
+    use agentforge_storage::StoreError;
+    match error {
+        StoreError::Core(error) => error.into(),
+        StoreError::NotFound => ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "not found"),
+        StoreError::Conflict(message) => ApiFailure::new(StatusCode::CONFLICT, "conflict", message),
+        StoreError::ObjectStore(message) => {
+            ApiFailure::new(StatusCode::BAD_GATEWAY, "object_store", message)
+        }
+        StoreError::Unsupported(operation) => ApiFailure::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "storage_unsupported",
+            format!("storage operation is unsupported: {operation}"),
+        ),
+        StoreError::Database(error) => ApiFailure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            error.to_string(),
+        ),
+        StoreError::Migration(error) => ApiFailure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            error.to_string(),
+        ),
+        StoreError::Io(error) => ApiFailure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            error.to_string(),
+        ),
+        StoreError::Json(error) => ApiFailure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage",
+            error.to_string(),
+        ),
+        StoreError::InvalidObjectKey(message) => {
+            ApiFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "storage", message)
+        }
+    }
+}
+
+pub async fn bootstrap_api_key(
+    repository: &dyn Repository,
+    raw_key: &str,
+    tenant_id: Uuid,
+    scopes: &[Scope],
+) -> Result<Uuid, agentforge_storage::StoreError> {
+    validate_api_key(raw_key)?;
+    let digest = key_digest(raw_key);
+    let validate_existing =
+        |existing: ApiKeyRecord| -> Result<Uuid, agentforge_storage::StoreError> {
+            if existing.tenant_id != tenant_id
+                || existing.revoked_at.is_some()
+                || existing
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= Utc::now())
+                || scopes.iter().any(|scope| !existing.scopes.contains(scope))
+            {
+                return Err(agentforge_storage::StoreError::Conflict(
+                "bootstrap API key already exists with different ownership, lifecycle, or scopes"
+                    .into(),
+            ));
+            }
+            Ok(existing.id)
+        };
+    match repository.find_key(&digest).await {
+        Ok(existing) => validate_existing(existing),
+        Err(agentforge_storage::StoreError::NotFound) => {
+            let candidate = ApiKeyRecord {
+                id: new_id(),
+                tenant_id,
+                digest,
+                scopes: scopes.to_vec(),
+                expires_at: None,
+                revoked_at: None,
+            };
+            let candidate_id = candidate.id;
+            match repository.put_key(candidate).await {
+                Ok(()) => Ok(candidate_id),
+                Err(agentforge_storage::StoreError::Conflict(_)) => repository
+                    .find_key(&digest)
+                    .await
+                    .and_then(validate_existing),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 pub fn router(state: AppState) -> Router {
     let protected = protected_routes().layer(middleware::from_fn_with_state(state.clone(), auth));
@@ -410,6 +495,7 @@ async fn reconcile_workers(State(state): State<AppState>) -> ApiResult<Value> {
                     last_heartbeat: node.last_heartbeat,
                 },
                 sandbox_count: node.sandbox_count,
+                observed_sandbox_count: node.sandbox_count,
                 last_error: None,
             })
             .collect(),
