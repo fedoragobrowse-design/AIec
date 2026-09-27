@@ -325,7 +325,12 @@ and the command is subject to a timeout.",
         annotations(
             title = "Exec in sandbox",
             read_only_hint = false,
-            destructive_hint = true
+            // Honest, and deliberately not "destructive": a command runs in a
+            // disposable sandbox the caller asked for. Marking this destructive
+            // makes clients prompt to confirm every clone, test run and diff.
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
         )
     )]
     async fn exec(
