@@ -1,0 +1,68 @@
+<!-- meta:title=AgentForge Cloud -->
+<!-- meta:description=AgentForge Cloud: managed Firecracker sandboxes for AI agents. We run the infrastructure, you use the API. -->
+
+<p class="eyebrow">AgentForge Cloud</p>
+<h1>Managed sandboxes, one API</h1>
+<p class="lead">
+  We run the Firecracker capacity, the database, object storage, TLS, backups and
+  upgrades. You create sandboxes, run code and destroy them.
+</p>
+
+<div class="row">
+  <a class="btn primary" href="/cloud/keys">Get an API key</a>
+  <a class="btn" href="/docs">Read the docs</a>
+</div>
+
+<h2>What you get</h2>
+<div class="grid two">
+  <div class="card">
+    <h3>Firecracker isolation by default</h3>
+    <p>Public workloads run in microVMs with their own kernel and filesystem. You
+       cannot request a weaker runtime and downgrade your own isolation.</p>
+  </div>
+  <div class="card">
+    <h3>Disposable by default</h3>
+    <p>Create, use, destroy. Sandboxes are short-lived and billed while they run,
+       so agents can churn through them freely.</p>
+  </div>
+  <div class="card">
+    <h3>Coding images</h3>
+    <p>Git, CA certificates, Python, curl and tar are in the image. Clone over
+       HTTPS with real certificate validation, edit in place, run the tests.</p>
+  </div>
+  <div class="card">
+    <h3>Works with your agent</h3>
+    <p>The API is the product. Use the Python SDK, the Rust SDK, or plain HTTP from
+       whatever runtime your agent is written in.</p>
+  </div>
+</div>
+
+<h2>How it fits together</h2>
+<pre><code>your agent
+  -> AgentForge API        auth, tenants, quotas, policy
+  -> scheduler             fenced leases, capability-aware placement
+  -> worker                HTTPS control channel
+  -> runtime               Firecracker microVM, or hosted capacity
+  -> sandbox               your code, isolated</code></pre>
+
+<h2>Using it</h2>
+<pre><code>from agentforge import AgentForge
+
+af = AgentForge(api_key="af_live_...")
+
+box = af.sandboxes.create(image="python:3.13")
+box.exec(["python", "-c", "print('hello from AgentForge')"])
+box.destroy()</code></pre>
+<p>
+  Prefer to run the platform yourself instead? It is the same software:
+  <a href="/docs#self-host">self-host AgentForge</a>.
+</p>
+
+<h2>Alpha status</h2>
+<div class="note">
+  <p>
+    Cloud is in <strong>public alpha</strong>: invite-only, limited capacity, and
+    no SLA. Current limitations are listed on the <a href="/status">status</a>
+    page. Nothing here bills without your approval.
+  </p>
+</div>

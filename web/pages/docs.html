@@ -1,0 +1,179 @@
+<!-- meta:title=Docs -->
+<!-- meta:description=AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance. -->
+
+<p class="eyebrow">Documentation</p>
+<h1>Docs</h1>
+<p class="lead">From nothing to a running sandbox in about five minutes, with no
+infrastructure of your own.</p>
+
+<h2 id="quickstart">Five-minute quickstart</h2>
+<ol class="steps">
+  <li><strong>Get an account.</strong> Public alpha is invite-only. Request access
+      and we will send an invite to your email.</li>
+  <li><strong>Create an API key.</strong> Open the
+      <a href="/cloud/keys">API keys</a> page and generate a key. It is shown
+      once — store it somewhere safe.</li>
+  <li><strong>Install the SDK.</strong>
+      <pre><code>pip install agentforge-sdk</code></pre></li>
+  <li><strong>Run something.</strong></li>
+</ol>
+<pre><code>from agentforge import AgentForge
+
+af = AgentForge(api_key="af_live_...")   # defaults to https://api.aiec.gobrowse.dev
+
+box = af.sandboxes.create(image="python:3.13")
+print(box.exec(["python", "-c", "print('hello from AgentForge')"])["stdout"])
+box.destroy()</code></pre>
+<p>If you are self-hosting, pass your own endpoint instead:</p>
+<pre><code>af = AgentForge(
+    base_url="https://agentforge.example.com",
+    api_key="af_live_...",
+)</code></pre>
+
+<h2 id="core">Core concepts</h2>
+<div class="grid two">
+  <div class="card">
+    <h3>Tenant</h3>
+    <p>Every API key belongs to a tenant. A tenant owns its sandboxes, snapshots,
+       artifacts, usage, quotas and secrets. Possession of a resource ID does not
+       grant access to it.</p>
+  </div>
+  <div class="card">
+    <h3>Sandbox</h3>
+    <p>A disposable computer. It is leased from the scheduler, billed while it
+       runs, and destroyed when you are done with it.</p>
+  </div>
+  <div class="card">
+    <h3>API key</h3>
+    <p>A bearer credential. Stored hashed, shown once, revocable, rotatable.
+       Scoped so a key can be limited to specific operations.</p>
+  </div>
+  <div class="card">
+    <h3>Quota</h3>
+    <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
+       placement time. Exceeding one returns <code>429</code>.</p>
+  </div>
+</div>
+
+<h2 id="lifecycle">Sandbox lifecycle</h2>
+<p>States move forward and fail closed:</p>
+<pre><code>creating -> starting -> running -> stopping -> stopped
+                  \-> paused -> running
+   any -> failed  (terminal, but recoverable via recovery or restore)
+   any -> destroying -> destroyed</code></pre>
+
+<h2 id="files">Files</h2>
+<pre><code>box.write_file("/workspace/main.py", source)
+contents = box.read_file("/workspace/main.py")
+box.make_directory("/workspace/out")
+box.delete_file("/workspace/tmp")
+for entry in box.list_files("/workspace"):
+    print(entry)</code></pre>
+<p>Guest paths are confined to the sandbox workspace. Traversal and symlink
+escapes are rejected by the guest agent, not by the caller.</p>
+
+<h2 id="snapshots">Snapshots</h2>
+<p>
+  A <strong>workspace snapshot</strong> is a portable archive of
+  <code>/workspace</code>. It is the unit of recovery: if a worker is lost, the
+  control plane reassigns the sandbox and reconstructs the workspace from the
+  newest complete snapshot on the new owner.
+</p>
+<pre><code>snap = box.snapshot()
+box2 = af.sandboxes.create(image="agentforge:latest")
+box2.restore(snap)</code></pre>
+<div class="note">
+  <p>
+    Snapshots preserve the workspace filesystem. They do <strong>not</strong>
+    preserve running VM memory, and a Firecracker VM snapshot is not portable
+    between hosts.
+  </p>
+</div>
+
+<h2 id="errors">Errors</h2>
+<p>Every error has the same envelope, so one handler covers all of them:</p>
+<pre><code>{
+  "error": {
+    "code": "quota_exceeded",
+    "message": "tenant vCPU quota exceeded",
+    "request_id": "01a0e113-..."
+  }
+}</code></pre>
+<table>
+  <tr><th>Status</th><th><code>code</code></th><th>Meaning</th></tr>
+  <tr><td>400</td><td><code>invalid_request</code></td><td>Malformed request</td></tr>
+  <tr><td>401</td><td><code>unauthorized</code></td><td>Missing or invalid API key</td></tr>
+  <tr><td>403</td><td><code>forbidden</code></td><td>Key lacks the required scope</td></tr>
+  <tr><td>404</td><td><code>not_found</code></td><td>No such resource in this tenant</td></tr>
+  <tr><td>409</td><td><code>conflict</code></td><td>Invalid state transition, or fenced</td></tr>
+  <tr><td>429</td><td><code>quota_exceeded</code></td><td>Tenant quota reached</td></tr>
+  <tr><td>429</td><td><code>rate_limited</code></td><td>Too many requests; see <code>Retry-After</code></td></tr>
+  <tr><td>503</td><td><code>backend_unavailable</code></td><td>No capacity or a dependency is down</td></tr>
+</table>
+<p>The Python SDK raises <code>AgentForgeError</code> with <code>code</code>,
+<code>request_id</code> and <code>retry_after</code> populated. Quote the
+<code>request_id</code> in a support report — it correlates with the server logs.</p>
+
+<h2 id="self-host">Self-hosting</h2>
+<p>AgentForge OSS needs no managed provider. You need:</p>
+<ul class="tight">
+  <li>a Linux host with <code>/dev/kvm</code> and nested virtualisation,</li>
+  <li>PostgreSQL 14+,</li>
+  <li>S3-compatible object storage (MinIO, or your own),</li>
+  <li>TLS certificates for the API and worker endpoints.</li>
+</ul>
+<pre><code>git clone https://github.com/fedoragobrowse-design/AIec.git
+cd AIec
+docker compose up -d postgres minio
+./scripts/build-firecracker-guest.sh
+
+export DATABASE_URL='postgresql://agentforge:...@127.0.0.1:5432/agentforge'
+export AGENTFORGE_S3_ENDPOINT='http://127.0.0.1:9000'
+export AGENTFORGE_S3_BUCKET='agentforge'
+# ... TLS paths ...
+
+agentforge doctor      # validates every prerequisite, with actionable errors
+agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
+<p>
+  <code>agentforge doctor</code> checks KVM, the Firecracker binary, the guest
+  artifact and its digest, the database, object storage, networking tooling and
+  TLS, and tells you precisely what is missing rather than failing later.
+</p>
+<p>Full instructions: <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>.</p>
+
+<h2 id="operations">Operating it</h2>
+<div class="grid two">
+  <div class="card">
+    <h3>Health endpoints</h3>
+    <p><code>/health</code> is liveness and is dependency-free.
+       <code>/ready</code> is readiness and reflects the database, object storage
+       and available capacity, so a rolling deploy is held back when the instance
+       genuinely cannot serve traffic.</p>
+  </div>
+  <div class="card">
+    <h3>Metrics</h3>
+    <p><code>/metrics</code> exposes Prometheus text format: request rate,
+       latency, errors, sandbox counts, worker capacity and health, lease
+       expirations, reassignments, quota and rate-limit denials.</p>
+  </div>
+  <div class="card">
+    <h3>Backups</h3>
+    <p>Back up both the database and the object store, and test the restore. The
+       database holds tenancy, leases and quotas; the object store holds snapshots
+       and artifacts.</p>
+  </div>
+  <div class="card">
+    <h3>Draining a worker</h3>
+    <p>A draining worker receives no new sandboxes while finishing the ones it
+       already holds, so it can be upgraded or restarted without disrupting
+       running work.</p>
+  </div>
+</div>
+
+<h2>SDKs</h2>
+<table>
+  <tr><th>Language</th><th>Install</th><th>Import</th></tr>
+  <tr><td>Python</td><td><code>pip install agentforge-sdk</code></td><td><code>from agentforge import AgentForge</code></td></tr>
+  <tr><td>Rust</td><td><code>cargo add agentforge-client</code></td><td><code>use agentforge_client::AgentForgeClient</code></td></tr>
+  <tr><td>HTTP</td><td>—</td><td><code>curl</code> / any HTTP client</td></tr>
+</table>

@@ -7,6 +7,7 @@ use agentforge_core::{
     storage::{ArtifactStore, GetObjectOptions, MetadataStore},
 };
 mod composition;
+pub mod ratelimit;
 mod worker;
 use axum::{
     Json, Router,
@@ -21,6 +22,7 @@ pub use composition::{DefaultPolicy, DevelopmentScheduler};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::sync::atomic::AtomicI64;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -46,6 +48,42 @@ pub struct AppState {
     worker_token: Option<Arc<str>>,
     lease_ttl_seconds: u64,
     secrets: SecretStore,
+    /// Per-tenant / per-client admission control for the public API.
+    limiter: Arc<ratelimit::RateLimiter>,
+    /// Aggregate execution budget for hosted capacity. Reaching it stops new
+    /// sandbox creation instead of risking a provider overage.
+    execution_budget: Option<ExecutionBudget>,
+    /// When true, only microVM-class runtimes are offered to tenants.
+    hosted_only: bool,
+}
+
+/// A global ceiling on hosted execution spend.
+#[derive(Clone, Debug)]
+pub struct ExecutionBudget {
+    /// Total units the control plane may consume before creation stops.
+    limit_units: i64,
+    /// Units consumed so far.
+    spent_units: Arc<AtomicI64>,
+}
+
+impl ExecutionBudget {
+    fn new(limit_units: i64) -> Self {
+        Self {
+            limit_units,
+            spent_units: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    /// Returns true when another unit of spend fits inside the ceiling.
+    fn admits(&self) -> bool {
+        self.spent_units.load(Ordering::Relaxed) < self.limit_units
+    }
+
+    /// Records consumed usage. The durable usage ledger remains the billing
+    /// record; this is the stop-loss that protects a finite free allowance.
+    fn charge(&self, units: i64) {
+        self.spent_units.fetch_add(units.max(0), Ordering::Relaxed);
+    }
 }
 
 type SecretMap = HashMap<String, SecretEntry>;
@@ -124,6 +162,19 @@ fn validate_secret_name(name: &str) -> Result<(), ApiFailure> {
 }
 impl AppState {
     pub fn new(platform: Platform) -> Self {
+        Self::with_limits(platform, default_rate_limit(), None)
+    }
+    /// The development backend keeps the same admission behaviour so a
+    /// self-hoster sees exactly what a public tenant experiences.
+    pub fn development(platform: Platform) -> Self {
+        Self::with_limits(platform, default_rate_limit(), None)
+            .development_mode(RuntimeKind::BwrapDev)
+    }
+    fn with_limits(
+        platform: Platform,
+        limit: ratelimit::RateLimit,
+        execution_budget: Option<ExecutionBudget>,
+    ) -> Self {
         Self {
             lease_ttl_seconds: 300,
             platform,
@@ -132,18 +183,63 @@ impl AppState {
             runtime_kind: RuntimeKind::Firecracker,
             worker_token: None,
             secrets: Arc::new(Mutex::new(HashMap::new())),
+            limiter: Arc::new(ratelimit::RateLimiter::new(limit)),
+            execution_budget,
+            // Permissive by default: a self-hoster may run any runtime they
+            // configured. The Cloud composition root calls `with_hosted_only`
+            // to restrict external tenants to microVM isolation.
+            hosted_only: false,
         }
     }
-    pub fn development(platform: Platform) -> Self {
-        Self {
-            lease_ttl_seconds: 300,
-            platform,
-            production: false,
-            runtime_kind: RuntimeKind::BwrapDev,
-            requests: Arc::new(AtomicU64::new(0)),
-            worker_token: None,
-            secrets: Arc::new(Mutex::new(HashMap::new())),
+    fn development_mode(mut self, kind: RuntimeKind) -> Self {
+        self.production = false;
+        self.runtime_kind = kind;
+        self
+    }
+    /// Applies an explicit rate limit, used by the composition root.
+    pub fn with_rate_limit(mut self, limit: ratelimit::RateLimit) -> Self {
+        self.limiter = Arc::new(ratelimit::RateLimiter::new(limit));
+        self
+    }
+    /// Applies a global execution budget in whole usage units.
+    pub fn with_execution_budget(mut self, limit_units: i64) -> Self {
+        self.execution_budget = Some(ExecutionBudget::new(limit_units.max(0)));
+        self
+    }
+    /// True when a hosted execution budget is configured and already spent.
+    pub fn execution_budget_exhausted(&self) -> bool {
+        self.execution_budget
+            .as_ref()
+            .is_some_and(|budget| !budget.admits())
+    }
+    /// Charges the hosted execution budget for a sandbox of this shape.
+    pub fn charge_execution(&self, units: i64) {
+        if let Some(budget) = &self.execution_budget {
+            budget.charge(units);
         }
+    }
+    /// The limiter applied to the public API.
+    pub fn limiter(&self) -> &ratelimit::RateLimiter {
+        &self.limiter
+    }
+    /// Whether this deployment offers a runtime to tenants.
+    ///
+    /// A hosted deployment refuses container and process runtimes outright, so
+    /// an external tenant cannot request a weaker isolation boundary than the
+    /// one they were given. Self-hosted deployments may opt out and offer every
+    /// runtime they have configured.
+    pub fn allows_runtime(&self, kind: RuntimeKind) -> bool {
+        if self.hosted_only {
+            return kind == RuntimeKind::Firecracker || kind == RuntimeKind::Hosted;
+        }
+        // A self-hoster is trusted with their own boundary; the rule that
+        // untrusted workloads use microVMs is enforced by the Cloud deployment.
+        true
+    }
+    /// Restricts tenants to microVM-class runtimes.
+    pub fn with_hosted_only(mut self, hosted_only: bool) -> Self {
+        self.hosted_only = hosted_only;
+        self
     }
     pub fn with_worker_token(mut self, token: impl Into<String>) -> Self {
         self.worker_token = Some(Arc::from(token.into().as_str()));
@@ -358,7 +454,11 @@ pub async fn bootstrap_api_key(
     }
 }
 pub fn router(state: AppState) -> Router {
-    let protected = protected_routes().layer(middleware::from_fn_with_state(state.clone(), auth));
+    // Rate limiting runs outside `auth` so that unauthenticated floods are
+    // bounded too, and inside it so a tenant is limited per tenant.
+    let protected = protected_routes()
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit));
     let workers = worker_routes().layer(middleware::from_fn_with_state(state.clone(), worker_auth));
     Router::new()
         .route("/health", get(health))
@@ -368,6 +468,47 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1/workers", workers)
         .layer(middleware::from_fn_with_state(state.clone(), count_request))
         .with_state(state)
+}
+
+/// Default sustained rate for the public API. Generous enough for a real
+/// coding agent, tight enough that one tenant cannot monopolise the control
+/// plane.
+fn default_rate_limit() -> ratelimit::RateLimit {
+    ratelimit::RateLimit::new(20.0, 60)
+}
+
+/// Admits a request against the tenant (when authenticated) or the peer
+/// address. Returns 429 with a machine-readable code and a `Retry-After`
+/// header so clients can back off correctly.
+async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let tenant = request.extensions().get::<TenantId>().copied();
+    let key = ratelimit::limit_key(tenant, peer);
+    let decision = state.limiter().check(&key);
+    if !decision.allowed {
+        return limited_response(decision.retry_after_seconds);
+    }
+    next.run(request).await
+}
+
+fn limited_response(retry_after_seconds: u64) -> Response {
+    let body = ApiErrorBody {
+        code: "rate_limited".to_string(),
+        message: "request rate limit exceeded for this tenant; retry later".to_string(),
+        request_id: new_id(),
+    };
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiErrorEnvelope { error: body }),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 async fn count_request(State(state): State<AppState>, request: Request, next: Next) -> Response {
     state.requests.fetch_add(1, Ordering::Relaxed);
@@ -441,6 +582,7 @@ fn worker_routes() -> Router<AppState> {
             post(complete_worker_lease),
         )
         .route("/{node}/ownership/{sandbox_id}", get(sandbox_ownership))
+        .route("/{id}/drain", post(drain_worker))
 }
 #[derive(Deserialize)]
 struct WorkerClaimQuery {
@@ -568,6 +710,62 @@ async fn worker_status(State(state): State<AppState>, Path(id): Path<Uuid>) -> A
         .get_worker(id)
         .await
         .map_err(ApiFailure::from)?;
+    Ok(Json(json!(status)))
+}
+
+/// Body for the worker drain control.
+#[derive(Deserialize)]
+struct DrainWorkerBody {
+    /// True stops new placement; false resumes it.
+    draining: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Stops or resumes new sandbox placement on a worker.
+///
+/// Draining is deliberately not the same as `healthy = false`: a draining
+/// worker keeps heartbeating and keeps serving the sandboxes it already holds,
+/// so it can be upgraded or restarted without disrupting running work. The
+/// scheduler refuses to place new sandboxes on it, and lease recovery will not
+/// move anything onto it.
+async fn drain_worker(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<DrainWorkerBody>>,
+) -> ApiResult<Value> {
+    let request = body.map(|Json(value)| value).unwrap_or(DrainWorkerBody {
+        draining: true,
+        reason: None,
+    });
+    let status = state
+        .repository()
+        .set_worker_draining(id, request.draining, request.reason.as_deref())
+        .await
+        .map_err(ApiFailure::from)?;
+    // Draining a worker is an operational action worth recording.
+    let detail = json!({ "reason": request.reason });
+    let _ = state
+        .repository()
+        .append_audit_event(agentforge_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: None,
+            actor: "system".to_string(),
+            action: if request.draining {
+                "worker.drain".to_string()
+            } else {
+                "worker.undrain".to_string()
+            },
+            subject_type: "worker".to_string(),
+            subject_id: Some(id.to_string()),
+            result: "success".to_string(),
+            request_id: None,
+            remote_addr: None,
+            // Operator text only: a drain reason never carries a credential.
+            detail,
+        })
+        .await;
     Ok(Json(json!(status)))
 }
 
@@ -956,11 +1154,51 @@ async fn auth(
     });
     Ok(next.run(request).await)
 }
+/// Liveness: the process is up and serving. Deliberately dependency-free so a
+/// database blip does not get the process killed.
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
 }
-async fn ready() -> Json<Value> {
-    Json(json!({"status":"ready"}))
+
+/// Readiness: the control plane can actually accept new workloads.
+///
+/// A static "ready" is wrong for a public API: if the database is unreachable,
+/// object storage is unusable, or no worker can take a sandbox, the instance
+/// must not advertise itself as ready or a rolling deploy will keep traffic
+/// flowing into a control plane that cannot serve it.
+async fn ready(State(state): State<AppState>) -> Response {
+    let mut checks = serde_json::Map::new();
+    let mut ready = true;
+
+    match state.repository().list_workers(true).await {
+        Ok(_) => {
+            checks.insert("database".to_string(), json!("ok"));
+        }
+        // A store that does not implement worker listing is a development
+        // backend, not a broken database. Only a real error means "not ready".
+        Err(CoreError::Unsupported(_)) => {
+            checks.insert("database".to_string(), json!("not_applicable"));
+        }
+        Err(error) => {
+            ready = false;
+            // The log names the failing dependency, never a credential.
+            checks.insert("database".to_string(), json!("unavailable"));
+            tracing::warn!(%error, "readiness check failed: database");
+        }
+    }
+
+    if state.execution_budget_exhausted() {
+        ready = false;
+        checks.insert("execution_budget".to_string(), json!("exhausted"));
+    }
+
+    let status = if ready { "ready" } else { "not_ready" };
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(json!({"status": status, "checks": checks}))).into_response()
 }
 async fn metrics(State(state): State<AppState>) -> Response {
     let nodes = state.repository().list_nodes().await.unwrap_or_default();
@@ -1008,6 +1246,9 @@ async fn create_sandbox(
         Some("firecracker") => Some(RuntimeKind::Firecracker),
         Some("docker") => Some(RuntimeKind::Docker),
         Some("bwrap-dev" | "bwrap_dev") => Some(RuntimeKind::BwrapDev),
+        // Hosted capacity is a real Firecracker-backed provider reached through
+        // the runtime abstraction, not a weaker isolation tier.
+        Some("hosted" | "e2b") => Some(RuntimeKind::Hosted),
         Some("auto") | None => None,
         Some(other) => {
             return Err(ApiFailure::new(
@@ -1065,6 +1306,31 @@ async fn create_sandbox(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "bwrap-dev is not available in production",
+        ));
+    }
+    // Public policy: a tenant may not downgrade their own isolation. Container
+    // runtimes are refused for hosted workloads; only microVM-class runtimes
+    // are offered to an external caller.
+    if let Some(kind) = requested_runtime
+        && !s.allows_runtime(kind)
+    {
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "runtime_not_permitted",
+            format!(
+                "runtime {} is not available to this deployment; hosted workloads run on microVM isolation",
+                kind.as_str()
+            ),
+        ));
+    }
+    // Hosted execution is finite. When the configured global budget is spent,
+    // new hosted sandboxes stop cleanly with a capacity error instead of
+    // silently becoming provider overage.
+    if requested_runtime == Some(RuntimeKind::Hosted) && s.execution_budget_exhausted() {
+        return Err(ApiFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporary_capacity_unavailable",
+            "the hosted execution budget is exhausted; no new sandboxes are being created right now",
         ));
     }
     let r = body.request;
@@ -1131,7 +1397,10 @@ async fn create_sandbox(
         updated_at: now,
         runtime_path: None,
     };
-    if s.is_production() {
+    // Hosted capacity is reached through the provider inside the runtime, not
+    // through a leased worker node, so there is nothing for the worker
+    // scheduler to place. Worker-backed runtimes are scheduled as before.
+    if s.is_production() && x.runtime != RuntimeKind::Hosted {
         x = s
             .scheduler()
             .schedule(agentforge_core::scheduler::ScheduleRequest {
@@ -1189,6 +1458,14 @@ async fn create_sandbox(
         .await
         .map_err(ApiFailure::from)?;
     x.state = SandboxState::Running;
+    // A hosted sandbox is charged one vCPU-second unit per allocated vCPU per
+    // hour of requested lifetime. This is a stop-loss against a finite provider
+    // allowance, not a bill: the durable usage ledger remains the record.
+    if x.runtime == RuntimeKind::Hosted {
+        let seconds = i64::try_from(x.timeout_seconds).unwrap_or(i64::MAX);
+        let units = i64::from(x.cpu) * ((seconds + 3599) / 3600);
+        s.charge_execution(units.max(1));
+    }
     Ok(create_response(x, &_selection_reason))
 }
 
@@ -2371,9 +2648,9 @@ pub async fn serve_worker_tls(
 mod tests {
     use super::*;
     use agentforge_core::storage::{
-        MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot, TenantRecord,
-        WorkerHeartbeat as HeartbeatRecord, WorkerLease, WorkerRegistration as RegistrationRecord,
-        WorkerStatus as WorkerRecord,
+        AuditEvent, MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot,
+        TenantRecord, WorkerHeartbeat as HeartbeatRecord, WorkerLease,
+        WorkerRegistration as RegistrationRecord, WorkerStatus as WorkerRecord,
     };
     use axum::{body::Body, http::Request};
     use std::collections::HashMap as TestMap;
@@ -2794,6 +3071,16 @@ mod tests {
         ) -> Result<Vec<WorkerRecord>, CoreError> {
             self.inner.list_workers(include_unhealthy).await
         }
+        async fn set_worker_draining(
+            &self,
+            node_id: WorkerId,
+            draining: bool,
+            reason: Option<&str>,
+        ) -> Result<WorkerRecord, CoreError> {
+            self.inner
+                .set_worker_draining(node_id, draining, reason)
+                .await
+        }
         async fn claim_worker_assignments(
             &self,
             node_id: WorkerId,
@@ -2985,6 +3272,17 @@ mod tests {
         }
         async fn put_image(&self, value: ImageRecord) -> Result<(), CoreError> {
             self.inner.put_image(value).await
+        }
+        async fn append_audit_event(&self, event: AuditEvent) -> Result<(), CoreError> {
+            self.inner.append_audit_event(event).await
+        }
+        async fn list_audit_events(
+            &self,
+            tenant: Option<TenantId>,
+            action: Option<&str>,
+            limit: u32,
+        ) -> Result<Vec<AuditEvent>, CoreError> {
+            self.inner.list_audit_events(tenant, action, limit).await
         }
         async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError> {
             self.inner.get_image(id).await

@@ -12,9 +12,9 @@ use agentforge_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
     UsageSummary,
     storage::{
-        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
-        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
-        WorkerLease, WorkerRegistration, WorkerStatus,
+        AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
+        SandboxOperation, SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment,
+        WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
     },
 };
 use async_trait::async_trait;
@@ -516,6 +516,14 @@ impl MetadataStore for MemoryRepository {
     async fn list_workers(&self, _include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> {
         Err(CoreError::Unsupported("memory metadata store".into()))
     }
+    async fn set_worker_draining(
+        &self,
+        _node_id: Uuid,
+        _draining: bool,
+        _reason: Option<&str>,
+    ) -> Result<WorkerStatus, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
     async fn claim_worker_assignments(
         &self,
         _node_id: Uuid,
@@ -640,6 +648,17 @@ impl MetadataStore for MemoryRepository {
         Err(CoreError::Unsupported("memory metadata store".into()))
     }
     async fn get_image(&self, _id: &str) -> Result<ImageRecord, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn append_audit_event(&self, _event: AuditEvent) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_audit_events(
+        &self,
+        _tenant: Option<Uuid>,
+        _action: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<AuditEvent>, CoreError> {
         Err(CoreError::Unsupported("memory metadata store".into()))
     }
 }

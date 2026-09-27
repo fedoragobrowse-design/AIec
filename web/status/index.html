@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status — AgentForge</title>
+<meta name="description" content="AgentForge public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven.">
+<meta property="og:title" content="Status — AgentForge">
+<meta property="og:description" content="AgentForge public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven.">
+<meta property="og:type" content="website">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%234ade80'/></svg>">
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/"><span class="dot"></span>AgentForge</a>
+    <nav class="site"><a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/pricing">Pricing</a>
+      <a href="/cloud">Cloud</a>
+      <a href="/cloud/keys">API keys</a>
+      <a href="/cloud/usage">Usage</a>
+      <a href="/cloud/sandboxes">Sandboxes</a>
+      <a href="/security">Security</a>
+      <a href="/status" aria-current="page">Status</a></nav>
+  </div>
+</header>
+<main><div class="wrap">
+<!-- meta:title=Status -->
+<!-- meta:description=AgentForge public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven. -->
+
+<p class="eyebrow">Status</p>
+<h1>Public alpha status</h1>
+<p class="lead">
+  What actually works today, and what does not. This page is deliberately
+  blunt: an unexercised capability is never reported as working.
+</p>
+
+<span class="pill live">Public alpha</span>
+
+<h2>Working</h2>
+<table>
+  <tr><th>Capability</th><th>Status</th></tr>
+  <tr><td>Firecracker microVM sandboxes</td><td>Working, exercised end to end</td></tr>
+  <tr><td>Docker runtime</td><td>Working, trusted deployments only</td></tr>
+  <tr><td>Exec, stdin, environment, cwd</td><td>Working, bounded by time and output size</td></tr>
+  <tr><td>File read/write/list/delete</td><td>Working, confined to the workspace</td></tr>
+  <tr><td>Coding guest image</td><td>Working — Git, CA certificates, Python, curl, tar</td></tr>
+  <tr><td>HTTPS Git clone, edit, diff</td><td>Working, verified inside a real microVM</td></tr>
+  <tr><td>Workspace snapshots</td><td>Working, portable between owners</td></tr>
+  <tr><td>PostgreSQL state, leases, quotas</td><td>Working</td></tr>
+  <tr><td>S3-compatible object storage</td><td>Working</td></tr>
+  <tr><td>Worker recovery and fencing</td><td>Working — reassignment at a higher generation, stale workers rejected</td></tr>
+</table>
+
+<h2>Limited</h2>
+<table>
+  <tr><th>Capability</th><th>Limitation</th></tr>
+  <tr><td>Signup</td><td>Invite-only. No open registration during alpha.</td></tr>
+  <tr><td>Capacity</td><td>Limited by the hosted provider's free allowance. When it is exhausted, creation stops with <code>TEMPORARY_CAPACITY_UNAVAILABLE</code> rather than overage.</td></tr>
+  <tr><td>SLA</td><td>None. This is alpha software without a support commitment.</td></tr>
+  <tr><td>Regions</td><td>A single execution region during alpha.</td></tr>
+  <tr><td>API stability</td><td>Endpoints may change before 1.0.</td></tr>
+  <tr><td>Snapshots</td><td>Workspace archives are portable. VM memory snapshots are not.</td></tr>
+</table>
+
+<h2>Not yet implemented</h2>
+<p>Stated plainly so nobody plans around them:</p>
+<ul class="tight">
+  <li>Per-tenant <strong>snapshot and persistent-storage byte quotas</strong>. Per-request size ceilings exist; aggregate accounting does not yet.</li>
+  <li>A control-plane <strong>sandbox lifetime reaper</strong>. Lifetime is enforced by the runtime; a worker restart resets the in-process timer.</li>
+  <li><strong>Multi-host</strong> validation with separate control and worker machines. Same-host multi-worker recovery is proven; genuinely distributed operation is not yet.</li>
+  <li>An <strong>audit log viewer</strong> in the dashboard. Events are recorded, the UI is not built.</li>
+  <li><strong>Self-service billing.</strong> Usage is metered and displayed; payment collection is behind a manual activation step.</li>
+</ul>
+
+<h2>Hosting model</h2>
+<p>
+  Cloud execution is provided by a hosted sandbox provider with Firecracker-based
+  isolation. AgentForge's <em>own</em> native Firecracker implementation is
+  complete and is what self-hosted deployments run — but the hosted capacity is
+  not AgentForge operating its own hardware. We report these separately rather
+  than merging them into one claim.
+</p>
+<table>
+  <tr><th>Claim</th><th>Status</th></tr>
+  <tr><td>AgentForge native Firecracker runtime</td><td>Complete and verified</td></tr>
+  <tr><td>Hosted Cloud execution capacity</td><td>Provided by a third-party Firecracker provider</td></tr>
+  <tr><td>AgentForge-operated multi-host worker fleet</td><td>Not deployed</td></tr>
+</table>
+
+<h2>Security posture</h2>
+<p>
+  The full picture, including what is <em>not</em> yet enforced, is in
+  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>.
+  Report a vulnerability to <strong>security@gobrowse.dev</strong>, not to a
+  public issue.
+</p>
+
+</div></main>
+<footer class="site">
+  <div class="wrap">
+    <span>Computers for AI agents.</span>
+    <nav><a href="/docs">Docs</a>
+      <a href="/security">Security</a>
+      <a href="/status">Status</a>
+      <a href="https://github.com/fedoragobrowse-design/AIec">GitHub</a></nav>
+  </div>
+</footer>
+</body>
+</html>

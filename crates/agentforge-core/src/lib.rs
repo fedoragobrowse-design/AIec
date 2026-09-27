@@ -109,6 +109,13 @@ pub enum RuntimeKind {
     Firecracker,
     Docker,
     BwrapDev,
+    /// Sandboxes placed on an external hosted isolation provider.
+    ///
+    /// The isolation boundary is owned by the provider, not by AgentForge, so
+    /// this kind never runs on a managed worker node. It exists because
+    /// untrusted public workloads need a microVM-grade boundary that a
+    /// deployment without KVM cannot provide itself.
+    Hosted,
 }
 
 impl RuntimeKind {
@@ -117,6 +124,7 @@ impl RuntimeKind {
             Self::Docker => "docker",
             Self::Firecracker => "firecracker",
             Self::BwrapDev => "bwrap-dev",
+            Self::Hosted => "hosted",
         }
     }
 }
@@ -219,6 +227,15 @@ pub struct Sandbox {
     pub environment: EnvironmentSpec,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Opaque backend handle the runtime needs to operate this sandbox again.
+    ///
+    /// AgentForge owns [`Sandbox::id`] as the only public sandbox identity. A
+    /// runtime that places the workload on a third-party provider persists the
+    /// provider's own handle here during `SandboxRuntime::create`, so the
+    /// provider resource stays recoverable across processes without ever being
+    /// exposed to clients as an identity. The value is runtime-private: only the
+    /// runtime that wrote it interprets it, and it is never a path on the
+    /// AgentForge host.
     pub runtime_path: Option<String>,
 }
 
@@ -915,5 +932,15 @@ mod tests {
     #[test]
     fn image_is_content_addressed() {
         assert_eq!(image_id("python:3.13"), image_id("python:3.13"));
+    }
+    #[test]
+    fn runtime_wire_strings_are_stable_across_the_workspace() {
+        // The API request parser and the persisted `runtime` column are parsed
+        // from these exact spellings in crates that cannot import a parser from
+        // here, so the strings are a cross-crate contract.
+        assert_eq!(RuntimeKind::Firecracker.as_str(), "firecracker");
+        assert_eq!(RuntimeKind::Docker.as_str(), "docker");
+        assert_eq!(RuntimeKind::BwrapDev.as_str(), "bwrap-dev");
+        assert_eq!(RuntimeKind::Hosted.as_str(), "hosted");
     }
 }

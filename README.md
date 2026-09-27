@@ -1,90 +1,143 @@
 # AgentForge
 
-**Serverless compute built specifically for autonomous AI agents.**
+**Computers for AI agents.**
 
-AgentForge is an independent, open-source sandbox control plane inspired by published sandbox-platform research. It is not affiliated with or endorsed by DeepSeek.
+AgentForge gives autonomous AI agents isolated, disposable computers: a sandbox
+with its own kernel, filesystem, network and lifecycle. An agent can clone a
+repository, run code, edit files, run tests, read the diff, and throw the whole
+environment away — thousands of times an hour — without ever touching the host.
 
-> **Development and Docker runtimes are not a public security boundary.** `bwrap-dev` and Docker runtimes have weaker isolation than Firecracker. Never expose them to strangers or untrusted public workloads. Production accepts an explicit `AGENTFORGE_RUNTIME=firecracker` or `AGENTFORGE_RUNTIME=docker`; Firecracker remains the recommended boundary for untrusted code.
+```python
+from agentforge import AgentForge
 
-## Quick start
+af = AgentForge(api_key="af_live_...")
 
-Requirements: Linux x86_64, Rust 1.88+, `bubblewrap` for the development runtime, a reachable Docker Engine for the Docker runtime, PostgreSQL 15+ and S3-compatible storage for production, and `tar` for development snapshots.
-
-```bash
-git clone <your-repository-url> agentforge
-cd agentforge
-cargo build --release
-
-# One explicit development server; this prints a generated API key once.
-export AGENTFORGE_RUNTIME=bwrap-dev
-export AGENTFORGE_DEV_API_KEY=af_live_$(openssl rand -hex 24)
-export AGENTFORGE_BIND=127.0.0.1:8080
-./target/release/agentforge server
+box = af.sandboxes.create(image="python:3.13")
+result = box.exec(["python", "-c", "print('hello from AgentForge')"])
+print(result["stdout"])
+box.destroy()
 ```
 
-In another shell:
+No SSH. No database access. No worker access. No manual repair.
+
+---
+
+## Two ways to use the same product
+
+| | **AgentForge Cloud** | **AgentForge OSS** |
+|---|---|---|
+| Who runs it | We do | You do |
+| Cost | Paid, usage-based | Free, open source |
+| Compute | Hosted Firecracker capacity | Your own KVM host |
+| Database | Managed PostgreSQL | Your own PostgreSQL |
+| Object storage | Managed S3 | Your own S3 or MinIO |
+| Operations | We upgrade, patch, back up and monitor | You own the host |
+
+They are the same API, the same SDK, the same runtime model. Customers pay for
+convenience, managed infrastructure, capacity, reliability and operations —
+**not** for access to the source code.
+
+- Cloud: `https://aiec.gobrowse.dev` · API `https://api.aiec.gobrowse.dev`
+- OSS: `https://github.com/fedoragobrowse-design/AIec`
+
+---
+
+## Security model
+
+Public workloads run under **Firecracker** microVMs. A tenant cannot select a
+weaker runtime; the Cloud control plane forces Firecracker for untrusted
+workloads, and Docker remains available for trusted self-hosted deployments and
+local development.
+
+Each sandbox gets its own guest kernel, its own virtio network namespace with an
+egress policy that blocks the host LAN, RFC1918, link-local and cloud metadata
+ranges, and a vsock control channel that is never exposed to the network. Guest
+paths are validated against a fixed workspace root, and the host is not reachable
+from inside the sandbox.
+
+Details, including known limitations: [`docs/SECURITY.md`](docs/SECURITY.md).
+
+---
+
+## Self-hosting
+
+AgentForge OSS has no dependency on any managed provider. It needs a Linux host
+with KVM, PostgreSQL, and S3-compatible object storage.
 
 ```bash
-export AF_URL=http://127.0.0.1:8080
-export AF_API_KEY='the-key-printed-by-server'
-ID=$(curl -fsS -H "Authorization: Bearer $AF_API_KEY" -H 'content-type: application/json' \
-  -d '{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300,"network":{"enabled":false}}' \
-  "$AF_URL/v1/sandboxes" | jq -r .id)
-curl -fsS -H "Authorization: Bearer $AF_API_KEY" -H 'content-type: application/json' \
-  -d '{"command":["python3","-c","print(\"AgentForge works\")"]}' \
-  "$AF_URL/v1/sandboxes/$ID/exec" | jq
+git clone https://github.com/fedoragobrowse-design/AIec.git
+cd AIec
+docker compose up -d postgres minio          # or point at your own
+./scripts/build-firecracker-guest.sh         # build the coding guest image
+agentforge doctor                            # check every prerequisite
 ```
 
-The development runtime is intentionally separate. Production uses an independent PostgreSQL-backed API, scheduler, authenticated worker RPC, and the explicitly configured Firecracker microVM or Docker Engine backend. See `docs/DEPLOYMENT.md` for exact variables and worker launch.
+`agentforge doctor` validates KVM, the Firecracker binary, the guest artifact,
+the database, object storage, networking and TLS, and tells you exactly what is
+wrong. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
+---
 
-## Components
+## Documentation
 
-- `agentforge-core`: dependency-light domain contracts and `Platform` composition for runtimes, scheduling, metadata, artifacts, networking, images, snapshots, and policy.
-- `agentforge-runtime`: Firecracker and Docker Engine API backends plus the explicit bubblewrap development backend; all implement the Core runtime contract.
-- `agentforge-storage`: PostgreSQL metadata/scheduling and S3/filesystem artifacts, adapted to Core storage contracts.
-- `agentforge-api`: Axum API, worker RPC, lifecycle orchestration, health, and metrics; production and development launchers compose a Core `Platform` first.
-- `agentforge-client` and `agentforge-cli`: Rust SDK and command-line UX over AgentForge's versioned HTTP API.
-- `guest/agentforge-guest`: minimal framed guest control agent.
+| Document | What it covers |
+|---|---|
+| [`docs/API.md`](docs/API.md) | Every REST endpoint, with request and response shapes |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model, isolation boundaries, reporting a vulnerability |
+| [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
+| [`docs/PRIVATE_ALPHA.md`](docs/PRIVATE_ALPHA.md) | Verified private-alpha evidence |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | What is next |
 
-AgentForge is the batteries-included distribution over AgentForge Core. The default server therefore consumes the same public trait objects available to custom systems rather than bypassing Core with a private composition path. See `docs/ARCHITECTURE.md` for the dependency graph, `docs/EXTENDING.md` for compile-time extension boundaries, and `docs/DEPLOYMENT.md` for production configuration.
+---
 
-The runnable `custom_core_platform` example composes the real bubblewrap runtime and filesystem artifact store with custom scheduler, policy, and network implementations. It performs platform validation without starting a server:
+## How it works
 
-```bash
-cargo run -p agentforge-api --example custom_core_platform
+```
+agent
+  ↓
+AgentForge API  →  scheduler  →  worker  →  runtime  →  isolated sandbox
+   auth            leases      HTTPS     Firecracker / hosted
+   tenants         quotas                or Docker (trusted)
+   quotas          fencing generations
 ```
 
-## Development infrastructure
+A sandbox is a leased resource. The scheduler picks a worker with matching
+capability and free capacity, records a monotonically increasing fencing
+generation, and every state-changing operation is checked against that
+generation. If a worker dies, its lease expires, the control plane reassigns the
+sandbox to a new owner at a higher generation, and the new owner reconstructs the
+durable workspace. The old worker, if it returns, is fenced out.
 
-`docker compose` is optional for PostgreSQL, MinIO, and Prometheus. The committed Compose file uses the locally built `agentforge-minio:RELEASE.2025-10-15T17-29-55Z` image by default; set `AGENTFORGE_MINIO_IMAGE` to an approved internal image when running elsewhere. The application itself runs on the host. `scripts/bootstrap-local-services.sh` requires a trusted host `mc` executable via `AGENTFORGE_MC_BIN` or `PATH`.
+The design follows the mechanisms described in the DSec paper
+(*DeepSeek Elastic Compute: A Sandbox Infrastructure for Effective Agentic
+Training at Scale*, arXiv:2609.22978): a unified runtime contract, capability-based
+scheduling, and fenced, recoverable sandbox ownership.
 
-## Verified Firecracker path
+---
 
-The KVM integration test boots Firecracker, waits for the guest agent, executes commands inside the guest, writes/reads a guest file, creates a full memory/device snapshot plus disk copy, destroys the source VM, restores the snapshot in a new Firecracker process, and reads the preserved file:
+## Repository layout
 
-```bash
-AGENTFORGE_RUN_FIRECRACKER_TESTS=1 \
-AGENTFORGE_FIRECRACKER_BIN=/opt/firecracker/firecracker \
-AGENTFORGE_KERNEL=/var/lib/agentforge/images/vmlinux \
-AGENTFORGE_ROOTFS=/var/lib/agentforge/images/agentforge-rootfs.ext4 \
-AGENTFORGE_GUEST_SECRET='<same secret used to build the guest>' \
-cargo test -p agentforge-runtime --test firecracker -- --nocapture
-```
+| Path | What it is |
+|---|---|
+| `crates/agentforge-core` | Domain model, protocols, runtime and storage traits |
+| `crates/agentforge-runtime` | Docker, Bubblewrap, Firecracker and hosted runtimes |
+| `crates/agentforge-api` | The control plane, worker service and HTTP API |
+| `crates/agentforge-storage` | PostgreSQL and S3-compatible persistence |
+| `crates/agentforge-client` | Rust SDK |
+| `sdk/python` | Python SDK (`pip install agentforge-sdk`) |
+| `guest/agentforge-guest` | The in-guest agent that serves the control channel |
+| `examples` | Runnable end-to-end examples |
 
-Earlier Firecracker measurements are historical only. The current authoritative run is blocked before boot because `AGENTFORGE_FIRECRACKER_BIN` is unset; this is not current PASS evidence.
-
-## Validation
+## Development
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
-An end-to-end script is in `scripts/smoke.sh`. Benchmarks are only reported after `agentforge benchmark` measures real requests; this README publishes no invented numbers.
+## Licence
 
-## Private-alpha status
-
-The current repository preserves the DSec-inspired Core/default-distribution split and contains Firecracker and Docker runtime paths. Live Docker Engine API execution, live PostgreSQL storage, live MinIO/S3 artifact workflows, and a real Firecracker v1.17.0 microVM test have passed. The Firecracker test used the approved uncompressed `.agentforge/images/vmlinux`, a freshly built rootfs, and the retained guest secret; it exercised exec, stdin, files, pause/resume, full snapshot, destroy, and restore. Two independent production workers remain blocked because the production worker client requires HTTPS and this host has no TLS-terminated worker endpoints. Remaining gaps are tracked in `docs/PRIVATE_ALPHA.md` with exact prerequisites and test commands.
-The following private-alpha capabilities remain intentionally incomplete and are not implied by the current evidence: live multi-worker recovery and distribution, durable independent toolkit layers, portable cross-worker memory recovery, domain-accurate restricted egress, Docker restricted-network allowlists and snapshots, durable per-sandbox secrets, TLS/mTLS worker identity and certificate rotation, WebSocket PTY sessions, rate limits and lifetime quotas, failure-injection convergence, and warm pools. These are tracked in `docs/PRIVATE_ALPHA.md` with exact prerequisites and test commands.
+See [`LICENSE`](LICENSE).

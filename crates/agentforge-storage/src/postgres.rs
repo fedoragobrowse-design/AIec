@@ -6,9 +6,9 @@ use agentforge_core::{
     Snapshot, UsageEvent, UsageSummary, new_id,
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
     storage::{
-        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
-        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
-        WorkerLease, WorkerRegistration, WorkerStatus,
+        AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
+        SandboxOperation, SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment,
+        WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
     },
 };
 use async_trait::async_trait;
@@ -22,6 +22,10 @@ use uuid::Uuid;
 
 /// Lease granted to a replacement owner during recovery, matching the scheduler default.
 const RECOVERY_LEASE_TTL_SECONDS: i64 = 300;
+
+/// Longest operator-supplied drain reason, matched by the `nodes_drain_reason_length`
+/// constraint so a reason that somehow bypasses this check still cannot bloat the row.
+const DRAIN_REASON_MAX_CHARS: usize = 512;
 
 fn stored_u32(value: i32, field: &str) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|error| StoreError::Conflict(format!("invalid {field}: {error}")))
@@ -57,6 +61,7 @@ fn runtime_from_str(value: &str) -> Result<RuntimeKind, StoreError> {
         "firecracker" => Ok(RuntimeKind::Firecracker),
         "docker" => Ok(RuntimeKind::Docker),
         "bwrap-dev" => Ok(RuntimeKind::BwrapDev),
+        "hosted" => Ok(RuntimeKind::Hosted),
         value => Err(StoreError::Conflict(format!(
             "invalid persisted runtime: {value}"
         ))),
@@ -203,6 +208,8 @@ fn worker_status_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkerStatus, S
             "worker observed_sandbox_count",
         )?,
         last_error: row.try_get("last_error")?,
+        accepting_sandboxes: row.try_get("accepting_sandboxes")?,
+        drain_reason: row.try_get("drain_reason")?,
     })
 }
 
@@ -218,6 +225,22 @@ fn action_from_row(row: &sqlx::postgres::PgRow) -> Result<ReconciliationAction, 
         reason: row.try_get("reason")?,
         detected_at: row.try_get("detected_at")?,
         processed_at: row.try_get("processed_at")?,
+    })
+}
+
+fn audit_event_from_row(row: &sqlx::postgres::PgRow) -> Result<AuditEvent, StoreError> {
+    Ok(AuditEvent {
+        id: row.try_get("id")?,
+        occurred_at: row.try_get("occurred_at")?,
+        tenant_id: row.try_get("tenant_id")?,
+        actor: row.try_get("actor")?,
+        action: row.try_get("action")?,
+        subject_type: row.try_get("subject_type")?,
+        subject_id: row.try_get("subject_id")?,
+        result: row.try_get("result")?,
+        request_id: row.try_get("request_id")?,
+        remote_addr: row.try_get("remote_addr")?,
+        detail: row.try_get("detail")?,
     })
 }
 
@@ -515,7 +538,10 @@ fn sandbox_capacity_demand(sandbox: &Sandbox) -> Result<(i32, i64, i64), StoreEr
 /// Picks the worker a placement runs on, locking the chosen row for the transaction.
 ///
 /// Scheduling and lease recovery share this so recovery cannot drift from the scheduler
-/// in health, runtime, capability or capacity requirements.
+/// in health, runtime, capability or capacity requirements. `accepting_sandboxes` is part
+/// of that set: a draining worker is healthy and still heartbeating, but it is being
+/// emptied on purpose, so it must not be handed a sandbox that has not been placed yet.
+/// Nothing here disturbs what the worker already holds.
 async fn select_schedulable_node(
     tx: &mut Transaction<'_, Postgres>,
     sandbox: &Sandbox,
@@ -526,6 +552,7 @@ async fn select_schedulable_node(
         "SELECT * FROM nodes \
          WHERE healthy = true \
            AND last_heartbeat >= now() - ($1 * interval '1 second') \
+           AND accepting_sandboxes = true \
            AND available_vcpus >= $2 \
            AND available_memory_bytes >= $3 \
            AND available_disk_bytes >= $4 AND runtime = $5 \
@@ -796,7 +823,9 @@ impl PostgresScheduler {
         let demand = sandbox_capacity_demand(&sandbox)?;
         let node = select_schedulable_node(&mut tx, &sandbox, preferred_node)
             .await?
-            .ok_or_else(|| StoreError::Conflict("no healthy worker has capacity".into()))?;
+            // Every healthy, capacity-bearing worker can also be draining, so the old
+            // "no healthy worker" wording sent operators looking for an outage.
+            .ok_or_else(|| StoreError::Conflict("no schedulable worker has capacity".into()))?;
         let worker_endpoint: String = node.try_get("control_endpoint")?;
         let node_id: Uuid = node.try_get("id")?;
         debit_capacity(&mut tx, node_id, demand).await?;
@@ -1351,6 +1380,76 @@ impl PostgresRepository {
         rows.iter().map(event_from_row).collect()
     }
 
+    /// Appends one audit event. There is deliberately no update or delete path:
+    /// the table's triggers reject both, so a mistake has to be answered with a
+    /// correcting event rather than an edit to the record of what happened.
+    async fn append_audit_event(&self, value: AuditEvent) -> Result<(), StoreError> {
+        if value.actor.trim().is_empty()
+            || value.action.trim().is_empty()
+            || value.subject_type.trim().is_empty()
+        {
+            return Err(StoreError::Conflict(
+                "an audit event needs an actor, an action and a subject type".into(),
+            ));
+        }
+        if !matches!(value.result.as_str(), "success" | "denied" | "failure") {
+            return Err(StoreError::Conflict(
+                "an audit event result must be success, denied or failure".into(),
+            ));
+        }
+        if !value.detail.is_object() {
+            return Err(StoreError::Conflict(
+                "an audit event detail must be a JSON object".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO audit_log \
+             (id, occurred_at, tenant_id, actor, action, subject_type, subject_id, result, \
+              request_id, remote_addr, detail) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(value.id)
+        .bind(value.occurred_at)
+        .bind(value.tenant_id)
+        .bind(value.actor)
+        .bind(value.action)
+        .bind(value.subject_type)
+        .bind(&value.subject_id)
+        .bind(&value.result)
+        .bind(value.request_id)
+        .bind(&value.remote_addr)
+        .bind(&value.detail)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Lists audit events newest first, optionally filtered by tenant and action.
+    ///
+    /// A `None` tenant matches system-level events too, which is how an operator
+    /// reads the whole trail rather than one tenant's slice of it.
+    async fn list_audit_events(
+        &self,
+        tenant: Option<Uuid>,
+        action: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM audit_log \
+             WHERE ($1::uuid IS NULL OR tenant_id = $1) \
+               AND ($2::text IS NULL OR action = $2) \
+             ORDER BY occurred_at DESC, id DESC LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(action)
+        .bind(i64::from(limit.clamp(1, 1_000)))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(audit_event_from_row).collect()
+    }
+
     async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), StoreError> {
         if value.checksum_sha256.len() != 64
             || !value
@@ -1542,6 +1641,10 @@ impl PostgresRepository {
             ));
         }
         let capabilities = serde_json::to_value(&value.capabilities).map_err(StoreError::Json)?;
+        // A re-registering worker restates its capacity, not its drain state. Adding
+        // accepting_sandboxes to this upsert would silently put a deliberately
+        // decommissioned worker back into the placement pool; clearing a drain is
+        // `set_worker_draining`'s job alone.
         let result = sqlx::query(
             "INSERT INTO nodes \
              (id, name, runtime, capabilities, control_endpoint, total_vcpus, total_memory_bytes, \
@@ -1711,6 +1814,51 @@ impl PostgresRepository {
         rows.iter().map(worker_status_from_row).collect()
     }
 
+    /// Starts or stops a worker draining without touching its health.
+    ///
+    /// `healthy` is left exactly as it is: a drained worker must keep reporting in,
+    /// because the reconciler reads an unhealthy worker as a reason to expire its
+    /// leases, and draining is a request to finish the work, not a report of failure.
+    async fn set_worker_draining(
+        &self,
+        node_id: Uuid,
+        draining: bool,
+        reason: Option<&str>,
+    ) -> Result<WorkerStatus, StoreError> {
+        let trimmed = reason.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(value) = trimmed
+            && value.chars().count() > DRAIN_REASON_MAX_CHARS
+        {
+            return Err(StoreError::Conflict(format!(
+                "drain reason must be at most {DRAIN_REASON_MAX_CHARS} characters"
+            )));
+        }
+        // Clearing the drain clears the reason with it, so a worker that comes back
+        // never advertises a stale reason to the next operator.
+        let stored_reason = if draining {
+            trimmed.map(str::to_string)
+        } else {
+            None
+        };
+        // `accepting_sandboxes` is the inverse of the flag the caller passes: the
+        // column is what the scheduler reads, the argument is what the operator
+        // asks for, and binding one straight into the other would leave a drained
+        // worker in the placement pool while reporting a drain in the reason column.
+        let result = sqlx::query(
+            "UPDATE nodes SET accepting_sandboxes = $2, drain_reason = $3 WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(!draining)
+        .bind(&stored_reason)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        self.get_worker(node_id).await
+    }
+
     async fn claim_worker_assignments(
         &self,
         node_id: Uuid,
@@ -1721,6 +1869,21 @@ impl PostgresRepository {
             return Err(StoreError::Conflict(
                 "lease TTL must be between 1 and 3600 seconds".into(),
             ));
+        }
+        // A draining worker is being emptied, so it must not be handed a reservation
+        // that has not been started yet either. A reservation left behind here stays
+        // `reserved`: its lease runs out and the reconciler recovers the sandbox on a
+        // worker that is still accepting work, which is what draining wants anyway.
+        // A node that does not exist has nothing to drain and yields nothing, exactly
+        // as this method already did for an unknown worker.
+        let accepting: Option<bool> =
+            sqlx::query_scalar("SELECT accepting_sandboxes FROM nodes WHERE id = $1")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(database_error)?;
+        if accepting != Some(true) {
+            return Ok(Vec::new());
         }
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         let rows = sqlx::query(
@@ -2519,6 +2682,21 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn append_audit_event(&self, event: AuditEvent) -> Result<(), CoreError> {
+        Self::append_audit_event(self, event)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_audit_events(
+        &self,
+        tenant: Option<Uuid>,
+        action: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, CoreError> {
+        Self::list_audit_events(self, tenant, action, limit)
+            .await
+            .map_err(core_error)
+    }
     async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), CoreError> {
         Self::put_stored_snapshot(self, value)
             .await
@@ -2568,6 +2746,16 @@ impl MetadataStore for PostgresRepository {
     }
     async fn list_workers(&self, include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> {
         Self::list_workers(self, include_unhealthy)
+            .await
+            .map_err(core_error)
+    }
+    async fn set_worker_draining(
+        &self,
+        node_id: Uuid,
+        draining: bool,
+        reason: Option<&str>,
+    ) -> Result<WorkerStatus, CoreError> {
+        Self::set_worker_draining(self, node_id, draining, reason)
             .await
             .map_err(core_error)
     }
@@ -2866,6 +3054,22 @@ mod tests {
     #[test]
     fn runtime_parser_accepts_docker() {
         assert_eq!(runtime_from_str("docker").unwrap(), RuntimeKind::Docker);
+    }
+
+    #[test]
+    fn runtime_parser_round_trips_every_persisted_runtime() {
+        // A hosted sandbox is persisted with the same `runtime` column as any other.
+        // Missing the arm makes it unreadable with "invalid persisted runtime", which
+        // is indistinguishable from a corrupt row.
+        for kind in [
+            RuntimeKind::Firecracker,
+            RuntimeKind::Docker,
+            RuntimeKind::BwrapDev,
+            RuntimeKind::Hosted,
+        ] {
+            assert_eq!(runtime_from_str(kind.as_str()).unwrap(), kind);
+        }
+        assert!(runtime_from_str("qemu").is_err());
     }
 
     #[test]
@@ -3725,6 +3929,494 @@ mod tests {
             after[&recovery.lease.node_id],
             (replacement_vcpus - 31, replacement_count + 1)
         );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    fn audit_event(
+        tenant: Option<Uuid>,
+        action: &str,
+        result: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> AuditEvent {
+        AuditEvent {
+            id: new_id(),
+            occurred_at,
+            tenant_id: tenant,
+            actor: "user:operator".into(),
+            action: action.into(),
+            subject_type: "sandbox".into(),
+            subject_id: Some(new_id().to_string()),
+            result: result.into(),
+            request_id: Some(new_id()),
+            remote_addr: Some("203.0.113.7".into()),
+            detail: json!({"cpu": 1, "runtime": "firecracker"}),
+        }
+    }
+
+    /// A timestamp a Postgres `timestamptz` round-trips exactly, so a read-back
+    /// audit event can be compared field by field instead of by proximity.
+    fn whole_microsecond_ago(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(Utc::now().timestamp_micros() - seconds * 1_000_000)
+            .expect("a timestamp a minute ago is representable")
+    }
+
+    #[tokio::test]
+    async fn audit_events_are_durable_filterable_and_append_only() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let other_tenant = new_id();
+        let first = audit_event(
+            Some(tenant),
+            "sandbox.create",
+            "success",
+            whole_microsecond_ago(30),
+        );
+        let second = audit_event(
+            Some(tenant),
+            "sandbox.destroy",
+            "denied",
+            whole_microsecond_ago(20),
+        );
+        let system = audit_event(None, "worker.drain", "success", whole_microsecond_ago(10));
+        for event in [&first, &second, &system] {
+            repository.append_audit_event(event.clone()).await.unwrap();
+        }
+        // A second connection proves the trail is durable rather than an artifact of
+        // the session that wrote it.
+        let reopened = PostgresRepository::connect(&database_url()).await.unwrap();
+        let everything = reopened.list_audit_events(None, None, 100).await.unwrap();
+        assert!(
+            [first.id, second.id, system.id]
+                .iter()
+                .all(|id| everything.iter().any(|event| event.id == *id)),
+            "every appended event survives a reconnect, read back {:?}",
+            everything
+                .iter()
+                .map(|event| (event.id, event.action.clone()))
+                .collect::<Vec<_>>()
+        );
+        let round_tripped = everything
+            .iter()
+            .find(|event| event.id == first.id)
+            .expect("the first event is readable");
+        assert_eq!(
+            *round_tripped, first,
+            "an audit event round-trips unchanged"
+        );
+        // Newest first, and the system event has no tenant to group it.
+        let positions: Vec<usize> = [first.id, second.id, system.id]
+            .iter()
+            .map(|id| {
+                everything
+                    .iter()
+                    .position(|event| event.id == *id)
+                    .expect("an appended event is in the page")
+            })
+            .collect();
+        assert!(
+            positions[2] < positions[1] && positions[1] < positions[0],
+            "events are listed newest first, got {positions:?}"
+        );
+        assert_eq!(system.tenant_id, None);
+
+        let scoped = reopened
+            .list_audit_events(Some(tenant), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            scoped.iter().all(|event| event.tenant_id == Some(tenant)),
+            "a tenant filter never leaks another tenant's events"
+        );
+        assert!(
+            !scoped.iter().any(|event| event.id == system.id),
+            "a system event belongs to no tenant"
+        );
+        let unrelated = reopened
+            .list_audit_events(Some(other_tenant), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            unrelated
+                .iter()
+                .all(|event| event.id != first.id && event.id != second.id),
+            "another tenant never sees these events"
+        );
+        let by_action = reopened
+            .list_audit_events(None, Some("sandbox.create"), 100)
+            .await
+            .unwrap();
+        assert!(
+            by_action
+                .iter()
+                .all(|event| event.action == "sandbox.create"),
+            "an action filter only returns that action"
+        );
+        let both = reopened
+            .list_audit_events(Some(tenant), Some("sandbox.destroy"), 100)
+            .await
+            .unwrap();
+        assert!(
+            both.iter().any(|event| event.id == second.id)
+                && !both.iter().any(|event| event.id == first.id),
+            "tenant and action filters intersect"
+        );
+        // The limit is a page size, not a threshold: asking for more than the clamp
+        // returns the newest page, and zero still returns the oldest of the clamp.
+        let capped = reopened.list_audit_events(None, None, 5_000).await.unwrap();
+        assert!(
+            capped.len() <= 1_000,
+            "an oversized limit is clamped instead of honoured"
+        );
+        let one = reopened.list_audit_events(None, None, 0).await.unwrap();
+        assert_eq!(one.len(), 1, "a zero limit still returns the minimum page");
+        assert_eq!(one[0].id, system.id);
+
+        // An audit trail that can be rewritten is not an audit trail.
+        for statement in [
+            "UPDATE audit_log SET result='failure'",
+            "UPDATE audit_log SET detail='{}'",
+            "DELETE FROM audit_log",
+        ] {
+            assert!(
+                sqlx::query(statement)
+                    .execute(&reopened.pool)
+                    .await
+                    .is_err(),
+                "`{statement}` must be rejected"
+            );
+        }
+        assert!(
+            sqlx::query("TRUNCATE audit_log")
+                .execute(&reopened.pool)
+                .await
+                .is_err(),
+            "TRUNCATE must be rejected too"
+        );
+        let survived = reopened
+            .list_audit_events(Some(tenant), None, 100)
+            .await
+            .unwrap();
+        assert!(
+            survived
+                .iter()
+                .any(|event| event.id == first.id && event.result == "success"),
+            "a rejected mutation leaves the record exactly as it was"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), reopened.pool.close()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn a_draining_worker_takes_no_new_work_and_keeps_the_work_it_holds() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_worker_with(&repository, tenant, 4, 256, 4_096).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        let generation = claimed[0].lease.generation;
+
+        let draining = repository
+            .set_worker_draining(node_id, true, Some("host maintenance"))
+            .await
+            .unwrap();
+        assert!(!draining.accepting_sandboxes);
+        assert_eq!(draining.drain_reason.as_deref(), Some("host maintenance"));
+        assert!(
+            draining.registration.healthy,
+            "draining is a request to finish the work, not a report of failure"
+        );
+        let listed = repository.list_workers(false).await.unwrap();
+        let entry = listed
+            .iter()
+            .find(|worker| worker.registration.node_id == node_id)
+            .expect("a draining worker is still a live worker and stays listed");
+        assert!(!entry.accepting_sandboxes);
+        assert_eq!(entry.drain_reason.as_deref(), Some("host maintenance"));
+
+        let refused = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await;
+        let refusal = match &refused {
+            Err(CoreError::Conflict(message)) => message.as_str(),
+            other => {
+                panic!("a draining worker must not be offered to the scheduler, got {other:?}")
+            }
+        };
+        assert_eq!(refusal, "no schedulable worker has capacity");
+
+        // Nothing about the sandbox it is already running changed: the lease is
+        // live, the reconciler has no reason to sweep it, and recovery will not
+        // move it. A drained worker that was treated as a dead one would fail all
+        // three, which is exactly the confusion draining has to avoid.
+        let held = repository
+            .get_active_worker_lease(tenant, scheduled.sandbox.id)
+            .await
+            .unwrap();
+        assert_eq!(held.id, scheduled.lease_id);
+        assert_eq!(held.node_id, node_id);
+        assert_eq!(held.generation, generation);
+        // The reconciler sweeps leases that ran out, not workers that stopped taking
+        // work, so running it over a drained worker has to leave the lease alone.
+        let actions = repository.reconcile_expired_leases(1_000).await.unwrap();
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.lease_id != Some(scheduled.lease_id)),
+            "draining does not expire a lease that has not run out"
+        );
+        let after_sweep = repository
+            .get_worker_lease(tenant, scheduled.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(after_sweep.status, "active");
+        assert_eq!(after_sweep.generation, generation);
+        assert_eq!(
+            repository.get_worker(node_id).await.unwrap().sandbox_count,
+            1,
+            "the drained worker still owns the capacity its sandbox holds"
+        );
+        assert!(
+            repository
+                .reassign_expired_lease(scheduled.lease_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a draining worker's live lease is not eligible for reassignment"
+        );
+        let renewed = repository
+            .renew_worker_lease(tenant, scheduled.lease_id, generation, 120)
+            .await
+            .unwrap();
+        assert_eq!(renewed.generation, generation + 1);
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, scheduled.sandbox.id)
+                .await
+                .unwrap()
+                .node_id,
+            Some(node_id)
+        );
+
+        // Draining withholds new placements; it must not become a shield. Once the
+        // lease genuinely runs out the reconciler still has to reclaim it, or a
+        // forgotten drain would leak a worker's capacity forever.
+        expire_lease(&repository, scheduled.lease_id).await;
+        let mut reclaimed = false;
+        for _ in 0..10 {
+            let actions = repository.reconcile_expired_leases(1_000).await.unwrap();
+            if actions
+                .iter()
+                .any(|action| action.lease_id == Some(scheduled.lease_id))
+            {
+                reclaimed = true;
+                break;
+            }
+        }
+        assert!(
+            reclaimed,
+            "a lease that ran out is reclaimed even while its worker is draining"
+        );
+        let drained = repository.get_worker(node_id).await.unwrap();
+        assert!(!drained.accepting_sandboxes);
+        assert_eq!(
+            drained.sandbox_count, 0,
+            "the reclaimed lease released the drained worker's capacity"
+        );
+
+        assert!(
+            repository
+                .set_worker_draining(new_id(), true, Some("no such worker"))
+                .await
+                .is_err(),
+            "draining an unknown worker is not a silent success"
+        );
+        assert!(
+            repository
+                .set_worker_draining(node_id, true, Some(&"x".repeat(513)))
+                .await
+                .is_err(),
+            "an unbounded drain reason is refused"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn a_drain_survives_the_worker_heartbeating_and_re_registering() {
+        // Both paths restate the worker's own view of itself. If either one carried
+        // accepting_sandboxes, an ordinary heartbeat would quietly undo an operator's
+        // decision and put a decommissioned machine back into the placement pool.
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_worker_with(&repository, tenant, 4, 256, 4_096).await;
+        repository
+            .set_worker_draining(node_id, true, Some("kernel upgrade"))
+            .await
+            .unwrap();
+        let beat = repository
+            .heartbeat_worker(WorkerHeartbeat {
+                node_id,
+                available_vcpus: 4,
+                available_memory_bytes: 256 * 1_048_576,
+                available_disk_bytes: 4_096 * 1_048_576,
+                sandbox_count: 0,
+                healthy: true,
+                version: 2,
+                metadata: json!({}),
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !beat.accepting_sandboxes,
+            "a heartbeat must not end a drain"
+        );
+        assert_eq!(beat.drain_reason.as_deref(), Some("kernel upgrade"));
+        assert!(beat.registration.healthy);
+
+        let reregistered = repository
+            .register_worker(WorkerRegistration {
+                node_id,
+                name: format!("recovery-node-{tenant}-{node_id}"),
+                runtime: RuntimeKind::Firecracker,
+                capabilities: agentforge_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    streaming: false,
+                    ..Default::default()
+                },
+                control_endpoint: "https://127.0.0.1:9000".into(),
+                total_vcpus: 4,
+                total_memory_bytes: 256 * 1_048_576,
+                total_disk_bytes: 4_096 * 1_048_576,
+                available_vcpus: 4,
+                available_memory_bytes: 256 * 1_048_576,
+                available_disk_bytes: 4_096 * 1_048_576,
+                healthy: true,
+                version: 3,
+                metadata: json!({}),
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+            })
+            .await;
+        assert!(
+            reregistered.is_ok(),
+            "re-registering a drained worker is a normal event, got {reregistered:?}"
+        );
+        let after = repository.get_worker(node_id).await.unwrap();
+        assert!(
+            !after.accepting_sandboxes,
+            "re-registering must not put a drained worker back into placement"
+        );
+        assert_eq!(after.drain_reason.as_deref(), Some("kernel upgrade"));
+        let refused = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await;
+        assert!(refused.is_err(), "the drain is still in force after both");
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn clearing_a_drain_gives_the_worker_its_work_and_capacity_back() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_worker_with(&repository, tenant, 4, 256, 4_096).await;
+        for _ in 0..2 {
+            schedule_test_sandbox(
+                &repository,
+                tenant,
+                new_id(),
+                sandbox(tenant),
+                Some(node_id),
+            )
+            .await
+            .unwrap();
+        }
+        let running = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        assert_eq!(running.len(), 1);
+        let waiting = repository
+            .list_worker_assignments_for_node(node_id, Some("reserved"), 10)
+            .await
+            .unwrap();
+        assert_eq!(waiting.len(), 1, "the second sandbox is still unclaimed");
+        let reserved_id = waiting[0].sandbox.id;
+
+        repository
+            .set_worker_draining(node_id, true, Some("kernel upgrade"))
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .claim_worker_assignments(node_id, 10, 60)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a draining worker is handed no new work"
+        );
+        let still_reserved = repository
+            .list_worker_assignments_for_node(node_id, Some("reserved"), 10)
+            .await
+            .unwrap();
+        assert_eq!(still_reserved.len(), 1);
+        assert_eq!(still_reserved[0].sandbox.id, reserved_id);
+
+        let restored = repository
+            .set_worker_draining(node_id, false, None)
+            .await
+            .unwrap();
+        assert!(restored.accepting_sandboxes);
+        assert!(
+            restored.drain_reason.is_none(),
+            "clearing the drain clears the reason with it, got {:?}",
+            restored.drain_reason
+        );
+        let claimed = repository
+            .claim_worker_assignments(node_id, 10, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the work withheld during the drain is handed over once it ends"
+        );
+        assert_eq!(claimed[0].sandbox.id, reserved_id);
+        let placed = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(placed.worker_id, node_id);
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 }

@@ -262,6 +262,7 @@ impl RuntimeRegistry {
         }) {
             [
                 RuntimeKind::Firecracker,
+                RuntimeKind::Hosted,
                 RuntimeKind::Docker,
                 RuntimeKind::BwrapDev,
             ]
@@ -269,6 +270,7 @@ impl RuntimeRegistry {
             [
                 RuntimeKind::Docker,
                 RuntimeKind::Firecracker,
+                RuntimeKind::Hosted,
                 RuntimeKind::BwrapDev,
             ]
         };
@@ -498,5 +500,110 @@ mod registry_tests {
             .await
             .unwrap();
         assert_eq!(microvm_selection.runtime, RuntimeKind::Firecracker);
+    }
+    #[tokio::test]
+    async fn hosted_is_reachable_by_auto_selection_without_displacing_firecracker() {
+        let hosted = Arc::new(TestRuntime {
+            capabilities: RuntimeCapabilities {
+                isolation: RuntimeIsolation::MicroVm,
+                exec: true,
+                files: true,
+                full_kernel_isolation: true,
+                guest_agent: true,
+                pause: true,
+                ..Default::default()
+            },
+            healthy: true,
+        });
+        let required = RuntimeCapabilities {
+            exec: true,
+            files: true,
+            full_kernel_isolation: true,
+            ..Default::default()
+        };
+        let hosted_only = RuntimeRegistry::with_runtime(RuntimeKind::Hosted, hosted.clone());
+        let selected = hosted_only
+            .select(None, &required, Some(RuntimeIsolation::MicroVm))
+            .await
+            .unwrap();
+        assert_eq!(selected.runtime, RuntimeKind::Hosted);
+        let firecracker = Arc::new(TestRuntime {
+            capabilities: RuntimeCapabilities {
+                isolation: RuntimeIsolation::MicroVm,
+                exec: true,
+                files: true,
+                full_kernel_isolation: true,
+                ..Default::default()
+            },
+            healthy: true,
+        });
+        let mut registry = RuntimeRegistry::new();
+        registry.register(RuntimeKind::Hosted, hosted);
+        registry.register(RuntimeKind::Firecracker, firecracker);
+        let preferred = registry
+            .select(None, &required, Some(RuntimeIsolation::MicroVm))
+            .await
+            .unwrap();
+        assert_eq!(preferred.runtime, RuntimeKind::Firecracker);
+    }
+
+    #[tokio::test]
+    async fn hosted_outranks_a_container_runtime_when_a_microvm_is_required() {
+        // The microVM branch of the preference order is [Firecracker, Hosted,
+        // Docker, BwrapDev]. A container runtime cannot satisfy a microVM
+        // minimum, so hosted must win here rather than the selection falling
+        // through to a runtime that cannot provide the requested boundary.
+        let hosted = Arc::new(TestRuntime {
+            capabilities: RuntimeCapabilities {
+                isolation: RuntimeIsolation::MicroVm,
+                exec: true,
+                files: true,
+                full_kernel_isolation: true,
+                guest_agent: true,
+                ..Default::default()
+            },
+            healthy: true,
+        });
+        let docker = Arc::new(TestRuntime {
+            capabilities: RuntimeCapabilities {
+                isolation: RuntimeIsolation::Container,
+                exec: true,
+                files: true,
+                ..Default::default()
+            },
+            healthy: true,
+        });
+        let mut registry = RuntimeRegistry::new();
+        registry.register(RuntimeKind::Docker, docker);
+        registry.register(RuntimeKind::Hosted, hosted);
+        let selected = registry
+            .select(
+                None,
+                &RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    full_kernel_isolation: true,
+                    ..Default::default()
+                },
+                Some(RuntimeIsolation::MicroVm),
+            )
+            .await
+            .expect("a hosted microVM satisfies a microVM requirement");
+        assert_eq!(selected.runtime, RuntimeKind::Hosted);
+        // Without a microVM requirement the container runtime still wins, so
+        // adding a hosted runtime never reorders the unprivileged path.
+        let container_first = registry
+            .select(
+                None,
+                &RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("docker satisfies a plain exec/files requirement");
+        assert_eq!(container_first.runtime, RuntimeKind::Docker);
     }
 }

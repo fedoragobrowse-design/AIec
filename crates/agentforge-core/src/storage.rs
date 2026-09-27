@@ -88,6 +88,46 @@ pub struct SandboxEvent {
     pub occurred_at: DateTime<Utc>,
 }
 
+/// One immutable record in the security audit trail.
+///
+/// `sandbox_events` answers "what happened to this sandbox"; an [`AuditEvent`]
+/// answers "who asked, for what, and was it allowed", which is a different
+/// question with different retention rules. Rows are append-only in storage:
+/// nothing in the system may rewrite or delete one.
+///
+/// # `detail` carries no secrets
+///
+/// `detail` is free-form context for a human reading the trail. It must never
+/// contain API keys, key digests, bearer tokens, sandbox payloads, environment
+/// values or any other credential: the audit trail is readable by operators and
+/// is retained far longer than the data it describes. Storage cannot check this,
+/// so the producer owns the contract — redact before you append.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditEvent {
+    /// Event identifier.
+    pub id: Uuid,
+    /// Time the audited action was decided, not the time it was recorded.
+    pub occurred_at: DateTime<Utc>,
+    /// Tenant the action belongs to, or `None` for system-level events.
+    pub tenant_id: Option<TenantId>,
+    /// Who acted: `user:<id>`, `worker:<node id>`, or `system`.
+    pub actor: String,
+    /// What was attempted, e.g. `sandbox.create` or `worker.drain`.
+    pub action: String,
+    /// Kind of thing acted on, e.g. `sandbox`, `api_key`, `worker`.
+    pub subject_type: String,
+    /// Identifier of the thing acted on, rendered as text.
+    pub subject_id: Option<String>,
+    /// Outcome: `success`, `denied` or `failure`.
+    pub result: String,
+    /// Correlates the trail with the request that caused it.
+    pub request_id: Option<Uuid>,
+    /// Remote address the request arrived from, if any.
+    pub remote_addr: Option<String>,
+    /// Redacted structured context. Never credentials.
+    pub detail: Value,
+}
+
 /// Durable snapshot metadata, including references to artifact objects.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredSnapshot {
@@ -194,6 +234,15 @@ pub struct WorkerStatus {
     pub observed_sandbox_count: u32,
     /// Most recent failure, if any.
     pub last_error: Option<String>,
+    /// Whether the worker is eligible for new sandbox placements.
+    ///
+    /// A worker is drained when it is otherwise perfectly healthy: it has been
+    /// asked to stop taking new work, not reported a fault. A drained worker
+    /// keeps running the sandboxes it already holds and keeps heartbeating, and
+    /// only placement is withheld from it.
+    pub accepting_sandboxes: bool,
+    /// Why the worker was drained, if it is.
+    pub drain_reason: Option<String>,
 }
 
 /// Fencing lease for one sandbox assigned to one worker.
@@ -409,6 +458,25 @@ pub trait MetadataStore: Send + Sync {
     async fn get_worker(&self, node_id: WorkerId) -> Result<WorkerStatus, CoreError>;
     /// Lists workers, optionally including unhealthy workers.
     async fn list_workers(&self, include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError>;
+    /// Starts or stops a worker draining, and returns its resulting state.
+    ///
+    /// Draining is an operator action on a healthy worker, not a health signal:
+    /// it never changes `registration.healthy`, and a drained worker's existing
+    /// leases are neither expired nor made eligible for reassignment. While
+    /// draining, the scheduler places no new sandboxes on the worker and
+    /// [`claim_worker_assignments`](Self::claim_worker_assignments) hands it
+    /// nothing new. Re-registering or heartbeating the worker does not clear the
+    /// flag; only calling this with `draining = false` does.
+    ///
+    /// `reason` is recorded only while draining and must be at most 512 bytes;
+    /// clearing the drain always clears the reason. An unknown worker is
+    /// [`CoreError::NotFound`].
+    async fn set_worker_draining(
+        &self,
+        node_id: WorkerId,
+        draining: bool,
+        reason: Option<&str>,
+    ) -> Result<WorkerStatus, CoreError>;
     /// Claims pending assignments for a worker.
     async fn claim_worker_assignments(
         &self,
@@ -520,4 +588,21 @@ pub trait MetadataStore: Send + Sync {
     async fn put_image(&self, value: ImageRecord) -> Result<(), CoreError>;
     /// Gets image metadata by identifier.
     async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError>;
+    /// Appends one record to the security audit trail.
+    ///
+    /// Storage never rewrites or deletes an appended event, so a mistake is
+    /// answered by appending a correcting event rather than editing history.
+    /// `event.detail` must already be redacted; see [`AuditEvent`].
+    async fn append_audit_event(&self, event: AuditEvent) -> Result<(), CoreError>;
+    /// Lists audit events newest first, optionally filtered by tenant and action.
+    ///
+    /// A `None` tenant matches every event, including system-level events that
+    /// have no tenant. `limit` is clamped by the store to a sane range; passing
+    /// `0` returns the same page as the minimum rather than nothing.
+    async fn list_audit_events(
+        &self,
+        tenant: Option<TenantId>,
+        action: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, CoreError>;
 }

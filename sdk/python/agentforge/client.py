@@ -7,23 +7,53 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 class AgentForgeError(RuntimeError):
+    """An error returned by the AgentForge API.
+
+    ``code`` is stable and machine-readable; ``request_id`` is echoed in the
+    server logs, so quoting it makes a support report actionable.
+    """
+
     def __init__(self, status: int, payload: Any):
         self.status = status
         self.payload = payload
-        message = (
-            payload.get("error", {}).get("message", str(payload))
-            if isinstance(payload, dict)
-            else str(payload)
-        )
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        self.code: str | None = error.get("code")
+        self.request_id: str | None = error.get("request_id")
+        message = error.get("message", str(payload))
         super().__init__(message)
+        # 429 carries a Retry-After so a client can back off without guessing.
+        self.retry_after: float | None = getattr(self, "_retry_after", None)
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        parts = [base]
+        if self.code:
+            parts.append(f"code={self.code}")
+        if self.request_id:
+            parts.append(f"request_id={self.request_id}")
+        return " | ".join(parts)
 
 
 class AgentForge:
+    """Client for the AgentForge API.
+
+    With no arguments beyond a key, this talks to AgentForge Cloud. Self-hosted
+    deployments pass ``base_url`` (or set ``AGENTFORGE_URL``); both use the same
+    API and the same methods.
+    """
+
+    #: AgentForge Cloud. Self-hosted deployments override this per client.
+    DEFAULT_BASE_URL = "https://api.aiec.gobrowse.dev"
+
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
-        self.base_url = (base_url or os.environ.get("AGENTFORGE_URL", "http://127.0.0.1:8080")).rstrip("/")
+        resolved = base_url or os.environ.get("AGENTFORGE_URL") or self.DEFAULT_BASE_URL
+        self.base_url = resolved.rstrip("/")
         self.api_key = api_key or os.environ.get("AGENTFORGE_API_KEY")
         if not self.api_key:
-            raise ValueError("set api_key or AGENTFORGE_API_KEY")
+            raise ValueError(
+                "set api_key or AGENTFORGE_API_KEY; create a key at "
+                "https://aiec.gobrowse.dev/cloud/keys"
+            )
         self.sandboxes = _Sandboxes(self)
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> Any:
@@ -46,7 +76,15 @@ class AgentForge:
                 error_payload = json.loads(error.read())
             except Exception:
                 error_payload = {"error": {"message": str(error)}}
-            raise AgentForgeError(error.code, error_payload) from error
+            failure = AgentForgeError(error.code, error_payload)
+            # A rate-limited client must be able to back off without guessing.
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            if retry_after:
+                try:
+                    failure.retry_after = float(retry_after)
+                except ValueError:
+                    failure.retry_after = None
+            raise failure from error
 
     def usage(self) -> Any:
         return self._request("GET", "/v1/usage")

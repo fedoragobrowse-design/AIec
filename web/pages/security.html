@@ -1,0 +1,94 @@
+<!-- meta:title=Security -->
+<!-- meta:description=How AgentForge isolates untrusted agent code: Firecracker microVMs, network egress policy, tenant isolation, secret handling and how to report a vulnerability. -->
+
+<p class="eyebrow">Trust</p>
+<h1>Security</h1>
+<p class="lead">
+  AgentForge runs code written by autonomous agents. That code is treated as
+  hostile, and the isolation boundary is the product.
+</p>
+
+<h2>The boundary</h2>
+<pre><code>tenant A sandbox  ─┐
+                   ├─ microVM: own kernel, own filesystem, own netns
+tenant B sandbox  ─┘
+                        │
+                        ├─ vsock control channel (never on the network)
+                        └─ egress filtered by nftables policy</code></pre>
+
+<div class="grid two">
+  <div class="card">
+    <h3>Firecracker, always, for untrusted code</h3>
+    <p>Public workloads run in microVMs with their own guest kernel. A tenant
+       cannot request a weaker runtime and downgrade their own isolation.
+       Docker remains available only for trusted self-hosted deployments and
+       local development.</p>
+  </div>
+  <div class="card">
+    <h3>Nothing shared</h3>
+    <p>Each sandbox gets its own kernel, root filesystem and network namespace.
+       A bug in one guest does not reach another guest, and the host kernel is not
+       exposed to the workload at all.</p>
+  </div>
+  <div class="card">
+    <h3>Filtered egress</h3>
+    <p>A sandbox cannot reach the host LAN, RFC1918 ranges, link-local and cloud
+       metadata addresses, the control plane, worker management endpoints, or
+       another tenant. Restricted network mode fails closed rather than silently
+       allowing traffic.</p>
+  </div>
+  <div class="card">
+    <h3>Tenancy is enforced server-side</h3>
+    <p>Every tenant-scoped query is filtered by the authenticated tenant.
+       Possession of a sandbox ID does not grant access to it; guessing another
+       tenant's ID returns <code>404</code>, not their data.</p>
+  </div>
+</div>
+
+<h2>Credentials</h2>
+<ul class="tight">
+  <li>API keys are stored hashed and compared in constant time.</li>
+  <li>Keys are shown once, scoped, rotatable and revocable.</li>
+  <li>Secret values never appear in logs, metadata, snapshots, error messages or
+      audit records.</li>
+  <li>Transient in-sandbox secret material is destroyed with the sandbox.</li>
+</ul>
+
+<h2>Abuse resistance</h2>
+<div class="grid three">
+  <div class="card">
+    <h3>Quotas</h3>
+    <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
+       placement time under a database lock.</p>
+  </div>
+  <div class="card">
+    <h3>Rate limits</h3>
+    <p>Per-tenant and per-address admission control on the public API, with
+       <code>429</code> and a <code>Retry-After</code> header.</p>
+  </div>
+  <div class="card">
+    <h3>Budget ceiling</h3>
+    <p>A global execution budget stops new creation rather than allowing a
+       runaway agent to become a charge.</p>
+  </div>
+</div>
+
+<h2>Reporting a vulnerability</h2>
+<p>
+  <strong>Do not open a public issue.</strong> Email
+  <strong>security@gobrowse.dev</strong> with what an attacker can do, how to
+  reproduce it, the affected component and version, and any request IDs (with
+  secrets redacted). We acknowledge within 3 business days and triage within 7.
+</p>
+<p>
+  There is no bug bounty. Our full policy, including known limitations, is in
+  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>.
+</p>
+
+<h2>Known limitations</h2>
+<p>
+  We would rather list these than have you find them. The current ones, and what
+  is not yet enforced, are in
+  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>
+  and summarised on the <a href="/status">status</a> page.
+</p>

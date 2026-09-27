@@ -1,0 +1,75 @@
+<!-- meta:title=Sandboxes -->
+<!-- meta:description=Create, inspect, exec into and destroy AgentForge sandboxes. The sandbox is the product: a disposable, isolated computer for your agent. -->
+
+<p class="eyebrow">Account</p>
+<h1>Sandboxes</h1>
+<p class="lead">
+  A sandbox is a disposable computer. Create it, run code in it, and destroy it
+  when you are done. This page is the operator's view; the API is the product.
+</p>
+
+<h2>Creating</h2>
+<pre><code>box = af.sandboxes.create(
+    image="agentforge:latest",
+    cpu=2,
+    memory_mb=1024,
+    disk_mb=2048,
+    timeout_seconds=900,
+)</code></pre>
+<p>
+  Public workloads always run on Firecracker. If you request another runtime the
+  control plane decides, and the response tells you what it chose via
+  <code>x-agentforge-selection-reason</code>.
+</p>
+
+<h2>Running code</h2>
+<pre><code>result = box.exec(["python", "-c", "print(1 + 1)"])
+result["stdout"]     # "2"
+result["exit_code"]  # 0
+result["timed_out"]  # False</code></pre>
+<p>
+  Exec is bounded by wall-clock time and by output size, and a string is accepted
+  as shorthand for a shell command.
+</p>
+
+<h2>Files</h2>
+<pre><code>box.write_file("/workspace/main.py", "print('hi')\n")
+box.read_file("/workspace/main.py")
+box.make_directory("/workspace/out")
+box.delete_file("/workspace/tmp")
+box.list_files("/workspace")</code></pre>
+
+<h2>Snapshots</h2>
+<pre><code>snap = box.snapshot()
+box.restore(snap)</code></pre>
+<p>A workspace snapshot is a portable archive and the unit of recovery. It does
+not capture running VM memory.</p>
+
+<h2>Inspecting</h2>
+<pre><code>af.sandboxes.list()
+af.sandboxes.get(box.id)</code></pre>
+<p>Each sandbox reports its state, runtime, allocated resources, the runtime
+owner, and when it was created and last updated.</p>
+
+<h2>Destroying</h2>
+<pre><code>box.destroy()</code></pre>
+<p>
+  Destroying releases the machine, the storage reservation and the quota it was
+  holding. Sandboxes that are not destroyed are removed when their lifetime
+  expires.
+</p>
+
+<h2>What is running right now</h2>
+<p>
+  The dashboard lists your live sandboxes with their state, runtime, size and age.
+  Anything that looks unfamiliar should be revoked or destroyed immediately —
+  see <a href="/security">security</a>.
+</p>
+
+<div class="note">
+  <p>
+    There is no long-term state in a sandbox. If an agent needs to remember
+    something, take a <a href="/docs#snapshots">snapshot</a> or store it as an
+    artifact.
+  </p>
+</div>

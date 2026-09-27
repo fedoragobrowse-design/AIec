@@ -1,0 +1,83 @@
+<!-- meta:title=Usage and quotas -->
+<!-- meta:description=AgentForge usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents. -->
+
+<p class="eyebrow">Account</p>
+<h1>Usage and quotas</h1>
+<p class="lead">
+  You can always see what you have used and what you have left. Quotas are
+  enforced when a sandbox is placed, not billed after the fact.
+</p>
+
+<h2>What counts as usage</h2>
+<table>
+  <tr><th>Metric</th><th>Measured</th></tr>
+  <tr><td>Sandbox runtime</td><td>From creation until destroy</td></tr>
+  <tr><td>vCPU</td><td>Allocated vCPU &times; seconds</td></tr>
+  <tr><td>Memory</td><td>Allocated GiB &times; seconds</td></tr>
+  <tr><td>Workspace storage</td><td>Bytes held by live sandboxes</td></tr>
+  <tr><td>Snapshots and artifacts</td><td>Bytes retained in object storage</td></tr>
+  <tr><td>Commands</td><td>Exec invocations, for visibility not billing</td></tr>
+</table>
+
+<h2>Reading your usage</h2>
+<pre><code>af = AgentForge(api_key="af_live_...")
+usage = af.usage()
+print(usage)</code></pre>
+<pre><code>curl https://api.aiec.gobrowse.dev/v1/usage \
+  -H "Authorization: Bearer af_live_..."</code></pre>
+
+<h2>Quotas</h2>
+<p>
+  Every tenant has limits. They are checked inside the same transaction that
+  places a sandbox, so two concurrent creates cannot both slip past the limit.
+</p>
+<table>
+  <tr><th>Quota</th><th>What it stops</th></tr>
+  <tr><td>Active sandboxes</td><td>A runaway agent accumulating machines</td></tr>
+  <tr><td>vCPU</td><td>One sandbox requesting a very large machine</td></tr>
+  <tr><td>Memory</td><td>The same, by RAM</td></tr>
+  <tr><td>Disk</td><td>Unbounded workspace growth</td></tr>
+  <tr><td>Request rate</td><td>One tenant exhausting the API for everyone</td></tr>
+  <tr><td>Sandbox lifetime</td><td>A machine left running forever</td></tr>
+</table>
+<p>Exceeding an aggregate quota returns <code>429 quota_exceeded</code>. Exceeding
+the request rate returns <code>429 rate_limited</code> with a
+<code>Retry-After</code> header.</p>
+
+<h2>Stopping runaway agents</h2>
+<div class="grid three">
+  <div class="card">
+    <h3>Short default lifetime</h3>
+    <p>Sandboxes time out on their own. A hung agent does not hold a machine
+       forever.</p>
+  </div>
+  <div class="card">
+    <h3>Hard maximum lifetime</h3>
+    <p>There is an absolute ceiling no single sandbox can exceed, whatever it
+       requests.</p>
+  </div>
+  <div class="card">
+    <h3>Global budget</h3>
+    <p>Cloud runs against a global execution budget. When it is reached, new
+       creation stops cleanly and you get
+       <code>TEMPORARY_CAPACITY_UNAVAILABLE</code>.</p>
+  </div>
+</div>
+
+<h2>We never overage silently</h2>
+<div class="note">
+  <p>
+    If capacity or the budget runs out, AgentForge stops creating sandboxes and
+    tells you. It does not enable automatic overage, upgrade a plan, or add a
+    payment method. Existing sandboxes follow the documented policy for their
+    remaining lifetime.
+  </p>
+</div>
+
+<h2>Reduce your usage</h2>
+<ul class="tight">
+  <li>Destroy sandboxes you are finished with. An idle sandbox still costs.</li>
+  <li>Request the smallest machine that runs your workload.</li>
+  <li>Use snapshots to resume work instead of keeping a sandbox alive.</li>
+  <li>Give each agent its own key so you can revoke one noisy workload cleanly.</li>
+</ul>

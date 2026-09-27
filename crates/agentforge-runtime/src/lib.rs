@@ -47,8 +47,10 @@ pub enum RuntimeError {
 
 pub use agentforge_core::runtime::SandboxRuntime;
 mod docker;
+pub mod e2b;
 pub mod guest_artifact;
 pub use docker::DockerRuntime;
+pub use e2b::{E2bConfig, E2bRuntime, RuntimePathProvider};
 
 fn into_core(error: RuntimeError) -> CoreError {
     match error {

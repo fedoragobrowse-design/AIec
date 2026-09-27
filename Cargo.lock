@@ -127,6 +127,7 @@ dependencies = [
  "futures-util",
  "hex",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

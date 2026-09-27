@@ -1,0 +1,90 @@
+<!-- meta:title=API keys -->
+<!-- meta:description=Create, rotate and revoke AgentForge API keys. Keys are shown once, stored hashed, and scoped to specific operations. -->
+
+<p class="eyebrow">Account</p>
+<h1>API keys</h1>
+<p class="lead">
+  An API key is how your agent talks to AgentForge. It is shown once, stored
+  hashed, and can be rotated or revoked at any time.
+</p>
+
+<div class="note">
+  <p>
+    <strong>Public alpha signup is invite-only.</strong> If you do not have an
+    account yet, request access. The key management UI below is live for
+    invited accounts.
+  </p>
+</div>
+
+<h2>Create a key</h2>
+<ol class="steps">
+  <li>Open the dashboard with the key you were invited with.</li>
+  <li>Choose a name that says where it will run, for example
+      <code>ci-agent</code> or <code>local-dev</code>.</li>
+  <li>Select the scopes it needs. Least privilege is the default: a key that
+      only creates and execs should not be able to read billing or rotate
+      other keys.</li>
+  <li>Copy the key. <strong>It is shown exactly once</strong> — AgentForge stores
+      only a hash and cannot show it again.</li>
+</ol>
+
+<h2>Scopes</h2>
+<table>
+  <tr><th>Scope</th><th>Allows</th></tr>
+  <tr><td><code>sandboxes:read</code></td><td>List and inspect sandboxes</td></tr>
+  <tr><td><code>sandboxes:write</code></td><td>Create, start, stop, destroy sandboxes</td></tr>
+  <tr><td><code>exec:write</code></td><td>Run commands and manage files</td></tr>
+  <tr><td><code>snapshots:read</code></td><td>List and restore snapshots</td></tr>
+  <tr><td><code>snapshots:write</code></td><td>Create and delete snapshots</td></tr>
+  <tr><td><code>artifacts:read</code> / <code>artifacts:write</code></td><td>Upload and download artifacts</td></tr>
+  <tr><td><code>usage:read</code></td><td>Read usage and quota for your tenant</td></tr>
+  <tr><td><code>keys:write</code></td><td>Create, rotate and revoke API keys</td></tr>
+</table>
+
+<h2>Using a key</h2>
+<pre><code>curl https://api.aiec.gobrowse.dev/v1/sandboxes \
+  -H "Authorization: Bearer af_live_..."</code></pre>
+<pre><code>from agentforge import AgentForge
+af = AgentForge(api_key="af_live_...")</code></pre>
+<pre><code># or, without hardcoding it
+export AGENTFORGE_API_KEY="af_live_..."
+export AGENTFORGE_URL="https://api.aiec.gobrowse.dev"</code></pre>
+
+<h2>Rotate a key</h2>
+<p>
+  Rotation issues a new key and immediately invalidates the old one. There is no
+  overlap window, so rotate deliberately — a running agent using the old key
+  will start receiving <code>401</code> the moment you rotate.
+</p>
+<ol class="steps">
+  <li>Create the replacement key with the same scopes.</li>
+  <li>Update the secret store your agent reads from.</li>
+  <li>Revoke the old key.</li>
+</ol>
+
+<h2>Revoke a key</h2>
+<p>
+  Revocation takes effect immediately. A revoked key returns
+  <code>401 unauthorized</code> and the action is recorded in the tenant's audit
+  log.
+</p>
+
+<h2>Good practice</h2>
+<ul class="tight">
+  <li>One key per workload. It makes revocation precise.</li>
+  <li>Least-privilege scopes. Most agents need only
+      <code>sandboxes:read</code>, <code>sandboxes:write</code> and
+      <code>exec:write</code>.</li>
+  <li>Never commit a key. Use your platform's secret store.</li>
+  <li>Rotate when someone leaves, or when a key may have been logged.</li>
+  <li>Set a short expiry on CI keys so a leaked key stops working on its own.</li>
+</ul>
+
+<div class="note">
+  <p>
+    Keys are transmitted only over TLS. AgentForge stores a hash, never a
+    recoverable value, and never logs a key. If you believe a key has been
+    exposed, revoke it and report it — see
+    <a href="/security">security</a>.
+  </p>
+</div>

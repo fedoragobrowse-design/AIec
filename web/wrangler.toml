@@ -1,0 +1,32 @@
+# AgentForge website — Cloudflare Workers with static assets.
+#
+# Build the site first:  python3 web/build.py
+# Deploy with:           npx wrangler deploy
+#
+# The site is plain static HTML built by `web/build.py`; there is no framework
+# and no bundler, so what is in `web/` is what ships.
+
+name = "agentforge-site"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+# Public hostnames. The API hostname is proxied to the private origin by the
+# Worker; the origin itself is never exposed to the internet.
+# Note: TOML tables are greedy, so `routes` must appear before any [table].
+routes = [
+  { pattern = "aiec.gobrowse.dev", custom_domain = true },
+  { pattern = "api.aiec.gobrowse.dev", custom_domain = true },
+]
+
+[assets]
+directory = "./"
+binding = "ASSETS"
+# Extensionless routes such as /docs are served from /docs/index.html.
+html_handling = "auto-trailing-slash"
+not_found_handling = "404-page"
+
+# The AgentForge control plane is reached privately (Cloudflare Tunnel or an
+# origin-only route), never as a public origin URL. Override in production with
+# `wrangler secret put AGENTFORGE_API_ORIGIN`.
+[vars]
+AGENTFORGE_API_ORIGIN = "https://origin.aiec.gobrowse.dev"

@@ -24,6 +24,35 @@ fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     std::env::var(name).map_err(|_| format!("{name} is required in production").into())
 }
 
+/// Sustained public API rate, from `AGENTFORGE_RATE_LIMIT_RPS` and
+/// `AGENTFORGE_RATE_LIMIT_BURST`. Unset means the built-in default.
+fn rate_limit() -> agentforge_api::ratelimit::RateLimit {
+    let rps = std::env::var("AGENTFORGE_RATE_LIMIT_RPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(20.0);
+    let burst = std::env::var("AGENTFORGE_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60);
+    agentforge_api::ratelimit::RateLimit::new(rps, burst)
+}
+
+/// Global hosted-execution budget, from `AGENTFORGE_CLOUD_EXECUTION_BUDGET`.
+///
+/// Unset means no ceiling is configured, which is only appropriate for a
+/// self-hosted deployment with its own capacity. A Cloud deployment should
+/// always set it: it is the stop-loss that turns a finite provider allowance
+/// into a clean refusal instead of an unexpected charge.
+fn execution_budget_units() -> Option<i64> {
+    std::env::var("AGENTFORGE_CLOUD_EXECUTION_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -45,8 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|value| match value {
             "firecracker" => Ok(RuntimeKind::Firecracker),
             "docker" => Ok(RuntimeKind::Docker),
+            "hosted" => Ok(RuntimeKind::Hosted),
             other => Err(format!(
-                "unsupported production runtime {other}; use firecracker or docker"
+                "unsupported production runtime {other}; use firecracker, docker or hosted"
             )
             .into()),
         })
@@ -93,6 +123,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let mut primary_runtime: Option<Arc<dyn SandboxRuntime>> = None;
     for kind in runtime_kinds.iter().copied() {
+        if kind == RuntimeKind::Hosted {
+            // The hosted provider owns the isolation boundary and the guest
+            // agent, so this runtime runs in the API process instead of being
+            // proxied to a worker node. It is env-gated: without
+            // AGENTFORGE_E2B_API_KEY the deployment behaves exactly as before.
+            let hosted = Arc::new(agentforge_runtime::E2bRuntime::new(
+                agentforge_runtime::E2bConfig::from_env()?,
+            )?);
+            tracing::info!(
+                template = %hosted.provider_template(),
+                "hosted sandbox runtime registered"
+            );
+            registry.register(kind, hosted.clone());
+            if primary_runtime.is_none() {
+                primary_runtime = Some(hosted);
+            }
+            continue;
+        }
         let capabilities = match kind {
             RuntimeKind::Docker => agentforge_core::runtime::RuntimeCapabilities {
                 isolation: agentforge_core::runtime::RuntimeIsolation::Container,
@@ -139,6 +187,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             RuntimeKind::BwrapDev => RuntimeCapabilities::default(),
+            // Handled above: a hosted runtime never becomes a worker proxy.
+            RuntimeKind::Hosted => RuntimeCapabilities::default(),
         };
         let runtime = Arc::new(base_worker_runtime.with_capabilities(capabilities));
         registry.register(kind, runtime.clone());
@@ -146,8 +196,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             primary_runtime = Some(runtime);
         }
     }
+    // Runtimes that isolate the workload themselves, such as the hosted
+    // provider, have no worker node and therefore no worker-backed snapshot
+    // provider to advertise.
+    let worker_backed = runtime_kinds
+        .iter()
+        .any(|kind| !matches!(kind, RuntimeKind::Hosted));
     let runtime = primary_runtime.ok_or("no production runtime configured")?;
-    let snapshots: Arc<dyn SnapshotProvider> = base_worker_runtime;
+    let snapshots: Option<Arc<dyn SnapshotProvider>> = if worker_backed {
+        let provider: Arc<dyn SnapshotProvider> = base_worker_runtime.clone();
+        Some(provider)
+    } else {
+        None
+    };
     let network: Arc<dyn NetworkBackend> = Arc::new(LinuxNetworkManager::new());
 
     let images: Option<Arc<dyn ImageResolver>> =
@@ -179,10 +240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(images) = images {
         platform_builder = platform_builder.images(images);
     }
-    let platform = platform_builder
-        .snapshots(snapshots)
-        .policy(policy)
-        .build()?;
+    if let Some(snapshots) = snapshots {
+        platform_builder = platform_builder.snapshots(snapshots);
+    }
+    let platform = platform_builder.policy(policy).build()?;
     metadata_store
         .put_tenant(agentforge_core::storage::TenantRecord {
             id: tenant_id,
@@ -190,10 +251,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             created_at: chrono::Utc::now(),
         })
         .await?;
-    let state = AppState::new(platform)
+    // Public Cloud policy: external tenants get microVM isolation only, and
+    // hosted execution runs against a global budget so a finite free allowance
+    // can never turn into an unexpected charge. A self-hoster can opt out of
+    // the runtime restriction with AGENTFORGE_ALLOW_CONTAINER_RUNTIMES=1.
+    let hosted_only = std::env::var("AGENTFORGE_ALLOW_CONTAINER_RUNTIMES").as_deref() != Ok("1");
+    let mut state = AppState::new(platform)
         .with_runtime_kind(runtime_kind)
         .with_lease_ttl(lease_ttl_seconds)
-        .with_worker_token(worker_token);
+        .with_worker_token(worker_token)
+        .with_hosted_only(hosted_only)
+        .with_rate_limit(rate_limit());
+    if let Some(limit) = execution_budget_units() {
+        state = state.with_execution_budget(limit);
+    }
     bootstrap_api_key(
         metadata_store.as_ref(),
         &api_key,
