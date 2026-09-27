@@ -1,0 +1,19 @@
+[Unit]
+Description=AIec Firecracker worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiec
+Group=aiec
+EnvironmentFile=/etc/aiec/aiec.env
+ExecStart=/usr/local/bin/aiec worker
+Restart=on-failure
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/aiec /dev/kvm
+
+[Install]
+WantedBy=multi-user.target

@@ -1,20 +1,20 @@
 [Unit]
-Description=AgentForge API
+Description=AIec API
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=agentforge
-Group=agentforge
-EnvironmentFile=/etc/agentforge/agentforge.env
-ExecStart=/usr/local/bin/agentforge-server
+User=aiec
+Group=aiec
+EnvironmentFile=/etc/aiec/aiec.env
+ExecStart=/usr/local/bin/aiec-server
 Restart=on-failure
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/agentforge
+ReadWritePaths=/var/lib/aiec
 
 [Install]
 WantedBy=multi-user.target

@@ -7,7 +7,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-export DATABASE_URL="${DATABASE_URL:-postgresql://agentforge:agentforge-dev-only@127.0.0.1:5432/agentforge}"
+export DATABASE_URL="${DATABASE_URL:-postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec}"
 
 status=0
 

@@ -2,22 +2,22 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: agentforge
-      POSTGRES_USER: agentforge
-      POSTGRES_PASSWORD: agentforge-dev-only
+      POSTGRES_DB: aiec
+      POSTGRES_USER: aiec
+      POSTGRES_PASSWORD: aiec-dev-only
     ports: ["127.0.0.1:5432:5432"]
     volumes: ["postgres-data:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agentforge"]
+      test: ["CMD-SHELL", "pg_isready -U aiec"]
       interval: 5s
       timeout: 3s
       retries: 20
   minio:
-    image: ${AGENTFORGE_MINIO_IMAGE:-agentforge-minio:RELEASE.2025-10-15T17-29-55Z}
+    image: ${AIEC_MINIO_IMAGE:-aiec-minio:RELEASE.2025-10-15T17-29-55Z}
     command: server /data --console-address :9001
     environment:
-      MINIO_ROOT_USER: agentforge
-      MINIO_ROOT_PASSWORD: agentforge-dev-only
+      MINIO_ROOT_USER: aiec
+      MINIO_ROOT_PASSWORD: aiec-dev-only
     ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: ["minio-data:/data"]
   prometheus:
