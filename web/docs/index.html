@@ -22,6 +22,7 @@
     <nav class="masthead__nav">
       <a href="/">Home</a>
       <a href="/docs" aria-current="page">Docs</a>
+      <a href="/mcp">MCP</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud">Cloud</a>
       <a href="/cloud/keys">API keys</a>
@@ -85,6 +86,12 @@ box.destroy()</code></pre>
     base_url="https://aiec.example.com",
     api_key="af_live_...",
 )</code></pre>
+
+<h2 id="mcp">Driving it from an agent</h2>
+<p>Prefer an MCP-capable coding agent? The <a href="/mcp">local MCP server</a>
+exposes the same lifecycle as tools: create a sandbox, run commands, read and
+write files, clone a repository, destroy it. It talks only to a local AIec
+control plane, so the workload stays on hardware you control.</p>
 
 <h2 id="core">Core concepts</h2>
 <div class="grid-2">
@@ -242,6 +249,7 @@ aiec --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
     <span>Computers for AI agents.</span>
     <nav class="colophon__nav">
       <a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
       <a href="/cloud/console">Console</a>

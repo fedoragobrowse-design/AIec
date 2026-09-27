@@ -139,7 +139,15 @@ export AIEC_LOCAL_API_KEY=af_live_...
 
 It is local-only by construction: a remote AIec URL is refused at startup, and
 the `hosted` and `e2b` runtimes are unavailable, so a workload cannot escape to
-AIec Cloud or a third-party provider. See [`docs/MCP.md`](docs/MCP.md).
+AIec Cloud or a third-party provider. A busy local worker reports
+`LOCAL_CAPACITY_UNAVAILABLE` rather than quietly sending work elsewhere.
+
+Thirteen tools cover the lifecycle, exec and files, plus higher-level ones that
+clone a repo, run a task and return the diff, and that run a coding agent — or
+compare two revisions of one — each side in its own clean sandbox.
+
+→ [aiec.gobrowse.dev/mcp](https://aiec.gobrowse.dev/mcp) ·
+[docs/MCP.md](docs/MCP.md)
 
 ---
 

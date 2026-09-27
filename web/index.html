@@ -22,6 +22,7 @@
     <nav class="masthead__nav">
       <a href="/" aria-current="page">Home</a>
       <a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud">Cloud</a>
       <a href="/cloud/keys">API keys</a>
@@ -108,8 +109,16 @@
 <div class="actions">
   <a class="btn btn--solid" href="/cloud">Start building</a>
   <a class="btn" href="/docs">Read the docs</a>
+  <a class="btn" href="/mcp">Local MCP</a>
   <a class="btn" href="/pricing">Pricing</a>
 </div>
+
+<h2>Bring your own agent</h2>
+<p>The <a href="/mcp">local MCP server</a> hands any MCP-capable coding agent a
+disposable machine on a cluster you run yourself. It is local-only by
+construction: it refuses to start against a remote AIec endpoint, and it cannot
+reach AIec Cloud or a third-party provider, so a workload cannot escape the
+hardware you control.</p>
 
 <h2>The whole workflow is six calls</h2>
 
@@ -222,6 +231,7 @@ box.destroy()</code></pre>
     <span>Computers for AI agents.</span>
     <nav class="colophon__nav">
       <a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
       <a href="/cloud/console">Console</a>

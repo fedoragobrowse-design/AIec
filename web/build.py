@@ -28,6 +28,7 @@ CONSOLE_ROUTES = {"/cloud/console"}
 NAV = [
     ("/", "Home"),
     ("/docs", "Docs"),
+    ("/mcp", "MCP"),
     ("/pricing", "Pricing"),
     ("/cloud", "Cloud"),
     ("/cloud/keys", "API keys"),
@@ -39,6 +40,7 @@ NAV = [
 ]
 FOOTER_NAV = [
     ("/docs", "Docs"),
+    ("/mcp", "MCP"),
     ("/security", "Security"),
     ("/status", "Status"),
     ("/cloud/console", "Console"),

@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP — AIec</title>
+<meta name="description" content="AIec&#x27;s local MCP server: give any MCP-capable coding agent a disposable machine on your own cluster, with no cloud and no external provider.">
+<meta property="og:title" content="MCP — AIec">
+<meta property="og:description" content="AIec&#x27;s local MCP server: give any MCP-capable coding agent a disposable machine on your own cluster, with no cloud and no external provider.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/mcp" aria-current="page">MCP</a>
+      <a href="/pricing">Pricing</a>
+      <a href="/cloud">Cloud</a>
+      <a href="/cloud/keys">API keys</a>
+      <a href="/cloud/usage">Usage</a>
+      <a href="/cloud/sandboxes">Sandboxes</a>
+      <a href="/security">Security</a>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
+  </div>
+</header>
+<div class="shell">
+  <aside class="rail">
+    
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>egress filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Availability</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+      </dl>
+    </div>
+
+  </aside>
+  <main class="content">
+<!-- meta:title=MCP -->
+<!-- meta:description=AIec's local MCP server: give any MCP-capable coding agent a disposable machine on your own cluster, with no cloud and no external provider. -->
+
+<h1>Local MCP</h1>
+<p class="lead">Point any MCP-capable agent at your own AIec cluster and it gets a
+disposable computer per task — a real machine, created and destroyed on demand.</p>
+
+<p>Everything below runs on <strong>your</strong> hardware. The server is
+local-only by construction: it refuses to start against a remote AIec endpoint,
+and it cannot reach AIec Cloud or a third-party provider, so a workload cannot
+escape the cluster you control.</p>
+
+<h2 id="connect">Connecting a client</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>URL</h3>
+    <p><code>http://127.0.0.1:8765/mcp</code></p>
+    <p class="muted">Streamable HTTP. The server binds to loopback and will
+       refuse any other address unless you opt in.</p>
+  </div>
+  <div class="block">
+    <h3>Authorization</h3>
+    <p><code>Bearer &lt;token&gt;</code></p>
+    <p class="muted">Generated on first run and stored at
+       <code>~/.config/aiec/mcp-token</code>, mode 0600.</p>
+  </div>
+</div>
+
+<pre><code>export AIEC_LOCAL_API_URL=https://127.0.0.1:18443
+export AIEC_LOCAL_API_KEY=af_live_...
+./target/release/aiec-mcp</code></pre>
+
+<h2 id="tools">What the agent gets</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>Lifecycle</h3>
+    <p><code>aiec_create_sandbox</code>, <code>aiec_list_sandboxes</code>,
+       <code>aiec_get_sandbox</code>, <code>aiec_destroy_sandbox</code></p>
+    <p class="muted">Destroy waits for cleanup to be confirmed and is safe to
+       call twice.</p>
+  </div>
+  <div class="block">
+    <h3>Working in a machine</h3>
+    <p><code>aiec_exec</code>, <code>aiec_read_file</code>,
+       <code>aiec_write_file</code>, <code>aiec_list_files</code></p>
+    <p class="muted">Commands run inside the sandbox with bounded output and a
+       timeout. Nothing runs on the host that serves MCP.</p>
+  </div>
+  <div class="block">
+    <h3>Repository work</h3>
+    <p><code>aiec_prepare_repo</code>, <code>aiec_run_repo_task</code></p>
+    <p class="muted">Clone, run a task, validate, collect the diff, then destroy
+       the machine — on the failure path too.</p>
+  </div>
+  <div class="block">
+    <h3>Evaluating an agent</h3>
+    <p><code>aiec_test_omp</code>, <code>aiec_compare_omp</code></p>
+    <p class="muted">Run a coding agent in a clean sandbox, or compare two
+       revisions against the same target, task and validations.</p>
+  </div>
+</div>
+
+<p>A loop an agent can run unattended:</p>
+<pre><code>{"name": "aiec_create_sandbox", "arguments": {"image": "aiec-coding:latest"}}
+{"name": "aiec_exec", "arguments": {"sandbox_id": "&lt;id&gt;", "command": ["git", "status"]}}
+{"name": "aiec_destroy_sandbox", "arguments": {"sandbox_id": "&lt;id&gt;"}}</code></pre>
+
+<h2 id="compare">Comparing two revisions of an agent</h2>
+<p>"I changed the compaction implementation. Does it actually improve things?"</p>
+<pre><code>{"name": "aiec_compare_omp", "arguments": {
+  "omp_repo": "https://github.com/can1357/oh-my-pi",
+  "baseline_ref": "main",
+  "candidate_ref": "feature/compaction-v2",
+  "target_repo": "https://github.com/me/fixture",
+  "task": "add a regression test for truncated output",
+  "repetitions": 3
+}}</code></pre>
+<p>Each side gets its own clean machine, same target, same task, same
+validations, same resources. You get successful and failed runs, validation
+passes, wall time, exit codes, changed files and diff sizes — measurements, not
+a verdict. All sandboxes are cleaned up afterwards.</p>
+
+<h2 id="guarantees">What it will not do</h2>
+<ul>
+  <li><strong>No cloud, no external provider.</strong> <code>hosted</code> and
+      <code>e2b</code> are refused. A busy local worker returns
+      <code>LOCAL_CAPACITY_UNAVAILABLE</code> rather than quietly sending your
+      workload somewhere else.</li>
+  <li><strong>No host execution.</strong> Commands are sent to AIec as an
+      argument vector. The server holds no path that runs a workload on the
+      machine it runs on, and a test reads the crate's own source to keep it
+      that way.</li>
+  <li><strong>No unbounded output.</strong> Every command is bounded and timed
+      out by AIec itself.</li>
+  <li><strong>No orphans.</strong> Only sandboxes this server created are
+      cleaned up on shutdown.</li>
+</ul>
+
+<p>Full reference: <code>docs/MCP.md</code> in the repository.</p>
+
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents.</span>
+    <nav class="colophon__nav">
+      <a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

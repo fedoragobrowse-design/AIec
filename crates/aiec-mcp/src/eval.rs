@@ -460,6 +460,9 @@ async fn omp_workflow(
 
     // The OMP revision first: a bad revision must not get as far as the
     // target repository, or the run would look like a target failure.
+    // The OMP checkout is not part of the prepared workspace, so it is cloned
+    // here. The target repository already is: AIec materialised it during
+    // create, and cloning it again collides on an existing `origin`.
     clone_revision(
         aiec,
         sandbox_id,
@@ -469,15 +472,8 @@ async fn omp_workflow(
         timeout,
     )
     .await?;
-    clone_revision(
-        aiec,
-        sandbox_id,
-        &request.target_repo,
-        request.target_ref.as_deref(),
-        REPO_PATH,
-        timeout,
-    )
-    .await?;
+    let _ = &request.target_repo;
+    let _ = request.target_ref.as_deref();
 
     // The OMP checkout is passed by path and revision, so the command does not
     // have to know where either of them lives.
