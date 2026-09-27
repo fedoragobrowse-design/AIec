@@ -1,17 +1,14 @@
 <!-- meta:title=Status -->
 <!-- meta:description=AgentForge public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven. -->
 
-<p class="eyebrow">Status</p>
 <h1>Public alpha status</h1>
 <p class="lead">
   What actually works today, and what does not. This page is deliberately
   blunt: an unexercised capability is never reported as working.
 </p>
 
-<span class="pill live">Public alpha</span>
-
 <h2>Working</h2>
-<table>
+<table class="kv">
   <tr><th>Capability</th><th>Status</th></tr>
   <tr><td>Firecracker microVM sandboxes</td><td>Working, exercised end to end</td></tr>
   <tr><td>Docker runtime</td><td>Working, trusted deployments only</td></tr>
@@ -26,7 +23,7 @@
 </table>
 
 <h2>Limited</h2>
-<table>
+<table class="kv">
   <tr><th>Capability</th><th>Limitation</th></tr>
   <tr><td>Signup</td><td>Invite-only. No open registration during alpha.</td></tr>
   <tr><td>Capacity</td><td>Limited by the hosted provider's free allowance. When it is exhausted, creation stops with <code>TEMPORARY_CAPACITY_UNAVAILABLE</code> rather than overage.</td></tr>
@@ -54,7 +51,7 @@
   not AgentForge operating its own hardware. We report these separately rather
   than merging them into one claim.
 </p>
-<table>
+<table class="kv">
   <tr><th>Claim</th><th>Status</th></tr>
   <tr><td>AgentForge native Firecracker runtime</td><td>Complete and verified</td></tr>
   <tr><td>Hosted Cloud execution capacity</td><td>Provided by a third-party Firecracker provider</td></tr>

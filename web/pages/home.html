@@ -1,110 +1,177 @@
 <!-- meta:title=Computers for AI agents -->
 <!-- meta:description=AgentForge gives autonomous AI agents isolated, disposable computers. Managed Firecracker sandboxes through one API, or self-host the same platform for free. -->
+<!-- wide -->
 
-<div class="hero">
-  <p class="eyebrow">Servers for agents</p>
-  <h1>Computers for AI agents.</h1>
-  <p class="lead">
-    AgentForge hands an autonomous agent a real, isolated computer — its own kernel,
-    filesystem and network — that it can use thousands of times an hour and throw
-    away. Clone a repo, run code, edit files, run tests, read the diff, destroy.
-    No SSH, no shared machines, no cleanup.
-  </p>
-  <div class="row">
-    <a class="btn primary" href="/cloud">Start Building</a>
-    <a class="btn" href="/docs">Read the docs</a>
-    <a class="btn" href="/pricing">Pricing</a>
-  </div>
-</div>
+<!-- block:rail -->
+    <div class="rail__group">
+      <span class="rail__caption">One sandbox</span>
+      <dl>
+        <dt>isolation</dt><dd>microVM</dd>
+        <dt>kernel</dt><dd>own, per guest</dd>
+        <dt>rootfs</dt><dd>4 GiB ext4</dd>
+        <dt>lifetime</dt><dd>minutes</dd>
+        <dt>egress</dt><dd>filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Platform</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+        <dt>billing</dt><dd>usage, capped</dd>
+      </dl>
+    </div>
+<!-- /block:rail -->
 
-<pre><code>from agentforge import AgentForge
+<h1>Computers for AI agents.</h1>
 
-af = AgentForge(api_key="af_live_...")
-
-box = af.sandboxes.create(image="python:3.13")
-result = box.exec(["python", "-c", "print('hello from AgentForge')"])
-print(result["stdout"])
-box.destroy()</code></pre>
-
-<h2>Two ways to use it</h2>
-<div class="grid two">
-  <div class="card">
-    <span class="pill">Managed</span>
-    <h3>AgentForge Cloud</h3>
-    <p>We run the Firecracker capacity, the database, object storage, TLS and upgrades.
-       You use the API. You pay for convenience, capacity and operations.</p>
-    <p><a href="/cloud">Explore Cloud &rarr;</a></p>
-  </div>
-  <div class="card">
-    <span class="pill live">Free · Open source</span>
-    <h3>AgentForge OSS</h3>
-    <p>Self-host on your own KVM host with your own PostgreSQL and object storage.
-       Same API, same SDK, same runtime model. You keep full control.</p>
-    <p><a href="/docs#self-host">Self-host guide &rarr;</a></p>
-  </div>
-</div>
-
-<h2>Built for coding agents, not terminals</h2>
-<div class="grid three">
-  <div class="card">
-    <h3>Isolated by default</h3>
-    <p>Public workloads run in Firecracker microVMs. A tenant cannot request a
-       weaker runtime and downgrade their own isolation.</p>
-  </div>
-  <div class="card">
-    <h3>Disposable</h3>
-    <p>Create, use, destroy. Sandboxes are cheap, short-lived and billed while
-       they run, so agents can churn through them freely.</p>
-  </div>
-  <div class="card">
-    <h3>Safe to run hostile code</h3>
-    <p>Per-sandbox kernel, filesystem and network namespace. Egress is filtered so a
-       sandbox cannot reach your LAN, metadata services or other tenants.</p>
-  </div>
-  <div class="card">
-    <h3>Recoverable</h3>
-    <p>Sandboxes are fenced with monotonic lease generations. If a worker dies the
-       control plane reassigns the sandbox and reconstructs its workspace.</p>
-  </div>
-  <div class="card">
-    <h3>Real repos</h3>
-    <p>Git, CA certificates, Python, curl and tar are in the image. Clone over
-       HTTPS, edit in place, run the tests, read the diff back.</p>
-  </div>
-  <div class="card">
-    <h3>One API</h3>
-    <p>REST, a Python SDK and a Rust SDK. Switching between Cloud and your own
-       host is a base URL, not a rewrite.</p>
-  </div>
-</div>
-
-<h2>A real coding workflow</h2>
-<p>
-  This is the workflow the platform is built for, and it runs entirely through the
-  public API with no host-side shortcuts.
+<p class="lede">
+  An agent needs somewhere to run code that nobody else can reach and nobody
+  has to clean up. AgentForge hands it a real machine — its own kernel, its own
+  filesystem, its own network — and takes it away when the work is done.
 </p>
-<pre><code>box = af.sandboxes.create(image="agentforge:latest")
 
-box.exec(["git", "clone", "--depth", "1", REPO, "/workspace/repo"])
-box.exec(["sh", "-c", "cd /workspace/repo && git status --porcelain"])
-box.exec(["sh", "-c", "cd /workspace/repo && printf '\\n# change\\n' &gt;&gt; README"])
-box.exec(["sh", "-c", "cd /workspace/repo && python -m pytest -q"])
-diff = box.exec(["sh", "-c", "cd /workspace/repo && git --no-pager diff"])
-print(diff["stdout"])
+<!-- The one memorable element: a leased machine's whole life, with the real
+     resource draw it costs while it exists. -->
+<div class="lifecycle">
+  <div class="lifecycle__head">
+    <span class="lifecycle__state">
+      <span class="lifecycle__pulse" aria-hidden="true"></span>
+      sandbox running
+    </span>
+    <span>agent-7f3c · created 41s ago</span>
+  </div>
+  <div class="lifecycle__track">
+    <div class="stage" style="--progress: 100%">
+      <span class="stage__name">allocated</span>
+      <span class="stage__value">2</span>
+      <span class="stage__unit">vCPU</span>
+    </div>
+    <div class="stage" style="--progress: 100%">
+      <span class="stage__name">memory</span>
+      <span class="stage__value">1</span>
+      <span class="stage__unit">GiB</span>
+    </div>
+    <div class="stage" style="--progress: 34%">
+      <span class="stage__name">elapsed</span>
+      <span class="stage__value">41</span>
+      <span class="stage__unit">seconds</span>
+    </div>
+    <div class="stage stage--spent" style="--progress: 0%">
+      <span class="stage__name">on destroy</span>
+      <span class="stage__value">0</span>
+      <span class="stage__unit">billed</span>
+    </div>
+  </div>
+</div>
+<div class="rule" aria-hidden="true"></div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/cloud">Start building</a>
+  <a class="btn" href="/docs">Read the docs</a>
+  <a class="btn" href="/pricing">Pricing</a>
+</div>
+
+<h2>The whole workflow is six calls</h2>
+
+<p>
+  Everything below runs through the public API. There is no SSH, no worker
+  access, and nothing for an operator to repair afterwards.
+</p>
+
+<pre><code><span class="kw">from</span> agentforge <span class="kw">import</span> AgentForge
+
+af = AgentForge(api_key=<span class="str">"af_live_…"</span>)
+
+box = af.sandboxes.create(image=<span class="str">"agentforge:latest"</span>)
+box.exec([<span class="str">"git"</span>, <span class="str">"clone"</span>, <span class="str">"--depth"</span>, <span class="str">"1"</span>, REPO, <span class="str">"/workspace/repo"</span>])
+box.exec([<span class="str">"sh"</span>, <span class="str">"-c"</span>, <span class="cm"># edit in place…</span>])
+box.exec([<span class="str">"python"</span>, <span class="str">"-m"</span>, <span class="str">"pytest"</span>, <span class="str">"-q"</span>])
+diff = box.exec([<span class="str">"sh"</span>, <span class="str">"-c"</span>, <span class="str">"git --no-pager diff"</span>])
 box.destroy()</code></pre>
+
+<h2>Two ways to run it</h2>
+
+<div class="grid-2">
+  <div class="block">
+    <h3>Cloud, we operate it</h3>
+    <p>
+      Firecracker capacity, PostgreSQL, object storage, TLS, backups and upgrades
+      are ours to run. You use the API. See <a href="/cloud">AgentForge Cloud</a>.
+    </p>
+  </div>
+  <div class="block">
+    <h3>OSS, you operate it</h3>
+    <p>
+      The same platform on your own KVM host, with your own database and object
+      storage. No managed provider required. See
+      <a href="/docs">the self-host guide</a>.
+    </p>
+  </div>
+</div>
+
+<h2>Why the machine can be thrown away safely</h2>
+
+<div class="grid-3">
+  <div class="block">
+    <h3>Nothing is shared</h3>
+    <p>
+      Each sandbox has its own guest kernel and root filesystem. A bug in one
+      guest never reaches another, and the host kernel is not exposed at all.
+    </p>
+  </div>
+  <div class="block">
+    <h3>Egress is filtered</h3>
+    <p>
+      A sandbox cannot reach your LAN, cloud metadata, the control plane or
+      another tenant. Restricted mode fails closed rather than quietly allowing
+      traffic.
+    </p>
+  </div>
+  <div class="block">
+    <h3>Ownership is fenced</h3>
+    <p>
+      Sandboxes are leased with a monotonic generation. If a worker dies the
+      sandbox is reassigned at a higher generation, and the old owner is refused.
+    </p>
+  </div>
+  <div class="block">
+    <h3>Real repos work</h3>
+    <p>
+      Git, CA certificates, Python, curl and tar are in the image. Clone over
+      HTTPS with genuine certificate validation, not a disabled check.
+    </p>
+  </div>
+  <div class="block">
+    <h3>Runaway agents are capped</h3>
+    <p>
+      Quotas, rate limits, a maximum lifetime and a global execution budget mean
+      a runaway workload cannot exhaust the platform or your allowance.
+    </p>
+  </div>
+  <div class="block">
+    <h3>One API either side</h3>
+    <p>
+      Moving between Cloud and your own host is a base URL, not a rewrite. The
+      same SDK, the same sandbox identifiers, the same behaviour.
+    </p>
+  </div>
+</div>
 
 <h2>What it is not</h2>
+
 <p>
-  AgentForge is not a notebook, not a CI runner, and not a place to keep
-  long-lived state. It is a control plane for short-lived, untrusted, agent-driven
-  computers. If you need durable storage between runs, that is what
-  <a href="/docs#snapshots">snapshots</a> are for.
+  AgentForge is not a notebook, not a CI runner, and not durable storage. It is a
+  control plane for short-lived, untrusted, agent-driven computers. If work has
+  to survive a run, take a <a href="/docs">snapshot</a>.
 </p>
 
-<div class="note">
+<div class="callout">
+  <span class="callout__head">Public alpha</span>
   <p>
-    <strong>Public alpha.</strong> Invite-only signup, limited capacity, no SLA.
-    Current limitations are listed in full on the
-    <a href="/status">status</a> and <a href="/security">security</a> pages.
+    Invite-only, limited capacity, no SLA. Everything that is not yet finished is
+    listed on the <a href="/status">status</a> page, including the parts we
+    cannot yet claim.
   </p>
 </div>

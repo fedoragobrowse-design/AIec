@@ -73,6 +73,10 @@ const MAX_LIST_ENTRIES: usize = 10_000;
 /// Unary calls answer with one JSON document; server streams answer with
 /// length-prefixed envelopes.
 const CONNECT_PROTOCOL_VERSION: &str = "1";
+/// ConnectRPC's JSON media type. The plain `application/json` type is rejected
+/// by envd with 415 Unsupported Media Type.
+const CONNECT_CONTENT_TYPE: &str = "application/connect+json";
+
 const ENVD_START: &str = "/process.Process/Start";
 const ENVD_LIST_DIR: &str = "/filesystem.Filesystem/ListDir";
 const ENVD_MAKE_DIR: &str = "/filesystem.Filesystem/MakeDir";
@@ -585,7 +589,7 @@ impl E2bRuntime {
         let started = Instant::now();
         let mut response = self
             .envd_request(binding, reqwest::Method::POST, ENVD_START)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", CONNECT_CONTENT_TYPE)
             .header("Connect-Protocol-Version", CONNECT_PROTOCOL_VERSION)
             .body(body)
             .send()

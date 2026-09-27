@@ -100,6 +100,7 @@ struct MemoryData {
     usage: Vec<UsageEvent>,
     stored_snapshots: HashMap<Uuid, StoredSnapshot>,
     nodes: HashMap<Uuid, Node>,
+    tenants: HashMap<Uuid, TenantRecord>,
 }
 
 #[derive(Default)]
@@ -200,6 +201,25 @@ impl MemoryRepository {
             .ok_or(StoreError::NotFound)?;
         value.revoked_at = Some(Utc::now());
         Ok(())
+    }
+
+    /// Lists a tenant's keys, newest first. The development store keeps the
+    /// same shape as production so the dashboard behaves identically.
+    async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, StoreError> {
+        let data = self.data.read().await;
+        let mut keys: Vec<ApiKeyRecord> = data
+            .keys
+            .values()
+            .filter(|value| value.tenant_id == tenant)
+            .cloned()
+            .collect();
+        keys.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(keys)
     }
 
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, StoreError> {
@@ -410,6 +430,10 @@ impl MetadataStore for MemoryRepository {
         Self::find_key(self, digest).await.map_err(core_error)
     }
 
+    async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, CoreError> {
+        Self::list_keys(self, tenant).await.map_err(core_error)
+    }
+
     async fn put_snapshot(&self, value: Snapshot) -> Result<(), CoreError> {
         Self::put_snapshot(self, value).await.map_err(core_error)
     }
@@ -456,11 +480,22 @@ impl MetadataStore for MemoryRepository {
         Self::list_nodes(self).await.map_err(core_error)
     }
 
-    async fn put_tenant(&self, _value: TenantRecord) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported("memory metadata store".into()))
+    async fn put_tenant(&self, value: TenantRecord) -> Result<(), CoreError> {
+        // Tenants are real here, not stubbed: the public signup flow and the
+        // dashboard must behave identically in development and production.
+        let mut data = self.data.write().await;
+        if data.tenants.contains_key(&value.id) {
+            return Err(CoreError::Conflict("tenant already exists".into()));
+        }
+        data.tenants.insert(value.id, value);
+        Ok(())
     }
-    async fn get_tenant(&self, _id: Uuid) -> Result<TenantRecord, CoreError> {
-        Err(CoreError::Unsupported("memory metadata store".into()))
+    async fn get_tenant(&self, id: Uuid) -> Result<TenantRecord, CoreError> {
+        let data = self.data.read().await;
+        data.tenants
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("tenant not found".into()))
     }
     async fn list_sandbox_events(
         &self,

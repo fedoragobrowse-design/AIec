@@ -1,0 +1,125 @@
+/* Cloud dashboard.
+ *
+ * The dashboard is deliberately small: account, API keys, sandboxes, usage,
+ * quotas and service health. It is not an IDE, because the product is API/SDK
+ * driven. It shares the site's design language so a stranger does not feel
+ * they have left the product, and it uses the same restrained palette — the
+ * only loud element is a credential being revealed, which happens once.
+ */
+
+.dash {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 40px var(--gutter) 96px;
+}
+
+.dash__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding-bottom: 20px;
+  border-bottom: 2px solid var(--ink);
+}
+
+.dash__title { font-size: 1.9rem; font-weight: 700; letter-spacing: -0.03em; margin: 0; }
+.dash__who { font-family: var(--mono); font-size: 13px; color: var(--ink-soft); }
+
+.panel { margin-top: 40px; }
+.panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--rule-firm);
+  padding-bottom: 8px;
+  margin-bottom: 18px;
+}
+.panel__title { font-size: 1.06rem; font-weight: 650; letter-spacing: -0.015em; margin: 0; }
+.panel__note { font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); }
+
+.field { display: grid; gap: 6px; margin-bottom: 14px; max-width: 420px; }
+.field label { font-size: 14.5px; font-weight: 550; color: var(--ink); }
+.field input {
+  font: inherit;
+  font-size: 15px;
+  padding: 10px 12px;
+  border: 1.5px solid var(--rule-firm);
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--ink);
+  width: 100%;
+}
+.field input:focus-visible { outline: 3px solid var(--signal); outline-offset: 1px; }
+.field__hint { font-size: 13.5px; color: var(--ink-faint); }
+
+/* The one moment that earns emphasis: a secret shown exactly once. */
+.reveal {
+  border: 2px solid var(--signal);
+  background: var(--signal-wash);
+  padding: 18px 20px;
+  margin: 20px 0;
+}
+.reveal__head { font-weight: 650; color: #12307f; display: block; margin-bottom: 4px; }
+.reveal__value {
+  display: block;
+  font-family: var(--mono);
+  font-size: 14px;
+  background: var(--surface);
+  border: 1px solid var(--signal);
+  padding: 11px 12px;
+  margin: 10px 0;
+  word-break: break-all;
+  user-select: all;
+}
+.reveal p { color: #12307f; margin: 0; }
+
+.msg { font-size: 14.5px; padding: 11px 14px; margin: 14px 0; border-left: 3px solid; }
+.msg--err { border-color: var(--alert); background: var(--alert-wash); color: #6d2617; }
+.msg--ok { border-color: var(--signal); background: var(--signal-wash); color: #12307f; }
+
+.rows { border-top: 1px solid var(--rule); }
+.row-i {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+}
+.row-i__main { min-width: 200px; flex: 1; }
+.row-i__name { font-weight: 600; }
+.row-i__meta { font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); }
+.row-i__act { margin-left: auto; }
+
+.linkbtn {
+  font: inherit;
+  font-size: 14px;
+  background: none;
+  border: 0;
+  padding: 4px 0;
+  color: var(--alert);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.linkbtn:hover { color: #6d2617; }
+.linkbtn:focus-visible { outline: 3px solid var(--signal); outline-offset: 2px; }
+
+.empty { color: var(--ink-soft); padding: 18px 0; }
+
+.gauge { margin-bottom: 18px; }
+.gauge__line { display: flex; justify-content: space-between; font-size: 14.5px; margin-bottom: 5px; }
+.gauge__bar { height: 8px; background: var(--surface-sunk); border: 1px solid var(--rule); }
+.gauge__fill { height: 100%; background: var(--signal); }
+.gauge__fill--near { background: var(--alert); }
+
+.meter { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 20px; }
+.meter__value { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.03em; }
+.meter__label { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+
+@media (max-width: 620px) {
+  .dash { padding-top: 26px; }
+  .row-i__act { margin-left: 0; }
+}

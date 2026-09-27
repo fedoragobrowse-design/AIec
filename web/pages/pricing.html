@@ -1,16 +1,14 @@
 <!-- meta:title=Pricing -->
 <!-- meta:description=AgentForge Cloud pricing for public alpha: invite-only, usage-based, no lock-in. Self-hosting is free and open source. -->
 
-<p class="eyebrow">Pricing</p>
 <h1>Pay for capacity, not for access</h1>
 <p class="lead">
   AgentForge is open source and free to self-host. Cloud is a paid, managed
   service: you pay for the infrastructure and the people who operate it.
 </p>
 
-<div class="grid two">
-  <div class="card">
-    <span class="pill">Free · Open source</span>
+<div class="grid-2">
+  <div class="block">
     <h3>AgentForge OSS</h3>
     <p><strong>$0</strong> in software cost, forever.</p>
     <p>You run it on your own hardware. Bring your own compute, PostgreSQL,
@@ -21,11 +19,10 @@
       <li>Same API, same SDKs, same docs</li>
       <li>No Cloudflare, Neon or AgentForge account required</li>
     </ul>
-    <p><a href="/docs#self-host">Self-host guide &rarr;</a></p>
+    <p><a href="/docs#self-host">Self-host guide </a></p>
   </div>
 
-  <div class="card">
-    <span class="pill live">Managed</span>
+  <div class="block">
     <h3>AgentForge Cloud</h3>
     <p><strong>Usage-based.</strong> Billed for the sandboxes you run.</p>
     <p>We operate the Firecracker capacity, the database, object storage, TLS,
@@ -36,7 +33,7 @@
       <li>Per-tenant quotas and a global spend ceiling</li>
       <li>Hard spend safeguards: we never silently overage</li>
     </ul>
-    <p><a href="/cloud">Explore Cloud &rarr;</a></p>
+    <p><a href="/cloud">Explore Cloud </a></p>
   </div>
 </div>
 
@@ -45,7 +42,7 @@
   You are charged for the sandboxes you actually run, for the time they run.
   Storage for snapshots and artifacts is tracked separately and is cheap.
 </p>
-<table>
+<table class="kv">
   <tr><th>Resource</th><th>Unit</th><th>Notes</th></tr>
   <tr><td>Sandbox compute</td><td>vCPU-second</td><td>Charged from creation until destroy</td></tr>
   <tr><td>Sandbox memory</td><td>GiB-second</td><td>Allocated size, not peak</td></tr>
@@ -60,18 +57,18 @@
 </p>
 
 <h2>Spend safeguards</h2>
-<div class="grid three">
-  <div class="card">
+<div class="grid-3">
+  <div class="block">
     <h3>Hard quotas</h3>
     <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
        placement time rather than billed after the fact.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Global budget</h3>
     <p>Cloud runs against a global execution budget. When it is reached, new
        sandbox creation stops cleanly instead of turning into a charge.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>No surprise overage</h3>
     <p>When capacity is exhausted you get
        <code>TEMPORARY_CAPACITY_UNAVAILABLE</code>. We do not enable automatic

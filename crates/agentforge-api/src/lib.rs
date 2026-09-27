@@ -6,6 +6,7 @@ use agentforge_core::{
     snapshots::{SnapshotKind, SnapshotMetadata, SnapshotRequest, verify_archive_checksum},
     storage::{ArtifactStore, GetObjectOptions, MetadataStore},
 };
+pub mod account;
 mod composition;
 pub mod ratelimit;
 mod worker;
@@ -55,6 +56,8 @@ pub struct AppState {
     execution_budget: Option<ExecutionBudget>,
     /// When true, only microVM-class runtimes are offered to tenants.
     hosted_only: bool,
+    /// Invite codes accepted by public signup. Empty means signup is closed.
+    invites: Arc<Vec<String>>,
 }
 
 /// A global ceiling on hosted execution spend.
@@ -189,6 +192,7 @@ impl AppState {
             // configured. The Cloud composition root calls `with_hosted_only`
             // to restrict external tenants to microVM isolation.
             hosted_only: false,
+            invites: Arc::new(Vec::new()),
         }
     }
     fn development_mode(mut self, kind: RuntimeKind) -> Self {
@@ -235,6 +239,15 @@ impl AppState {
         // A self-hoster is trusted with their own boundary; the rule that
         // untrusted workloads use microVMs is enforced by the Cloud deployment.
         true
+    }
+    /// Sets the invite codes accepted by public signup.
+    pub fn with_invites(mut self, invites: Vec<String>) -> Self {
+        self.invites = Arc::new(invites);
+        self
+    }
+    /// The configured invite codes.
+    pub fn invites(&self) -> &[String] {
+        &self.invites
     }
     /// Restricts tenants to microVM-class runtimes.
     pub fn with_hosted_only(mut self, hosted_only: bool) -> Self {
@@ -439,6 +452,11 @@ pub async fn bootstrap_api_key(
                 scopes: scopes.to_vec(),
                 expires_at: None,
                 revoked_at: None,
+                // Bootstrap keys are operator-issued, not self-service, so the
+                // label records that rather than pretending a stranger chose it.
+                name: "bootstrap".to_string(),
+                created_at: Utc::now(),
+                last_used_at: None,
             };
             let candidate_id = candidate.id;
             match repository.put_key(candidate).await {
@@ -456,15 +474,27 @@ pub async fn bootstrap_api_key(
 pub fn router(state: AppState) -> Router {
     // Rate limiting runs outside `auth` so that unauthenticated floods are
     // bounded too, and inside it so a tenant is limited per tenant.
-    let protected = protected_routes()
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit));
+    // Signup is deliberately outside the auth layer: it is how a stranger
+    // obtains a credential in the first place. It is invite-gated, and rate
+    // limited like everything else.
+    let public = Router::new().route("/account", post(signup));
+    let protected = protected_routes().route("/account", get(current_account));
     let workers = worker_routes().layer(middleware::from_fn_with_state(state.clone(), worker_auth));
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
-        .nest("/v1", protected)
+        .nest(
+            "/v1",
+            public.layer(middleware::from_fn_with_state(state.clone(), rate_limit)),
+        )
+        .nest(
+            "/v1",
+            protected
+                .merge(key_routes())
+                .layer(middleware::from_fn_with_state(state.clone(), auth))
+                .layer(middleware::from_fn_with_state(state.clone(), rate_limit)),
+        )
         .nest("/v1/workers", workers)
         .layer(middleware::from_fn_with_state(state.clone(), count_request))
         .with_state(state)
@@ -526,6 +556,150 @@ async fn count_request(State(state): State<AppState>, request: Request, next: Ne
     }
     tracing::info!(request_id = %operation_id, method = %method, path = %path, status = response.status().as_u16(), "api request");
     response
+}
+
+/// Tenant self-service key management. Requires an authenticated caller, so a
+/// key can only ever manage keys inside its own tenant.
+fn key_routes() -> Router<AppState> {
+    Router::new()
+        .route("/keys", get(list_keys).post(create_key))
+        .route("/keys/{id}", delete(revoke_key))
+}
+
+/// Creates an account from an invite and returns its first API key.
+async fn signup(
+    State(s): State<AppState>,
+    Json(body): Json<account::SignupRequest>,
+) -> ApiResult<Value> {
+    if !account::invite_is_valid(s.invites(), &body.invite) {
+        // Do not distinguish a wrong code from signup being closed: either
+        // would let an unauthenticated caller enumerate the deployment.
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "invite_rejected",
+            "that invite code is not valid. Public alpha is invite only.",
+        ));
+    }
+    let (account, key) = account::create_account(s.repository().as_ref(), body)
+        .await
+        .map_err(ApiFailure::from)?;
+    let _ = s
+        .repository()
+        .append_audit_event(agentforge_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(account.id),
+            actor: format!("user:{}", account.id),
+            action: "account.created".to_string(),
+            subject_type: "tenant".to_string(),
+            subject_id: Some(account.id.to_string()),
+            result: "success".to_string(),
+            request_id: None,
+            remote_addr: None,
+            // Never the key itself: only the fact that one was issued.
+            detail: json!({ "key_id": key.id }),
+        })
+        .await;
+    Ok(Json(json!({ "account": account, "key": key })))
+}
+
+/// The authenticated caller's own account.
+async fn current_account(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Value> {
+    let tenant = s
+        .repository()
+        .get_tenant(p.tenant_id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(
+        json!({ "id": tenant.id, "name": tenant.name, "created_at": tenant.created_at }),
+    ))
+}
+
+/// Lists the caller's keys as metadata. Secrets are never returned.
+async fn list_keys(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Value> {
+    p.authorize(Scope::Admin).ok();
+    let keys = account::list_keys_for(s.repository().as_ref(), p.tenant_id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(json!({ "keys": keys })))
+}
+
+/// Issues a new key for the caller's tenant.
+async fn create_key(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Json(body): Json<account::CreateKeyRequest>,
+) -> ApiResult<Value> {
+    let scopes = if body.scopes.is_empty() {
+        account::DEFAULT_KEY_SCOPES.to_vec()
+    } else {
+        let mut parsed = Vec::new();
+        for scope in &body.scopes {
+            parsed.push(Scope::parse(scope).map_err(ApiFailure::from)?);
+        }
+        parsed
+    };
+    let (created, _record) = account::create_key(
+        s.repository().as_ref(),
+        p.tenant_id,
+        &body.name,
+        scopes,
+        body.expires_in_days,
+    )
+    .await
+    .map_err(ApiFailure::from)?;
+    let _ = s
+        .repository()
+        .append_audit_event(agentforge_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(p.tenant_id),
+            actor: format!("key:{}", p.key_id),
+            action: "api_key.created".to_string(),
+            subject_type: "api_key".to_string(),
+            subject_id: Some(created.id.to_string()),
+            result: "success".to_string(),
+            request_id: None,
+            remote_addr: None,
+            detail: json!({ "name": created.name, "scopes": created.scopes }),
+        })
+        .await;
+    Ok(Json(json!(created)))
+}
+
+/// Revokes a key in the caller's tenant.
+async fn revoke_key(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Value> {
+    s.repository()
+        .revoke_key(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let _ = s
+        .repository()
+        .append_audit_event(agentforge_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(p.tenant_id),
+            actor: format!("key:{}", p.key_id),
+            action: "api_key.revoked".to_string(),
+            subject_type: "api_key".to_string(),
+            subject_id: Some(id.to_string()),
+            result: "success".to_string(),
+            request_id: None,
+            remote_addr: None,
+            detail: json!({}),
+        })
+        .await;
+    Ok(Json(json!({ "revoked": id })))
 }
 
 fn protected_routes() -> Router<AppState> {
@@ -1448,7 +1622,10 @@ async fn create_sandbox(
         let _ = s
             .commit_state(&x, SandboxState::Starting, SandboxState::Failed)
             .await;
-        if s.is_production() {
+        // Hosted capacity is not leased from a worker, so there is nothing to
+        // release; asking the scheduler would fail for a lease that never
+        // existed.
+        if s.is_production() && x.runtime != RuntimeKind::Hosted {
             let _ = s.scheduler().release(p.tenant_id, x.id).await;
         }
         return Err(error);
@@ -1809,7 +1986,9 @@ async fn delete_sandbox(
         .destroy(&x)
         .await
         .map_err(ApiFailure::from)?;
-    if s.is_production() {
+    // Hosted capacity is never leased from a worker, so there is no lease to
+    // release; asking the scheduler would fail for a lease that never existed.
+    if s.is_production() && x.runtime != RuntimeKind::Hosted {
         s.scheduler()
             .release(p.tenant_id, id)
             .await
@@ -3070,6 +3249,9 @@ mod tests {
             include_unhealthy: bool,
         ) -> Result<Vec<WorkerRecord>, CoreError> {
             self.inner.list_workers(include_unhealthy).await
+        }
+        async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, CoreError> {
+            self.inner.list_keys(tenant).await
         }
         async fn set_worker_draining(
             &self,

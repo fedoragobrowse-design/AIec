@@ -1,7 +1,6 @@
 <!-- meta:title=Usage and quotas -->
 <!-- meta:description=AgentForge usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents. -->
 
-<p class="eyebrow">Account</p>
 <h1>Usage and quotas</h1>
 <p class="lead">
   You can always see what you have used and what you have left. Quotas are
@@ -9,7 +8,7 @@
 </p>
 
 <h2>What counts as usage</h2>
-<table>
+<table class="kv">
   <tr><th>Metric</th><th>Measured</th></tr>
   <tr><td>Sandbox runtime</td><td>From creation until destroy</td></tr>
   <tr><td>vCPU</td><td>Allocated vCPU &times; seconds</td></tr>
@@ -31,7 +30,7 @@ print(usage)</code></pre>
   Every tenant has limits. They are checked inside the same transaction that
   places a sandbox, so two concurrent creates cannot both slip past the limit.
 </p>
-<table>
+<table class="kv">
   <tr><th>Quota</th><th>What it stops</th></tr>
   <tr><td>Active sandboxes</td><td>A runaway agent accumulating machines</td></tr>
   <tr><td>vCPU</td><td>One sandbox requesting a very large machine</td></tr>
@@ -45,18 +44,18 @@ the request rate returns <code>429 rate_limited</code> with a
 <code>Retry-After</code> header.</p>
 
 <h2>Stopping runaway agents</h2>
-<div class="grid three">
-  <div class="card">
+<div class="grid-3">
+  <div class="block">
     <h3>Short default lifetime</h3>
     <p>Sandboxes time out on their own. A hung agent does not hold a machine
        forever.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Hard maximum lifetime</h3>
     <p>There is an absolute ceiling no single sandbox can exceed, whatever it
        requests.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Global budget</h3>
     <p>Cloud runs against a global execution budget. When it is reached, new
        creation stops cleanly and you get

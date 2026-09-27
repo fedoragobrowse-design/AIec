@@ -593,6 +593,10 @@ pub struct ApiKeyRecord {
     pub scopes: Vec<Scope>,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Human-recognisable label so the right key can be revoked later.
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
 }
 #[derive(Clone, Debug)]
 pub struct Principal {

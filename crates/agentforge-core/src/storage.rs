@@ -395,6 +395,9 @@ pub trait MetadataStore: Send + Sync {
     async fn revoke_key(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError>;
     /// Finds an API key by digest.
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError>;
+    /// Lists a tenant's API keys as metadata. Secrets are never returned:
+    /// only a digest is stored.
+    async fn list_keys(&self, tenant: TenantId) -> Result<Vec<ApiKeyRecord>, CoreError>;
     /// Stores snapshot metadata.
     async fn put_snapshot(&self, value: Snapshot) -> Result<(), CoreError>;
     /// Gets tenant-owned snapshot metadata.

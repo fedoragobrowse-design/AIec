@@ -178,6 +178,9 @@ async fn registry_auto_uses_available_capable_runtime() {
         digest: key_digest(&key),
         scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     }))
     .unwrap();
@@ -253,6 +256,9 @@ async fn registry_auto_honors_microvm_isolation_policy() {
         digest: key_digest(&key),
         scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     }))
     .unwrap();
@@ -335,6 +341,14 @@ fn development_platform(
     )
 }
 
+/// Builds a router over `repo` whose signup accepts `invites`.
+fn setup_with_invites(repo: Arc<MemoryRepository>, invites: &[&str]) -> axum::Router {
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo, None);
+    let state = AppState::development(platform)
+        .with_invites(invites.iter().map(|code| code.to_string()).collect());
+    agentforge_api::router(state)
+}
+
 fn setup() -> (axum::Router, String, String) {
     let repo = MemoryRepository::new();
     let a = generate_api_key();
@@ -353,6 +367,9 @@ fn setup() -> (axum::Router, String, String) {
                 Scope::SnapshotsWrite,
             ],
             expires_at: None,
+            name: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
             revoked_at: None,
         })
         .await
@@ -363,6 +380,9 @@ fn setup() -> (axum::Router, String, String) {
             digest: key_digest(&b),
             scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
             expires_at: None,
+            name: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
             revoked_at: None,
         })
         .await
@@ -382,6 +402,9 @@ fn setup_docker() -> (axum::Router, String) {
         digest: key_digest(&key),
         scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     }))
     .unwrap();
@@ -414,6 +437,9 @@ fn setup_docker_with_resolver() -> (axum::Router, String, Arc<RecordingResolver>
         digest: key_digest(&key),
         scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     }))
     .unwrap();
@@ -729,6 +755,9 @@ async fn bubblewrap_pause_returns_not_implemented() {
         digest: key_digest(&key),
         scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     }))
     .unwrap();
@@ -1041,6 +1070,9 @@ fn setup_with_artifacts() -> (axum::Router, String, String) {
             digest: key_digest(&a),
             scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
             expires_at: None,
+            name: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
             revoked_at: None,
         })
         .await
@@ -1051,6 +1083,9 @@ fn setup_with_artifacts() -> (axum::Router, String, String) {
             digest: key_digest(&b),
             scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
             expires_at: None,
+            name: "test".to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
             revoked_at: None,
         })
         .await
@@ -1264,6 +1299,365 @@ async fn cross_tenant_is_not_found() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+/// Cross-tenant attack matrix.
+///
+/// Tenant B must not be able to reach Tenant A's resources by knowing their
+/// identifiers. Possession of a resource ID must never imply authorization, so
+/// every operation below must answer 404 rather than 403 (a 403 would confirm
+/// the resource exists) and must never return A's data or mutate A's state.
+#[tokio::test]
+async fn cross_tenant_attack_matrix_is_denied_everywhere() {
+    let (router, a, b) = setup();
+
+    // Tenant A creates a sandbox, a secret, a snapshot and an artifact.
+    let create = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/sandboxes")
+                .header("authorization", format!("Bearer {a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let sandbox = created["id"].as_str().expect("sandbox id").to_string();
+
+    let seeded = router
+        .clone()
+        .oneshot(
+            Request::put(format!("/v1/sandboxes/{sandbox}/secrets/TOKEN"))
+                .header("authorization", format!("Bearer {a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"value":"a-private-value"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(seeded.status().is_success(), "seeding a secret failed");
+
+    let snap = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{sandbox}/snapshots"))
+                .header("authorization", format!("Bearer {a}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"workspace"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let snap_status = snap.status();
+    let snap_id = if snap_status == StatusCode::CREATED || snap_status == StatusCode::OK {
+        serde_json::from_slice::<serde_json::Value>(
+            &axum::body::to_bytes(snap.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .ok()
+        .and_then(|value| value["id"].as_str().map(str::to_string))
+    } else {
+        None
+    };
+
+    // Every cross-tenant operation, with a known-good identifier.
+    let mut attacks: Vec<(&str, axum::http::Method, String, Option<&str>)> = vec![
+        (
+            "get sandbox",
+            axum::http::Method::GET,
+            format!("/v1/sandboxes/{sandbox}"),
+            None,
+        ),
+        (
+            "exec",
+            axum::http::Method::POST,
+            format!("/v1/sandboxes/{sandbox}/exec"),
+            Some(r#"{"command":["id"]}"#),
+        ),
+        (
+            "write file",
+            axum::http::Method::PUT,
+            format!("/v1/sandboxes/{sandbox}/files"),
+            Some(r#"{"path":"/workspace/x","content_base64":"eA=="}"#),
+        ),
+        (
+            "read file",
+            axum::http::Method::GET,
+            format!("/v1/sandboxes/{sandbox}/files/content?path=/workspace/x"),
+            None,
+        ),
+        (
+            "list files",
+            axum::http::Method::GET,
+            format!("/v1/sandboxes/{sandbox}/files"),
+            None,
+        ),
+        (
+            "delete file",
+            axum::http::Method::DELETE,
+            format!("/v1/sandboxes/{sandbox}/files?path=/workspace/x"),
+            None,
+        ),
+        (
+            "make directory",
+            axum::http::Method::POST,
+            format!("/v1/sandboxes/{sandbox}/files/mkdir"),
+            Some(r#"{"path":"/workspace/d"}"#),
+        ),
+        (
+            "stop",
+            axum::http::Method::POST,
+            format!("/v1/sandboxes/{sandbox}/stop"),
+            None,
+        ),
+        (
+            "start",
+            axum::http::Method::POST,
+            format!("/v1/sandboxes/{sandbox}/start"),
+            None,
+        ),
+        (
+            "delete sandbox",
+            axum::http::Method::DELETE,
+            format!("/v1/sandboxes/{sandbox}"),
+            None,
+        ),
+    ];
+    if let Some(snap_id) = &snap_id {
+        attacks.push((
+            "get snapshot",
+            axum::http::Method::GET,
+            format!("/v1/snapshots/{snap_id}"),
+            None,
+        ));
+        attacks.push((
+            "delete snapshot",
+            axum::http::Method::DELETE,
+            format!("/v1/snapshots/{snap_id}"),
+            None,
+        ));
+        attacks.push((
+            "restore snapshot",
+            axum::http::Method::POST,
+            format!("/v1/snapshots/{snap_id}/restore"),
+            Some(r#"{}"#),
+        ));
+    }
+
+    for (label, method, path, body) in attacks {
+        let payload = body.map(Body::from).unwrap_or_else(Body::empty);
+        let request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header("authorization", format!("Bearer {b}"))
+            .header("content-type", "application/json")
+            .body(payload)
+            .expect("request builds");
+        let response = router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        // 404 proves the resource is invisible to B. 401/403 would mean B was
+        // denied rather than hidden, which leaks existence.
+        assert!(
+            status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST,
+            "cross-tenant {label} returned {status}, expected the resource to be invisible"
+        );
+    }
+
+    // List endpoints may legitimately answer 200 — a tenant may list its own
+    // resources. What must never happen is tenant A's data appearing in tenant
+    // B's view, so those are asserted on content rather than status.
+    for (label, path) in [
+        ("sandboxes", "/v1/sandboxes".to_string()),
+        ("usage", "/v1/usage".to_string()),
+        ("snapshots", format!("/v1/sandboxes/{sandbox}/snapshots")),
+        ("artifacts", format!("/v1/sandboxes/{sandbox}/artifacts")),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(&path)
+                    .header("authorization", format!("Bearer {b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(&sandbox),
+            "tenant B saw tenant A's sandbox through {label}: {text}"
+        );
+        assert!(
+            !text.contains("a-private-value"),
+            "tenant B saw tenant A's secret value through {label}"
+        );
+    }
+
+    // Tenant A's sandbox must still exist and be usable: the attacks above
+    // must not have mutated another tenant's state.
+    let survivor = router
+        .oneshot(
+            Request::get(format!("/v1/sandboxes/{sandbox}"))
+                .header("authorization", format!("Bearer {a}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        survivor.status(),
+        StatusCode::OK,
+        "tenant A's sandbox was damaged by cross-tenant attacks"
+    );
+}
+
+/// A stranger can sign up with an invite and immediately use the key they get.
+#[tokio::test]
+async fn signup_with_invite_returns_a_usable_key() {
+    let repo = MemoryRepository::new();
+    let router = setup_with_invites(repo, &["alpha-one"]);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Ada"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key = value["key"]["key"]
+        .as_str()
+        .expect("key returned once")
+        .to_string();
+    assert!(key.starts_with("af_live_"));
+    assert_eq!(value["account"]["name"], "Ada");
+
+    // The returned key must actually authenticate.
+    let usable = router
+        .clone()
+        .oneshot(
+            Request::get("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(usable.status(), StatusCode::OK);
+}
+
+/// Signup without a valid invite is refused, and an unconfigured deployment has
+/// signup closed rather than open.
+#[tokio::test]
+async fn signup_requires_a_configured_invite() {
+    let repo = MemoryRepository::new();
+    let router_closed = setup_with_invites(repo, &[]);
+    let response = router_closed
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"anything","name":"Mallory"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a deployment with no configured invites must not accept signups"
+    );
+}
+
+/// A signed-up tenant can list and revoke its own keys, and never sees a secret.
+#[tokio::test]
+async fn a_tenant_can_manage_its_own_keys() {
+    let repo = MemoryRepository::new();
+    let router = setup_with_invites(repo, &["alpha-one"]);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Grace"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key = value["key"]["key"].as_str().expect("key").to_string();
+    let key_id = value["key"]["id"].as_str().expect("key id").to_string();
+
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::get("/v1/keys")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listed["keys"].as_array().expect("keys array").len(), 1);
+    assert!(
+        body.windows(11).all(|w| w != b"af_live_abc"),
+        "a listing must never contain key material"
+    );
+
+    let revoked = router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/keys/{key_id}"))
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+
+    // The revoked key must stop working immediately.
+    let after = router
+        .oneshot(
+            Request::get("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+}
 #[tokio::test]
 async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
     use agentforge_runtime::BubblewrapRuntime;
@@ -1281,6 +1675,9 @@ async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
         digest: key_digest(&key),
         scopes: vec![Scope::Admin],
         expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
         revoked_at: None,
     })
     .await

@@ -8,14 +8,19 @@
 <meta property="og:title" content="Docs — AgentForge">
 <meta property="og:description" content="AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance.">
 <meta property="og:type" content="website">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/assets/site.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%234ade80'/></svg>">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
 </head>
 <body>
-<header class="site">
-  <div class="wrap">
-    <a class="brand" href="/"><span class="dot"></span>AgentForge</a>
-    <nav class="site"><a href="/">Home</a>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
       <a href="/docs" aria-current="page">Docs</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud">Cloud</a>
@@ -23,14 +28,36 @@
       <a href="/cloud/usage">Usage</a>
       <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security">Security</a>
-      <a href="/status">Status</a></nav>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </header>
-<main><div class="wrap">
+<div class="shell">
+  <aside class="rail">
+    
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>egress filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Availability</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+      </dl>
+    </div>
+
+  </aside>
+  <main class="content">
 <!-- meta:title=Docs -->
 <!-- meta:description=AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance. -->
 
-<p class="eyebrow">Documentation</p>
 <h1>Docs</h1>
 <p class="lead">From nothing to a running sandbox in about five minutes, with no
 infrastructure of your own.</p>
@@ -60,24 +87,24 @@ box.destroy()</code></pre>
 )</code></pre>
 
 <h2 id="core">Core concepts</h2>
-<div class="grid two">
-  <div class="card">
+<div class="grid-2">
+  <div class="block">
     <h3>Tenant</h3>
     <p>Every API key belongs to a tenant. A tenant owns its sandboxes, snapshots,
        artifacts, usage, quotas and secrets. Possession of a resource ID does not
        grant access to it.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Sandbox</h3>
     <p>A disposable computer. It is leased from the scheduler, billed while it
        runs, and destroyed when you are done with it.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>API key</h3>
     <p>A bearer credential. Stored hashed, shown once, revocable, rotatable.
        Scoped so a key can be limited to specific operations.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Quota</h3>
     <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
        placement time. Exceeding one returns <code>429</code>.</p>
@@ -128,7 +155,7 @@ box2.restore(snap)</code></pre>
     "request_id": "01a0e113-..."
   }
 }</code></pre>
-<table>
+<table class="kv">
   <tr><th>Status</th><th><code>code</code></th><th>Meaning</th></tr>
   <tr><td>400</td><td><code>invalid_request</code></td><td>Malformed request</td></tr>
   <tr><td>401</td><td><code>unauthorized</code></td><td>Missing or invalid API key</td></tr>
@@ -171,27 +198,27 @@ agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
 <p>Full instructions: <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>.</p>
 
 <h2 id="operations">Operating it</h2>
-<div class="grid two">
-  <div class="card">
+<div class="grid-2">
+  <div class="block">
     <h3>Health endpoints</h3>
     <p><code>/health</code> is liveness and is dependency-free.
        <code>/ready</code> is readiness and reflects the database, object storage
        and available capacity, so a rolling deploy is held back when the instance
        genuinely cannot serve traffic.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Metrics</h3>
     <p><code>/metrics</code> exposes Prometheus text format: request rate,
        latency, errors, sandbox counts, worker capacity and health, lease
        expirations, reassignments, quota and rate-limit denials.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Backups</h3>
     <p>Back up both the database and the object store, and test the restore. The
        database holds tenancy, leases and quotas; the object store holds snapshots
        and artifacts.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Draining a worker</h3>
     <p>A draining worker receives no new sandboxes while finishing the ones it
        already holds, so it can be upgraded or restarted without disrupting
@@ -200,21 +227,25 @@ agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
 </div>
 
 <h2>SDKs</h2>
-<table>
+<table class="kv">
   <tr><th>Language</th><th>Install</th><th>Import</th></tr>
   <tr><td>Python</td><td><code>pip install agentforge-sdk</code></td><td><code>from agentforge import AgentForge</code></td></tr>
   <tr><td>Rust</td><td><code>cargo add agentforge-client</code></td><td><code>use agentforge_client::AgentForgeClient</code></td></tr>
   <tr><td>HTTP</td><td>—</td><td><code>curl</code> / any HTTP client</td></tr>
 </table>
 
-</div></main>
-<footer class="site">
-  <div class="wrap">
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
     <span>Computers for AI agents.</span>
-    <nav><a href="/docs">Docs</a>
+    <nav class="colophon__nav">
+      <a href="/docs">Docs</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="https://github.com/fedoragobrowse-design/AIec">GitHub</a></nav>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </footer>
 </body>

@@ -8,14 +8,19 @@
 <meta property="og:title" content="Security — AgentForge">
 <meta property="og:description" content="How AgentForge isolates untrusted agent code: Firecracker microVMs, network egress policy, tenant isolation, secret handling and how to report a vulnerability.">
 <meta property="og:type" content="website">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/assets/site.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%234ade80'/></svg>">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
 </head>
 <body>
-<header class="site">
-  <div class="wrap">
-    <a class="brand" href="/"><span class="dot"></span>AgentForge</a>
-    <nav class="site"><a href="/">Home</a>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
       <a href="/docs">Docs</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud">Cloud</a>
@@ -23,14 +28,36 @@
       <a href="/cloud/usage">Usage</a>
       <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security" aria-current="page">Security</a>
-      <a href="/status">Status</a></nav>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </header>
-<main><div class="wrap">
+<div class="shell">
+  <aside class="rail">
+    
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>egress filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Availability</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+      </dl>
+    </div>
+
+  </aside>
+  <main class="content">
 <!-- meta:title=Security -->
 <!-- meta:description=How AgentForge isolates untrusted agent code: Firecracker microVMs, network egress policy, tenant isolation, secret handling and how to report a vulnerability. -->
 
-<p class="eyebrow">Trust</p>
 <h1>Security</h1>
 <p class="lead">
   AgentForge runs code written by autonomous agents. That code is treated as
@@ -45,28 +72,28 @@ tenant B sandbox  ─┘
                         ├─ vsock control channel (never on the network)
                         └─ egress filtered by nftables policy</code></pre>
 
-<div class="grid two">
-  <div class="card">
+<div class="grid-2">
+  <div class="block">
     <h3>Firecracker, always, for untrusted code</h3>
     <p>Public workloads run in microVMs with their own guest kernel. A tenant
        cannot request a weaker runtime and downgrade their own isolation.
        Docker remains available only for trusted self-hosted deployments and
        local development.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Nothing shared</h3>
     <p>Each sandbox gets its own kernel, root filesystem and network namespace.
        A bug in one guest does not reach another guest, and the host kernel is not
        exposed to the workload at all.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Filtered egress</h3>
     <p>A sandbox cannot reach the host LAN, RFC1918 ranges, link-local and cloud
        metadata addresses, the control plane, worker management endpoints, or
        another tenant. Restricted network mode fails closed rather than silently
        allowing traffic.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Tenancy is enforced server-side</h3>
     <p>Every tenant-scoped query is filtered by the authenticated tenant.
        Possession of a sandbox ID does not grant access to it; guessing another
@@ -84,18 +111,18 @@ tenant B sandbox  ─┘
 </ul>
 
 <h2>Abuse resistance</h2>
-<div class="grid three">
-  <div class="card">
+<div class="grid-3">
+  <div class="block">
     <h3>Quotas</h3>
     <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
        placement time under a database lock.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Rate limits</h3>
     <p>Per-tenant and per-address admission control on the public API, with
        <code>429</code> and a <code>Retry-After</code> header.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Budget ceiling</h3>
     <p>A global execution budget stops new creation rather than allowing a
        runaway agent to become a charge.</p>
@@ -122,14 +149,18 @@ tenant B sandbox  ─┘
   and summarised on the <a href="/status">status</a> page.
 </p>
 
-</div></main>
-<footer class="site">
-  <div class="wrap">
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
     <span>Computers for AI agents.</span>
-    <nav><a href="/docs">Docs</a>
+    <nav class="colophon__nav">
+      <a href="/docs">Docs</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="https://github.com/fedoragobrowse-design/AIec">GitHub</a></nav>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </footer>
 </body>

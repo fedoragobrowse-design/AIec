@@ -40,6 +40,19 @@ fn rate_limit() -> agentforge_api::ratelimit::RateLimit {
     agentforge_api::ratelimit::RateLimit::new(rps, burst)
 }
 
+/// Invite codes accepted by public signup, from `AGENTFORGE_INVITE_CODES`.
+///
+/// Comma-separated. When unset, signup is closed: a missing configuration must
+/// never silently become "anyone can create an account".
+fn invite_codes() -> Vec<String> {
+    std::env::var("AGENTFORGE_INVITE_CODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|code| code.trim().to_string())
+        .filter(|code| !code.is_empty())
+        .collect()
+}
+
 /// Global hosted-execution budget, from `AGENTFORGE_CLOUD_EXECUTION_BUDGET`.
 ///
 /// Unset means no ceiling is configured, which is only appropriate for a
@@ -261,6 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_lease_ttl(lease_ttl_seconds)
         .with_worker_token(worker_token)
         .with_hosted_only(hosted_only)
+        .with_invites(invite_codes())
         .with_rate_limit(rate_limit());
     if let Some(limit) = execution_budget_units() {
         state = state.with_execution_budget(limit);

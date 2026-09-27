@@ -1106,10 +1106,34 @@ impl PostgresRepository {
         Ok(())
     }
 
+    /// Reads an API key row, including its name and last-used stamp.
+    fn api_key_from_row(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord, StoreError> {
+        let scopes: serde_json::Value = row.try_get("scopes")?;
+        Ok(ApiKeyRecord {
+            id: row.try_get("id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            digest: {
+                let raw: Vec<u8> = row.try_get("digest")?;
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&raw);
+                out
+            },
+            scopes: scopes_from_value(scopes)?,
+            expires_at: row.try_get("expires_at")?,
+            revoked_at: row.try_get("revoked_at")?,
+            name: row
+                .try_get::<Option<String>, _>("name")?
+                .unwrap_or_default(),
+            created_at: row.try_get("created_at")?,
+            last_used_at: row.try_get("last_used_at")?,
+        })
+    }
+
     async fn put_key(&self, value: ApiKeyRecord) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO api_keys \
-             (id, tenant_id, digest, scopes, expires_at, revoked_at) VALUES ($1,$2,$3,$4,$5,$6)",
+             (id, tenant_id, digest, scopes, expires_at, revoked_at, name, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(value.id)
         .bind(value.tenant_id)
@@ -1117,6 +1141,8 @@ impl PostgresRepository {
         .bind(scope_values(&value.scopes)?)
         .bind(value.expires_at)
         .bind(value.revoked_at)
+        .bind(&value.name)
+        .bind(value.created_at)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
@@ -1139,6 +1165,18 @@ impl PostgresRepository {
         Ok(())
     }
 
+    /// Lists a tenant's API keys, newest first.
+    async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC, id DESC",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(Self::api_key_from_row).collect()
+    }
+
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, StoreError> {
         let row = sqlx::query("SELECT * FROM api_keys WHERE digest = $1")
             .bind(digest.as_slice())
@@ -1156,6 +1194,11 @@ impl PostgresRepository {
             scopes: scopes_from_value(row.try_get("scopes")?)?,
             expires_at: row.try_get("expires_at")?,
             revoked_at: row.try_get("revoked_at")?,
+            name: row
+                .try_get::<Option<String>, _>("name")?
+                .unwrap_or_default(),
+            created_at: row.try_get("created_at")?,
+            last_used_at: row.try_get("last_used_at")?,
         })
     }
 
@@ -2626,6 +2669,10 @@ impl MetadataStore for PostgresRepository {
     async fn revoke_key(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
         Self::revoke_key(self, tenant, id).await.map_err(core_error)
     }
+    async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, CoreError> {
+        Self::list_keys(self, tenant).await.map_err(core_error)
+    }
+
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {
         Self::find_key(self, digest).await.map_err(core_error)
     }

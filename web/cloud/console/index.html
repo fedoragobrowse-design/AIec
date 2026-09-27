@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console — AgentForge</title>
+<meta name="description" content="Your AgentForge account, API keys, sandboxes, usage and service health.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="stylesheet" href="/assets/dashboard.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <nav class="masthead__nav"><a href="/docs">Docs</a>
+      <a href="/security">Security</a>
+      <a href="/status">Status</a></nav>
+  </div>
+</header>
+<!-- meta:title=Console -->
+<!-- meta:description=Your AgentForge account, API keys, sandboxes, usage and service health. -->
+
+<main class="dash">
+  <div class="dash__head">
+    <div>
+      <h1 class="dash__title">Console</h1>
+      <p class="lede" style="margin-top:6px">
+        Your account, keys, sandboxes and usage. Everything here is also
+        available through the API and SDK.
+      </p>
+    </div>
+    <div style="display:flex;gap:16px;align-items:baseline">
+      <span class="dash__who" id="who"></span>
+      <button class="linkbtn" id="signout" type="button" hidden>Sign out</button>
+    </div>
+  </div>
+
+  <!-- Signup and sign-in. Public alpha is invite only. -->
+  <section class="panel" id="auth-panel">
+    <div class="panel__head">
+      <h2 class="panel__title">Get access</h2>
+      <span class="panel__note">public alpha · invite only</span>
+    </div>
+    <form id="signup-form" novalidate>
+      <div class="field">
+        <label for="invite">Invite code</label>
+        <input id="invite" name="invite" autocomplete="off" spellcheck="false" required>
+        <span class="field__hint">Sent to you when your invite was accepted.</span>
+      </div>
+      <div class="field">
+        <label for="account-name">Account name</label>
+        <input id="account-name" name="name" autocomplete="organization" required>
+      </div>
+      <button class="btn btn--solid" type="submit">Create my account</button>
+    </form>
+    <div id="auth-message" role="status" aria-live="polite"></div>
+  </section>
+
+  <!-- Signed-in view. -->
+  <div id="dash-panel" hidden>
+    <section class="panel">
+      <div class="panel__head">
+        <h2 class="panel__title">API keys</h2>
+        <span class="panel__note" id="key-count"></span>
+      </div>
+      <form id="create-key-form" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+        <div class="field" style="margin-bottom:0">
+          <label for="key-name">New key name</label>
+          <input id="key-name" name="name" placeholder="ci-agent" autocomplete="off">
+        </div>
+        <button class="btn" type="submit">Create key</button>
+      </form>
+      <div id="key-message" role="status" aria-live="polite"></div>
+      <div id="key-reveal"></div>
+      <div class="rows" id="key-rows"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2 class="panel__title">Sandboxes</h2>
+        <span class="panel__note" id="box-count"></span>
+      </div>
+      <div id="box-message" role="status" aria-live="polite"></div>
+      <div class="rows" id="box-rows"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2 class="panel__title">Usage</h2>
+        <span class="panel__note">this tenant</span>
+      </div>
+      <div class="rows" id="usage-meters"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2 class="panel__title">Service</h2>
+        <span class="panel__note">live</span>
+      </div>
+      <div class="rows" id="health-rows"></div>
+    </section>
+  </div>
+</main>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/security">Security</a>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a></nav>
+  </div>
+</footer>
+<script src="/assets/dashboard.js" defer></script>
+</body>
+</html>

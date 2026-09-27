@@ -8,14 +8,19 @@
 <meta property="og:title" content="AgentForge Cloud — AgentForge">
 <meta property="og:description" content="AgentForge Cloud: managed Firecracker sandboxes for AI agents. We run the infrastructure, you use the API.">
 <meta property="og:type" content="website">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/assets/site.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%234ade80'/></svg>">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
 </head>
 <body>
-<header class="site">
-  <div class="wrap">
-    <a class="brand" href="/"><span class="dot"></span>AgentForge</a>
-    <nav class="site"><a href="/">Home</a>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
       <a href="/docs">Docs</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud" aria-current="page">Cloud</a>
@@ -23,14 +28,36 @@
       <a href="/cloud/usage">Usage</a>
       <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security">Security</a>
-      <a href="/status">Status</a></nav>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </header>
-<main><div class="wrap">
+<div class="shell">
+  <aside class="rail">
+    
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>egress filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Availability</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+      </dl>
+    </div>
+
+  </aside>
+  <main class="content">
 <!-- meta:title=AgentForge Cloud -->
 <!-- meta:description=AgentForge Cloud: managed Firecracker sandboxes for AI agents. We run the infrastructure, you use the API. -->
 
-<p class="eyebrow">AgentForge Cloud</p>
 <h1>Managed sandboxes, one API</h1>
 <p class="lead">
   We run the Firecracker capacity, the database, object storage, TLS, backups and
@@ -43,23 +70,23 @@
 </div>
 
 <h2>What you get</h2>
-<div class="grid two">
-  <div class="card">
+<div class="grid-2">
+  <div class="block">
     <h3>Firecracker isolation by default</h3>
     <p>Public workloads run in microVMs with their own kernel and filesystem. You
        cannot request a weaker runtime and downgrade your own isolation.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Disposable by default</h3>
     <p>Create, use, destroy. Sandboxes are short-lived and billed while they run,
        so agents can churn through them freely.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Coding images</h3>
     <p>Git, CA certificates, Python, curl and tar are in the image. Clone over
        HTTPS with real certificate validation, edit in place, run the tests.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Works with your agent</h3>
     <p>The API is the product. Use the Python SDK, the Rust SDK, or plain HTTP from
        whatever runtime your agent is written in.</p>
@@ -96,14 +123,18 @@ box.destroy()</code></pre>
   </p>
 </div>
 
-</div></main>
-<footer class="site">
-  <div class="wrap">
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
     <span>Computers for AI agents.</span>
-    <nav><a href="/docs">Docs</a>
+    <nav class="colophon__nav">
+      <a href="/docs">Docs</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="https://github.com/fedoragobrowse-design/AIec">GitHub</a></nav>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </footer>
 </body>

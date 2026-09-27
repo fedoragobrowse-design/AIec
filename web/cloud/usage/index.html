@@ -8,14 +8,19 @@
 <meta property="og:title" content="Usage and quotas — AgentForge">
 <meta property="og:description" content="AgentForge usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents.">
 <meta property="og:type" content="website">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/assets/site.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%234ade80'/></svg>">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
 </head>
 <body>
-<header class="site">
-  <div class="wrap">
-    <a class="brand" href="/"><span class="dot"></span>AgentForge</a>
-    <nav class="site"><a href="/">Home</a>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
       <a href="/docs">Docs</a>
       <a href="/pricing">Pricing</a>
       <a href="/cloud">Cloud</a>
@@ -23,14 +28,36 @@
       <a href="/cloud/usage" aria-current="page">Usage</a>
       <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security">Security</a>
-      <a href="/status">Status</a></nav>
+      <a href="/status">Status</a>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </header>
-<main><div class="wrap">
+<div class="shell">
+  <aside class="rail">
+    
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>egress filtered</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Availability</span>
+      <dl>
+        <dt>signup</dt><dd>invite only</dd>
+        <dt>regions</dt><dd>1</dd>
+        <dt>SLA</dt><dd>none in alpha</dd>
+      </dl>
+    </div>
+
+  </aside>
+  <main class="content">
 <!-- meta:title=Usage and quotas -->
 <!-- meta:description=AgentForge usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents. -->
 
-<p class="eyebrow">Account</p>
 <h1>Usage and quotas</h1>
 <p class="lead">
   You can always see what you have used and what you have left. Quotas are
@@ -38,7 +65,7 @@
 </p>
 
 <h2>What counts as usage</h2>
-<table>
+<table class="kv">
   <tr><th>Metric</th><th>Measured</th></tr>
   <tr><td>Sandbox runtime</td><td>From creation until destroy</td></tr>
   <tr><td>vCPU</td><td>Allocated vCPU &times; seconds</td></tr>
@@ -60,7 +87,7 @@ print(usage)</code></pre>
   Every tenant has limits. They are checked inside the same transaction that
   places a sandbox, so two concurrent creates cannot both slip past the limit.
 </p>
-<table>
+<table class="kv">
   <tr><th>Quota</th><th>What it stops</th></tr>
   <tr><td>Active sandboxes</td><td>A runaway agent accumulating machines</td></tr>
   <tr><td>vCPU</td><td>One sandbox requesting a very large machine</td></tr>
@@ -74,18 +101,18 @@ the request rate returns <code>429 rate_limited</code> with a
 <code>Retry-After</code> header.</p>
 
 <h2>Stopping runaway agents</h2>
-<div class="grid three">
-  <div class="card">
+<div class="grid-3">
+  <div class="block">
     <h3>Short default lifetime</h3>
     <p>Sandboxes time out on their own. A hung agent does not hold a machine
        forever.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Hard maximum lifetime</h3>
     <p>There is an absolute ceiling no single sandbox can exceed, whatever it
        requests.</p>
   </div>
-  <div class="card">
+  <div class="block">
     <h3>Global budget</h3>
     <p>Cloud runs against a global execution budget. When it is reached, new
        creation stops cleanly and you get
@@ -111,14 +138,18 @@ the request rate returns <code>429 rate_limited</code> with a
   <li>Give each agent its own key so you can revoke one noisy workload cleanly.</li>
 </ul>
 
-</div></main>
-<footer class="site">
-  <div class="wrap">
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
     <span>Computers for AI agents.</span>
-    <nav><a href="/docs">Docs</a>
+    <nav class="colophon__nav">
+      <a href="/docs">Docs</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="https://github.com/fedoragobrowse-design/AIec">GitHub</a></nav>
+      <a href="/cloud/console">Console</a>
+    </nav>
   </div>
 </footer>
 </body>
