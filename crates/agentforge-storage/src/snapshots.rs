@@ -10,16 +10,16 @@ pub fn snapshot_kind(kind: &str) -> Result<SnapshotKind, CoreError> {
         "vm" | "virtual_machine" => Ok(SnapshotKind::VirtualMachine),
         "memory" => Ok(SnapshotKind::Memory),
         "filesystem" | "workspace" => Ok(SnapshotKind::Workspace),
-        _ => Err(CoreError::Unsupported(format!(
-            "snapshot kind `{kind}`"
-        ))),
+        _ => Err(CoreError::Unsupported(format!("snapshot kind `{kind}`"))),
     }
 }
 
 /// Maps detailed relational snapshot metadata to provider-neutral restore metadata.
 pub fn snapshot_metadata(value: &StoredSnapshot) -> Result<SnapshotMetadata, CoreError> {
     if !value.complete {
-        return Err(CoreError::Conflict("snapshot metadata is incomplete".into()));
+        return Err(CoreError::Conflict(
+            "snapshot metadata is incomplete".into(),
+        ));
     }
     if value.checksum_sha256.len() != 64
         || !value

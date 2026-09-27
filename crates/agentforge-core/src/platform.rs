@@ -1,14 +1,14 @@
 //! Dependency-injection composition for an AgentForge deployment.
 
 use crate::{
+    CoreError,
     images::ImageResolver,
     network::NetworkBackend,
     policy::PlatformPolicy,
-    runtime::SandboxRuntime,
+    runtime::{RuntimeRegistry, SandboxRuntime},
     scheduler::Scheduler,
     snapshots::SnapshotProvider,
     storage::{ArtifactStore, MetadataStore},
-    CoreError,
 };
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Platform {
     runtime: Arc<dyn SandboxRuntime>,
+    runtime_registry: Option<Arc<RuntimeRegistry>>,
     metadata_store: Arc<dyn MetadataStore>,
     scheduler: Arc<dyn Scheduler>,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
@@ -32,6 +33,9 @@ impl Platform {
     }
 
     /// Returns the configured sandbox runtime.
+    pub fn runtime_registry(&self) -> Option<Arc<RuntimeRegistry>> {
+        self.runtime_registry.clone()
+    }
     pub fn runtime(&self) -> Arc<dyn SandboxRuntime> {
         self.runtime.clone()
     }
@@ -76,6 +80,7 @@ impl Platform {
 #[derive(Default)]
 pub struct PlatformBuilder {
     runtime: Option<Arc<dyn SandboxRuntime>>,
+    runtime_registry: Option<Arc<RuntimeRegistry>>,
     metadata_store: Option<Arc<dyn MetadataStore>>,
     scheduler: Option<Arc<dyn Scheduler>>,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
@@ -94,6 +99,12 @@ impl PlatformBuilder {
     /// Sets the required sandbox runtime.
     pub fn runtime(mut self, runtime: Arc<dyn SandboxRuntime>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Injects the runtime registry used for capability-based dispatch.
+    pub fn runtime_registry(mut self, registry: Arc<RuntimeRegistry>) -> Self {
+        self.runtime_registry = Some(registry);
         self
     }
 
@@ -141,10 +152,15 @@ impl PlatformBuilder {
 
     /// Validates required components and constructs the platform.
     pub fn build(self) -> Result<Platform, CoreError> {
-        let missing = |name: &str| CoreError::InvalidRequest(format!("platform component `{name}` is required"));
+        let missing = |name: &str| {
+            CoreError::InvalidRequest(format!("platform component `{name}` is required"))
+        };
         Ok(Platform {
             runtime: self.runtime.ok_or_else(|| missing("runtime"))?,
-            metadata_store: self.metadata_store.ok_or_else(|| missing("metadata_store"))?,
+            runtime_registry: self.runtime_registry,
+            metadata_store: self
+                .metadata_store
+                .ok_or_else(|| missing("metadata_store"))?,
             scheduler: self.scheduler.ok_or_else(|| missing("scheduler"))?,
             artifact_store: self.artifact_store,
             network: self.network,

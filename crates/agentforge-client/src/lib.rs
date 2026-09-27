@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub enum ClientError {
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("client configuration: {0}")]
+    Configuration(String),
     #[error("API error {status}: {message} (request {request_id})")]
     Api {
         status: StatusCode,
@@ -35,7 +37,15 @@ impl AgentForgeClient {
         base_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Result<Self, ClientError> {
-        let http = Client::builder().timeout(Duration::from_secs(60)).build()?;
+        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        if let Ok(path) = std::env::var("AGENTFORGE_TLS_CA_CERT") {
+            let pem = std::fs::read(&path)
+                .map_err(|error| ClientError::Configuration(format!("read {path}: {error}")))?;
+            let certificate = reqwest::Certificate::from_pem(&pem)
+                .map_err(|error| ClientError::Configuration(format!("parse {path}: {error}")))?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -108,10 +118,24 @@ impl AgentForgeClient {
         self.send(self.request(reqwest::Method::POST, &format!("/v1/sandboxes/{id}/resume")))
             .await
     }
+    pub async fn pause(&self, id: Uuid) -> Result<Sandbox, ClientError> {
+        self.send(self.request(reqwest::Method::POST, &format!("/v1/sandboxes/{id}/pause")))
+            .await
+    }
     pub async fn exec(&self, id: Uuid, request: &ExecRequest) -> Result<ExecResult, ClientError> {
         self.send(
             self.request(reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"))
                 .json(request),
+        )
+        .await
+    }
+    pub async fn git_diff(&self, id: Uuid) -> Result<serde_json::Value, ClientError> {
+        self.send(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/v1/sandboxes/{id}/git/diff"),
+            )
+            .json(&serde_json::json!({})),
         )
         .await
     }

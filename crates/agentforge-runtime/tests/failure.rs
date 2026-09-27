@@ -16,6 +16,7 @@ fn sandbox(runtime: RuntimeKind) -> Sandbox {
         disk_mb: 512,
         timeout_seconds: 60,
         network: NetworkPolicy::default(),
+        environment: Default::default(),
         created_at: now,
         updated_at: now,
         runtime_path: None,
@@ -34,6 +35,9 @@ fn firecracker_fails_closed_without_prerequisites() {
         guest_secret: vec![1; 32],
         guest_cid: 3,
         readiness_timeout: Duration::from_millis(1),
+        guest_artifact_dir: None,
+        guest_artifact: None,
+        require_coding_guest: false,
     };
     let error = config.check().expect_err("missing prerequisites must fail");
     assert!(error.to_string().contains("Firecracker binary"));

@@ -33,7 +33,10 @@ struct InlineScheduler;
 
 #[async_trait]
 impl Scheduler for InlineScheduler {
-    async fn schedule(&self, request: ScheduleRequest) -> Result<ScheduledSandbox, agentforge_core::CoreError> {
+    async fn schedule(
+        &self,
+        request: ScheduleRequest,
+    ) -> Result<ScheduledSandbox, agentforge_core::CoreError> {
         if request.request_id.is_nil() {
             return Err(agentforge_core::CoreError::InvalidRequest(
                 "request id is required".into(),
@@ -48,6 +51,13 @@ impl Scheduler for InlineScheduler {
         })
     }
 
+    async fn lease_generation(
+        &self,
+        _tenant_id: agentforge_core::TenantId,
+        _sandbox_id: agentforge_core::SandboxId,
+    ) -> Result<i64, agentforge_core::CoreError> {
+        Ok(1)
+    }
     async fn worker_endpoint(
         &self,
         _tenant_id: agentforge_core::TenantId,
@@ -113,6 +123,7 @@ fn sandbox(tenant_id: agentforge_core::TenantId) -> Sandbox {
         disk_mb: 2048,
         timeout_seconds: 300,
         network: NetworkPolicy::Disabled,
+        environment: Default::default(),
         created_at: now,
         updated_at: now,
         runtime_path: None,
@@ -169,18 +180,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         disk_mb: 2048,
         timeout_seconds: 300,
         network: NetworkPolicy::Disabled,
+        environment: Default::default(),
     };
-    assert!(policy.evaluate(PolicyOperation::CreateSandbox(&valid)).allowed);
-    let oversized = CreateSandboxRequest {
-        cpu: 2,
-        ..valid
-    };
-    assert!(!policy.evaluate(PolicyOperation::CreateSandbox(&oversized)).allowed);
+    assert!(
+        policy
+            .evaluate(PolicyOperation::CreateSandbox(&valid))
+            .allowed
+    );
+    let oversized = CreateSandboxRequest { cpu: 2, ..valid };
+    assert!(
+        !policy
+            .evaluate(PolicyOperation::CreateSandbox(&oversized))
+            .allowed
+    );
 
     let metadata = platform.artifact_store().expect("artifact store");
-    let stored = metadata.put("validation/artifact", b"core-extension").await?;
+    let stored = metadata
+        .put("validation/artifact", b"core-extension")
+        .await?;
     assert_eq!(stored.size_bytes, 14);
-    assert_eq!(metadata.get("validation/artifact").await?, b"core-extension");
+    assert_eq!(
+        metadata.get("validation/artifact").await?,
+        b"core-extension"
+    );
     metadata.delete("validation/artifact").await?;
 
     let attachment = network
@@ -188,10 +210,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     assert!(attachment.resource.is_empty());
     assert!(platform.runtime().capabilities().workspace_snapshot);
-    assert!(platform.snapshots().expect("snapshot provider").capabilities().workspace);
+    assert!(
+        platform
+            .snapshots()
+            .expect("snapshot provider")
+            .capabilities()
+            .workspace
+    );
     let _: RuntimeCapabilities = platform.runtime().capabilities();
     let _: RuntimeHealth = platform.runtime().health().await;
-    let _: SnapshotCapabilities = platform.snapshots().expect("snapshot provider").capabilities();
+    let _: SnapshotCapabilities = platform
+        .snapshots()
+        .expect("snapshot provider")
+        .capabilities();
 
     std::fs::remove_dir_all(&state_dir)?;
     println!(

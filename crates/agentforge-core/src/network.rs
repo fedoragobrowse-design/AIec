@@ -22,7 +22,6 @@ pub enum NetworkPolicy {
     },
 }
 
-
 impl NetworkPolicy {
     /// Whether a network attachment is required.
     pub fn is_enabled(&self) -> bool {
@@ -54,7 +53,6 @@ impl Serialize for NetworkPolicy {
 }
 
 impl<'de> Deserialize<'de> for NetworkPolicy {
-
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -72,14 +70,20 @@ impl<'de> Deserialize<'de> for NetworkPolicy {
         } else if value.allowed_hosts.is_empty() {
             Ok(Self::Internet)
         } else {
-            Ok(Self::Restricted { allowed_hosts: value.allowed_hosts })
+            Ok(Self::Restricted {
+                allowed_hosts: value.allowed_hosts,
+            })
         }
     }
 }
 impl NetworkAttachment {
     /// Creates an attachment description from backend resource data.
     pub fn new(resource: impl Into<String>, addresses: Vec<String>) -> Self {
-        Self { resource: resource.into(), addresses }
+        Self {
+            resource: resource.into(),
+            addresses,
+            guest_addresses: Vec::new(),
+        }
     }
 
     /// Returns the backend resource name.
@@ -90,6 +94,11 @@ impl NetworkAttachment {
     /// Returns addresses assigned to the attachment.
     pub fn addresses(&self) -> &[String] {
         &self.addresses
+    }
+
+    /// Returns addresses configured inside the guest.
+    pub fn guest_addresses(&self) -> &[String] {
+        &self.guest_addresses
     }
 }
 
@@ -122,6 +131,13 @@ pub struct NetworkAttachment {
     pub resource: String,
     /// Addresses assigned to the sandbox interface.
     pub addresses: Vec<String>,
+    /// Addresses configured inside the guest, as `address/prefix` or bare addresses.
+    ///
+    /// Backends whose guest is only reachable through host-side plumbing, such as
+    /// the Firecracker kernel command line, report the in-guest addresses here so
+    /// the runtime can configure the interface without guessing.
+    #[serde(default)]
+    pub guest_addresses: Vec<String>,
 }
 
 /// Creates and releases network resources for sandboxes.

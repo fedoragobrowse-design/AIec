@@ -1,7 +1,7 @@
 use agentforge_core::{
+    CoreError, CreateSandboxRequest, RestoreSnapshotRequest, Sandbox, SandboxId, TenantId,
     policy::{PlatformPolicy, PolicyDecision, PolicyOperation},
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
-    CoreError, CreateSandboxRequest, RestoreSnapshotRequest, Sandbox, TenantId, SandboxId,
 };
 use async_trait::async_trait;
 
@@ -40,7 +40,11 @@ fn validate_optional_resources(
     memory_mb: Option<u32>,
     disk_mb: Option<u32>,
 ) -> Result<(), CoreError> {
-    validate_resources(cpu.unwrap_or(1), memory_mb.unwrap_or(512), disk_mb.unwrap_or(2048))
+    validate_resources(
+        cpu.unwrap_or(1),
+        memory_mb.unwrap_or(512),
+        disk_mb.unwrap_or(2048),
+    )
 }
 
 fn validate_resources(cpu: u32, memory_mb: u32, disk_mb: u32) -> Result<(), CoreError> {
@@ -66,10 +70,7 @@ pub struct DevelopmentScheduler;
 
 #[async_trait]
 impl Scheduler for DevelopmentScheduler {
-    async fn schedule(
-        &self,
-        request: ScheduleRequest,
-    ) -> Result<ScheduledSandbox, CoreError> {
+    async fn schedule(&self, request: ScheduleRequest) -> Result<ScheduledSandbox, CoreError> {
         Ok(ScheduledSandbox {
             sandbox: request.sandbox,
             worker_id: TenantId::nil(),
@@ -79,6 +80,13 @@ impl Scheduler for DevelopmentScheduler {
         })
     }
 
+    async fn lease_generation(
+        &self,
+        _tenant_id: TenantId,
+        _sandbox_id: SandboxId,
+    ) -> Result<i64, CoreError> {
+        Ok(0)
+    }
     async fn worker_endpoint(
         &self,
         _tenant_id: TenantId,
@@ -87,11 +95,7 @@ impl Scheduler for DevelopmentScheduler {
         Ok(String::new())
     }
 
-    async fn release(
-        &self,
-        _tenant_id: TenantId,
-        _sandbox_id: SandboxId,
-    ) -> Result<(), CoreError> {
+    async fn release(&self, _tenant_id: TenantId, _sandbox_id: SandboxId) -> Result<(), CoreError> {
         Ok(())
     }
 }

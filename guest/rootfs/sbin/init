@@ -1,23 +1,71 @@
 #!/bin/sh
-set -eu
-mount -t proc proc /proc 2>/dev/null || true
-mount -t sysfs sysfs /sys 2>/dev/null || true
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-mkdir -p /dev/pts /run /workspace
-mount -t devpts devpts /dev/pts 2>/dev/null || true
-hostname agentforge-guest
-if [ ! -r /etc/agentforge-guest-secret ]; then
-  echo "FATAL: guest secret is missing" >/dev/console
+# PID 1 for the AgentForge Firecracker guest (Debian bookworm-slim rootfs).
+#
+# The guest address, gateway and DNS server come from the Firecracker boot
+# cmdline (the kernel does IP autoconfiguration); this script only brings up
+# the kernel filesystems and supervises the guest agent, which listens on vsock
+# port 1024 and serves /workspace.
+set -u
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+log() {
+  if [ -w /dev/console ]; then
+    printf '%s\n' "$*" >/dev/console 2>/dev/null || true
+  fi
+  printf '%s\n' "$*" >>/run/agentforge-init.log 2>/dev/null || true
+}
+
+mount -t proc proc /proc 2>/dev/null || log "WARN: could not mount /proc"
+mount -t sysfs sysfs /sys 2>/dev/null || log "WARN: could not mount /sys"
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || log "WARN: could not mount devtmpfs on /dev"
+mkdir -p /dev/pts /dev/shm /run /workspace
+mount -t devpts devpts /dev/pts -o gid=5,mode=620 2>/dev/null || log "WARN: could not mount devpts"
+mount -t tmpfs tmpfs /run -o mode=0755 2>/dev/null || true
+# Fallback nodes for a kernel without CONFIG_DEVTMPFS_MOUNT.
+[ -c /dev/null ] || mknod -m 0666 /dev/null c 1 3 2>/dev/null || true
+[ -c /dev/zero ] || mknod -m 0666 /dev/zero c 1 5 2>/dev/null || true
+[ -c /dev/console ] || mknod -m 0600 /dev/console c 5 1 2>/dev/null || true
+[ -c /dev/ttyS0 ] || mknod -m 0620 /dev/ttyS0 c 4 64 2>/dev/null || true
+
+if [ -r /etc/hostname ]; then
+  hostname "$(cat /etc/hostname)" 2>/dev/null || log "WARN: could not set the hostname"
+fi
+
+if [ ! -s /etc/resolv.conf ]; then
+  log "FATAL: /etc/resolv.conf is missing; the guest cannot resolve DNS"
   exec /bin/sh
 fi
-export AGENTFORGE_GUEST_SECRET="$(cat /etc/agentforge-guest-secret)"
-/usr/local/bin/agentforge-guest >/run/agentforge-guest.log 2>&1 &
-echo $! >/run/agentforge-guest.pid
-echo "agentforge-guest started" >/dev/console
+
+if [ ! -s /etc/agentforge-guest-secret ]; then
+  log "FATAL: guest secret is missing"
+  exec /bin/sh
+fi
+AGENTFORGE_GUEST_SECRET=$(cat /etc/agentforge-guest-secret)
+export AGENTFORGE_GUEST_SECRET
+
+AGENT=/usr/local/bin/agentforge-guest
+if [ ! -x "$AGENT" ]; then
+  log "FATAL: $AGENT is missing"
+  exec /bin/sh
+fi
+
+start_agent() {
+  # Agent stderr goes to the console as well as the log: the console is the
+  # only channel the host can read when the control path is the thing that is
+  # broken, and a guest agent that dies silently is undiagnosable.
+  "$AGENT" >>/run/agentforge-guest.log 2>>/dev/console &
+  echo $! >/run/agentforge-guest.pid
+}
+
+start_agent
+log "agentforge-guest started (pid $(cat /run/agentforge-guest.pid)), control port 1024"
 while :; do
-  if ! /bin/kill -0 "$(cat /run/agentforge-guest.pid 2>/dev/null || echo 0)" 2>/dev/null; then
-    /usr/local/bin/agentforge-guest >/run/agentforge-guest.log 2>&1 &
-    echo $! >/run/agentforge-guest.pid
+  pid=$(cat /run/agentforge-guest.pid 2>/dev/null || echo 0)
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "agentforge-guest exited; restarting"
+    start_agent
   fi
   sleep 1
 done

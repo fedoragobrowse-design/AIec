@@ -4,11 +4,11 @@
 
 AgentForge is an independent, open-source sandbox control plane inspired by published sandbox-platform research. It is not affiliated with or endorsed by DeepSeek.
 
-> **Development runtimes are not a public security boundary.** `bwrap-dev` and Docker development modes run hostile code with substantially weaker isolation than Firecracker. Never expose them to strangers or untrusted public workloads. Production mode is `firecracker` and fails closed when KVM, Firecracker, a kernel, rootfs, or guest networking prerequisites are missing.
+> **Development and Docker runtimes are not a public security boundary.** `bwrap-dev` and Docker runtimes have weaker isolation than Firecracker. Never expose them to strangers or untrusted public workloads. Production accepts an explicit `AGENTFORGE_RUNTIME=firecracker` or `AGENTFORGE_RUNTIME=docker`; Firecracker remains the recommended boundary for untrusted code.
 
 ## Quick start
 
-Requirements: Linux x86_64, Rust 1.88+, `bubblewrap`, PostgreSQL 15+ for production, and `tar`.
+Requirements: Linux x86_64, Rust 1.88+, `bubblewrap` for the development runtime, a reachable Docker Engine for the Docker runtime, PostgreSQL 15+ and S3-compatible storage for production, and `tar` for development snapshots.
 
 ```bash
 git clone <your-repository-url> agentforge
@@ -35,13 +35,13 @@ curl -fsS -H "Authorization: Bearer $AF_API_KEY" -H 'content-type: application/j
   "$AF_URL/v1/sandboxes/$ID/exec" | jq
 ```
 
-The development runtime is intentionally separate. Production uses an independent PostgreSQL-backed API, scheduler, authenticated worker RPC, Firecracker VM, and guest-agent VSock channel. See `docs/DEPLOYMENT.md` for exact production variables and worker launch.
+The development runtime is intentionally separate. Production uses an independent PostgreSQL-backed API, scheduler, authenticated worker RPC, and the explicitly configured Firecracker microVM or Docker Engine backend. See `docs/DEPLOYMENT.md` for exact variables and worker launch.
 
 
 ## Components
 
 - `agentforge-core`: dependency-light domain contracts and `Platform` composition for runtimes, scheduling, metadata, artifacts, networking, images, snapshots, and policy.
-- `agentforge-runtime`: Firecracker lifecycle/config and explicit bubblewrap development backend; both implement the Core runtime contract.
+- `agentforge-runtime`: Firecracker and Docker Engine API backends plus the explicit bubblewrap development backend; all implement the Core runtime contract.
 - `agentforge-storage`: PostgreSQL metadata/scheduling and S3/filesystem artifacts, adapted to Core storage contracts.
 - `agentforge-api`: Axum API, worker RPC, lifecycle orchestration, health, and metrics; production and development launchers compose a Core `Platform` first.
 - `agentforge-client` and `agentforge-cli`: Rust SDK and command-line UX over AgentForge's versioned HTTP API.
@@ -57,7 +57,7 @@ cargo run -p agentforge-api --example custom_core_platform
 
 ## Development infrastructure
 
-`docker compose` is optional for PostgreSQL, MinIO, and Prometheus. The application itself runs on the host. The committed compose file is infrastructure-only.
+`docker compose` is optional for PostgreSQL, MinIO, and Prometheus. The committed Compose file uses the locally built `agentforge-minio:RELEASE.2025-10-15T17-29-55Z` image by default; set `AGENTFORGE_MINIO_IMAGE` to an approved internal image when running elsewhere. The application itself runs on the host. `scripts/bootstrap-local-services.sh` requires a trusted host `mc` executable via `AGENTFORGE_MC_BIN` or `PATH`.
 
 ## Verified Firecracker path
 
@@ -72,7 +72,7 @@ AGENTFORGE_GUEST_SECRET='<same secret used to build the guest>' \
 cargo test -p agentforge-runtime --test firecracker -- --nocapture
 ```
 
-On the development host this completed in 37.23 seconds (40.17 seconds including Cargo startup), with 529,304 KiB maximum resident set size for the test process. This is a single-host functional measurement, not a production benchmark.
+Earlier Firecracker measurements are historical only. The current authoritative run is blocked before boot because `AGENTFORGE_FIRECRACKER_BIN` is unset; this is not current PASS evidence.
 
 ## Validation
 
@@ -83,3 +83,8 @@ cargo test --workspace
 ```
 
 An end-to-end script is in `scripts/smoke.sh`. Benchmarks are only reported after `agentforge benchmark` measures real requests; this README publishes no invented numbers.
+
+## Private-alpha status
+
+The current repository preserves the DSec-inspired Core/default-distribution split and contains Firecracker and Docker runtime paths. Live Docker Engine API execution, live PostgreSQL storage, live MinIO/S3 artifact workflows, and a real Firecracker v1.17.0 microVM test have passed. The Firecracker test used the approved uncompressed `.agentforge/images/vmlinux`, a freshly built rootfs, and the retained guest secret; it exercised exec, stdin, files, pause/resume, full snapshot, destroy, and restore. Two independent production workers remain blocked because the production worker client requires HTTPS and this host has no TLS-terminated worker endpoints. Remaining gaps are tracked in `docs/PRIVATE_ALPHA.md` with exact prerequisites and test commands.
+The following private-alpha capabilities remain intentionally incomplete and are not implied by the current evidence: live multi-worker recovery and distribution, durable independent toolkit layers, portable cross-worker memory recovery, domain-accurate restricted egress, Docker restricted-network allowlists and snapshots, durable per-sandbox secrets, TLS/mTLS worker identity and certificate rotation, WebSocket PTY sessions, rate limits and lifetime quotas, failure-injection convergence, and warm pools. These are tracked in `docs/PRIVATE_ALPHA.md` with exact prerequisites and test commands.

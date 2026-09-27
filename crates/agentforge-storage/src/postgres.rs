@@ -3,23 +3,25 @@ use crate::{
 };
 use agentforge_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
-    Snapshot, UsageEvent, UsageSummary,
+    Snapshot, UsageEvent, UsageSummary, new_id,
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
     storage::{
-        ReconciliationAction, SandboxEvent, SandboxOperation, StoredSnapshot, TenantRecord,
-        WorkerAssignment, WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
-        MetadataStore,
+        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
+        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
+        WorkerLease, WorkerRegistration, WorkerStatus,
     },
-    new_id,
 };
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 #[cfg(test)]
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Lease granted to a replacement owner during recovery, matching the scheduler default.
+const RECOVERY_LEASE_TTL_SECONDS: i64 = 300;
 
 fn stored_u32(value: i32, field: &str) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|error| StoreError::Conflict(format!("invalid {field}: {error}")))
@@ -38,6 +40,7 @@ fn state_from_str(value: &str) -> Result<SandboxState, StoreError> {
         "creating" => Ok(SandboxState::Creating),
         "starting" => Ok(SandboxState::Starting),
         "running" => Ok(SandboxState::Running),
+        "paused" => Ok(SandboxState::Paused),
         "stopping" => Ok(SandboxState::Stopping),
         "stopped" => Ok(SandboxState::Stopped),
         "snapshotting" => Ok(SandboxState::Snapshotting),
@@ -52,6 +55,7 @@ fn state_from_str(value: &str) -> Result<SandboxState, StoreError> {
 fn runtime_from_str(value: &str) -> Result<RuntimeKind, StoreError> {
     match value {
         "firecracker" => Ok(RuntimeKind::Firecracker),
+        "docker" => Ok(RuntimeKind::Docker),
         "bwrap-dev" => Ok(RuntimeKind::BwrapDev),
         value => Err(StoreError::Conflict(format!(
             "invalid persisted runtime: {value}"
@@ -74,6 +78,7 @@ fn sandbox_from_row(row: &sqlx::postgres::PgRow) -> Result<Sandbox, StoreError> 
         disk_mb: stored_u32(row.try_get("disk_mb")?, "sandbox disk_mb")?,
         timeout_seconds: stored_u64(row.try_get("timeout_seconds")?, "sandbox timeout_seconds")?,
         network: serde_json::from_value(row.try_get("network")?)?,
+        environment: serde_json::from_value(row.try_get("environment")?)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         runtime_path: row.try_get("runtime_path")?,
@@ -165,6 +170,8 @@ fn worker_status_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkerStatus, S
             node_id: row.try_get("id")?,
             name: row.try_get("name")?,
             runtime: runtime_from_str(&runtime)?,
+            capabilities: serde_json::from_value(row.try_get("capabilities")?)
+                .map_err(StoreError::Json)?,
             control_endpoint: row.try_get("control_endpoint")?,
             total_vcpus: stored_u32(row.try_get("total_vcpus")?, "worker total_vcpus")?,
             total_memory_bytes: stored_u64(
@@ -281,8 +288,8 @@ async fn insert_sandbox(
     sqlx::query(
         "INSERT INTO sandboxes \
          (id, tenant_id, node_id, image_id, state, runtime, cpu, memory_mb, disk_mb, \
-          timeout_seconds, network, runtime_path, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+          timeout_seconds, network, environment, runtime_path, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
     )
     .bind(value.id)
     .bind(value.tenant_id)
@@ -299,6 +306,10 @@ async fn insert_sandbox(
     )
     .bind(
         serde_json::to_value(&value.network)
+            .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?,
+    )
+    .bind(
+        serde_json::to_value(&value.environment)
             .map_err(|error| StoreError::Database(sqlx::Error::Decode(Box::new(error))))?,
     )
     .bind(&value.runtime_path)
@@ -318,26 +329,31 @@ async fn insert_sandbox(
     .await
 }
 
-async fn update_state_transaction(
-    pool: &sqlx::PgPool,
+async fn lock_sandbox(
+    tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
     id: Uuid,
+) -> Result<sqlx::postgres::PgRow, StoreError> {
+    sqlx::query("SELECT * FROM sandboxes WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)
+}
+
+/// Applies the shared compare-and-set transition to an already locked sandbox row.
+async fn apply_state_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    row: sqlx::postgres::PgRow,
     expected: SandboxState,
     next: SandboxState,
     runtime_path: Option<String>,
     reason: &str,
 ) -> Result<Sandbox, StoreError> {
-    let mut tx = pool.begin().await.map_err(database_error)?;
-    let row = sqlx::query("SELECT * FROM sandboxes WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
-        .bind(tenant)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(database_error)?
-        .ok_or(StoreError::NotFound)?;
     let mut value = sandbox_from_row(&row)?;
     if value.state == next {
-        tx.commit().await.map_err(database_error)?;
         return Ok(value);
     }
     if value.state != expected || !value.state.can_transition_to(next) {
@@ -351,19 +367,92 @@ async fn update_state_transaction(
     .bind(next.as_str())
     .bind(runtime_path.clone())
     .bind(updated_at)
-    .bind(tenant)
-    .bind(id)
-    .execute(&mut *tx)
+    .bind(value.tenant_id)
+    .bind(value.id)
+    .execute(&mut **tx)
     .await
     .map_err(database_error)?;
-    insert_sandbox_event(&mut tx, tenant, id, Some(value.state), next, Some(reason)).await?;
+    insert_sandbox_event(
+        tx,
+        value.tenant_id,
+        value.id,
+        Some(value.state),
+        next,
+        Some(reason),
+    )
+    .await?;
     value.state = next;
     value.updated_at = updated_at;
     if let Some(path) = runtime_path {
         value.runtime_path = Some(path);
     }
+    Ok(value)
+}
+
+/// Reads the fencing generation of the sandbox's active, unexpired lease.
+async fn active_lease_generation(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    sandbox: Uuid,
+) -> Result<Option<i64>, StoreError> {
+    sqlx::query_scalar(
+        "SELECT generation FROM sandbox_leases \
+         WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND expires_at > now() \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant)
+    .bind(sandbox)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)
+}
+
+async fn update_state_transaction(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    id: Uuid,
+    expected: SandboxState,
+    next: SandboxState,
+    runtime_path: Option<String>,
+    reason: &str,
+) -> Result<Sandbox, StoreError> {
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    let row = lock_sandbox(&mut tx, tenant, id).await?;
+    let value = apply_state_transition(&mut tx, row, expected, next, runtime_path, reason).await?;
     tx.commit().await.map_err(database_error)?;
     Ok(value)
+}
+
+/// Compare-and-set transition fenced by the sandbox's current lease generation.
+///
+/// The sandbox row lock and the lease generation read share one transaction, so a lease
+/// reassignment committed by another transaction is always observed here.
+async fn update_state_with_generation_transaction(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    id: Uuid,
+    expected: SandboxState,
+    next: SandboxState,
+    generation: i64,
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await.map_err(database_error)?;
+    let row = lock_sandbox(&mut tx, tenant, id).await?;
+    if active_lease_generation(&mut tx, tenant, id).await? != Some(generation) {
+        return Err(StoreError::Conflict(
+            "stale sandbox lease generation".into(),
+        ));
+    }
+    apply_state_transition(
+        &mut tx,
+        row,
+        expected,
+        next,
+        None,
+        "sandbox state changed by lease owner",
+    )
+    .await?;
+    tx.commit().await.map_err(database_error)?;
+    Ok(())
 }
 
 fn sandbox_fingerprint(value: &Sandbox) -> Result<Vec<u8>, StoreError> {
@@ -377,6 +466,7 @@ fn sandbox_fingerprint(value: &Sandbox) -> Result<Vec<u8>, StoreError> {
         "disk_mb": value.disk_mb,
         "timeout_seconds": value.timeout_seconds,
         "network": value.network,
+        "environment": value.environment,
     });
     Ok(Sha256::digest(serde_json::to_vec(&semantic)?).to_vec())
 }
@@ -404,6 +494,139 @@ async fn advisory_lock(
         .execute(&mut **tx)
         .await
         .map_err(database_error)?;
+    Ok(())
+}
+
+/// CPU, memory and disk bytes a placement debits from a worker.
+fn sandbox_capacity_demand(sandbox: &Sandbox) -> Result<(i32, i64, i64), StoreError> {
+    let memory_bytes = u64::from(sandbox.memory_mb)
+        .checked_mul(1_048_576)
+        .ok_or_else(|| StoreError::Conflict("sandbox memory size overflow".into()))?;
+    let disk_bytes = u64::from(sandbox.disk_mb)
+        .checked_mul(1_048_576)
+        .ok_or_else(|| StoreError::Conflict("sandbox disk size overflow".into()))?;
+    Ok((
+        i32::try_from(sandbox.cpu).map_err(|error| StoreError::Conflict(error.to_string()))?,
+        i64::try_from(memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?,
+        i64::try_from(disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?,
+    ))
+}
+
+/// Picks the worker a placement runs on, locking the chosen row for the transaction.
+///
+/// Scheduling and lease recovery share this so recovery cannot drift from the scheduler
+/// in health, runtime, capability or capacity requirements.
+async fn select_schedulable_node(
+    tx: &mut Transaction<'_, Postgres>,
+    sandbox: &Sandbox,
+    preferred_node: Option<Uuid>,
+) -> Result<Option<sqlx::postgres::PgRow>, StoreError> {
+    let (vcpus, memory_bytes, disk_bytes) = sandbox_capacity_demand(sandbox)?;
+    sqlx::query(
+        "SELECT * FROM nodes \
+         WHERE healthy = true \
+           AND last_heartbeat >= now() - ($1 * interval '1 second') \
+           AND available_vcpus >= $2 \
+           AND available_memory_bytes >= $3 \
+           AND available_disk_bytes >= $4 AND runtime = $5 \
+           AND capabilities @> $6 \
+           AND ($7::uuid IS NULL OR id = $7) \
+         ORDER BY \
+           (1.0 / GREATEST(available_vcpus, 1)) + \
+           (1.0 / GREATEST(available_memory_bytes::numeric / 1073741824, 0.25)) + \
+           (sandbox_count::numeric * 0.0001), \
+           last_heartbeat DESC \
+         LIMIT 1 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(NODE_HEARTBEAT_TTL_SECONDS)
+    .bind(vcpus)
+    .bind(memory_bytes)
+    .bind(disk_bytes)
+    .bind(sandbox.runtime.as_str())
+    .bind(serde_json::json!({ "exec": true, "files": true }))
+    .bind(preferred_node)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)
+}
+
+/// Debits a placement from a worker's advertised capacity.
+async fn debit_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: Uuid,
+    demand: (i32, i64, i64),
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE nodes SET available_vcpus = available_vcpus - $1, \
+           available_memory_bytes = available_memory_bytes - $2, \
+           available_disk_bytes = available_disk_bytes - $3, sandbox_count = sandbox_count + 1 \
+         WHERE id = $4",
+    )
+    .bind(demand.0)
+    .bind(demand.1)
+    .bind(demand.2)
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// Points a sandbox's durable assignment at a replacement lease so the new worker claims it.
+async fn retarget_assignment(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: Uuid,
+    sandbox: Uuid,
+    expired_lease: Uuid,
+    node_id: Uuid,
+    replacement_lease: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let retargeted = sqlx::query(
+        "UPDATE sandbox_assignments SET node_id=$3, lease_id=$4, status='reserved', \
+         updated_at=$5 WHERE tenant_id=$1 AND lease_id=$2",
+    )
+    .bind(tenant)
+    .bind(expired_lease)
+    .bind(node_id)
+    .bind(replacement_lease)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if retargeted.rows_affected() > 0 {
+        return Ok(());
+    }
+    // The expired lease never had an assignment row; rebuild it from the scheduling request.
+    let request_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT request_id FROM sandbox_requests WHERE tenant_id=$1 AND sandbox_id=$2",
+    )
+    .bind(tenant)
+    .bind(sandbox)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    let Some(request_id) = request_id else {
+        return Err(StoreError::Conflict(
+            "reassigned sandbox has no scheduling request".into(),
+        ));
+    };
+    sqlx::query(
+        "INSERT INTO sandbox_assignments \
+         (tenant_id, request_id, sandbox_id, node_id, lease_id, status, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,'reserved',$6,$6) \
+         ON CONFLICT (tenant_id, request_id) DO UPDATE SET node_id=EXCLUDED.node_id, \
+         lease_id=EXCLUDED.lease_id, status='reserved', updated_at=EXCLUDED.updated_at",
+    )
+    .bind(tenant)
+    .bind(request_id)
+    .bind(sandbox)
+    .bind(node_id)
+    .bind(replacement_lease)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
     Ok(())
 }
 
@@ -443,6 +666,11 @@ impl PostgresScheduler {
         }
         let mut tx = self.repository.pool.begin().await.map_err(database_error)?;
         advisory_lock(&mut tx, tenant, request_id).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("tenant-quota:{tenant}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
         let existing_request = sqlx::query(
             "SELECT fingerprint FROM sandbox_requests WHERE tenant_id = $1 AND request_id = $2",
         )
@@ -473,13 +701,12 @@ impl PostgresScheduler {
             let existing_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox_id).await?;
             let existing_lease = fetch_lease_for_sandbox(&mut tx, tenant, sandbox_id).await?;
             if existing_lease.status == "active" || existing_sandbox.node_id.is_some() {
-                let worker_endpoint: String = sqlx::query_scalar(
-                    "SELECT control_endpoint FROM nodes WHERE id = $1",
-                )
-                .bind(existing_lease.node_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(database_error)?;
+                let worker_endpoint: String =
+                    sqlx::query_scalar("SELECT control_endpoint FROM nodes WHERE id = $1")
+                        .bind(existing_lease.node_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(database_error)?;
                 tx.commit().await.map_err(database_error)?;
                 return Ok(ScheduledSandbox {
                     sandbox: existing_sandbox,
@@ -501,6 +728,53 @@ impl PostgresScheduler {
                 .checked_add(1)
                 .ok_or_else(|| StoreError::Conflict("lease generation overflow".into()))?;
         } else {
+            let quota = sqlx::query(
+                "SELECT max_active_sandboxes, max_vcpus, max_memory_mb, max_disk_mb \
+                 FROM tenant_quotas WHERE tenant_id=$1 FOR UPDATE",
+            )
+            .bind(tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database_error)?;
+            let usage = sqlx::query(
+                "SELECT count(*)::bigint AS active, COALESCE(sum(cpu),0)::bigint AS vcpus, \
+                 COALESCE(sum(memory_mb),0)::bigint AS memory_mb, COALESCE(sum(disk_mb),0)::bigint AS disk_mb \
+                 FROM sandboxes WHERE tenant_id=$1 AND state NOT IN ('destroyed','failed')",
+            )
+            .bind(tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database_error)?;
+            let current = agentforge_core::QuotaUsage {
+                active_sandboxes: u32::try_from(usage.try_get::<i64, _>("active")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid active usage".into()))?,
+                vcpus: u32::try_from(usage.try_get::<i64, _>("vcpus")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid vCPU usage".into()))?,
+                memory_mb: u64::try_from(usage.try_get::<i64, _>("memory_mb")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid memory usage".into()))?,
+                disk_mb: u64::try_from(usage.try_get::<i64, _>("disk_mb")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid disk usage".into()))?,
+            };
+            let next = current
+                .checked_add(&sandbox)
+                .ok_or_else(|| StoreError::QuotaExceeded("quota usage overflow".into()))?;
+            let limits = agentforge_core::QuotaLimits {
+                max_active_sandboxes: u32::try_from(
+                    quota.try_get::<i32, _>("max_active_sandboxes")?,
+                )
+                .map_err(|_| StoreError::QuotaExceeded("invalid active quota".into()))?,
+                max_vcpus: u32::try_from(quota.try_get::<i32, _>("max_vcpus")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid vCPU quota".into()))?,
+                max_memory_mb: u64::try_from(quota.try_get::<i64, _>("max_memory_mb")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid memory quota".into()))?,
+                max_disk_mb: u64::try_from(quota.try_get::<i64, _>("max_disk_mb")?)
+                    .map_err(|_| StoreError::QuotaExceeded("invalid disk quota".into()))?,
+            };
+            if next.exceeds(limits) {
+                return Err(StoreError::QuotaExceeded(
+                    "tenant resource quota exceeded".into(),
+                ));
+            }
             insert_sandbox(&mut tx, &sandbox).await?;
             sqlx::query(
                 "INSERT INTO sandbox_requests (tenant_id, request_id, sandbox_id, fingerprint) \
@@ -519,52 +793,13 @@ impl PostgresScheduler {
             .map_err(database_error)?;
         }
 
-        let memory_bytes = u64::from(sandbox.memory_mb)
-            .checked_mul(1_048_576)
-            .ok_or_else(|| StoreError::Conflict("sandbox memory size overflow".into()))?;
-        let disk_bytes = u64::from(sandbox.disk_mb)
-            .checked_mul(1_048_576)
-            .ok_or_else(|| StoreError::Conflict("sandbox disk size overflow".into()))?;
-        let node = sqlx::query(
-            "SELECT * FROM nodes \
-             WHERE healthy = true \
-               AND last_heartbeat >= now() - ($1 * interval '1 second') \
-               AND available_vcpus >= $2 \
-               AND available_memory_bytes >= $3 \
-               AND available_disk_bytes >= $4 AND runtime = $5 \
-               AND ($6::uuid IS NULL OR id = $6) \
-             ORDER BY \
-               (1.0 / GREATEST(available_vcpus, 1)) + \
-               (1.0 / GREATEST(available_memory_bytes::numeric / 1073741824, 0.25)) + \
-               (sandbox_count::numeric * 0.0001), \
-               last_heartbeat DESC \
-             LIMIT 1 FOR UPDATE SKIP LOCKED",
-        )
-        .bind(NODE_HEARTBEAT_TTL_SECONDS)
-        .bind(i32::try_from(sandbox.cpu).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(sandbox.runtime.as_str())
-        .bind(preferred_node)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(database_error)?
-        .ok_or_else(|| StoreError::Conflict("no healthy worker has capacity".into()))?;
+        let demand = sandbox_capacity_demand(&sandbox)?;
+        let node = select_schedulable_node(&mut tx, &sandbox, preferred_node)
+            .await?
+            .ok_or_else(|| StoreError::Conflict("no healthy worker has capacity".into()))?;
         let worker_endpoint: String = node.try_get("control_endpoint")?;
         let node_id: Uuid = node.try_get("id")?;
-        sqlx::query(
-            "UPDATE nodes SET available_vcpus = available_vcpus - $1, \
-               available_memory_bytes = available_memory_bytes - $2, \
-               available_disk_bytes = available_disk_bytes - $3, sandbox_count = sandbox_count + 1 \
-             WHERE id = $4",
-        )
-        .bind(i32::try_from(sandbox.cpu).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(node_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(database_error)?;
+        debit_capacity(&mut tx, node_id, demand).await?;
         let assigned = sqlx::query(
             "UPDATE sandboxes SET node_id = $1, updated_at = now() \
              WHERE tenant_id = $2 AND id = $3 AND node_id IS NULL",
@@ -688,6 +923,19 @@ impl Scheduler for PostgresScheduler {
         .map_err(|error| core_error(database_error(error)))?
         .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))
     }
+    async fn lease_generation(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<i64, CoreError> {
+        sqlx::query_scalar(
+            "SELECT generation FROM sandbox_leases \
+             WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND expires_at > now() \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(sandbox_id)
+        .fetch_optional(&self.repository.pool)
+        .await
+        .map_err(|error| core_error(database_error(error)))?
+        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))
+    }
 
     async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), CoreError> {
         let lease = sqlx::query(
@@ -707,15 +955,16 @@ impl Scheduler for PostgresScheduler {
         let generation = lease
             .try_get("generation")
             .map_err(|error| core_error(error.into()))?;
-        self.repository.release_worker_lease(
-            tenant_id,
-            lease_id,
-            generation,
-            "released through scheduler",
-        )
-        .await
-        .map(|_| ())
-        .map_err(core_error)
+        self.repository
+            .release_worker_lease(
+                tenant_id,
+                lease_id,
+                generation,
+                "released through scheduler",
+            )
+            .await
+            .map(|_| ())
+            .map_err(core_error)
     }
 }
 
@@ -986,6 +1235,7 @@ impl PostgresRepository {
             node_id: value.id,
             name: value.name,
             runtime: RuntimeKind::BwrapDev,
+            capabilities: agentforge_core::runtime::RuntimeCapabilities::default(),
             control_endpoint: String::new(),
             total_vcpus: value.available_vcpus,
             total_memory_bytes: value.available_memory_bytes,
@@ -1044,16 +1294,27 @@ impl PostgresRepository {
     }
 
     async fn put_tenant(&self, value: TenantRecord) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
         sqlx::query(
             "INSERT INTO tenants (id, name, created_at) VALUES ($1,$2,$3) \
              ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
         )
         .bind(value.id)
-        .bind(value.name)
+        .bind(&value.name)
         .bind(value.created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO tenant_quotas \
+             (tenant_id, max_active_sandboxes, max_vcpus, max_memory_mb, max_disk_mb) \
+             VALUES ($1, 8, 32, 65536, 1048576) ON CONFLICT (tenant_id) DO NOTHING",
+        )
+        .bind(value.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -1101,14 +1362,44 @@ impl PostgresRepository {
                 "stored snapshot requires a SHA-256 checksum".into(),
             ));
         }
-        if value.complete
-            && (value.memory_object_key.is_none()
-                || value.disk_object_key.is_none()
-                || value.workspace_object_key.is_none())
-        {
-            return Err(StoreError::Conflict(
-                "complete VM snapshot requires memory, disk, and workspace objects".into(),
-            ));
+        // Completeness means "every object this kind promises is present". A
+        // workspace snapshot carries no memory or disk object, so demanding them
+        // made portable-workspace snapshots unstorable and blocked the recovery
+        // path that restores them on a new owner.
+        if value.complete {
+            match value.kind.as_str() {
+                "workspace" => {
+                    if value.workspace_object_key.is_none() {
+                        return Err(StoreError::Conflict(
+                            "complete workspace snapshot requires a workspace object".into(),
+                        ));
+                    }
+                }
+                "virtual_machine" | "memory" => {
+                    if value.memory_object_key.is_none()
+                        || value.disk_object_key.is_none()
+                        || value.workspace_object_key.is_none()
+                    {
+                        return Err(StoreError::Conflict(
+                            "complete VM snapshot requires memory, disk, and workspace objects"
+                                .into(),
+                        ));
+                    }
+                }
+                // An unrecognised kind cannot be validated against a known set of
+                // objects, so it keeps the strictest requirement.
+                _ => {
+                    if value.memory_object_key.is_none()
+                        || value.disk_object_key.is_none()
+                        || value.workspace_object_key.is_none()
+                    {
+                        return Err(StoreError::Conflict(
+                            "complete VM snapshot requires memory, disk, and workspace objects"
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
         sqlx::query(
             "INSERT INTO snapshots \
@@ -1235,11 +1526,11 @@ impl PostgresRepository {
         if value.runtime == RuntimeKind::Firecracker
             && reqwest::Url::parse(&value.control_endpoint)
                 .ok()
-                .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+                .filter(|url| url.scheme() == "https" && url.host_str().is_some())
                 .is_none()
         {
             return Err(StoreError::Conflict(
-                "Firecracker worker requires an HTTP(S) control endpoint".into(),
+                "Firecracker worker requires an HTTPS control endpoint".into(),
             ));
         }
         if value.available_vcpus > value.total_vcpus
@@ -1250,31 +1541,55 @@ impl PostgresRepository {
                 "worker available capacity exceeds total capacity".into(),
             ));
         }
+        let capabilities = serde_json::to_value(&value.capabilities).map_err(StoreError::Json)?;
         let result = sqlx::query(
             "INSERT INTO nodes \
-             (id, name, runtime, control_endpoint, total_vcpus, total_memory_bytes, \
+             (id, name, runtime, capabilities, control_endpoint, total_vcpus, total_memory_bytes, \
               total_disk_bytes, available_vcpus, available_memory_bytes, available_disk_bytes, \
               sandbox_count, healthy, version, metadata, started_at, last_heartbeat) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,$12,$13,$14,$15) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,0,$12,$13,$14,$15,$16) \
              ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, runtime=EXCLUDED.runtime, \
-             control_endpoint=EXCLUDED.control_endpoint, total_vcpus=EXCLUDED.total_vcpus, \
-             total_memory_bytes=EXCLUDED.total_memory_bytes, total_disk_bytes=EXCLUDED.total_disk_bytes, \
-             sandbox_count=nodes.sandbox_count, healthy=EXCLUDED.healthy, \
-             version=EXCLUDED.version, metadata=EXCLUDED.metadata, started_at=EXCLUDED.started_at, \
-             last_heartbeat=EXCLUDED.last_heartbeat WHERE nodes.version < EXCLUDED.version",
+             capabilities=EXCLUDED.capabilities, control_endpoint=EXCLUDED.control_endpoint, \
+             total_vcpus=EXCLUDED.total_vcpus, total_memory_bytes=EXCLUDED.total_memory_bytes, \
+             total_disk_bytes=EXCLUDED.total_disk_bytes, sandbox_count=nodes.sandbox_count, \
+             healthy=EXCLUDED.healthy, version=EXCLUDED.version, metadata=EXCLUDED.metadata, \
+             started_at=EXCLUDED.started_at, last_heartbeat=EXCLUDED.last_heartbeat \
+             WHERE nodes.version < EXCLUDED.version",
         )
         .bind(value.node_id)
         .bind(&value.name)
         .bind(value.runtime.as_str())
+        .bind(&capabilities)
         .bind(&value.control_endpoint)
-        .bind(i32::try_from(value.total_vcpus).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(value.total_memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(value.total_disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i32::try_from(value.available_vcpus).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(value.available_memory_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
-        .bind(i64::try_from(value.available_disk_bytes).map_err(|error| StoreError::Conflict(error.to_string()))?)
+        .bind(
+            i32::try_from(value.total_vcpus)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
+        .bind(
+            i64::try_from(value.total_memory_bytes)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
+        .bind(
+            i64::try_from(value.total_disk_bytes)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
+        .bind(
+            i32::try_from(value.available_vcpus)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
+        .bind(
+            i64::try_from(value.available_memory_bytes)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
+        .bind(
+            i64::try_from(value.available_disk_bytes)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
         .bind(value.healthy)
-        .bind(i64::try_from(value.version).map_err(|error| StoreError::Conflict(error.to_string()))?)
+        .bind(
+            i64::try_from(value.version)
+                .map_err(|error| StoreError::Conflict(error.to_string()))?,
+        )
         .bind(&value.metadata)
         .bind(value.started_at)
         .bind(value.last_heartbeat)
@@ -1285,6 +1600,7 @@ impl PostgresRepository {
             let current = self.get_worker(value.node_id).await?;
             let same_registration = current.registration.name == value.name
                 && current.registration.runtime == value.runtime
+                && current.registration.capabilities == value.capabilities
                 && current.registration.control_endpoint == value.control_endpoint
                 && current.registration.total_vcpus == value.total_vcpus
                 && current.registration.total_memory_bytes == value.total_memory_bytes
@@ -1325,15 +1641,44 @@ impl PostgresRepository {
         .await
         .map_err(database_error)?;
         if result.rows_affected() == 0 {
-            let current = self.get_worker(heartbeat.node_id).await?;
+            // A worker that never registered must not be reported as merely stale: the two
+            // failures mean different things to the caller and to the operator.
+            let current = match self.get_worker(heartbeat.node_id).await {
+                Ok(current) => current,
+                Err(StoreError::NotFound) => {
+                    return Err(StoreError::Conflict("worker does not exist".into()));
+                }
+                Err(error) => return Err(error),
+            };
             if current.registration.version > heartbeat.version {
                 return Err(StoreError::Conflict(
                     "worker heartbeat version is stale".into(),
                 ));
             }
             return Err(StoreError::Conflict(
-                "worker heartbeat version is stale".into(),
+                "worker heartbeat lost a concurrent update race".into(),
             ));
+        }
+        // A node whose leases have all been expired or released owns nothing, so
+        // a heartbeat claiming to still be serving sandboxes reports ownership
+        // the control plane has already taken back. Refuse it rather than record
+        // it: a returning worker must re-register to become schedulable again.
+        let owned: i64 = sqlx::query_scalar(
+            // The expiry predicate matters: a lease that has lapsed on the clock
+            // but has not been swept yet still reads as 'active', and that is
+            // exactly the window in which a late heartbeat arrives.
+            "SELECT count(*) FROM sandbox_leases \
+             WHERE node_id = $1 AND status = 'active' AND expires_at > now()",
+        )
+        .bind(heartbeat.node_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if owned == 0 && heartbeat.healthy && heartbeat.sandbox_count > 0 {
+            return Err(StoreError::Conflict(format!(
+                "worker reports {} running sandboxes but holds no active lease",
+                heartbeat.sandbox_count
+            )));
         }
         self.get_worker(heartbeat.node_id).await
     }
@@ -1762,6 +2107,201 @@ impl PostgresRepository {
         rows.iter().map(action_from_row).collect()
     }
 
+    async fn update_state_with_generation(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        expected: SandboxState,
+        next: SandboxState,
+        generation: i64,
+    ) -> Result<(), StoreError> {
+        update_state_with_generation_transaction(&self.pool, tenant, id, expected, next, generation)
+            .await
+    }
+
+    /// Reads the active lease that currently owns a sandbox, expired or not.
+    async fn sandbox_ownership(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<Option<SandboxOwnership>, StoreError> {
+        let Some(row) = sqlx::query(
+            "SELECT node_id, id, generation, expires_at FROM sandbox_leases \
+             WHERE sandbox_id=$1 AND status='active' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SandboxOwnership {
+            node_id: row.try_get("node_id")?,
+            lease_id: row.try_get("id")?,
+            generation: row.try_get("generation")?,
+            expires_at: row.try_get("expires_at")?,
+        }))
+    }
+
+    /// Expires a dead worker's lease and places the sandbox on a healthy worker.
+    ///
+    /// Accepts a lease that this store still holds as `active` and one that
+    /// [`reconcile_expired_leases`](Self::reconcile_expired_leases) already expired, so
+    /// recovery works whether or not the reconciler ran first. Returns `None` when the
+    /// lease is not expired, when the sandbox is already owned, or when no healthy worker
+    /// has capacity.
+    /// The sandbox is returned to the state a fresh placement uses, so the replacement
+    /// worker recreates the machine; recovery is an authoritative reset rather than a
+    /// lifecycle transition, because the previous owner's machine is already gone.
+    async fn reassign_expired_lease(
+        &self,
+        lease_id: Uuid,
+    ) -> Result<Option<Reassignment>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query("SELECT * FROM sandbox_leases WHERE id = $1 FOR UPDATE SKIP LOCKED")
+            .bind(lease_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let lease = lease_from_row(&row)?;
+        if lease.expires_at > Utc::now() {
+            return Ok(None);
+        }
+        if !matches!(lease.status.as_str(), "active" | "expired") {
+            return Ok(None);
+        }
+        // A sandbox another lease already owns is not recoverable: a repeated recovery pass
+        // must never install a second owner or regress the fencing generation.
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM sandbox_leases \
+             WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND id <> $3 LIMIT 1",
+        )
+        .bind(lease.tenant_id)
+        .bind(lease.sandbox_id)
+        .bind(lease.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if owned.is_some() {
+            return Ok(None);
+        }
+        let sandbox = fetch_sandbox(&mut *tx, lease.tenant_id, lease.sandbox_id).await?;
+        // Only a live sandbox is worth recovering: a sandbox that is being stopped,
+        // snapshotted or torn down is left to those flows.
+        if !matches!(
+            sandbox.state,
+            SandboxState::Creating
+                | SandboxState::Starting
+                | SandboxState::Running
+                | SandboxState::Paused
+                | SandboxState::Restoring
+        ) {
+            return Ok(None);
+        }
+        match lease.status.as_str() {
+            // Still active: expiry, capacity release and node clearing happen here.
+            "active" => {
+                release_capacity(&mut tx, &lease, "expired", "lease_expired_recovery").await?;
+            }
+            // The reconciler already expired this lease and released its capacity, so the
+            // release is skipped and only a leftover node pointer is cleared.
+            _ => {
+                sqlx::query(
+                    "UPDATE sandboxes SET node_id=NULL, updated_at=now() \
+                     WHERE tenant_id=$1 AND id=$2 AND node_id=$3",
+                )
+                .bind(lease.tenant_id)
+                .bind(lease.sandbox_id)
+                .bind(lease.node_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(database_error)?;
+            }
+        }
+        // Ordering: the expiry and capacity release above are committed even when no worker
+        // is available, because a dead owner must not keep a worker's capacity debited
+        // while we wait for a replacement. The caller retries on `None`.
+        let Some(node) = select_schedulable_node(&mut tx, &sandbox, None).await? else {
+            tx.commit().await.map_err(database_error)?;
+            return Ok(None);
+        };
+        let node_id: Uuid = node.try_get("id")?;
+        debit_capacity(&mut tx, node_id, sandbox_capacity_demand(&sandbox)?).await?;
+        let highest: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(generation), 0) FROM sandbox_leases \
+             WHERE tenant_id=$1 AND sandbox_id=$2",
+        )
+        .bind(lease.tenant_id)
+        .bind(lease.sandbox_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let generation = highest
+            .max(lease.generation)
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Conflict("lease generation overflow".into()))?;
+        let replacement_id = new_id();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sandbox_leases \
+             (id, tenant_id, sandbox_id, node_id, generation, status, expires_at, created_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,'active',$6,$7,$7)",
+        )
+        .bind(replacement_id)
+        .bind(lease.tenant_id)
+        .bind(lease.sandbox_id)
+        .bind(node_id)
+        .bind(generation)
+        .bind(now + Duration::seconds(RECOVERY_LEASE_TTL_SECONDS))
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        retarget_assignment(
+            &mut tx,
+            lease.tenant_id,
+            lease.sandbox_id,
+            lease.id,
+            node_id,
+            replacement_id,
+            now,
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE sandboxes SET node_id=$1, state=$2, runtime_path=NULL, updated_at=$3 \
+             WHERE tenant_id=$4 AND id=$5",
+        )
+        .bind(node_id)
+        .bind(SandboxState::Creating.as_str())
+        .bind(now)
+        .bind(lease.tenant_id)
+        .bind(lease.sandbox_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        insert_sandbox_event(
+            &mut tx,
+            lease.tenant_id,
+            lease.sandbox_id,
+            Some(sandbox.state),
+            SandboxState::Creating,
+            Some("sandbox reassigned after lease expiry"),
+        )
+        .await?;
+        let sandbox = fetch_sandbox(&mut *tx, lease.tenant_id, lease.sandbox_id).await?;
+        let lease_row = sqlx::query("SELECT * FROM sandbox_leases WHERE id = $1")
+            .bind(replacement_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        let lease = lease_from_row(&lease_row)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(Some(Reassignment { lease, sandbox }))
+    }
+
     async fn begin_sandbox_operation(
         &self,
         value: SandboxOperation,
@@ -1881,16 +2421,41 @@ impl MetadataStore for PostgresRepository {
         Self::create_sandbox(self, value).await.map_err(core_error)
     }
     async fn get_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<Sandbox, CoreError> {
-        Self::get_sandbox(self, tenant, id).await.map_err(core_error)
+        Self::get_sandbox(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
     async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, CoreError> {
         Self::list_sandboxes(self, tenant).await.map_err(core_error)
     }
-    async fn update_state(&self, tenant: Uuid, id: Uuid, expected: SandboxState, next: SandboxState, runtime_path: Option<String>) -> Result<Sandbox, CoreError> {
-        Self::update_state(self, tenant, id, expected, next, runtime_path).await.map_err(core_error)
+    async fn update_state(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        expected: SandboxState,
+        next: SandboxState,
+        runtime_path: Option<String>,
+    ) -> Result<Sandbox, CoreError> {
+        Self::update_state(self, tenant, id, expected, next, runtime_path)
+            .await
+            .map_err(core_error)
+    }
+    async fn update_state_with_generation(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        expected: SandboxState,
+        next: SandboxState,
+        generation: i64,
+    ) -> Result<(), CoreError> {
+        Self::update_state_with_generation(self, tenant, id, expected, next, generation)
+            .await
+            .map_err(core_error)
     }
     async fn delete_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
-        Self::delete_sandbox(self, tenant, id).await.map_err(core_error)
+        Self::delete_sandbox(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
     async fn put_key(&self, value: ApiKeyRecord) -> Result<(), CoreError> {
         Self::put_key(self, value).await.map_err(core_error)
@@ -1905,13 +2470,23 @@ impl MetadataStore for PostgresRepository {
         Self::put_snapshot(self, value).await.map_err(core_error)
     }
     async fn get_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<Snapshot, CoreError> {
-        Self::get_snapshot(self, tenant, id).await.map_err(core_error)
+        Self::get_snapshot(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
-    async fn list_snapshots(&self, tenant: Uuid, sandbox: Uuid) -> Result<Vec<Snapshot>, CoreError> {
-        Self::list_snapshots(self, tenant, sandbox).await.map_err(core_error)
+    async fn list_snapshots(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<Snapshot>, CoreError> {
+        Self::list_snapshots(self, tenant, sandbox)
+            .await
+            .map_err(core_error)
     }
     async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
-        Self::delete_snapshot(self, tenant, id).await.map_err(core_error)
+        Self::delete_snapshot(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
     async fn append_usage(&self, value: UsageEvent) -> Result<(), CoreError> {
         Self::append_usage(self, value).await.map_err(core_error)
@@ -1934,74 +2509,219 @@ impl MetadataStore for PostgresRepository {
     async fn get_tenant(&self, id: Uuid) -> Result<TenantRecord, CoreError> {
         Self::get_tenant(self, id).await.map_err(core_error)
     }
-    async fn list_sandbox_events(&self, tenant: Uuid, sandbox: Uuid, limit: u32) -> Result<Vec<SandboxEvent>, CoreError> {
-        Self::list_sandbox_events(self, tenant, sandbox, limit).await.map_err(core_error)
+    async fn list_sandbox_events(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        limit: u32,
+    ) -> Result<Vec<SandboxEvent>, CoreError> {
+        Self::list_sandbox_events(self, tenant, sandbox, limit)
+            .await
+            .map_err(core_error)
     }
     async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), CoreError> {
-        Self::put_stored_snapshot(self, value).await.map_err(core_error)
+        Self::put_stored_snapshot(self, value)
+            .await
+            .map_err(core_error)
     }
-    async fn get_stored_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<StoredSnapshot, CoreError> {
-        Self::get_stored_snapshot(self, tenant, id).await.map_err(core_error)
+    async fn get_stored_snapshot(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<StoredSnapshot, CoreError> {
+        Self::get_stored_snapshot(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
-    async fn list_stored_snapshots(&self, tenant: Uuid, sandbox: Uuid) -> Result<Vec<StoredSnapshot>, CoreError> {
-        Self::list_stored_snapshots(self, tenant, sandbox).await.map_err(core_error)
+    async fn list_stored_snapshots(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<StoredSnapshot>, CoreError> {
+        Self::list_stored_snapshots(self, tenant, sandbox)
+            .await
+            .map_err(core_error)
     }
-    async fn create_sandbox_idempotent(&self, tenant: Uuid, request_id: Uuid, sandbox: Sandbox) -> Result<Sandbox, CoreError> {
-        Self::create_sandbox_idempotent(self, tenant, request_id, sandbox).await.map_err(core_error)
+    async fn create_sandbox_idempotent(
+        &self,
+        tenant: Uuid,
+        request_id: Uuid,
+        sandbox: Sandbox,
+    ) -> Result<Sandbox, CoreError> {
+        Self::create_sandbox_idempotent(self, tenant, request_id, sandbox)
+            .await
+            .map_err(core_error)
     }
     async fn register_worker(&self, value: WorkerRegistration) -> Result<(), CoreError> {
         Self::register_worker(self, value).await.map_err(core_error)
     }
-    async fn heartbeat_worker(&self, heartbeat: WorkerHeartbeat) -> Result<WorkerStatus, CoreError> {
-        Self::heartbeat_worker(self, heartbeat).await.map_err(core_error)
+    async fn heartbeat_worker(
+        &self,
+        heartbeat: WorkerHeartbeat,
+    ) -> Result<WorkerStatus, CoreError> {
+        Self::heartbeat_worker(self, heartbeat)
+            .await
+            .map_err(core_error)
     }
     async fn get_worker(&self, node_id: Uuid) -> Result<WorkerStatus, CoreError> {
         Self::get_worker(self, node_id).await.map_err(core_error)
     }
     async fn list_workers(&self, include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> {
-        Self::list_workers(self, include_unhealthy).await.map_err(core_error)
+        Self::list_workers(self, include_unhealthy)
+            .await
+            .map_err(core_error)
     }
-    async fn claim_worker_assignments(&self, node_id: Uuid, limit: u32, lease_ttl_seconds: u64) -> Result<Vec<WorkerAssignment>, CoreError> {
-        Self::claim_worker_assignments(self, node_id, limit, lease_ttl_seconds).await.map_err(core_error)
+    async fn claim_worker_assignments(
+        &self,
+        node_id: Uuid,
+        limit: u32,
+        lease_ttl_seconds: u64,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::claim_worker_assignments(self, node_id, limit, lease_ttl_seconds)
+            .await
+            .map_err(core_error)
     }
-    async fn list_worker_assignments(&self, tenant: Uuid, node_id: Uuid, status: Option<&str>, limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> {
-        Self::list_worker_assignments(self, tenant, node_id, status, limit).await.map_err(core_error)
+    async fn list_worker_assignments(
+        &self,
+        tenant: Uuid,
+        node_id: Uuid,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::list_worker_assignments(self, tenant, node_id, status, limit)
+            .await
+            .map_err(core_error)
     }
-    async fn list_worker_assignments_for_node(&self, node_id: Uuid, status: Option<&str>, limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> {
-        Self::list_worker_assignments_for_node(self, node_id, status, limit).await.map_err(core_error)
+    async fn list_worker_assignments_for_node(
+        &self,
+        node_id: Uuid,
+        status: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Self::list_worker_assignments_for_node(self, node_id, status, limit)
+            .await
+            .map_err(core_error)
     }
-    async fn get_worker_lease(&self, tenant: Uuid, lease_id: Uuid) -> Result<WorkerLease, CoreError> {
-        Self::get_worker_lease(self, tenant, lease_id).await.map_err(core_error)
+    async fn get_worker_lease(
+        &self,
+        tenant: Uuid,
+        lease_id: Uuid,
+    ) -> Result<WorkerLease, CoreError> {
+        Self::get_worker_lease(self, tenant, lease_id)
+            .await
+            .map_err(core_error)
     }
-    async fn get_active_worker_lease(&self, tenant: Uuid, sandbox: Uuid) -> Result<WorkerLease, CoreError> {
-        Self::get_active_worker_lease(self, tenant, sandbox).await.map_err(core_error)
+    async fn get_active_worker_lease(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<WorkerLease, CoreError> {
+        Self::get_active_worker_lease(self, tenant, sandbox)
+            .await
+            .map_err(core_error)
     }
-    async fn renew_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, ttl_seconds: u64) -> Result<WorkerLease, CoreError> {
-        Self::renew_worker_lease(self, tenant, lease_id, generation, ttl_seconds).await.map_err(core_error)
+    async fn renew_worker_lease(
+        &self,
+        tenant: Uuid,
+        lease_id: Uuid,
+        generation: i64,
+        ttl_seconds: u64,
+    ) -> Result<WorkerLease, CoreError> {
+        Self::renew_worker_lease(self, tenant, lease_id, generation, ttl_seconds)
+            .await
+            .map_err(core_error)
     }
-    async fn complete_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, result: Value) -> Result<WorkerLease, CoreError> {
-        Self::complete_worker_lease(self, tenant, lease_id, generation, result).await.map_err(core_error)
+    async fn complete_worker_lease(
+        &self,
+        tenant: Uuid,
+        lease_id: Uuid,
+        generation: i64,
+        result: Value,
+    ) -> Result<WorkerLease, CoreError> {
+        Self::complete_worker_lease(self, tenant, lease_id, generation, result)
+            .await
+            .map_err(core_error)
     }
-    async fn release_worker_lease(&self, tenant: Uuid, lease_id: Uuid, generation: i64, reason: &str) -> Result<WorkerLease, CoreError> {
-        Self::release_worker_lease(self, tenant, lease_id, generation, reason).await.map_err(core_error)
+    async fn release_worker_lease(
+        &self,
+        tenant: Uuid,
+        lease_id: Uuid,
+        generation: i64,
+        reason: &str,
+    ) -> Result<WorkerLease, CoreError> {
+        Self::release_worker_lease(self, tenant, lease_id, generation, reason)
+            .await
+            .map_err(core_error)
     }
-    async fn reconcile_expired_leases(&self, limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> {
-        Self::reconcile_expired_leases(self, limit).await.map_err(core_error)
+    async fn reconcile_expired_leases(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Self::reconcile_expired_leases(self, limit)
+            .await
+            .map_err(core_error)
     }
-    async fn list_reconciliation_actions(&self, tenant: Uuid, limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> {
-        Self::list_reconciliation_actions(self, tenant, limit).await.map_err(core_error)
+    async fn reassign_expired_lease(
+        &self,
+        lease_id: Uuid,
+    ) -> Result<Option<Reassignment>, CoreError> {
+        Self::reassign_expired_lease(self, lease_id)
+            .await
+            .map_err(core_error)
     }
-    async fn begin_sandbox_operation(&self, value: SandboxOperation) -> Result<SandboxOperation, CoreError> {
-        Self::begin_sandbox_operation(self, value).await.map_err(core_error)
+    async fn sandbox_ownership(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<Option<SandboxOwnership>, CoreError> {
+        Self::sandbox_ownership(self, sandbox_id)
+            .await
+            .map_err(core_error)
     }
-    async fn complete_sandbox_operation(&self, tenant: Uuid, request_id: Uuid, result: Value) -> Result<SandboxOperation, CoreError> {
-        Self::complete_sandbox_operation(self, tenant, request_id, result).await.map_err(core_error)
+    async fn list_reconciliation_actions(
+        &self,
+        tenant: Uuid,
+        limit: u32,
+    ) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Self::list_reconciliation_actions(self, tenant, limit)
+            .await
+            .map_err(core_error)
     }
-    async fn fail_sandbox_operation(&self, tenant: Uuid, request_id: Uuid, error: Value) -> Result<SandboxOperation, CoreError> {
-        Self::fail_sandbox_operation(self, tenant, request_id, error).await.map_err(core_error)
+    async fn begin_sandbox_operation(
+        &self,
+        value: SandboxOperation,
+    ) -> Result<SandboxOperation, CoreError> {
+        Self::begin_sandbox_operation(self, value)
+            .await
+            .map_err(core_error)
     }
-    async fn get_sandbox_operation(&self, tenant: Uuid, request_id: Uuid) -> Result<SandboxOperation, CoreError> {
-        Self::get_sandbox_operation(self, tenant, request_id).await.map_err(core_error)
+    async fn complete_sandbox_operation(
+        &self,
+        tenant: Uuid,
+        request_id: Uuid,
+        result: Value,
+    ) -> Result<SandboxOperation, CoreError> {
+        Self::complete_sandbox_operation(self, tenant, request_id, result)
+            .await
+            .map_err(core_error)
+    }
+    async fn fail_sandbox_operation(
+        &self,
+        tenant: Uuid,
+        request_id: Uuid,
+        error: Value,
+    ) -> Result<SandboxOperation, CoreError> {
+        Self::fail_sandbox_operation(self, tenant, request_id, error)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_sandbox_operation(
+        &self,
+        tenant: Uuid,
+        request_id: Uuid,
+    ) -> Result<SandboxOperation, CoreError> {
+        Self::get_sandbox_operation(self, tenant, request_id)
+            .await
+            .map_err(core_error)
     }
     async fn put_image(&self, value: ImageRecord) -> Result<(), CoreError> {
         Self::put_image(self, value).await.map_err(core_error)
@@ -2010,7 +2730,6 @@ impl MetadataStore for PostgresRepository {
         Self::get_image(self, id).await.map_err(core_error)
     }
 }
-
 
 async fn update_operation(
     repository: &PostgresRepository,
@@ -2144,6 +2863,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn runtime_parser_accepts_docker() {
+        assert_eq!(runtime_from_str("docker").unwrap(), RuntimeKind::Docker);
+    }
+
+    #[test]
+    fn capability_json_round_trips() {
+        let capabilities = agentforge_core::runtime::RuntimeCapabilities {
+            isolation: agentforge_core::runtime::RuntimeIsolation::Container,
+            exec: true,
+            files: true,
+            streaming: false,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(capabilities.clone()).unwrap();
+        let parsed: agentforge_core::runtime::RuntimeCapabilities =
+            serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, capabilities);
+    }
     fn sandbox(tenant: Uuid) -> Sandbox {
         let now = Utc::now();
         Sandbox {
@@ -2158,6 +2896,7 @@ mod tests {
             disk_mb: 512,
             timeout_seconds: 60,
             network: Default::default(),
+            environment: Default::default(),
             created_at: now,
             updated_at: now,
             runtime_path: None,
@@ -2169,13 +2908,14 @@ mod tests {
         tenant: Uuid,
         request_id: Uuid,
         sandbox: Sandbox,
+        preferred_worker: Option<Uuid>,
     ) -> Result<ScheduledSandbox, CoreError> {
         PostgresScheduler::new(repository.clone())
             .schedule(ScheduleRequest {
                 tenant_id: tenant,
                 request_id,
                 sandbox,
-                preferred_worker: None,
+                preferred_worker,
                 lease_ttl: Duration::from_secs(60),
             })
             .await
@@ -2186,6 +2926,9 @@ mod tests {
         let Ok(database_url) = std::env::var("DATABASE_URL") else {
             return;
         };
+        if database_url.is_empty() {
+            return;
+        }
         let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
         repository.migrate().await.unwrap();
         let tenant = new_id();
@@ -2203,7 +2946,13 @@ mod tests {
                 node_id,
                 name: format!("node-{}", node_id),
                 runtime: RuntimeKind::Firecracker,
-                control_endpoint: "http://127.0.0.1:9000".into(),
+                capabilities: agentforge_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    streaming: false,
+                    ..Default::default()
+                },
+                control_endpoint: "https://127.0.0.1:9000".into(),
                 total_vcpus: 1,
                 total_memory_bytes: 64 * 1_048_576,
                 total_disk_bytes: 512 * 1_048_576,
@@ -2223,13 +2972,13 @@ mod tests {
         let left = tokio::spawn({
             let repository = repository.clone();
             async move {
-                schedule_test_sandbox(&repository, tenant, new_id(), first).await
+                schedule_test_sandbox(&repository, tenant, new_id(), first, Some(node_id)).await
             }
         });
         let right = tokio::spawn({
             let repository = repository.clone();
             async move {
-                schedule_test_sandbox(&repository, tenant, new_id(), second).await
+                schedule_test_sandbox(&repository, tenant, new_id(), second, Some(node_id)).await
             }
         });
         let mut successes = 0;
@@ -2245,9 +2994,67 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    #[tokio::test]
+    async fn concurrent_quota_admission_is_serialized() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        sqlx::query(
+            "UPDATE tenant_quotas SET max_active_sandboxes=1, max_vcpus=2, \
+             max_memory_mb=128, max_disk_mb=1024 WHERE tenant_id=$1",
+        )
+        .bind(tenant)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        let left = tokio::spawn({
+            let repository = repository.clone();
+            async move {
+                schedule_test_sandbox(
+                    &repository,
+                    tenant,
+                    new_id(),
+                    sandbox(tenant),
+                    Some(node_id),
+                )
+                .await
+            }
+        });
+        let right = tokio::spawn({
+            let repository = repository.clone();
+            async move {
+                schedule_test_sandbox(
+                    &repository,
+                    tenant,
+                    new_id(),
+                    sandbox(tenant),
+                    Some(node_id),
+                )
+                .await
+            }
+        });
+        let results = [left.await.unwrap(), right.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(CoreError::QuotaExceeded(_))))
+                .count(),
+            1
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
     async fn repository_and_tenant() -> Option<(Arc<PostgresRepository>, Uuid)> {
-        let database_url = std::env::var("DATABASE_URL").ok()?;
-        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        let database_url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        let repository = Arc::new(
+            PostgresRepository::connect(database_url.trim())
+                .await
+                .unwrap(),
+        );
         repository.migrate().await.unwrap();
         let tenant = new_id();
         repository
@@ -2268,7 +3075,13 @@ mod tests {
                 node_id,
                 name: format!("node-{}-{node_id}", tenant),
                 runtime: RuntimeKind::Firecracker,
-                control_endpoint: "http://127.0.0.1:9000".into(),
+                capabilities: agentforge_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    streaming: false,
+                    ..Default::default()
+                },
+                control_endpoint: "https://127.0.0.1:9000".into(),
                 total_vcpus: 2,
                 total_memory_bytes: 128 * 1_048_576,
                 total_disk_bytes: 1024 * 1_048_576,
@@ -2292,9 +3105,15 @@ mod tests {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
-        let _scheduled = schedule_test_sandbox(&repository, tenant, new_id(), sandbox(tenant))
-            .await
-            .unwrap();
+        let _scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
         let before = repository.get_worker(node_id).await.unwrap();
         sqlx::query("UPDATE nodes SET last_heartbeat=now()-interval '1 minute' WHERE id=$1")
             .bind(node_id)
@@ -2341,9 +3160,15 @@ mod tests {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
-        let scheduled = schedule_test_sandbox(&repository, tenant, new_id(), sandbox(tenant))
-            .await
-            .unwrap();
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
         let claimed = repository
             .claim_worker_assignments(node_id, 1, 60)
             .await
@@ -2402,6 +3227,503 @@ mod tests {
                 .execute(&repository.pool)
                 .await
                 .is_err()
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    async fn expire_lease(repository: &PostgresRepository, lease_id: Uuid) {
+        sqlx::query("UPDATE sandbox_leases SET expires_at=now()-interval '1 second' WHERE id=$1")
+            .bind(lease_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn mark_worker_dead(repository: &PostgresRepository, node_id: Uuid) {
+        sqlx::query(
+            "UPDATE nodes SET healthy=false, last_heartbeat=now()-interval '1 hour' WHERE id=$1",
+        )
+        .bind(node_id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Registers a worker of an explicit shape so a recovery test can use a sandbox that
+    /// only workers of that shape can hold.
+    async fn register_worker_with(
+        repository: &PostgresRepository,
+        tenant: Uuid,
+        vcpus: u32,
+        memory_mb: u64,
+        disk_mb: u64,
+    ) -> Uuid {
+        let node_id = new_id();
+        let memory_bytes = memory_mb * 1_048_576;
+        let disk_bytes = disk_mb * 1_048_576;
+        repository
+            .register_worker(WorkerRegistration {
+                node_id,
+                name: format!("recovery-node-{tenant}-{node_id}"),
+                runtime: RuntimeKind::Firecracker,
+                capabilities: agentforge_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    streaming: false,
+                    ..Default::default()
+                },
+                control_endpoint: "https://127.0.0.1:9000".into(),
+                total_vcpus: vcpus,
+                total_memory_bytes: memory_bytes,
+                total_disk_bytes: disk_bytes,
+                available_vcpus: vcpus,
+                available_memory_bytes: memory_bytes,
+                available_disk_bytes: disk_bytes,
+                healthy: true,
+                version: 1,
+                metadata: json!({}),
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+            })
+            .await
+            .unwrap();
+        node_id
+    }
+
+    fn sandbox_with(tenant: Uuid, vcpus: u32, memory_mb: u32, disk_mb: u32) -> Sandbox {
+        let mut value = sandbox(tenant);
+        value.cpu = vcpus;
+        value.memory_mb = memory_mb;
+        value.disk_mb = disk_mb;
+        value
+    }
+
+    /// Snapshot of every worker's debited vCPUs and sandbox count, taken around a
+    /// reassignment so the capacity it moves can be asserted whichever worker is chosen.
+    async fn node_capacity(
+        repository: &PostgresRepository,
+    ) -> std::collections::HashMap<Uuid, (i32, i32)> {
+        let rows = sqlx::query("SELECT id, available_vcpus, sandbox_count FROM nodes")
+            .fetch_all(&repository.pool)
+            .await
+            .unwrap();
+        rows.iter()
+            .map(|row| {
+                (
+                    row.try_get::<Uuid, _>("id").unwrap(),
+                    (
+                        row.try_get::<i32, _>("available_vcpus").unwrap(),
+                        row.try_get::<i32, _>("sandbox_count").unwrap(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Workers sized so that only [`MEMORY_WORKER`] can hold the memory-shaped sandbox and
+    /// only [`DISK_WORKER`] can hold the disk-shaped one. The two recovery tests therefore
+    /// never select each other's workers on the shared test database.
+    const MEMORY_WORKER: (u32, u64, u64) = (32, 61_000, 4_096);
+    const MEMORY_SANDBOX: (u32, u32, u32) = (31, 60_000, 3_072);
+    const DISK_WORKER: (u32, u64, u64) = (32, 4_096, 1_010_000);
+    const DISK_SANDBOX: (u32, u32, u32) = (31, 3_072, 1_000_000);
+
+    #[tokio::test]
+    async fn fenced_state_update_accepts_only_the_current_lease_generation() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        let generation = claimed[0].lease.generation;
+        let sandbox_id = scheduled.sandbox.id;
+        for stale in [generation - 1, generation + 1] {
+            let error = repository
+                .update_state_with_generation(
+                    tenant,
+                    sandbox_id,
+                    SandboxState::Creating,
+                    SandboxState::Starting,
+                    stale,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &error,
+                StoreError::Conflict(message) if message == "stale sandbox lease generation"
+            ));
+            assert_eq!(
+                repository
+                    .get_sandbox(tenant, sandbox_id)
+                    .await
+                    .unwrap()
+                    .state,
+                SandboxState::Creating
+            );
+        }
+        MetadataStore::update_state_with_generation(
+            &*repository,
+            tenant,
+            sandbox_id,
+            SandboxState::Creating,
+            SandboxState::Starting,
+            generation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Starting
+        );
+        let renewed = repository
+            .renew_worker_lease(tenant, scheduled.lease_id, generation, 60)
+            .await
+            .unwrap();
+        assert_eq!(renewed.generation, generation + 1);
+        assert!(
+            repository
+                .update_state_with_generation(
+                    tenant,
+                    sandbox_id,
+                    SandboxState::Starting,
+                    SandboxState::Running,
+                    generation,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Starting
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn a_workspace_snapshot_is_storable_and_restorable() {
+        // Regression: completeness used to require memory and disk objects for
+        // every snapshot kind, and the capture path inserted the same row twice,
+        // so a workspace snapshot could never be stored. Recovery restores
+        // exactly this row, so it has to round-trip.
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let (vcpus, memory_mb, disk_mb) = MEMORY_WORKER;
+        let node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, MEMORY_SANDBOX.0, MEMORY_SANDBOX.1, MEMORY_SANDBOX.2),
+            Some(node),
+        )
+        .await
+        .unwrap();
+        let snapshot_id = new_id();
+        let object_key = format!("{}-{}", scheduled.sandbox.id, new_id());
+        repository
+            .put_stored_snapshot(StoredSnapshot {
+                id: snapshot_id,
+                tenant_id: tenant,
+                sandbox_id: scheduled.sandbox.id,
+                object_key: object_key.clone(),
+                manifest_object_key: format!("{object_key}.manifest.json"),
+                memory_object_key: None,
+                disk_object_key: None,
+                workspace_object_key: Some(object_key.clone()),
+                size_bytes: 128,
+                image_id: scheduled.sandbox.image_id.clone(),
+                checksum_sha256: "a".repeat(64),
+                kind: "workspace".to_string(),
+                manifest: serde_json::json!({"kind": "workspace"}),
+                complete: true,
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let stored = repository
+            .get_stored_snapshot(tenant, snapshot_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.kind, "workspace");
+        assert!(stored.complete);
+        assert_eq!(stored.workspace_object_key.as_deref(), Some(&*object_key));
+        let recoverable = repository
+            .list_stored_snapshots(tenant, scheduled.sandbox.id)
+            .await
+            .unwrap();
+        assert!(
+            recoverable.iter().any(|entry| entry.id == snapshot_id),
+            "recovery would not find the workspace archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassignment_moves_the_sandbox_and_fences_the_dead_owner() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let (vcpus, memory_mb, disk_mb) = MEMORY_WORKER;
+        let dead_node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let _second_worker =
+            register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, MEMORY_SANDBOX.0, MEMORY_SANDBOX.1, MEMORY_SANDBOX.2),
+            Some(dead_node),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(dead_node, 1, 60)
+            .await
+            .unwrap();
+        let dead_generation = claimed[0].lease.generation;
+        let sandbox_id = scheduled.sandbox.id;
+        for (expected, next) in [
+            (SandboxState::Creating, SandboxState::Starting),
+            (SandboxState::Starting, SandboxState::Running),
+        ] {
+            repository
+                .update_state_with_generation(tenant, sandbox_id, expected, next, dead_generation)
+                .await
+                .unwrap();
+        }
+        let before = node_capacity(&repository).await;
+        mark_worker_dead(&repository, dead_node).await;
+        expire_lease(&repository, scheduled.lease_id).await;
+        let recovery = repository
+            .reassign_expired_lease(scheduled.lease_id)
+            .await
+            .unwrap()
+            .expect("an expired lease of a dead worker is reassigned");
+        let replacement = recovery.lease.node_id;
+        assert_ne!(replacement, dead_node);
+        assert_eq!(recovery.lease.generation, dead_generation + 1);
+        assert_eq!(recovery.lease.status, "active");
+        assert!(recovery.lease.expires_at > Utc::now());
+        assert_eq!(recovery.sandbox.id, sandbox_id);
+        assert_eq!(recovery.sandbox.node_id, Some(replacement));
+        assert_eq!(recovery.sandbox.state, SandboxState::Creating);
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .node_id,
+            Some(replacement)
+        );
+        let after = node_capacity(&repository).await;
+        let (dead_vcpus, dead_count) = before[&dead_node];
+        assert_eq!(after[&dead_node], (dead_vcpus + 31, dead_count - 1));
+        let (replacement_vcpus, replacement_count) = before[&replacement];
+        assert_eq!(
+            after[&replacement],
+            (replacement_vcpus - 31, replacement_count + 1)
+        );
+        let reclaimed = repository
+            .claim_worker_assignments(replacement, 1, 60)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].lease.id, recovery.lease.id);
+        let ownership = repository
+            .sandbox_ownership(sandbox_id)
+            .await
+            .unwrap()
+            .expect("the reassigned sandbox has an owner");
+        assert_eq!(ownership.lease_id, recovery.lease.id);
+        assert_eq!(ownership.node_id, replacement);
+        assert_eq!(ownership.generation, reclaimed[0].lease.generation);
+        let expired = repository
+            .get_worker_lease(tenant, scheduled.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(expired.status, "expired");
+        assert_eq!(expired.reason.as_deref(), Some("lease_expired_recovery"));
+        assert!(
+            repository
+                .complete_worker_lease(
+                    tenant,
+                    scheduled.lease_id,
+                    dead_generation,
+                    json!({ "ok": true }),
+                )
+                .await
+                .is_err()
+        );
+        let late = repository
+            .update_state_with_generation(
+                tenant,
+                sandbox_id,
+                SandboxState::Creating,
+                SandboxState::Starting,
+                dead_generation,
+            )
+            .await;
+        assert!(matches!(
+            late,
+            Err(StoreError::Conflict(message)) if message == "stale sandbox lease generation"
+        ));
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Creating
+        );
+        repository
+            .update_state_with_generation(
+                tenant,
+                sandbox_id,
+                SandboxState::Creating,
+                SandboxState::Starting,
+                ownership.generation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Starting
+        );
+        assert!(
+            repository
+                .reassign_expired_lease(scheduled.lease_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn reassignment_refuses_a_live_lease_and_an_unknown_lease() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        assert!(
+            repository
+                .reassign_expired_lease(scheduled.lease_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repository
+                .reassign_expired_lease(new_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let lease = repository
+            .get_worker_lease(tenant, scheduled.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(lease.status, "active");
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, scheduled.sandbox.id)
+                .await
+                .unwrap()
+                .node_id,
+            Some(node_id)
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn reassignment_recovers_a_lease_the_reconciler_already_expired() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let (vcpus, memory_mb, disk_mb) = DISK_WORKER;
+        let dead_node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let _second_worker =
+            register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, DISK_SANDBOX.0, DISK_SANDBOX.1, DISK_SANDBOX.2),
+            Some(dead_node),
+        )
+        .await
+        .unwrap();
+        let before = node_capacity(&repository).await;
+        mark_worker_dead(&repository, dead_node).await;
+        expire_lease(&repository, scheduled.lease_id).await;
+        // The reconciler works in bounded batches, so drain until this lease is expired.
+        let mut reconciled_here = false;
+        for _ in 0..10 {
+            let actions = repository.reconcile_expired_leases(100).await.unwrap();
+            if actions
+                .iter()
+                .any(|action| action.lease_id == Some(scheduled.lease_id))
+            {
+                reconciled_here = true;
+                break;
+            }
+        }
+        assert!(
+            reconciled_here,
+            "the reconciler expired the dead owner's lease"
+        );
+        let reconciled = node_capacity(&repository).await;
+        let (dead_vcpus, dead_count) = before[&dead_node];
+        assert_eq!(reconciled[&dead_node], (dead_vcpus + 31, dead_count - 1));
+        // The capacity release already happened, so recovery must not release it again.
+        let recovery = repository
+            .reassign_expired_lease(scheduled.lease_id)
+            .await
+            .unwrap()
+            .expect("a lease the reconciler expired is still recoverable");
+        assert_eq!(recovery.lease.generation, scheduled.lease_generation + 1);
+        assert_ne!(recovery.lease.node_id, dead_node);
+        assert_eq!(recovery.sandbox.node_id, Some(recovery.lease.node_id));
+        assert_eq!(recovery.sandbox.state, SandboxState::Creating);
+        let after = node_capacity(&repository).await;
+        assert_eq!(after[&dead_node], reconciled[&dead_node]);
+        let (replacement_vcpus, replacement_count) = before[&recovery.lease.node_id];
+        assert_eq!(
+            after[&recovery.lease.node_id],
+            (replacement_vcpus - 31, replacement_count + 1)
         );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }

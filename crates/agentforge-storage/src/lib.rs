@@ -3,20 +3,18 @@ mod object_store;
 mod postgres;
 mod snapshots;
 
-pub use images::StandardImageResolver;
-pub use object_store::{
-    FilesystemObjectStore, S3Config, S3ObjectStore,
-};
+pub use images::{SignedImageResolver, StandardImageResolver};
+pub use object_store::{FilesystemObjectStore, S3Config, S3ObjectStore};
 pub use postgres::PostgresScheduler;
 pub use snapshots::{snapshot_capabilities, snapshot_kind, snapshot_metadata};
 
 use agentforge_core::{
-    ApiKeyRecord, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent, UsageSummary,
-    CoreError,
+    ApiKeyRecord, CoreError, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
+    UsageSummary,
     storage::{
-        MetadataStore, ReconciliationAction, SandboxEvent, SandboxOperation, StoredSnapshot,
-        TenantRecord, WorkerAssignment, WorkerHeartbeat, WorkerLease, WorkerRegistration,
-        WorkerStatus,
+        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
+        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
+        WorkerLease, WorkerRegistration, WorkerStatus,
     },
 };
 use async_trait::async_trait;
@@ -39,6 +37,8 @@ pub enum StoreError {
     Conflict(String),
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
     #[error("migration: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("io: {0}")]
@@ -58,6 +58,7 @@ pub(crate) fn core_error(error: StoreError) -> CoreError {
         StoreError::Core(error) => error,
         StoreError::NotFound => CoreError::NotFound("record not found".into()),
         StoreError::Conflict(message) => CoreError::Conflict(message),
+        StoreError::QuotaExceeded(message) => CoreError::QuotaExceeded(message),
         StoreError::Database(error) => {
             if matches!(
                 &error,
@@ -90,7 +91,6 @@ pub(crate) fn database_error(error: sqlx::Error) -> StoreError {
     }
     StoreError::Database(error)
 }
-
 
 #[derive(Default)]
 struct MemoryData {
@@ -350,7 +350,6 @@ impl MemoryRepository {
             .cloned()
             .collect())
     }
-
 }
 
 #[async_trait]
@@ -360,7 +359,9 @@ impl MetadataStore for MemoryRepository {
     }
 
     async fn get_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<Sandbox, CoreError> {
-        Self::get_sandbox(self, tenant, id).await.map_err(core_error)
+        Self::get_sandbox(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
 
     async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, CoreError> {
@@ -380,8 +381,21 @@ impl MetadataStore for MemoryRepository {
             .map_err(core_error)
     }
 
+    async fn update_state_with_generation(
+        &self,
+        _tenant: Uuid,
+        _id: Uuid,
+        _expected: SandboxState,
+        _next: SandboxState,
+        _generation: i64,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+
     async fn delete_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
-        Self::delete_sandbox(self, tenant, id).await.map_err(core_error)
+        Self::delete_sandbox(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
 
     async fn put_key(&self, value: ApiKeyRecord) -> Result<(), CoreError> {
@@ -401,7 +415,9 @@ impl MetadataStore for MemoryRepository {
     }
 
     async fn get_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<Snapshot, CoreError> {
-        Self::get_snapshot(self, tenant, id).await.map_err(core_error)
+        Self::get_snapshot(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
 
     async fn list_snapshots(
@@ -440,40 +456,192 @@ impl MetadataStore for MemoryRepository {
         Self::list_nodes(self).await.map_err(core_error)
     }
 
-
-    async fn put_tenant(&self, _value: TenantRecord) -> Result<(), CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_tenant(&self, _id: Uuid) -> Result<TenantRecord, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn list_sandbox_events(&self, _tenant: Uuid, _sandbox: Uuid, _limit: u32) -> Result<Vec<SandboxEvent>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
+    async fn put_tenant(&self, _value: TenantRecord) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_tenant(&self, _id: Uuid) -> Result<TenantRecord, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_sandbox_events(
+        &self,
+        _tenant: Uuid,
+        _sandbox: Uuid,
+        _limit: u32,
+    ) -> Result<Vec<SandboxEvent>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
     async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), CoreError> {
-        Self::put_stored_snapshot(self, value).await.map_err(core_error)
+        Self::put_stored_snapshot(self, value)
+            .await
+            .map_err(core_error)
     }
-    async fn get_stored_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<StoredSnapshot, CoreError> {
-        Self::get_stored_snapshot(self, tenant, id).await.map_err(core_error)
+    async fn get_stored_snapshot(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<StoredSnapshot, CoreError> {
+        Self::get_stored_snapshot(self, tenant, id)
+            .await
+            .map_err(core_error)
     }
-    async fn list_stored_snapshots(&self, tenant: Uuid, sandbox: Uuid) -> Result<Vec<StoredSnapshot>, CoreError> {
-        Self::list_stored_snapshots(self, tenant, sandbox).await.map_err(core_error)
+    async fn list_stored_snapshots(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<StoredSnapshot>, CoreError> {
+        Self::list_stored_snapshots(self, tenant, sandbox)
+            .await
+            .map_err(core_error)
     }
-    async fn create_sandbox_idempotent(&self, _tenant: Uuid, _request_id: Uuid, _sandbox: Sandbox) -> Result<Sandbox, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn register_worker(&self, _value: WorkerRegistration) -> Result<(), CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn heartbeat_worker(&self, _heartbeat: WorkerHeartbeat) -> Result<WorkerStatus, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_worker(&self, _node_id: Uuid) -> Result<WorkerStatus, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn list_workers(&self, _include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn claim_worker_assignments(&self, _node_id: Uuid, _limit: u32, _lease_ttl_seconds: u64) -> Result<Vec<WorkerAssignment>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn list_worker_assignments(&self, _tenant: Uuid, _node_id: Uuid, _status: Option<&str>, _limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn list_worker_assignments_for_node(&self, _node_id: Uuid, _status: Option<&str>, _limit: u32) -> Result<Vec<WorkerAssignment>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_worker_lease(&self, _tenant: Uuid, _lease_id: Uuid) -> Result<WorkerLease, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_active_worker_lease(&self, _tenant: Uuid, _sandbox: Uuid) -> Result<WorkerLease, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn renew_worker_lease(&self, _tenant: Uuid, _lease_id: Uuid, _generation: i64, _ttl_seconds: u64) -> Result<WorkerLease, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn complete_worker_lease(&self, _tenant: Uuid, _lease_id: Uuid, _generation: i64, _result: serde_json::Value) -> Result<WorkerLease, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn release_worker_lease(&self, _tenant: Uuid, _lease_id: Uuid, _generation: i64, _reason: &str) -> Result<WorkerLease, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn reconcile_expired_leases(&self, _limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn list_reconciliation_actions(&self, _tenant: Uuid, _limit: u32) -> Result<Vec<ReconciliationAction>, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn begin_sandbox_operation(&self, _value: SandboxOperation) -> Result<SandboxOperation, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn complete_sandbox_operation(&self, _tenant: Uuid, _request_id: Uuid, _result: serde_json::Value) -> Result<SandboxOperation, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn fail_sandbox_operation(&self, _tenant: Uuid, _request_id: Uuid, _error: serde_json::Value) -> Result<SandboxOperation, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_sandbox_operation(&self, _tenant: Uuid, _request_id: Uuid) -> Result<SandboxOperation, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn put_image(&self, _value: ImageRecord) -> Result<(), CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
-    async fn get_image(&self, _id: &str) -> Result<ImageRecord, CoreError> { Err(CoreError::Unsupported("memory metadata store".into())) }
+    async fn create_sandbox_idempotent(
+        &self,
+        _tenant: Uuid,
+        _request_id: Uuid,
+        _sandbox: Sandbox,
+    ) -> Result<Sandbox, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn register_worker(&self, _value: WorkerRegistration) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn heartbeat_worker(
+        &self,
+        _heartbeat: WorkerHeartbeat,
+    ) -> Result<WorkerStatus, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_worker(&self, _node_id: Uuid) -> Result<WorkerStatus, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_workers(&self, _include_unhealthy: bool) -> Result<Vec<WorkerStatus>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn claim_worker_assignments(
+        &self,
+        _node_id: Uuid,
+        _limit: u32,
+        _lease_ttl_seconds: u64,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_worker_assignments(
+        &self,
+        _tenant: Uuid,
+        _node_id: Uuid,
+        _status: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_worker_assignments_for_node(
+        &self,
+        _node_id: Uuid,
+        _status: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<WorkerAssignment>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _lease_id: Uuid,
+    ) -> Result<WorkerLease, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_active_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _sandbox: Uuid,
+    ) -> Result<WorkerLease, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn renew_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _lease_id: Uuid,
+        _generation: i64,
+        _ttl_seconds: u64,
+    ) -> Result<WorkerLease, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn complete_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _lease_id: Uuid,
+        _generation: i64,
+        _result: serde_json::Value,
+    ) -> Result<WorkerLease, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn release_worker_lease(
+        &self,
+        _tenant: Uuid,
+        _lease_id: Uuid,
+        _generation: i64,
+        _reason: &str,
+    ) -> Result<WorkerLease, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn reconcile_expired_leases(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn reassign_expired_lease(
+        &self,
+        _lease_id: Uuid,
+    ) -> Result<Option<Reassignment>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn sandbox_ownership(
+        &self,
+        _sandbox_id: Uuid,
+    ) -> Result<Option<SandboxOwnership>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn list_reconciliation_actions(
+        &self,
+        _tenant: Uuid,
+        _limit: u32,
+    ) -> Result<Vec<ReconciliationAction>, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn begin_sandbox_operation(
+        &self,
+        _value: SandboxOperation,
+    ) -> Result<SandboxOperation, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn complete_sandbox_operation(
+        &self,
+        _tenant: Uuid,
+        _request_id: Uuid,
+        _result: serde_json::Value,
+    ) -> Result<SandboxOperation, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn fail_sandbox_operation(
+        &self,
+        _tenant: Uuid,
+        _request_id: Uuid,
+        _error: serde_json::Value,
+    ) -> Result<SandboxOperation, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_sandbox_operation(
+        &self,
+        _tenant: Uuid,
+        _request_id: Uuid,
+    ) -> Result<SandboxOperation, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn put_image(&self, _value: ImageRecord) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+    async fn get_image(&self, _id: &str) -> Result<ImageRecord, CoreError> {
+        Err(CoreError::Unsupported("memory metadata store".into()))
+    }
 }
 
 #[derive(Clone)]

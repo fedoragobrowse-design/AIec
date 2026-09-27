@@ -20,7 +20,6 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 
 type HmacSha256 = Hmac<Sha256>;
 
-
 fn validate_object_key(key: &str) -> Result<(), StoreError> {
     if key.is_empty() || key.len() > 1024 {
         return Err(StoreError::InvalidObjectKey(
@@ -68,7 +67,6 @@ impl FilesystemObjectStore {
             mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
-
 
     async fn root(&self) -> Result<PathBuf, StoreError> {
         tokio::fs::create_dir_all(&self.root).await?;
@@ -183,6 +181,66 @@ impl FilesystemObjectStore {
 }
 
 impl FilesystemObjectStore {
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, StoreError> {
+        let prefix = prefix.trim_end_matches('/');
+        let root = self.root().await?;
+        let base = self.existing_path(prefix).await?;
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+        let base_metadata = tokio::fs::symlink_metadata(&base).await?;
+        if base_metadata.file_type().is_symlink() {
+            return Err(StoreError::InvalidObjectKey(
+                "object prefix is a symlink".into(),
+            ));
+        }
+        if !base_metadata.is_dir() {
+            return Err(StoreError::InvalidObjectKey(
+                "object prefix is not a directory".into(),
+            ));
+        }
+        let mut pending = vec![base];
+        let mut objects = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let mut entries = tokio::fs::read_dir(&directory).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let metadata = tokio::fs::symlink_metadata(&path).await?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') && name.ends_with(".tmp") {
+                    continue;
+                }
+                if metadata.file_type().is_symlink() {
+                    return Err(StoreError::InvalidObjectKey(
+                        "object tree contains a symlink".into(),
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                let key = path
+                    .strip_prefix(&root)
+                    .map_err(|_| StoreError::InvalidObjectKey("object path escaped root".into()))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let bytes = tokio::fs::read(&path).await?;
+                let digest = checksum(&bytes);
+                objects.push(ObjectMetadata {
+                    key,
+                    size_bytes: bytes.len() as u64,
+                    checksum_sha256: digest.clone(),
+                    etag: Some(digest),
+                });
+            }
+        }
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        Ok(objects)
+    }
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let path = self.safe_path(key, true).await?;
@@ -278,6 +336,9 @@ impl FilesystemObjectStore {
 impl ArtifactStore for FilesystemObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
         Self::put(self, key, bytes).await.map_err(core_error)
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError> {
+        Self::list(self, prefix).await.map_err(core_error)
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError> {
@@ -405,7 +466,6 @@ impl S3ObjectStore {
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
         Ok(Self { client, config })
     }
-
 
     fn full_key(&self, key: &str) -> Result<String, StoreError> {
         validate_object_key(key)?;
@@ -669,6 +729,11 @@ impl ArtifactStore for S3ObjectStore {
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
         Self::put(self, key, bytes).await.map_err(core_error)
     }
+    async fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError> {
+        Err(CoreError::Unsupported(
+            "S3 artifact listing is not implemented".into(),
+        ))
+    }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError> {
         Self::get(self, key).await.map_err(core_error)
@@ -770,6 +835,52 @@ mod tests {
         })
         .expect("test configuration")
     }
+    #[tokio::test]
+    async fn s3_put_get_delete_when_configured() {
+        if std::env::var("AGENTFORGE_RUN_S3_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let endpoint = std::env::var("AGENTFORGE_S3_ENDPOINT")
+            .expect("AGENTFORGE_S3_ENDPOINT is required when S3 tests are enabled");
+        let store = S3ObjectStore::new(S3Config {
+            endpoint,
+            region: std::env::var("AGENTFORGE_S3_REGION")
+                .expect("AGENTFORGE_S3_REGION is required when S3 tests are enabled"),
+            bucket: std::env::var("AGENTFORGE_S3_BUCKET")
+                .expect("AGENTFORGE_S3_BUCKET is required when S3 tests are enabled"),
+            access_key_id: std::env::var("AGENTFORGE_S3_ACCESS_KEY_ID")
+                .expect("AGENTFORGE_S3_ACCESS_KEY_ID is required when S3 tests are enabled"),
+            secret_access_key: std::env::var("AGENTFORGE_S3_SECRET_ACCESS_KEY")
+                .expect("AGENTFORGE_S3_SECRET_ACCESS_KEY is required when S3 tests are enabled"),
+            prefix: std::env::var("AGENTFORGE_S3_PREFIX").unwrap_or_default(),
+            request_timeout: Duration::from_secs(10),
+        })
+        .expect("valid S3 configuration");
+        let key = format!("integration/{}.txt", Uuid::new_v4());
+        let payload = b"agentforge live S3 artifact";
+        let operation = async {
+            let metadata = store
+                .put(&key, payload)
+                .await
+                .map_err(|error| error.to_string())?;
+            if metadata.size_bytes != payload.len() as u64 {
+                return Err(format!("unexpected object size: {}", metadata.size_bytes));
+            }
+            let downloaded = store.get(&key).await.map_err(|error| error.to_string())?;
+            if downloaded != payload {
+                return Err("downloaded object bytes differ".into());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        let cleanup = store.delete(&key).await;
+        operation.expect("live S3 put/get workflow");
+        cleanup.expect("live S3 delete cleanup");
+        assert!(
+            store.get(&key).await.is_err(),
+            "deleted object remains readable"
+        );
+    }
 
     #[test]
     fn rejects_unsafe_keys() {
@@ -784,6 +895,39 @@ mod tests {
             assert!(validate_object_key(key).is_err(), "accepted {key:?}");
         }
         assert!(validate_object_key("tenant/sandbox-123/manifest.json").is_ok());
+    }
+    #[tokio::test]
+    async fn filesystem_list_omits_in_progress_temp_files() {
+        let root = std::env::temp_dir().join(format!("agentforge-list-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+        store.put("prefix/committed", b"payload").await.unwrap();
+        tokio::fs::create_dir_all(root.join("prefix"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("prefix/.upload.uuid.tmp"), b"incomplete")
+            .await
+            .unwrap();
+        let listed = store.list("prefix").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "prefix/committed");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn filesystem_list_rejects_symlinked_intermediate_directory() {
+        let root = std::env::temp_dir().join(format!("agentforge-list-root-{}", Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("agentforge-list-outside-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::create_dir_all(outside.join("nested"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(outside.join("nested"), root.join("linked")).unwrap();
+        let store = FilesystemObjectStore::new(&root);
+        assert!(store.list("linked").await.is_err());
+        let _ = tokio::fs::remove_dir_all(root).await;
+        let _ = tokio::fs::remove_dir_all(outside).await;
     }
 
     #[test]

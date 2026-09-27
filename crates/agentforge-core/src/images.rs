@@ -13,9 +13,13 @@ impl ImageReference {
     /// Creates a reference without interpreting its tag or digest.
     pub fn new(value: impl Into<String>) -> Result<Self, crate::CoreError> {
         let value = value.into();
-        if value.is_empty() || value.len() > 1024 || value.bytes().any(|byte| byte.is_ascii_control())
+        if value.is_empty()
+            || value.len() > 1024
+            || value.bytes().any(|byte| byte.is_ascii_control())
         {
-            return Err(crate::CoreError::InvalidRequest("invalid image reference".into()));
+            return Err(crate::CoreError::InvalidRequest(
+                "invalid image reference".into(),
+            ));
         }
         Ok(Self(value))
     }
@@ -50,9 +54,13 @@ impl ImageDigest {
     pub fn new(value: impl Into<String>) -> Result<Self, crate::CoreError> {
         let value = value.into();
         if value.len() != 64
-            || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(crate::CoreError::InvalidRequest("invalid SHA-256 digest".into()));
+            return Err(crate::CoreError::InvalidRequest(
+                "invalid SHA-256 digest".into(),
+            ));
         }
         Ok(Self(value))
     }
@@ -94,12 +102,54 @@ pub struct ResolvedImage {
     pub architecture: Option<String>,
 }
 
+/// Signed admission data for a production image artifact.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedImageManifest {
+    /// Image reference approved by the operator.
+    pub reference: String,
+    /// SHA-256 digest of the rootfs artifact.
+    pub rootfs_sha256: String,
+    /// Hex-encoded HMAC-SHA256 signature over the canonical fields.
+    pub signature: String,
+}
+
+impl SignedImageManifest {
+    /// Verifies a manifest using a deployment secret and constant-time comparison.
+    pub fn verify(&self, secret: &[u8]) -> Result<(), crate::CoreError> {
+        if self.rootfs_sha256.len() != 64
+            || !self
+                .rootfs_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(crate::CoreError::InvalidRequest(
+                "invalid image digest".into(),
+            ));
+        }
+        let expected =
+            crate::image_manifest_signature(secret, &self.reference, &self.rootfs_sha256);
+        if !constant_time_hex_eq(expected.as_bytes(), self.signature.as_bytes()) {
+            return Err(crate::CoreError::Forbidden(
+                "image manifest signature mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn constant_time_hex_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
 /// Resolves human-facing image names to immutable runtime images.
 #[async_trait]
 pub trait ImageResolver: Send + Sync {
     /// Resolves an image reference without executing it.
-    async fn resolve(
-        &self,
-        reference: &ImageReference,
-    ) -> Result<ResolvedImage, crate::CoreError>;
+    async fn resolve(&self, reference: &ImageReference) -> Result<ResolvedImage, crate::CoreError>;
 }

@@ -51,6 +51,12 @@ pub trait Scheduler: Send + Sync {
         tenant_id: TenantId,
         sandbox_id: SandboxId,
     ) -> Result<String, crate::CoreError>;
+    /// Returns the current active lease generation for a sandbox.
+    async fn lease_generation(
+        &self,
+        tenant_id: TenantId,
+        sandbox_id: SandboxId,
+    ) -> Result<i64, crate::CoreError>;
     /// Releases any active lease for a sandbox.
     async fn release(
         &self,

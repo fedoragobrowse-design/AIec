@@ -1,17 +1,21 @@
-use agentforge_api::{WorkerHeartbeat, WorkerRegistration, WorkerService, WorkerStatus};
+use agentforge_api::{
+    HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
+    WorkerStatus, serve_worker_tls,
+};
 use agentforge_client::AgentForgeClient;
 use agentforge_core::*;
 use agentforge_core::{
     platform::Platform,
     runtime::SandboxRuntime,
     snapshots::SnapshotProvider,
-    storage::MetadataStore,
+    storage::{MetadataStore, WorkerAssignment},
 };
+use agentforge_runtime::DockerRuntime;
 use agentforge_runtime::{BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{
         Arc,
@@ -19,6 +23,8 @@ use std::{
     },
     time::Instant,
 };
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -198,27 +204,51 @@ async fn main() -> Result<()> {
 }
 
 async fn server(args: ServerArgs) -> Result<()> {
-    if args.runtime != "bwrap-dev" {
-        anyhow::bail!("server only supports explicit bwrap-dev; production uses agentforge-server")
+    if !matches!(args.runtime.as_str(), "bwrap-dev" | "docker") {
+        anyhow::bail!("server supports bwrap-dev or docker; production uses a server launcher")
     }
     std::fs::create_dir_all(&args.state_dir)?;
-    let bubblewrap = Arc::new(BubblewrapRuntime::new(&args.state_dir));
-    let runtime: Arc<dyn SandboxRuntime> = bubblewrap.clone();
-    let snapshots: Arc<dyn SnapshotProvider> = bubblewrap;
-    let metadata_store: Arc<dyn MetadataStore> =
-        agentforge_storage::MemoryRepository::new();
+    let artifacts: Arc<dyn agentforge_core::storage::ArtifactStore> = Arc::new(
+        agentforge_storage::FilesystemObjectStore::new(args.state_dir.join("artifacts")),
+    );
+    let (runtime, snapshots, runtime_kind): (
+        Arc<dyn SandboxRuntime>,
+        Arc<dyn SnapshotProvider>,
+        RuntimeKind,
+    ) = match args.runtime.as_str() {
+        "bwrap-dev" => {
+            let backend = Arc::new(BubblewrapRuntime::new(&args.state_dir));
+            (backend.clone(), backend, RuntimeKind::BwrapDev)
+        }
+        "docker" => {
+            let backend = Arc::new(
+                DockerRuntime::new(&args.state_dir)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            );
+            (backend.clone(), backend, RuntimeKind::Docker)
+        }
+        other => anyhow::bail!("unsupported server runtime {other}"),
+    };
+    let metadata_store: Arc<dyn MetadataStore> = agentforge_storage::MemoryRepository::new();
     let scheduler: Arc<dyn agentforge_core::scheduler::Scheduler> =
         Arc::new(agentforge_api::DevelopmentScheduler);
+    let registry = Arc::new(agentforge_core::runtime::RuntimeRegistry::with_runtime(
+        runtime_kind,
+        runtime.clone(),
+    ));
     let platform = Platform::builder()
         .runtime(runtime)
+        .runtime_registry(registry)
         .metadata_store(metadata_store)
         .scheduler(scheduler)
         .snapshots(snapshots)
+        .artifact_store(artifacts)
         .policy(Arc::new(agentforge_api::DefaultPolicy))
         .build()?;
     let worker_token =
         std::env::var("AGENTFORGE_WORKER_TOKEN").unwrap_or_else(|_| generate_api_key());
     let state = agentforge_api::AppState::development(platform)
+        .with_runtime_kind(runtime_kind)
         .with_worker_token(worker_token.clone());
     let addr = args.bind.parse().context("invalid bind address")?;
     let key = std::env::var("AGENTFORGE_API_KEY").unwrap_or_else(|_| generate_api_key());
@@ -244,7 +274,9 @@ async fn client(url: &str, api_key: Option<String>) -> Result<AgentForgeClient> 
     AgentForgeClient::new(url, key).context("create API client")
 }
 async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
-    std::fs::create_dir_all(&args.state_dir)?;
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
     let token = args
         .token
         .or_else(|| std::env::var("AGENTFORGE_WORKER_TOKEN").ok())
@@ -254,6 +286,9 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     }
     let advertised = reqwest::Url::parse(&args.advertise_url)
         .context("--advertise-url must be an absolute HTTP(S) URL")?;
+    if args.runtime == "firecracker" && advertised.scheme() != "https" {
+        anyhow::bail!("Firecracker worker --advertise-url must use HTTPS")
+    }
     if !matches!(advertised.scheme(), "http" | "https")
         || advertised.host_str().is_none()
         || !advertised.username().is_empty()
@@ -267,7 +302,21 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         );
     }
     let advertise_url = advertised.as_str().trim_end_matches('/').to_owned();
+    let tls_config = match (
+        std::env::var("AGENTFORGE_TLS_CERT_FILE"),
+        std::env::var("AGENTFORGE_TLS_KEY_FILE"),
+    ) {
+        (Ok(cert), Ok(key)) => Some((cert, key)),
+        _ if args.runtime == "bwrap-dev" => None,
+        _ => anyhow::bail!("TLS certificate and key are required for non-development workers"),
+    };
+    if args.runtime != "bwrap-dev" && advertised.scheme() != "https" {
+        anyhow::bail!("non-development workers must advertise HTTPS");
+    }
+    let control = control_url.trim_end_matches('/').to_owned();
     let node_id = args.node_id.unwrap_or_else(Uuid::now_v7);
+    let mut startup_report = None;
+    let mut guest_profile = None;
     let (runtime, snapshots, runtime_kind): (
         Arc<dyn SandboxRuntime>,
         Arc<dyn SnapshotProvider>,
@@ -277,31 +326,81 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             let backend = Arc::new(BubblewrapRuntime::new(&args.state_dir));
             (backend.clone(), backend, RuntimeKind::BwrapDev)
         }
+        "docker" => {
+            let backend = Arc::new(
+                DockerRuntime::new(&args.state_dir)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+            );
+            (backend.clone(), backend, RuntimeKind::Docker)
+        }
         "firecracker" => {
             let config = FirecrackerConfig::from_env()
                 .map_err(|error| anyhow::anyhow!("invalid Firecracker configuration: {error}"))?;
+            // The runtime already verified the artifact against the rootfs, so
+            // the profile it resolved is what /health reports.
+            guest_profile = config
+                .guest_artifact
+                .as_ref()
+                .map(guest_profile_from)
+                .or_else(|| {
+                    tracing::warn!("no Firecracker guest artifact metadata is configured");
+                    None
+                });
+            // Verify the guest image before this worker serves anything. A
+            // worker that cannot verify its image must fail to start, not fail
+            // its first sandbox on the control plane's request timeout.
+            config.verify_guest_image()?;
             let backend = Arc::new(FirecrackerRuntime::new(config));
+            let report = backend.reconcile_local(node_id)?;
+            startup_report = Some(report.clone());
+            if !report.orphan_candidates.is_empty() {
+                tracing::warn!(owner_id = %report.owner_id, orphan_candidates = ?report.orphan_candidates, "owner-scoped Firecracker reconciliation found VM directories for operator review");
+            }
             (backend.clone(), backend, RuntimeKind::Firecracker)
         }
-        other => anyhow::bail!("unsupported worker runtime {other}; use bwrap-dev or firecracker"),
+        other => anyhow::bail!(
+            "unsupported worker runtime {other}; use bwrap-dev, docker, or firecracker"
+        ),
     };
-    let service = WorkerService::new(
+    let capabilities = runtime.capabilities();
+    let verifier = HttpOwnershipVerifier::new(control.clone(), token.clone(), node_id)
+        .map_err(|error| anyhow::anyhow!("build worker ownership verifier: {error}"))?;
+    let mut service = WorkerService::new(
         runtime,
         runtime_kind,
+        capabilities.clone(),
         Some(snapshots),
         token.clone(),
         node_id,
         args.capacity,
-    );
-    let client = reqwest::Client::new();
-    let control = control_url.trim_end_matches('/').to_owned();
+    )
+    .with_state_dir(&args.state_dir)
+    .with_ownership_verifier(Arc::new(verifier));
+    if let Some(profile) = guest_profile {
+        service = service.with_guest_profile(profile);
+    }
+    let mut client_builder =
+        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
+    if let Ok(path) = std::env::var("AGENTFORGE_TLS_CA_CERT") {
+        let pem = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+        let certificate =
+            reqwest::Certificate::from_pem(&pem).with_context(|| format!("parse {path}"))?;
+        client_builder = client_builder.add_root_certificate(certificate);
+    }
+    let client = client_builder.build().context("build worker API client")?;
     let now = chrono::Utc::now();
+    // One version base for this process, shared by the registration and every
+    // heartbeat it sends. The control plane rejects a re-registration that does
+    // not outrank the stored version, so registration and heartbeat must never
+    // derive their versions separately.
+    let version_base = worker_version_base();
     let total_memory_bytes = u64::from(args.capacity) * 1024 * 1024 * 1024;
     let total_disk_bytes = u64::from(args.capacity) * 10 * 1024 * 1024 * 1024;
     let registration = WorkerRegistration {
         node_id,
         name: args.name,
         runtime: runtime_kind,
+        capabilities,
         control_endpoint: advertise_url.clone(),
         total_vcpus: args.capacity,
         total_memory_bytes,
@@ -310,33 +409,72 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         available_memory_bytes: total_memory_bytes,
         available_disk_bytes: total_disk_bytes,
         healthy: true,
-        version: 1,
-        metadata: serde_json::json!({"state_dir": args.state_dir}),
+        version: version_base,
+        metadata: serde_json::json!({
+            "state_dir": args.state_dir,
+            "startup_reconciliation": startup_report,
+        }),
         started_at: now,
         last_heartbeat: now,
     };
-    client
+    let registration_response = client
         .post(format!("{control}/v1/workers/register"))
         .bearer_auth(&token)
         .json(&registration)
         .send()
         .await
-        .context("register worker")?
+        .context("register worker")?;
+    if !registration_response.status().is_success() {
+        // Surface the control plane's reason: a version conflict and a bad
+        // endpoint look identical in a bare 409.
+        let status = registration_response.status();
+        let body = registration_response.text().await.unwrap_or_default();
+        anyhow::bail!("worker registration rejected ({status}): {body}");
+    }
+    client
+        .post(format!("{control}/v1/workers/reconcile"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .context("initial worker reconciliation")?
         .error_for_status()
-        .context("worker registration rejected")?;
-    let heartbeat_version = Arc::new(AtomicU64::new(1));
-    let loop_heartbeat_version = heartbeat_version.clone();
+        .context("initial worker reconciliation rejected")?;
+    let owned_leases: Arc<Mutex<HashMap<Uuid, OwnedLease>>> = Arc::new(Mutex::new(HashMap::new()));
+    match claim_assignments(&client, &control, &token, node_id, args.capacity).await {
+        Ok(leases) => {
+            tracing::info!(leases = leases.len(), "claimed worker assignments");
+            owned_leases.lock().await.extend(leases);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "worker assignment claim failed; retrying with the heartbeat")
+        }
+    }
+    let loop_leases = owned_leases.clone();
+    let loop_capacity = args.capacity;
+    // Heartbeats continue the version sequence the registration started, so a
+    // worker that restarts outranks the version it last reported.
+    let heartbeat_version = Arc::new(AtomicU64::new(version_base));
     let heartbeat_token = token.clone();
     let heartbeat_client = client.clone();
     let heartbeat_url = control.clone();
-    let heartbeat_bind = args.bind.clone();
+    // Liveness and maintenance run on separate tasks on purpose. The control
+    // plane treats a node as dead once its heartbeat is older than
+    // NODE_HEARTBEAT_TTL_SECONDS, so a slow reconcile, claim, or renewal must
+    // never delay the heartbeat that keeps this node schedulable.
+    let liveness_node = node_id;
+    let liveness_version = heartbeat_version.clone();
+    let liveness_token = token.clone();
+    let liveness_client = client.clone();
+    let liveness_url = control.clone();
+    let liveness_health_url = format!("{}/health", advertise_url);
+    let liveness_capacity = args.capacity;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let Ok(status) = heartbeat_client
-                .get(format!("http://{heartbeat_bind}/health"))
-                .bearer_auth(&heartbeat_token)
+            let Ok(status) = liveness_client
+                .get(&liveness_health_url)
+                .bearer_auth(&liveness_token)
                 .send()
                 .await
             else {
@@ -346,21 +484,23 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 continue;
             };
             let active = status.sandbox_count as u32;
-            let available = args_capacity(status.capacity, active);
+            let available = args_capacity(liveness_capacity, active);
             let heartbeat = WorkerHeartbeat {
-                node_id,
+                node_id: liveness_node,
                 available_vcpus: available,
                 available_memory_bytes: u64::from(available) * 1024 * 1024 * 1024,
                 available_disk_bytes: u64::from(available) * 10 * 1024 * 1024 * 1024,
                 sandbox_count: active,
                 healthy: status.healthy,
-                version: loop_heartbeat_version.fetch_add(1, Ordering::Relaxed) + 1,
+                version: liveness_version.fetch_add(1, Ordering::Relaxed) + 1,
                 metadata: serde_json::json!({}),
                 last_error: None,
             };
-            if let Err(error) = heartbeat_client
-                .post(format!("{heartbeat_url}/v1/workers/{node_id}/heartbeat"))
-                .bearer_auth(&heartbeat_token)
+            if let Err(error) = liveness_client
+                .post(format!(
+                    "{liveness_url}/v1/workers/{liveness_node}/heartbeat"
+                ))
+                .bearer_auth(&liveness_token)
                 .json(&heartbeat)
                 .send()
                 .await
@@ -368,25 +508,219 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             {
                 tracing::warn!(%error, "worker heartbeat failed");
             }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
             let _ = heartbeat_client
                 .post(format!("{heartbeat_url}/v1/workers/reconcile"))
                 .bearer_auth(&heartbeat_token)
                 .send()
                 .await;
+            match claim_assignments(
+                &heartbeat_client,
+                &heartbeat_url,
+                &heartbeat_token,
+                node_id,
+                loop_capacity,
+            )
+            .await
+            {
+                Ok(leases) if !leases.is_empty() => {
+                    tracing::info!(leases = leases.len(), "claimed worker assignments");
+                    loop_leases.lock().await.extend(leases);
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "worker assignment claim failed"),
+            }
+            let leases: Vec<OwnedLease> = loop_leases.lock().await.values().cloned().collect();
+            let renewal = renew_leases(
+                &heartbeat_client,
+                &heartbeat_url,
+                &heartbeat_token,
+                node_id,
+                &leases,
+            )
+            .await;
+            let mut owned = loop_leases.lock().await;
+            // Write the generation the control plane just assigned back into the
+            // tracked lease. Renewal bumps the generation server-side, so
+            // replaying the old one would fence this worker out of its own
+            // sandbox and abandon a lease it still legitimately holds.
+            for (sandbox_id, generation) in &renewal.renewed {
+                if let Some(lease) = owned.get_mut(sandbox_id) {
+                    lease.generation = *generation;
+                }
+            }
+            if !renewal.superseded.is_empty() {
+                for sandbox_id in &renewal.superseded {
+                    owned.remove(sandbox_id);
+                }
+                tracing::info!(
+                    released = renewal.superseded.len(),
+                    "dropped leases the control plane no longer owns"
+                );
+            }
+            let tracked = owned.len();
+            drop(owned);
+            if let Some(error) = renewal.failure {
+                tracing::warn!(%error, leases = leases.len(), tracked, "worker lease renewal failed");
+            }
         }
     });
-    println!(
-        "agentforge worker listening on {} node={}",
-        args.bind, node_id
-    );
     let bind = args.bind.parse().context("invalid worker bind address")?;
-    agentforge_api::serve_worker(service, bind)
-        .await
-        .context("serve worker operations")
+    if let Some((cert, key)) = tls_config {
+        serve_worker_tls(service, bind, cert, key)
+            .await
+            .context("serve worker operations over TLS")
+    } else {
+        agentforge_api::serve_worker(service, bind)
+            .await
+            .context("serve worker operations")
+    }
+}
+
+/// Lease lifetime requested when this worker claims assignments.
+const WORKER_LEASE_TTL_SECONDS: u64 = 300;
+
+/// A lease this worker currently holds for a sandbox.
+#[derive(Clone)]
+struct OwnedLease {
+    sandbox_id: Uuid,
+    lease_id: Uuid,
+    tenant_id: Uuid,
+    generation: i64,
+}
+
+/// Claims the assignments reserved for this worker.
+async fn claim_assignments(
+    client: &reqwest::Client,
+    control: &str,
+    token: &str,
+    node_id: Uuid,
+    capacity: u32,
+) -> Result<Vec<(Uuid, OwnedLease)>, reqwest::Error> {
+    let assignments: Vec<WorkerAssignment> = client
+        .post(format!(
+            "{control}/v1/workers/{node_id}/assignments/claim?limit={}&lease_ttl_seconds={}",
+            capacity.clamp(1, 128),
+            WORKER_LEASE_TTL_SECONDS
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(assignments
+        .into_iter()
+        .map(|assignment| {
+            (
+                assignment.sandbox.id,
+                OwnedLease {
+                    sandbox_id: assignment.sandbox.id,
+                    lease_id: assignment.lease.id,
+                    tenant_id: assignment.lease.tenant_id,
+                    generation: assignment.lease.generation,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Renews every owned lease, reporting the first transport failure without
+/// skipping the remaining leases, and collecting the sandboxes whose lease the
+/// control plane no longer recognizes.
+#[derive(Default)]
+struct RenewalOutcome {
+    superseded: Vec<Uuid>,
+    /// The generation each successfully renewed lease now holds. Renewal bumps
+    /// the server-side generation, so a client that kept the old one would be
+    /// fenced out on the very next cycle and would drop the lease it still owns.
+    renewed: Vec<(Uuid, i64)>,
+    failure: Option<reqwest::Error>,
+}
+
+async fn renew_leases(
+    client: &reqwest::Client,
+    control: &str,
+    token: &str,
+    node_id: Uuid,
+    leases: &[OwnedLease],
+) -> RenewalOutcome {
+    let mut outcome = RenewalOutcome::default();
+    for lease in leases {
+        let response = match client
+            .post(format!(
+                "{control}/v1/workers/{node_id}/leases/{}/renew",
+                lease.lease_id
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "tenant_id": lease.tenant_id,
+                "generation": lease.generation,
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if outcome.failure.is_none() {
+                    outcome.failure = Some(error);
+                }
+                continue;
+            }
+        };
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            // The sandbox was destroyed, reassigned, or fenced: stop tracking it
+            // instead of failing every later cycle.
+            outcome.superseded.push(lease.sandbox_id);
+            continue;
+        }
+        let response = match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                if outcome.failure.is_none() {
+                    outcome.failure = Some(error);
+                }
+                continue;
+            }
+        };
+        match response
+            .json::<agentforge_core::storage::WorkerLease>()
+            .await
+        {
+            Ok(lease) => outcome.renewed.push((lease.sandbox_id, lease.generation)),
+            // The lease is extended; only the reported generation is unknown, so
+            // keep the lease rather than dropping a sandbox we still own.
+            Err(error) if outcome.failure.is_none() => {
+                outcome.failure = Some(error);
+            }
+            Err(_) => {}
+        }
+    }
+    outcome
 }
 
 fn args_capacity(capacity: u32, in_flight: u32) -> u32 {
     capacity.saturating_sub(in_flight)
+}
+/// Base value for this process's node version.
+///
+/// Derived from the process start time so a restarted worker always outranks
+/// the version it last reported, which the control plane requires before it
+/// will accept the re-registration.
+fn worker_version_base() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    // Leave headroom above the millisecond clock so the counter can never
+    // overflow a u64 through normal operation.
+    u64::try_from(millis).unwrap_or(u64::MAX / 2)
 }
 async fn doctor() -> Result<()> {
     println!("os: {}", std::env::consts::OS);
@@ -400,6 +734,16 @@ async fn doctor() -> Result<()> {
             "available"
         } else {
             "missing (install bubblewrap)"
+        }
+    );
+    println!(
+        "docker: {}",
+        match agentforge_runtime::DockerRuntime::new(std::env::temp_dir()) {
+            Ok(runtime) => match runtime.health().await {
+                health if health.healthy => "ready".to_owned(),
+                health => health.message.unwrap_or_else(|| "not ready".into()),
+            },
+            Err(error) => format!("not ready ({error})"),
         }
     );
     println!(
@@ -418,7 +762,67 @@ async fn doctor() -> Result<()> {
             "not configured (in-memory API)"
         }
     );
+    let require_coding_guest =
+        std::env::var("AGENTFORGE_REQUIRE_CODING_GUEST").as_deref() == Ok("1");
+    let mut coding_guest = false;
+    match FirecrackerConfig::from_env() {
+        Ok(config) => {
+            match config.check() {
+                Ok(()) => println!(
+                    "firecracker: ready (binary {}, kernel {})",
+                    config.binary.display(),
+                    config.kernel.display()
+                ),
+                Err(error) => println!("firecracker: {error}"),
+            }
+            match config.guest_artifact.as_ref() {
+                Some(artifact) => {
+                    coding_guest = artifact.is_coding_guest();
+                    println!(
+                        "firecracker guest: base {} profile {} (artifact {})",
+                        artifact.base, artifact.profile, artifact.artifact_version
+                    );
+                    println!(
+                        "firecracker guest capabilities: {}",
+                        artifact.capabilities.join(", ")
+                    );
+                    println!(
+                        "firecracker guest git: {}",
+                        artifact
+                            .git_version
+                            .clone()
+                            .unwrap_or_else(|| "missing".into())
+                    );
+                    println!("firecracker guest agent: {}", artifact.guest_agent_version);
+                }
+                None => println!(
+                    "firecracker guest image: no guest artifact metadata (set AGENTFORGE_GUEST_ARTIFACT_DIR)"
+                ),
+            }
+        }
+        Err(error) => println!(
+            "firecracker: {error} (set AGENTFORGE_FIRECRACKER_BIN, AGENTFORGE_KERNEL, AGENTFORGE_ROOTFS, AGENTFORGE_GUEST_SECRET)"
+        ),
+    }
+    if require_coding_guest && !coding_guest {
+        anyhow::bail!(
+            "AGENTFORGE_REQUIRE_CODING_GUEST=1 requires a verified Firecracker guest image that provides git"
+        );
+    }
     Ok(())
+}
+
+fn guest_profile_from(
+    artifact: &agentforge_runtime::guest_artifact::GuestArtifact,
+) -> WorkerGuestProfile {
+    WorkerGuestProfile {
+        artifact_version: artifact.artifact_version.clone(),
+        base: artifact.base.clone(),
+        profile: artifact.profile.clone(),
+        capabilities: artifact.capabilities.clone(),
+        git_version: artifact.git_version.clone(),
+        guest_agent_version: artifact.guest_agent_version.clone(),
+    }
 }
 async fn migrate() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL")
@@ -467,10 +871,10 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
             timeout_seconds,
             network,
         } => {
-            if !matches!(runtime.as_str(), "bwrap-dev" | "firecracker") {
+            if !matches!(runtime.as_str(), "bwrap-dev" | "docker" | "firecracker") {
                 anyhow::bail!(
-                    "unsupported sandbox runtime {runtime}; use bwrap-dev or firecracker"
-                );
+                    "unsupported sandbox runtime {runtime}; use bwrap-dev, docker, or firecracker"
+                )
             }
             let request = CreateSandboxRequest {
                 image,
@@ -483,11 +887,12 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
                 } else {
                     NetworkPolicy::Disabled
                 },
+                environment: Default::default(),
             };
-            let sandbox = if runtime == "firecracker" {
+            let sandbox = if matches!(runtime.as_str(), "firecracker" | "docker") {
                 let api_key = raw_key.context("set --api-key or AGENTFORGE_API_KEY")?;
                 let mut payload = serde_json::to_value(&request)?;
-                payload["runtime"] = serde_json::json!("firecracker");
+                payload["runtime"] = serde_json::json!(runtime);
                 let response = reqwest::Client::new()
                     .post(format!("{}/v1/sandboxes", url.trim_end_matches('/')))
                     .bearer_auth(api_key)
@@ -495,10 +900,7 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
                     .send()
                     .await?;
                 if !response.status().is_success() {
-                    anyhow::bail!(
-                        "firecracker sandbox creation rejected: {}",
-                        response.text().await?
-                    );
+                    anyhow::bail!("sandbox creation rejected: {}", response.text().await?);
                 }
                 response.json::<Sandbox>().await?
             } else {
@@ -604,7 +1006,8 @@ async fn snapshot_command(url: &str, key: Option<String>, command: SnapshotComma
                         image: None,
                         cpu: None,
                         memory_mb: None,
-                        disk_mb: None
+                        disk_mb: None,
+                        runtime: None,
                     }
                 )
                 .await?
@@ -621,36 +1024,46 @@ async fn benchmark(url: &str, key: Option<String>, args: BenchmarkArgs) -> Resul
     if args.sandboxes == 0 || args.concurrency == 0 {
         anyhow::bail!("sandboxes and concurrency must be positive")
     }
-    let c = client(url, key).await?;
-    let started = Instant::now();
-    let mut durations = Vec::new();
-    let mut success = 0usize;
-    for _ in 0..args.sandboxes {
-        let request = CreateSandboxRequest {
-            image: "ubuntu:24.04".into(),
-            cpu: 1,
-            memory_mb: 512,
-            disk_mb: 2048,
-            timeout_seconds: 300,
-            network: NetworkPolicy::default(),
-        };
-        let t = Instant::now();
-        match c.create_sandbox(&request).await {
-            Ok(sandbox) => {
-                durations.push(t.elapsed().as_micros() as u64);
-                success += 1;
-                let _ = c.delete_sandbox(sandbox.id).await;
-            }
-            Err(_) => {
-                durations.push(t.elapsed().as_micros() as u64);
-            }
-        }
+    if args.sandboxes > 10_000 || args.concurrency > 1_000 {
+        anyhow::bail!("benchmark limits: sandboxes <= 10000 and concurrency <= 1000")
     }
-    if args.concurrency > 1 {
-        println!(
-            "note: benchmark currently executes requests serially; requested concurrency {}",
-            args.concurrency
-        );
+    let client = client(url, key).await?;
+    let started = Instant::now();
+    let permits = Arc::new(Semaphore::new(args.concurrency));
+    let mut tasks: JoinSet<Result<(u64, bool)>> = JoinSet::new();
+    for _ in 0..args.sandboxes {
+        let client = client.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            let request = CreateSandboxRequest {
+                image: "ubuntu:24.04".into(),
+                cpu: 1,
+                memory_mb: 512,
+                disk_mb: 2048,
+                timeout_seconds: 300,
+                network: NetworkPolicy::default(),
+                environment: Default::default(),
+            };
+            let started = Instant::now();
+            match client.create_sandbox(&request).await {
+                Ok(sandbox) => {
+                    let _ = client.delete_sandbox(sandbox.id).await;
+                    Ok((started.elapsed().as_micros() as u64, true))
+                }
+                Err(_) => Ok((started.elapsed().as_micros() as u64, false)),
+            }
+        });
+    }
+    let mut durations = Vec::with_capacity(args.sandboxes);
+    let mut success = 0usize;
+    while let Some(result) = tasks.join_next().await {
+        let (duration, created) = result??;
+        durations.push(duration);
+        success += usize::from(created);
     }
     durations.sort_unstable();
     let p = |q: f64| {
@@ -661,8 +1074,9 @@ async fn benchmark(url: &str, key: Option<String>, args: BenchmarkArgs) -> Resul
         }
     };
     println!(
-        "samples={} success={} success_rate={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} total_ms={:.3}",
+        "samples={} concurrency={} success={} success_rate={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} total_ms={:.3}",
         durations.len(),
+        args.concurrency,
         success,
         success as f64 / durations.len().max(1) as f64,
         p(0.50) as f64 / 1000.0,

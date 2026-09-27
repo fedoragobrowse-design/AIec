@@ -1,3 +1,4 @@
+use agentforge_core::snapshots::SnapshotProvider;
 use agentforge_core::*;
 use agentforge_runtime::{FirecrackerConfig, FirecrackerRuntime, SandboxRuntime};
 use std::collections::BTreeMap;
@@ -26,6 +27,7 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         disk_mb: 512,
         timeout_seconds: 120,
         network: NetworkPolicy::default(),
+        environment: Default::default(),
         created_at: now,
         updated_at: now,
         runtime_path: None,
@@ -35,15 +37,16 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         .start(&sandbox)
         .await
         .expect("boot Firecracker and guest agent");
+    runtime.pause(&sandbox).await.expect("pause Firecracker VM");
+    runtime
+        .resume(&sandbox)
+        .await
+        .expect("resume Firecracker VM");
     let result = runtime
         .exec(
             &sandbox,
             ExecRequest {
-                command: vec![
-                    "/bin/busybox".into(),
-                    "printf".into(),
-                    "hello-from-firecracker".into(),
-                ],
+                command: vec!["/usr/bin/printf".into(), "hello-from-firecracker".into()],
                 working_directory: Some("/workspace".into()),
                 environment: BTreeMap::new(),
                 timeout_seconds: 10,
@@ -57,7 +60,7 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         .exec(
             &sandbox,
             ExecRequest {
-                command: vec!["/bin/busybox".into(), "env".into()],
+                command: vec!["/usr/bin/env".into()],
                 working_directory: Some("/workspace".into()),
                 environment: BTreeMap::new(),
                 timeout_seconds: 10,
@@ -71,7 +74,7 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         .exec(
             &sandbox,
             ExecRequest {
-                command: vec!["/bin/busybox".into(), "cat".into()],
+                command: vec!["/usr/bin/cat".into()],
                 working_directory: Some("/workspace".into()),
                 environment: BTreeMap::new(),
                 timeout_seconds: 10,
@@ -130,5 +133,88 @@ async fn real_firecracker_exec_file_snapshot_restore() {
         .destroy(&restored)
         .await
         .expect("destroy restored VM");
+    let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
+}
+
+#[tokio::test]
+async fn real_firecracker_portable_workspace_snapshot() {
+    if std::env::var("AGENTFORGE_RUN_FIRECRACKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("set AGENTFORGE_RUN_FIRECRACKER_TESTS=1 to run the KVM integration test");
+        return;
+    }
+    let mut config = FirecrackerConfig::from_env().expect("Firecracker environment");
+    config.state_dir = std::env::temp_dir().join(format!("af-fc-ws-{}", Uuid::now_v7()));
+    config.readiness_timeout = std::time::Duration::from_secs(20);
+    let runtime = FirecrackerRuntime::new(config);
+    let now = chrono::Utc::now();
+    let sandbox = Sandbox {
+        id: Uuid::now_v7(),
+        tenant_id: Uuid::now_v7(),
+        node_id: None,
+        image_id: "agentforge".into(),
+        state: SandboxState::Creating,
+        runtime: RuntimeKind::Firecracker,
+        cpu: 1,
+        memory_mb: 256,
+        disk_mb: 512,
+        timeout_seconds: 120,
+        network: NetworkPolicy::default(),
+        environment: Default::default(),
+        created_at: now,
+        updated_at: now,
+        runtime_path: None,
+    };
+    runtime.create(&sandbox).await.expect("create rootfs");
+    runtime.start(&sandbox).await.expect("boot Firecracker");
+    runtime
+        .put_file(
+            &sandbox,
+            PutFileRequest {
+                path: "/workspace/portable.txt".into(),
+                content_base64: "cG9ydGFibGU=".into(),
+                mode: None,
+            },
+        )
+        .await
+        .expect("write workspace");
+    let captured = SnapshotProvider::capture(
+        &runtime,
+        &sandbox,
+        &agentforge_core::snapshots::SnapshotRequest {
+            kind: agentforge_core::snapshots::SnapshotKind::Workspace,
+            object_key: format!("portable-workspace-{}", Uuid::now_v7()),
+        },
+    )
+    .await
+    .expect("capture workspace");
+    if let Err(error) = runtime.destroy(&sandbox).await {
+        eprintln!("source cleanup failed: {error}");
+    }
+    let restored = Sandbox {
+        id: Uuid::now_v7(),
+        ..sandbox.clone()
+    };
+    runtime
+        .create(&restored)
+        .await
+        .expect("create restored rootfs");
+    SnapshotProvider::restore(
+        &runtime,
+        &restored,
+        &agentforge_core::snapshots::SnapshotMetadata {
+            id: captured.id,
+            kind: captured.kind,
+            object_key: captured.object_key,
+            checksum_sha256: captured.checksum_sha256,
+        },
+    )
+    .await
+    .expect("restore workspace");
+    let file = runtime
+        .get_file(&restored, "/workspace/portable.txt")
+        .await
+        .expect("read restored workspace");
+    assert_eq!(file.content_base64, "cG9ydGFibGU=");
+    runtime.destroy(&restored).await.expect("destroy restored");
     let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
 }

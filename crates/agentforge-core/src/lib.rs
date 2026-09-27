@@ -1,8 +1,11 @@
 use chrono::{DateTime, Utc};
+use hmac::Mac;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path, PathBuf},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -32,6 +35,42 @@ pub use network::NetworkPolicy;
 pub mod protocol;
 
 pub const MAX_STDOUT: usize = 1_048_576;
+
+/// Durable tenant resource quota policy.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaLimits {
+    pub max_active_sandboxes: u32,
+    pub max_vcpus: u32,
+    pub max_memory_mb: u64,
+    pub max_disk_mb: u64,
+}
+
+/// Current aggregate usage for a tenant.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaUsage {
+    pub active_sandboxes: u32,
+    pub vcpus: u32,
+    pub memory_mb: u64,
+    pub disk_mb: u64,
+}
+
+impl QuotaUsage {
+    pub fn checked_add(&self, sandbox: &Sandbox) -> Option<Self> {
+        Some(Self {
+            active_sandboxes: self.active_sandboxes.checked_add(1)?,
+            vcpus: self.vcpus.checked_add(sandbox.cpu)?,
+            memory_mb: self.memory_mb.checked_add(u64::from(sandbox.memory_mb))?,
+            disk_mb: self.disk_mb.checked_add(u64::from(sandbox.disk_mb))?,
+        })
+    }
+
+    pub fn exceeds(&self, limits: QuotaLimits) -> bool {
+        self.active_sandboxes > limits.max_active_sandboxes
+            || self.vcpus > limits.max_vcpus
+            || self.memory_mb > limits.max_memory_mb
+            || self.disk_mb > limits.max_disk_mb
+    }
+}
 pub const MAX_STDERR: usize = 1_048_576;
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_VCPU: u32 = 32;
@@ -52,6 +91,8 @@ pub enum CoreError {
     Forbidden(String),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
     #[error("backend unavailable: {0}")]
     Unavailable(String),
     #[error("unsupported operation: {0}")]
@@ -66,12 +107,14 @@ pub enum CoreError {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
     Firecracker,
+    Docker,
     BwrapDev,
 }
 
 impl RuntimeKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Docker => "docker",
             Self::Firecracker => "firecracker",
             Self::BwrapDev => "bwrap-dev",
         }
@@ -84,6 +127,7 @@ pub enum SandboxState {
     Creating,
     Starting,
     Running,
+    Paused,
     Stopping,
     Stopped,
     Snapshotting,
@@ -99,6 +143,7 @@ impl SandboxState {
             Self::Creating => "creating",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::Snapshotting => "snapshotting",
@@ -115,6 +160,8 @@ impl SandboxState {
             (Creating, Starting | Failed | Destroying)
                 | (Starting, Running | Failed | Destroying)
                 | (Running, Stopping | Snapshotting | Failed | Destroying)
+                | (Running, Paused)
+                | (Paused, Running)
                 | (Stopping, Stopped | Failed)
                 | (Stopped, Starting | Destroying)
                 | (Snapshotting, Running | Stopped | Failed)
@@ -125,7 +172,6 @@ impl SandboxState {
         )
     }
 }
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CreateSandboxRequest {
@@ -140,6 +186,8 @@ pub struct CreateSandboxRequest {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub network: NetworkPolicy,
+    #[serde(default)]
+    pub environment: EnvironmentSpec,
 }
 fn default_cpu() -> u32 {
     1
@@ -167,9 +215,208 @@ pub struct Sandbox {
     pub disk_mb: u32,
     pub timeout_seconds: u64,
     pub network: NetworkPolicy,
+    #[serde(default)]
+    pub environment: EnvironmentSpec,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub runtime_path: Option<String>,
+}
+
+/// Environment composition requested for a sandbox.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EnvironmentSpec {
+    /// Workspace source. Empty is the default writable workspace.
+    #[serde(default)]
+    pub workspace: WorkspaceSpec,
+    /// Independently named setup toolkits applied after the workspace exists.
+    #[serde(default)]
+    pub toolkits: Vec<ToolkitSpec>,
+    /// Independently versioned environment layers composed above the base image.
+    #[serde(default)]
+    pub layers: Vec<LayerSpec>,
+}
+
+/// A workspace source with an explicit lifecycle.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceSpec {
+    /// Start with an empty writable workspace.
+    #[default]
+    Empty,
+    /// Clone a repository into `/workspace/repository`.
+    Git {
+        /// Repository URL. Credentials are deliberately not part of this type.
+        repo: String,
+        /// Optional branch, tag, or commit to check out.
+        #[serde(default)]
+        reference: Option<String>,
+        /// Use a shallow clone when true.
+        #[serde(default = "default_true")]
+        shallow: bool,
+    },
+    /// Restore workspace state from a previously captured portable snapshot.
+    Snapshot {
+        /// Snapshot identifier.
+        snapshot_id: Uuid,
+    },
+}
+
+/// A small independently versioned setup layer.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolkitSpec {
+    /// Stable toolkit name, used in logs and validation errors.
+    pub name: String,
+    /// Commands run inside the sandbox after workspace preparation.
+    pub setup_commands: Vec<Vec<String>>,
+}
+
+/// Identity of an independently versioned environment layer.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerKind {
+    Base,
+    Workspace,
+    Toolkit,
+}
+impl LayerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Workspace => "workspace",
+            Self::Toolkit => "toolkit",
+        }
+    }
+}
+
+/// Immutable layer metadata and its bounded materialization payload.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayerSpec {
+    pub kind: LayerKind,
+    pub name: String,
+    pub content_digest: String,
+    #[serde(default)]
+    pub content_base64: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl EnvironmentSpec {
+    /// Validates repository URLs, refs, toolkit names, and bounded setup argv.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.toolkits.len() > 16 {
+            return Err(CoreError::LimitExceeded("too many toolkits".into()));
+        }
+        if self.layers.len() > 32 {
+            return Err(CoreError::LimitExceeded(
+                "too many environment layers".into(),
+            ));
+        }
+        let mut layer_names = std::collections::HashSet::new();
+        for layer in &self.layers {
+            if layer.name.is_empty()
+                || layer.name.len() > 128
+                || layer.name.as_bytes().contains(&0)
+                || !layer
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                || !layer_names.insert((layer.kind, layer.name.as_str()))
+            {
+                return Err(CoreError::InvalidRequest(
+                    "invalid or duplicate environment layer".into(),
+                ));
+            }
+            if layer.content_digest.len() != 64
+                || !layer
+                    .content_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(CoreError::InvalidRequest(
+                    "invalid environment layer digest".into(),
+                ));
+            }
+            if !layer.content_base64.is_empty() {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&layer.content_base64)
+                    .map_err(|_| {
+                        CoreError::InvalidRequest("invalid environment layer payload".into())
+                    })?;
+                if bytes.len() > MAX_FILE {
+                    return Err(CoreError::LimitExceeded(
+                        "environment layer is too large".into(),
+                    ));
+                }
+                if hex::encode(Sha256::digest(&bytes)) != layer.content_digest {
+                    return Err(CoreError::InvalidRequest(
+                        "environment layer digest mismatch".into(),
+                    ));
+                }
+            }
+        }
+        if let WorkspaceSpec::Git {
+            repo, reference, ..
+        } = &self.workspace
+        {
+            validate_git_repo(repo)?;
+            if reference.as_ref().is_some_and(|value| {
+                value.is_empty() || value.len() > 256 || value.as_bytes().contains(&0)
+            }) {
+                return Err(CoreError::InvalidRequest("invalid git reference".into()));
+            }
+        }
+        for toolkit in &self.toolkits {
+            if toolkit.name.is_empty()
+                || toolkit.name.len() > 64
+                || !toolkit
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(CoreError::InvalidRequest("invalid toolkit name".into()));
+            }
+            if toolkit.setup_commands.len() > 32
+                || toolkit.setup_commands.iter().any(|command| {
+                    command.is_empty()
+                        || command.len() > 64
+                        || command.iter().any(|arg| {
+                            arg.is_empty() || arg.len() > 4096 || arg.as_bytes().contains(&0)
+                        })
+                })
+            {
+                return Err(CoreError::InvalidRequest("invalid toolkit commands".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_git_repo(repo: &str) -> Result<(), CoreError> {
+    if repo.is_empty() || repo.len() > 2048 || repo.as_bytes().contains(&0) {
+        return Err(CoreError::InvalidRequest("invalid git repository".into()));
+    }
+    let valid = repo.starts_with("https://")
+        || repo.starts_with("git@")
+        || repo.starts_with("ssh://")
+        || repo.starts_with("git://");
+    if !valid {
+        return Err(CoreError::InvalidRequest(
+            "git repository must use https, ssh, or git transport".into(),
+        ));
+    }
+    if let Some(authority) = repo
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        && authority.contains('@')
+    {
+        return Err(CoreError::InvalidRequest(
+            "git repository credentials must use scoped secret injection".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +492,12 @@ pub struct RestoreSnapshotRequest {
     pub cpu: Option<u32>,
     pub memory_mb: Option<u32>,
     pub disk_mb: Option<u32>,
+    pub runtime: Option<crate::RuntimeKind>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CreateSnapshotRequest {
+    pub kind: Option<crate::snapshots::SnapshotKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -346,6 +599,15 @@ pub fn new_id() -> Uuid {
 pub fn key_digest(raw: &str) -> [u8; 32] {
     Sha256::digest(raw.as_bytes()).into()
 }
+
+pub fn image_manifest_signature(secret: &[u8], reference: &str, digest: &str) -> String {
+    let mut mac =
+        hmac::Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts arbitrary key lengths");
+    mac.update(reference.as_bytes());
+    mac.update(b"\0");
+    mac.update(digest.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
 pub fn generate_api_key() -> String {
     let mut bytes = [0u8; 24];
     // Avoid external RNG dependency in domain primitives; UUID v4 supplies OS randomness.
@@ -380,6 +642,7 @@ pub fn validate_create(req: &CreateSandboxRequest, max_lifetime: u64) -> Result<
     if req.timeout_seconds == 0 || req.timeout_seconds > max_lifetime.min(MAX_LIFETIME_SECONDS) {
         return Err(CoreError::LimitExceeded("timeout_seconds".into()));
     }
+    req.environment.validate()?;
     Ok(())
 }
 pub fn validate_exec(req: &ExecRequest) -> Result<(), CoreError> {
@@ -405,21 +668,22 @@ pub fn validate_exec(req: &ExecRequest) -> Result<(), CoreError> {
 }
 
 pub fn validate_image(image: &str) -> Result<(), CoreError> {
-    let allowed = [
-        "python:3.13",
-        "node:24",
-        "rust:stable",
-        "ubuntu:24.04",
-        "alpine:3.21",
-    ];
-    if allowed.contains(&image) {
-        Ok(())
-    } else {
-        Err(CoreError::InvalidRequest(format!(
-            "unsupported image: {image}"
-        )))
+    if image.is_empty()
+        || image.len() > 1024
+        || image
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || image.starts_with('-')
+        || image.contains("..")
+        || image.contains("://")
+    {
+        return Err(CoreError::InvalidRequest(format!(
+            "invalid image reference: {image}"
+        )));
     }
+    Ok(())
 }
+
 pub fn image_id(image: &str) -> String {
     format!("afimg1_{}", hex::encode(Sha256::digest(image.as_bytes())))
 }
@@ -462,9 +726,171 @@ pub fn score_node(node: &Node) -> f64 {
 mod tests {
     use super::*;
     #[test]
+    fn quota_usage_adds_and_rejects_over_limit_without_overflow() {
+        let limits = QuotaLimits {
+            max_active_sandboxes: 2,
+            max_vcpus: 2,
+            max_memory_mb: 1024,
+            max_disk_mb: 2048,
+        };
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: new_id(),
+            node_id: None,
+            image_id: "test".into(),
+
+            state: SandboxState::Creating,
+            runtime: RuntimeKind::Firecracker,
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: 1024,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: EnvironmentSpec::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            runtime_path: None,
+        };
+        let one = QuotaUsage::default().checked_add(&sandbox).unwrap();
+        let two = one.checked_add(&sandbox).unwrap();
+        assert!(!two.exceeds(limits));
+        let three = two.checked_add(&sandbox).unwrap();
+        assert!(three.exceeds(limits));
+        let max = QuotaUsage {
+            active_sandboxes: 2,
+            vcpus: 2,
+            memory_mb: 1024,
+            disk_mb: 2048,
+        };
+        let updated = max.checked_add(&sandbox).unwrap();
+        assert!(updated.exceeds(limits));
+        let overflow = QuotaUsage {
+            active_sandboxes: u32::MAX,
+            ..QuotaUsage::default()
+        };
+        assert!(overflow.checked_add(&sandbox).is_none());
+    }
+
+    #[test]
+    fn image_admission_accepts_normal_oci_reference() {
+        assert!(validate_image("ghcr.io/example/agent:latest").is_ok());
+        assert!(validate_image("registry.example/team/tool:1.2.3").is_ok());
+    }
+
+    #[test]
+    fn image_admission_rejects_malformed_reference() {
+        assert!(validate_image("https://registry.example/image").is_err());
+        assert!(validate_image("image\nname").is_err());
+        assert!(validate_image("../escape").is_err());
+    }
+    #[test]
+    fn environment_layers_are_bounded_and_content_addressed() {
+        let mut environment = EnvironmentSpec {
+            layers: vec![LayerSpec {
+                kind: LayerKind::Toolkit,
+                name: "git-tools".into(),
+                content_digest: "a".repeat(64),
+                content_base64: String::new(),
+            }],
+            ..EnvironmentSpec::default()
+        };
+        environment.validate().unwrap();
+        environment.layers.push(LayerSpec {
+            kind: LayerKind::Toolkit,
+            name: "git-tools".into(),
+            content_digest: "b".repeat(64),
+            content_base64: String::new(),
+        });
+        assert!(environment.validate().is_err());
+    }
+    #[test]
+    fn environment_layers_reject_invalid_digests_and_excess_count() {
+        let mut environment = EnvironmentSpec::default();
+        environment.layers.push(LayerSpec {
+            kind: LayerKind::Toolkit,
+            name: "broken".into(),
+            content_digest: "not-a-digest".into(),
+            content_base64: String::new(),
+        });
+        assert!(environment.validate().is_err());
+        environment.layers = (0..33)
+            .map(|index| LayerSpec {
+                kind: LayerKind::Toolkit,
+                name: format!("toolkit-{index}"),
+                content_digest: "a".repeat(64),
+                content_base64: String::new(),
+            })
+            .collect();
+        assert!(environment.validate().is_err());
+    }
+    #[test]
+    fn environment_layers_validate_non_empty_payloads() {
+        let payload = b"toolkit payload";
+        let digest = hex::encode(Sha256::digest(payload));
+        let mut environment = EnvironmentSpec::default();
+        environment.layers.push(LayerSpec {
+            kind: LayerKind::Toolkit,
+            name: "valid".into(),
+            content_digest: digest,
+            content_base64: "dG9vbGtpdCBwYXlsb2Fk".into(),
+        });
+        assert!(environment.validate().is_ok());
+        environment.layers[0].content_base64 = "not-base64".into();
+        assert!(environment.validate().is_err());
+        environment.layers[0].content_base64 = "dG9vbGtpdCBwYXlsb2Fk".into();
+        environment.layers[0].content_digest = "0".repeat(64);
+        assert!(environment.validate().is_err());
+    }
+    #[test]
     fn state_machine_rejects_skip() {
         assert!(!SandboxState::Creating.can_transition_to(SandboxState::Running));
         assert!(SandboxState::Creating.can_transition_to(SandboxState::Starting));
+    }
+    #[test]
+    fn environment_rejects_credentials_and_unbounded_toolkits() {
+        let mut request = CreateSandboxRequest {
+            image: "python:3.13".into(),
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: 2048,
+            timeout_seconds: 300,
+            network: NetworkPolicy::Disabled,
+            environment: EnvironmentSpec::default(),
+        };
+        request.environment.workspace = WorkspaceSpec::Git {
+            repo: "https://user:password@example.com/repo.git".into(),
+            reference: None,
+            shallow: true,
+        };
+        assert!(request.environment.validate().is_err());
+        request.environment.workspace = WorkspaceSpec::Git {
+            repo: "file:///etc/passwd".into(),
+            reference: None,
+            shallow: true,
+        };
+        assert!(request.environment.validate().is_err());
+        request.environment.workspace = WorkspaceSpec::Empty;
+        request.environment.toolkits = (0..17)
+            .map(|index| ToolkitSpec {
+                name: format!("toolkit-{index}"),
+                setup_commands: Vec::new(),
+            })
+            .collect();
+        assert!(request.environment.validate().is_err());
+    }
+
+    #[test]
+    fn signed_image_manifest_rejects_tampering() {
+        let secret = b"deployment-image-signing-key";
+        let digest = "a".repeat(64);
+        let mut manifest = crate::images::SignedImageManifest {
+            reference: "python:3.13".into(),
+            rootfs_sha256: digest.clone(),
+            signature: image_manifest_signature(secret, "python:3.13", &digest),
+        };
+        manifest.verify(secret).unwrap();
+        manifest.rootfs_sha256 = "b".repeat(64);
+        assert!(manifest.verify(secret).is_err());
     }
     #[test]
     fn path_rejects_traversal() {

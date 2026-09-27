@@ -11,10 +11,10 @@ AgentForge treats every tenant workload as hostile. `bwrap-dev` is retained only
 - Firecracker-enforced vCPU/RAM, ext4 disk sizing, guest command timeout/output/upload caps, and worker lifetime stop.
 - Per-VM TAP plus nftables blocks for metadata, loopback, and RFC1918 destinations when network is enabled; no NIC when disabled.
 - Hashed/scoped/rotatable API keys, PostgreSQL tenant ownership, and no cross-tenant object access.
-- Constant-time authenticated worker RPC, request IDs, bounded responses, and idempotent operation replay.
+- Worker RPC requires bearer authentication, bounded request/response handling, and HTTPS endpoints in production composition. Native mTLS identity verification and certificate rotation are not implemented; HTTPS admission is not equivalent to mTLS.
 - PostgreSQL CAS transitions, transition events, row locks, `SKIP LOCKED`, monotonic worker versions, fenced/renewable leases, and reconciliation history.
 - S3 Signature V4, SHA-256 checksums, safe keys, and explicit development-only filesystem object storage.
-- Firecracker full memory/device snapshots plus checksummed disk copies and restore validation.
+- Firecracker full memory/device snapshot code paths plus checksummed disk copies and restore validation are implemented, but live Firecracker execution is currently environment-blocked; do not treat this as current production evidence.
 
 ## Threats still requiring deployment controls
 
@@ -22,8 +22,9 @@ AgentForge treats every tenant workload as hostile. `bwrap-dev` is retained only
 - The guest image contains a shared HMAC secret. Per-tenant guest secrets, secret rotation, and compromise containment are not implemented.
 - Snapshot restore is worker-local with Firecracker 1.17 because block-path override is not yet released.
 - Enabled networking blocks broad private/metadata ranges but has no domain allowlist, DNS policy, bandwidth quota, or egress accounting.
-- No rate limiting, organization quotas, malware scanning, signed images, billing enforcement, or HSM-backed secrets.
-- Worker/API endpoints require private network placement and TLS termination.
+- Tenant resource quota admission is implemented in PostgreSQL, but live database race evidence, rate limits, and lifetime quotas are not complete.
+- Production image admission verifies signed rootfs manifests; external key governance, rotation, malware scanning, and HSM-backed signing remain deployment responsibilities.
+- Worker/API endpoints require private network placement and HTTPS; native mTLS identity verification and certificate rotation are not implemented.
 - Object-success/database-failed snapshot operations need a reconciliation controller.
 - Bubblewrap must never face untrusted public workloads.
 - No independent penetration test or production certification has occurred.

@@ -14,12 +14,18 @@ pub struct PolicyDecision {
 impl PolicyDecision {
     /// Allows an operation.
     pub fn allow() -> Self {
-        Self { allowed: true, reason: None }
+        Self {
+            allowed: true,
+            reason: None,
+        }
     }
 
     /// Denies an operation for a specific reason.
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self { allowed: false, reason: Some(reason.into()) }
+        Self {
+            allowed: false,
+            reason: Some(reason.into()),
+        }
     }
 }
 
@@ -46,14 +52,23 @@ mod tests {
 
     #[test]
     fn allow_has_no_denial_reason() {
-        assert_eq!(PolicyDecision::allow(), PolicyDecision { allowed: true, reason: None });
+        assert_eq!(
+            PolicyDecision::allow(),
+            PolicyDecision {
+                allowed: true,
+                reason: None
+            }
+        );
     }
 
     #[test]
     fn deny_preserves_reason() {
-        assert_eq!(PolicyDecision::deny("network denied"), PolicyDecision {
-            allowed: false,
-            reason: Some("network denied".into()),
-        });
+        assert_eq!(
+            PolicyDecision::deny("network denied"),
+            PolicyDecision {
+                allowed: false,
+                reason: Some("network denied".into()),
+            }
+        );
     }
 }

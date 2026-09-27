@@ -24,14 +24,19 @@ agentforge-runtime = { path = "crates/agentforge-runtime" }
 agentforge-network-linux = { path = "crates/agentforge-network-linux" }
 agentforge-client = { path = "crates/agentforge-client" }
 agentforge-api = { path = "crates/agentforge-api" }
+bollard = "0.21.1"
 anyhow = "1.0"
+tar = "0.4"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 base64 = "0.22"
 bytes = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
+futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
 http = "1.3"

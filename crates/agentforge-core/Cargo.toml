@@ -18,4 +18,5 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio.workspace = true
 proptest = "1.6"

@@ -5,13 +5,15 @@ use agentforge_core::{
     network::{NetworkAttachment, NetworkBackend},
     runtime::{RuntimeCapabilities, RuntimeHealth},
     snapshots::{
-        CapturedSnapshot, SnapshotCapabilities, SnapshotKind, SnapshotMetadata, SnapshotProvider,
-        SnapshotRequest,
+        CapturedSnapshot, MAX_WORKSPACE_ARCHIVE_BYTES, PortableWorkspaceArchive,
+        PortableWorkspaceEntry, SnapshotCapabilities, SnapshotKind, SnapshotMetadata,
+        SnapshotProvider, SnapshotRequest,
     },
     *,
 };
 use agentforge_network_linux::LinuxNetworkManager;
 use async_trait::async_trait;
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -44,6 +46,9 @@ pub enum RuntimeError {
 }
 
 pub use agentforge_core::runtime::SandboxRuntime;
+mod docker;
+pub mod guest_artifact;
+pub use docker::DockerRuntime;
 
 fn into_core(error: RuntimeError) -> CoreError {
     match error {
@@ -54,21 +59,85 @@ fn into_core(error: RuntimeError) -> CoreError {
 
 fn bwrap_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
+        isolation: agentforge_core::runtime::RuntimeIsolation::Process,
+        exec: true,
+        files: true,
+        streaming: false,
         network_policy: true,
         workspace_snapshot: true,
         ..RuntimeCapabilities::default()
     }
 }
 
-fn firecracker_capabilities(_network: &dyn NetworkBackend) -> RuntimeCapabilities {
+fn firecracker_capabilities(
+    _network: &dyn NetworkBackend,
+    artifact: Option<&guest_artifact::GuestArtifact>,
+) -> RuntimeCapabilities {
     RuntimeCapabilities {
+        isolation: agentforge_core::runtime::RuntimeIsolation::MicroVm,
+        exec: true,
+        files: true,
+        streaming: false,
+        guest_agent: true,
+        full_kernel_isolation: true,
         vm_snapshot: true,
         memory_resume: true,
         network_policy: true,
         pause: true,
+        pause_reclaims_resources: false,
         vsock: true,
+        coding_guest: artifact.is_some_and(guest_artifact::GuestArtifact::is_coding_guest),
         ..RuntimeCapabilities::default()
     }
+}
+
+/// Builds the guest kernel command line.
+///
+/// With a network attachment the guest interface is configured statically from the
+/// subnet the network backend allocated, because the guest has no DHCP server and
+/// no in-guest agent involvement before the first vsock call.
+fn firecracker_boot_args(network: Option<&NetworkAttachment>) -> String {
+    const BASE: &str = "console=ttyS0 reboot=k panic=1 pci=off";
+    let Some(attachment) = network else {
+        return BASE.to_string();
+    };
+    let (Some(gateway), true) = (
+        attachment.addresses.first(),
+        !attachment.guest_addresses.is_empty(),
+    ) else {
+        return BASE.to_string();
+    };
+    const NETMASK: &str = "255.255.255.252";
+    let mut args = String::from(BASE);
+    args.push_str(" net.ifnames=0");
+    for address in &attachment.guest_addresses {
+        args.push_str(&format!(
+            " ip={address}::{gateway}:{NETMASK}:agentforge:eth0:off"
+        ));
+    }
+    args
+}
+
+/// A validated development workspace archive suitable for handoff between runtimes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceArchive {
+    pub key: String,
+    pub bytes: Vec<u8>,
+    pub checksum_sha256: String,
+}
+
+fn validate_archive_key(key: &str) -> Result<(), RuntimeError> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RuntimeError::Archive(
+            "invalid workspace archive key".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -370,6 +439,49 @@ impl BubblewrapRuntime {
         }
         Ok(())
     }
+    pub async fn export_workspace_snapshot(
+        &self,
+        sandbox: &Sandbox,
+        key: &str,
+    ) -> Result<WorkspaceArchive, RuntimeError> {
+        validate_archive_key(key)?;
+        let size = self.snapshot(sandbox, key).await?;
+        if size > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+            return Err(RuntimeError::Archive(
+                "workspace archive exceeds 64 MiB".into(),
+            ));
+        }
+        let bytes = tokio::fs::read(self.root.join("snapshots").join(format!("{key}.tar"))).await?;
+        Ok(WorkspaceArchive {
+            key: key.to_owned(),
+            checksum_sha256: hex::encode(Sha256::digest(&bytes)),
+            bytes,
+        })
+    }
+
+    pub async fn import_workspace_snapshot(
+        &self,
+        sandbox: &Sandbox,
+        archive: &WorkspaceArchive,
+    ) -> Result<(), RuntimeError> {
+        validate_archive_key(&archive.key)?;
+        if archive.bytes.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
+            return Err(RuntimeError::Archive(
+                "workspace archive exceeds 64 MiB".into(),
+            ));
+        }
+        if hex::encode(Sha256::digest(&archive.bytes)) != archive.checksum_sha256 {
+            return Err(RuntimeError::Archive(
+                "workspace archive checksum mismatch".into(),
+            ));
+        }
+        let directory = self.root.join("snapshots");
+        tokio::fs::create_dir_all(&directory).await?;
+        let temporary = directory.join(format!(".{}.import", archive.key));
+        tokio::fs::write(&temporary, &archive.bytes).await?;
+        tokio::fs::rename(temporary, directory.join(format!("{}.tar", archive.key))).await?;
+        self.restore(sandbox, &archive.key).await
+    }
     async fn destroy(&self, s: &Sandbox) -> Result<(), RuntimeError> {
         match tokio::fs::remove_dir_all(self.base(s)).await {
             Ok(()) => Ok(()),
@@ -393,36 +505,40 @@ impl SandboxRuntime for BubblewrapRuntime {
     async fn stop(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::stop(self, sandbox).await.map_err(into_core)
     }
-    async fn exec(
-        &self,
-        sandbox: &Sandbox,
-        request: ExecRequest,
-    ) -> Result<ExecResult, CoreError> {
+    async fn pause(&self, _sandbox: &Sandbox) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "bubblewrap pause is unsupported".into(),
+        ))
+    }
+    async fn resume(&self, _sandbox: &Sandbox) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "bubblewrap resume is unsupported".into(),
+        ))
+    }
+    async fn exec(&self, sandbox: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
         Self::exec(self, sandbox, request).await.map_err(into_core)
     }
-    async fn put_file(
-        &self,
-        sandbox: &Sandbox,
-        request: PutFileRequest,
-    ) -> Result<(), CoreError> {
-        Self::put_file(self, sandbox, request).await.map_err(into_core)
+    async fn put_file(&self, sandbox: &Sandbox, request: PutFileRequest) -> Result<(), CoreError> {
+        Self::put_file(self, sandbox, request)
+            .await
+            .map_err(into_core)
     }
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         Self::get_file(self, sandbox, path).await.map_err(into_core)
     }
-    async fn list_files(
-        &self,
-        sandbox: &Sandbox,
-        path: &str,
-    ) -> Result<Vec<FileEntry>, CoreError> {
-        Self::list_files(self, sandbox, path).await.map_err(into_core)
+    async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
+        Self::list_files(self, sandbox, path)
+            .await
+            .map_err(into_core)
     }
     async fn delete_file(
         &self,
         sandbox: &Sandbox,
         request: DeleteFileRequest,
     ) -> Result<(), CoreError> {
-        Self::delete_file(self, sandbox, &request.path).await.map_err(into_core)
+        Self::delete_file(self, sandbox, &request.path)
+            .await
+            .map_err(into_core)
     }
     async fn make_directory(
         &self,
@@ -432,6 +548,30 @@ impl SandboxRuntime for BubblewrapRuntime {
         Self::make_directory(self, sandbox, &request.path)
             .await
             .map_err(into_core)
+    }
+    async fn import_workspace_archive(
+        &self,
+        sandbox: &Sandbox,
+        archive: &[u8],
+    ) -> Result<(), CoreError> {
+        if archive.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
+            return Err(CoreError::LimitExceeded(
+                "workspace archive exceeds 64 MiB".into(),
+            ));
+        }
+        // The tar payload is the archive; `import_workspace_snapshot`
+        // re-verifies the digest it derives here before unpacking.
+        Self::import_workspace_snapshot(
+            self,
+            sandbox,
+            &WorkspaceArchive {
+                key: format!("import-{}", sandbox.id),
+                checksum_sha256: hex::encode(Sha256::digest(archive)),
+                bytes: archive.to_vec(),
+            },
+        )
+        .await
+        .map_err(into_core)
     }
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::destroy(self, sandbox).await.map_err(into_core)
@@ -451,20 +591,40 @@ impl SandboxRuntime for BubblewrapRuntime {
 #[async_trait]
 impl SnapshotProvider for BubblewrapRuntime {
     fn capabilities(&self) -> SnapshotCapabilities {
-        SnapshotCapabilities { workspace: true, ..SnapshotCapabilities::default() }
-    }
-    async fn capture(&self, sandbox: &Sandbox, request: &SnapshotRequest) -> Result<CapturedSnapshot, CoreError> {
-        if request.kind != SnapshotKind::Workspace {
-            return Err(CoreError::Unsupported("bubblewrap supports workspace snapshots only".into()));
+        SnapshotCapabilities {
+            workspace: true,
+            cross_instance_restore: true,
+            ..SnapshotCapabilities::default()
         }
-        let size = Self::snapshot(self, sandbox, &request.object_key).await.map_err(into_core)?;
-        Ok(CapturedSnapshot {
-            id: Uuid::now_v7(), kind: request.kind, object_key: request.object_key.clone(), size_bytes: size,
-            checksum_sha256: hex::encode(Sha256::digest(request.object_key.as_bytes())),
-        })
     }
-    async fn restore(&self, sandbox: &Sandbox, metadata: &SnapshotMetadata) -> Result<(), CoreError> {
-        Self::restore(self, sandbox, &metadata.object_key).await.map_err(into_core)
+    async fn capture(
+        &self,
+        sandbox: &Sandbox,
+        request: &SnapshotRequest,
+    ) -> Result<CapturedSnapshot, CoreError> {
+        if request.kind != SnapshotKind::Workspace {
+            return Err(CoreError::Unsupported(
+                "bubblewrap supports workspace snapshots only".into(),
+            ));
+        }
+        let archive = Self::export_workspace_snapshot(self, sandbox, &request.object_key)
+            .await
+            .map_err(into_core)?;
+        Ok(CapturedSnapshot::from_archive(
+            Uuid::now_v7(),
+            request.kind,
+            request.object_key.clone(),
+            archive.bytes,
+        ))
+    }
+    async fn restore(
+        &self,
+        sandbox: &Sandbox,
+        metadata: &SnapshotMetadata,
+    ) -> Result<(), CoreError> {
+        Self::restore(self, sandbox, &metadata.object_key)
+            .await
+            .map_err(into_core)
     }
 }
 
@@ -479,6 +639,12 @@ pub struct FirecrackerConfig {
     pub guest_secret: Vec<u8>,
     pub guest_cid: u32,
     pub readiness_timeout: Duration,
+    /// Directory holding `guest-capabilities.json`, defaulting to the rootfs directory.
+    pub guest_artifact_dir: Option<PathBuf>,
+    /// Metadata of the configured guest image, when it was built from repository tooling.
+    pub guest_artifact: Option<guest_artifact::GuestArtifact>,
+    /// Whether the deployment refuses to start without a verified coding guest image.
+    pub require_coding_guest: bool,
 }
 
 impl FirecrackerConfig {
@@ -487,10 +653,31 @@ impl FirecrackerConfig {
             std::env::var(name)
                 .map_err(|_| RuntimeError::Unavailable(format!("{name} is required")))
         };
+        let rootfs = PathBuf::from(required("AGENTFORGE_ROOTFS")?);
+        let guest_artifact_dir = std::env::var("AGENTFORGE_GUEST_ARTIFACT_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| rootfs.parent().map(Path::to_path_buf));
+        let guest_artifact = guest_artifact_dir.as_deref().and_then(|dir| {
+            let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
+            let artifact = guest_artifact::load_guest_artifact(&path);
+            match &artifact {
+                Ok(artifact) => tracing::info!(
+                    path = %path.display(),
+                    profile = %artifact.profile,
+                    version = %artifact.artifact_version,
+                    "loaded firecracker guest artifact metadata"
+                ),
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "no firecracker guest artifact metadata")
+                }
+            }
+            artifact.ok()
+        });
         Ok(Self {
             binary: PathBuf::from(required("AGENTFORGE_FIRECRACKER_BIN")?),
             kernel: PathBuf::from(required("AGENTFORGE_KERNEL")?),
-            rootfs: PathBuf::from(required("AGENTFORGE_ROOTFS")?),
+            rootfs,
             jailer: std::env::var("AGENTFORGE_JAILER").ok().map(PathBuf::from),
             tap: std::env::var("AGENTFORGE_TAP").ok(),
             state_dir: PathBuf::from(
@@ -500,6 +687,10 @@ impl FirecrackerConfig {
             guest_secret: required("AGENTFORGE_GUEST_SECRET")?.into_bytes(),
             guest_cid: 3,
             readiness_timeout: Duration::from_secs(30),
+            guest_artifact_dir,
+            guest_artifact,
+            require_coding_guest: std::env::var("AGENTFORGE_REQUIRE_CODING_GUEST")
+                .is_ok_and(|value| value == "1"),
         })
     }
 
@@ -528,6 +719,10 @@ impl FirecrackerConfig {
                 "AGENTFORGE_GUEST_SECRET must contain at least 32 bytes".into(),
             ));
         }
+        // Structural validation only. Hashing a multi-gigabyte rootfs is not a
+        // boot-time cost: the control plane calls this on every start, and a
+        // worker calls [`Self::verify_guest_image`] before it boots a guest.
+        self.check_guest_capabilities()?;
         kvm.map_err(|error| {
             RuntimeError::Unavailable(format!("/dev/kvm is not readable and writable: {error}"))
         })?;
@@ -538,22 +733,118 @@ impl FirecrackerConfig {
                 "configured jailer is missing".into(),
             ));
         }
-        if self.tap.is_some() && (which("ip").is_none() || which("nft").is_none()) {
+        if self.tap.is_some()
+            && (which("ip").is_none() || which("nft").is_none() || which("sysctl").is_none())
+        {
             return Err(RuntimeError::Unavailable(
-                "network isolation requires ip(8) and nft".into(),
+                "network isolation requires ip(8), nft and sysctl".into(),
             ));
         }
         Ok(())
     }
 
+    /// Verifies the guest image digest, at most once per process.
+    ///
+    /// A worker calls this before it boots a guest. The result is cached because
+    /// the same image is used for every sandbox on the node and the digest of a
+    /// multi-gigabyte rootfs is not cheap to recompute per create.
+    pub fn verify_guest_image(&self) -> Result<(), RuntimeError> {
+        static VERIFIED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        let outcome =
+            VERIFIED.get_or_init(|| self.check_guest_artifact().map_err(|e| e.to_string()));
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => Err(RuntimeError::Unavailable(error.clone())),
+        }
+    }
+
+    /// Hashes the guest image and compares it with the recorded metadata.
+    ///
+    /// A deployment without artifact metadata keeps running on whatever image it
+    /// was pointed at; a deployment with metadata never runs an image that does
+    /// not match it, and a deployment that demands a coding guest never runs a
+    /// guest that cannot clone over HTTPS.
+    pub fn check_guest_artifact(&self) -> Result<(), RuntimeError> {
+        if self.guest_artifact.is_some() {
+            let dir = self
+                .guest_artifact_dir
+                .clone()
+                .or_else(|| self.rootfs.parent().map(Path::to_path_buf))
+                .ok_or_else(|| {
+                    RuntimeError::Unavailable(
+                        "guest artifact metadata is loaded but no artifact directory is configured"
+                            .into(),
+                    )
+                })?;
+            guest_artifact::verify_guest_artifact(&dir, &self.rootfs, &self.kernel).map_err(
+                |error| {
+                    RuntimeError::Unavailable(format!(
+                        "Firecracker guest artifact is unusable: {error}"
+                    ))
+                },
+            )?;
+        }
+        self.check_guest_capabilities()
+    }
+
+    /// Checks the guest capability requirements without hashing the image.
+    ///
+    /// The control plane calls this at startup: reading the artifact metadata is
+    /// cheap, while hashing a multi-gigabyte rootfs is not something to pay on
+    /// every API boot. [`Self::check_guest_artifact`] adds the digest
+    /// verification and is the check a worker runs before it boots a guest.
+    pub fn check_guest_capabilities(&self) -> Result<(), RuntimeError> {
+        if self.require_coding_guest {
+            let Some(artifact) = &self.guest_artifact else {
+                return Err(RuntimeError::Unavailable(
+                    "AGENTFORGE_REQUIRE_CODING_GUEST=1 requires guest artifact metadata, but none could be loaded"
+                        .into(),
+                ));
+            };
+            if artifact.profile != guest_artifact::CODING_PROFILE {
+                return Err(RuntimeError::Unavailable(format!(
+                    "AGENTFORGE_REQUIRE_CODING_GUEST=1 requires the {} profile, artifact {} declares {}",
+                    guest_artifact::CODING_PROFILE,
+                    artifact.artifact_version,
+                    artifact.profile
+                )));
+            }
+            for required in [
+                guest_artifact::CAPABILITY_GIT,
+                guest_artifact::CAPABILITY_CA_CERTIFICATES,
+            ] {
+                if !artifact
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == required)
+                {
+                    return Err(RuntimeError::Unavailable(format!(
+                        "coding guest artifact {} is missing the {required} capability",
+                        artifact.artifact_version
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn socket_root(&self) -> PathBuf {
+        let digest = hex::encode(Sha256::digest(self.state_dir.to_string_lossy().as_bytes()));
+        std::env::temp_dir()
+            .join("agentforge-fc")
+            .join(&digest[..16])
+    }
+    fn socket_dir(&self, id: Uuid) -> PathBuf {
+        self.socket_root().join(id.to_string())
+    }
     fn vm_dir(&self, id: Uuid) -> PathBuf {
         self.state_dir.join("vms").join(id.to_string())
     }
     fn api_socket(&self, id: Uuid) -> PathBuf {
-        self.vm_dir(id).join("api.sock")
+        self.socket_dir(id).join("api.sock")
     }
     fn vsock_socket(&self, id: Uuid) -> PathBuf {
-        self.vm_dir(id).join("vsock.sock")
+        self.socket_dir(id).join("vsock.sock")
     }
     fn rootfs(&self, id: Uuid) -> PathBuf {
         self.vm_dir(id).join("rootfs.ext4")
@@ -580,6 +871,18 @@ pub struct FirecrackerRuntime {
     network: Arc<dyn NetworkBackend>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LocalReconciliationReport {
+    /// Worker identity used to establish ownership.
+    pub owner_id: Uuid,
+    /// Number of VM directories inspected.
+    pub scanned: usize,
+    /// Number of directories carrying this worker's owner marker.
+    pub owned: usize,
+    /// Owned directories with no live API socket; reported, never killed.
+    pub orphan_candidates: Vec<Uuid>,
+}
+
 impl FirecrackerRuntime {
     pub fn new(config: FirecrackerConfig) -> Self {
         Self::with_network_backend(config, Arc::new(LinuxNetworkManager::new()))
@@ -594,6 +897,60 @@ impl FirecrackerRuntime {
             vms: Arc::new(Mutex::new(HashMap::new())),
             network,
         }
+    }
+
+    /// Records this worker's ownership of a VM directory without touching
+    /// another worker's state. Ownership is explicit and durable.
+    pub fn claim_local_vm(&self, sandbox_id: Uuid, owner_id: Uuid) -> Result<(), RuntimeError> {
+        let dir = self.config.vm_dir(sandbox_id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("owner.json"), owner_id.to_string())?;
+        Ok(())
+    }
+
+    /// Reports only VM directories explicitly owned by `owner_id`. Missing API
+    /// sockets are candidates for operator review; this method never kills or
+    /// deletes a process or directory.
+    pub fn reconcile_local(
+        &self,
+        owner_id: Uuid,
+    ) -> Result<LocalReconciliationReport, RuntimeError> {
+        let root = self.config.state_dir.join("vms");
+        let mut report = LocalReconciliationReport {
+            owner_id,
+            ..LocalReconciliationReport::default()
+        };
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            report.scanned += 1;
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let owner = std::fs::read_to_string(entry.path().join("owner.json"))
+                .ok()
+                .and_then(|value| Uuid::parse_str(value.trim()).ok());
+            if owner != Some(owner_id) {
+                continue;
+            }
+            report.owned += 1;
+            if !self.config.api_socket(id).exists() {
+                report.orphan_candidates.push(id);
+            }
+        }
+        report.orphan_candidates.sort_unstable();
+        Ok(report)
     }
 
     async fn api(
@@ -687,36 +1044,42 @@ impl FirecrackerRuntime {
                             "guest vsock CONNECT timed out".into(),
                         ));
                     }
+                    // Firecracker's vsock UDS accepts connections as soon as the
+                    // device exists, which is before the guest agent has bound
+                    // the control port. An early CONNECT is therefore expected to
+                    // fail, so every handshake failure retries against the same
+                    // readiness deadline as a failed connect.
                     let connect = format!("CONNECT {}\n", protocol::DEFAULT_CONTROL_PORT);
-                    match tokio::time::timeout(remaining, stream.write_all(connect.as_bytes()))
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(error.into()),
-                        Err(_) => {
-                            return Err(RuntimeError::Unavailable(
-                                "guest vsock CONNECT timed out".into(),
-                            ));
-                        }
-                    }
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
-                        Ok(Ok(_)) if line.starts_with("OK ") => {
+                    let write =
+                        tokio::time::timeout(remaining, stream.write_all(connect.as_bytes()))
+                            .await
+                            .map_err(|_| {
+                                RuntimeError::Unavailable("guest vsock CONNECT timed out".into())
+                            });
+                    if let Ok(Ok(())) = write {
+                        let mut reader = BufReader::new(stream);
+                        let mut line = String::new();
+                        let reply =
+                            tokio::time::timeout(remaining, reader.read_line(&mut line)).await;
+                        if let Ok(Ok(_)) = reply
+                            && line.starts_with("OK ")
+                        {
                             return Ok(reader.into_inner());
                         }
-                        Ok(Ok(_)) => {
-                            return Err(RuntimeError::Unavailable(format!(
-                                "guest vsock CONNECT rejected: {}",
-                                line.trim()
-                            )));
-                        }
-                        Ok(Err(error)) => return Err(error.into()),
-                        Err(_) => {
-                            return Err(RuntimeError::Unavailable(
-                                "guest vsock CONNECT timed out".into(),
-                            ));
-                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(RuntimeError::Unavailable(format!(
+                            "guest vsock CONNECT was still refused after {:?}",
+                            self.config.readiness_timeout
+                        )));
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if !remaining.is_zero() {
+                        let _ = tokio::time::timeout(
+                            remaining,
+                            tokio::time::sleep(Duration::from_millis(50)),
+                        )
+                        .await;
                     }
                 }
                 Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
@@ -829,6 +1192,7 @@ impl FirecrackerRuntime {
     async fn spawn(&self, id: Uuid) -> Result<FirecrackerVm, RuntimeError> {
         let dir = self.config.vm_dir(id);
         tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::create_dir_all(self.config.socket_dir(id)).await?;
         let api_socket = self.config.api_socket(id);
         let vsock_socket = self.config.vsock_socket(id);
         let mut command = if let Some(jailer) = &self.config.jailer {
@@ -880,14 +1244,31 @@ impl FirecrackerRuntime {
         if let Some(network) = &vm.network {
             self.api(&vm.api_socket, "PUT", "/network-interfaces/eth0", Some(serde_json::json!({"iface_id":"eth0", "guest_mac":"06:00:AC:10:00:02", "host_dev_name":network.resource}))).await?;
         }
-        self.api(&vm.api_socket, "PUT", "/boot-source", Some(serde_json::json!({"kernel_image_path": self.config.kernel, "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"}))).await?;
+        self.api(&vm.api_socket, "PUT", "/boot-source", Some(serde_json::json!({"kernel_image_path": self.config.kernel, "boot_args": firecracker_boot_args(vm.network.as_ref())}))).await?;
         self.api(&vm.api_socket, "PUT", "/drives/rootfs", Some(serde_json::json!({"drive_id":"rootfs", "path_on_host":vm.rootfs, "is_root_device":true, "is_read_only":false}))).await?;
         self.api(&vm.api_socket, "PUT", "/machine-config", Some(serde_json::json!({"vcpu_count":sandbox.cpu, "mem_size_mib":sandbox.memory_mb, "smt":false}))).await?;
-        self.api(&vm.api_socket, "PUT", "/vsock", Some(serde_json::json!({"guest_cid":self.config.guest_cid, "uds_path":vm.vsock_socket}))).await?;
-        self.api(&vm.api_socket, "PUT", "/actions", Some(serde_json::json!({"action_type":"InstanceStart"}))).await?;
+        self.api(
+            &vm.api_socket,
+            "PUT",
+            "/vsock",
+            Some(
+                serde_json::json!({"guest_cid":self.config.guest_cid, "uds_path":vm.vsock_socket}),
+            ),
+        )
+        .await?;
+        self.api(
+            &vm.api_socket,
+            "PUT",
+            "/actions",
+            Some(serde_json::json!({"action_type":"InstanceStart"})),
+        )
+        .await?;
         let deadline = tokio::time::Instant::now() + self.config.readiness_timeout;
         loop {
-            match self.guest_call(sandbox.id, Operation::Health, RequestPayload::None).await {
+            match self
+                .guest_call(sandbox.id, Operation::Health, RequestPayload::None)
+                .await
+            {
                 Ok(ResponsePayload::Health { ready: true }) => return Ok(()),
                 Ok(_) => {}
                 Err(error) if tokio::time::Instant::now() < deadline => {
@@ -898,7 +1279,6 @@ impl FirecrackerRuntime {
             }
         }
     }
-
 
     fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
         let runtime = self.clone();
@@ -989,11 +1369,28 @@ fn which(program: &str) -> Option<PathBuf> {
 
 impl FirecrackerRuntime {
     async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        let started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox.id, runtime = "firecracker", stage = "create_begin", "firecracker create started");
         self.config.check()?;
+        // The guest image is verified once at worker startup, not per create:
+        // a worker that cannot verify its image must fail to start rather than
+        // fail its first sandbox, and hashing the image on the request path
+        // would blow the control plane's client timeout.
         let dir = self.config.vm_dir(sandbox.id);
         tokio::fs::create_dir_all(&dir).await?;
+        if let Some(owner_id) = sandbox.node_id {
+            tokio::fs::write(dir.join("owner.json"), owner_id.to_string()).await?;
+        }
         let destination = self.config.rootfs(sandbox.id);
-        tokio::fs::copy(&self.config.rootfs, &destination).await?;
+        let copy_started = Instant::now();
+        tracing::info!(sandbox_id = %sandbox.id, source = %self.config.rootfs.display(), destination = %destination.display(), stage = "rootfs_copy_begin", "firecracker rootfs copy started");
+        let copied = tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::fs::copy(&self.config.rootfs, &destination),
+        )
+        .await
+        .map_err(|_| RuntimeError::Unavailable("Firecracker rootfs copy timed out".into()))??;
+        tracing::info!(sandbox_id = %sandbox.id, bytes = copied, elapsed_ms = copy_started.elapsed().as_millis() as u64, stage = "rootfs_copy_done", "firecracker rootfs copy completed");
         let requested = (sandbox.disk_mb as u64) * 1024 * 1024;
         let current = tokio::fs::metadata(&self.config.rootfs).await?.len();
         if requested < current {
@@ -1038,6 +1435,7 @@ impl FirecrackerRuntime {
                 ));
             }
         }
+        tracing::info!(sandbox_id = %sandbox.id, elapsed_ms = started.elapsed().as_millis() as u64, stage = "create_done", "firecracker create completed");
         Ok(())
     }
 
@@ -1064,6 +1462,38 @@ impl FirecrackerRuntime {
             self.terminate_vm(sandbox, vm).await;
         }
         Ok(())
+    }
+    async fn pause(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        let socket = self
+            .vms
+            .lock()
+            .await
+            .get(&sandbox.id)
+            .map(|vm| vm.api_socket.clone())
+            .ok_or_else(|| RuntimeError::Unavailable("sandbox VM is not running".into()))?;
+        self.api(
+            &socket,
+            "PATCH",
+            "/vm",
+            Some(serde_json::json!({"state":"Paused"})),
+        )
+        .await
+    }
+    async fn resume(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        let socket = self
+            .vms
+            .lock()
+            .await
+            .get(&sandbox.id)
+            .map(|vm| vm.api_socket.clone())
+            .ok_or_else(|| RuntimeError::Unavailable("sandbox VM is not running".into()))?;
+        self.api(
+            &socket,
+            "PATCH",
+            "/vm",
+            Some(serde_json::json!({"state":"Resumed"})),
+        )
+        .await
     }
 
     async fn exec(
@@ -1203,6 +1633,262 @@ impl FirecrackerRuntime {
         Ok(())
     }
 
+    async fn export_workspace(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
+        let mut entries = Vec::new();
+        let mut pending = vec!["/workspace".to_owned()];
+        let mut total = 0_u64;
+        while let Some(path) = pending.pop() {
+            let response = self
+                .guest_call(
+                    sandbox.id,
+                    Operation::ListDirectory,
+                    RequestPayload::Path { path: path.clone() },
+                )
+                .await?;
+            let ResponsePayload::ListDirectory { entries: children } = response else {
+                return Err(RuntimeError::Unavailable(
+                    "guest returned wrong directory response".into(),
+                ));
+            };
+            for child in children {
+                if child.kind == protocol::FileKind::Directory {
+                    entries.push(PortableWorkspaceEntry {
+                        path: child.path.clone(),
+                        directory: true,
+                        content_base64: String::new(),
+                    });
+                    pending.push(child.path);
+                } else {
+                    let response = self
+                        .guest_call(
+                            sandbox.id,
+                            Operation::ReadFile,
+                            RequestPayload::Path {
+                                path: child.path.clone(),
+                            },
+                        )
+                        .await?;
+                    let ResponsePayload::ReadFile { content } = response else {
+                        return Err(RuntimeError::Unavailable(
+                            "guest returned wrong file response".into(),
+                        ));
+                    };
+                    total = total.checked_add(content.len() as u64).ok_or_else(|| {
+                        RuntimeError::Archive("workspace snapshot size overflow".into())
+                    })?;
+                    if total > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+                        return Err(RuntimeError::Archive(
+                            "workspace snapshot exceeds 64 MiB".into(),
+                        ));
+                    }
+                    entries.push(PortableWorkspaceEntry {
+                        path: child.path,
+                        directory: false,
+                        content_base64: base64::engine::general_purpose::STANDARD.encode(content),
+                    });
+                }
+                if entries.len() > 10_000 {
+                    return Err(RuntimeError::Archive(
+                        "workspace snapshot has too many members".into(),
+                    ));
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let bytes = serde_json::to_vec(&PortableWorkspaceArchive {
+            version: 1,
+            entries,
+        })?;
+        let destination = self.config.snapshot_dir(key);
+        tokio::fs::create_dir_all(&destination).await?;
+        tokio::fs::write(destination.join("workspace.json"), &bytes).await?;
+        Ok(bytes.len() as u64)
+    }
+
+    async fn import_workspace(&self, sandbox: &Sandbox, key: &str) -> Result<(), RuntimeError> {
+        let source = self.config.snapshot_dir(key).join("workspace.json");
+        let bytes = tokio::fs::read(source).await?;
+        let archive: PortableWorkspaceArchive = serde_json::from_slice(&bytes)?;
+        if archive.version != 1 || archive.entries.len() > 10_000 {
+            return Err(RuntimeError::Archive(
+                "invalid portable workspace archive".into(),
+            ));
+        }
+        for entry in archive.entries {
+            if !entry.path.starts_with("/workspace/")
+                || entry.path.split('/').any(|part| part == "..")
+            {
+                return Err(RuntimeError::Archive(
+                    "invalid portable workspace path".into(),
+                ));
+            }
+            if entry.directory {
+                self.guest_call(
+                    sandbox.id,
+                    Operation::CreateDirectory,
+                    RequestPayload::Path { path: entry.path },
+                )
+                .await?;
+            } else {
+                let content = base64::engine::general_purpose::STANDARD
+                    .decode(entry.content_base64)
+                    .map_err(|_| {
+                        RuntimeError::Archive("invalid portable workspace encoding".into())
+                    })?;
+                if content.len() > MAX_FILE {
+                    return Err(RuntimeError::Archive(
+                        "portable workspace file is too large".into(),
+                    ));
+                }
+                self.guest_call(
+                    sandbox.id,
+                    Operation::WriteFile,
+                    RequestPayload::WriteFile {
+                        path: entry.path,
+                        content,
+                        mode: None,
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    pub async fn export_workspace_archive(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let mut entries = Vec::new();
+        let mut pending = vec!["/workspace".to_owned()];
+        let mut total = 0_u64;
+        while let Some(path) = pending.pop() {
+            let response = self
+                .guest_call(
+                    sandbox.id,
+                    Operation::ListDirectory,
+                    RequestPayload::Path { path: path.clone() },
+                )
+                .await?;
+            let ResponsePayload::ListDirectory { entries: children } = response else {
+                return Err(RuntimeError::Unavailable(
+                    "guest returned wrong directory response".into(),
+                ));
+            };
+            for child in children {
+                if child.kind == protocol::FileKind::Directory {
+                    entries.push(PortableWorkspaceEntry {
+                        path: child.path.clone(),
+                        directory: true,
+                        content_base64: String::new(),
+                    });
+                    pending.push(child.path);
+                } else {
+                    let response = self
+                        .guest_call(
+                            sandbox.id,
+                            Operation::ReadFile,
+                            RequestPayload::Path {
+                                path: child.path.clone(),
+                            },
+                        )
+                        .await?;
+                    let ResponsePayload::ReadFile { content } = response else {
+                        return Err(RuntimeError::Unavailable(
+                            "guest returned wrong file response".into(),
+                        ));
+                    };
+                    total = total.checked_add(content.len() as u64).ok_or_else(|| {
+                        RuntimeError::Archive("workspace snapshot size overflow".into())
+                    })?;
+                    if total > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+                        return Err(RuntimeError::Archive(
+                            "workspace snapshot exceeds 64 MiB".into(),
+                        ));
+                    }
+                    entries.push(PortableWorkspaceEntry {
+                        path: child.path,
+                        directory: false,
+                        content_base64: base64::engine::general_purpose::STANDARD.encode(content),
+                    });
+                }
+                if entries.len() > 10_000 {
+                    return Err(RuntimeError::Archive(
+                        "workspace snapshot has too many members".into(),
+                    ));
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        serde_json::to_vec(&PortableWorkspaceArchive {
+            version: 1,
+            entries,
+        })
+        .map_err(RuntimeError::Json)
+    }
+
+    pub async fn import_workspace_archive(
+        &self,
+        sandbox: &Sandbox,
+        bytes: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let archive: PortableWorkspaceArchive = serde_json::from_slice(bytes)?;
+        if archive.version != 1 || archive.entries.len() > 10_000 {
+            return Err(RuntimeError::Archive(
+                "invalid portable workspace archive".into(),
+            ));
+        }
+        let mut total = 0_u64;
+        for entry in archive.entries {
+            let Some(relative) = entry.path.strip_prefix("/workspace/") else {
+                return Err(RuntimeError::Archive(
+                    "invalid portable workspace path".into(),
+                ));
+            };
+            if relative.is_empty()
+                || Path::new(relative)
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(RuntimeError::Archive(
+                    "invalid portable workspace path".into(),
+                ));
+            }
+            if entry.directory {
+                self.guest_call(
+                    sandbox.id,
+                    Operation::CreateDirectory,
+                    RequestPayload::Path { path: entry.path },
+                )
+                .await?;
+            } else {
+                let content = base64::engine::general_purpose::STANDARD
+                    .decode(entry.content_base64)
+                    .map_err(|_| {
+                        RuntimeError::Archive("invalid portable workspace encoding".into())
+                    })?;
+                total = total.checked_add(content.len() as u64).ok_or_else(|| {
+                    RuntimeError::Archive("workspace snapshot size overflow".into())
+                })?;
+                if total > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+                    return Err(RuntimeError::Archive(
+                        "workspace snapshot exceeds 64 MiB".into(),
+                    ));
+                }
+                self.guest_call(
+                    sandbox.id,
+                    Operation::WriteFile,
+                    RequestPayload::WriteFile {
+                        path: entry.path,
+                        content,
+                        mode: None,
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn snapshot(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
         self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
             .await?;
@@ -1339,7 +2025,14 @@ impl FirecrackerRuntime {
 
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         self.stop(sandbox).await?;
-        match tokio::fs::remove_dir_all(self.config.vm_dir(sandbox.id)).await {
+        let state = self.config.vm_dir(sandbox.id);
+        let socket = self.config.socket_dir(sandbox.id);
+        match tokio::fs::remove_dir_all(&state).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match tokio::fs::remove_dir_all(&socket).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
@@ -1361,52 +2054,139 @@ impl SandboxRuntime for FirecrackerRuntime {
     async fn stop(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::stop(self, sandbox).await.map_err(into_core)
     }
+    async fn pause(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::pause(self, sandbox).await.map_err(into_core)
+    }
+    async fn resume(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        Self::resume(self, sandbox).await.map_err(into_core)
+    }
     async fn exec(&self, sandbox: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
         Self::exec(self, sandbox, request).await.map_err(into_core)
     }
     async fn put_file(&self, sandbox: &Sandbox, request: PutFileRequest) -> Result<(), CoreError> {
-        Self::put_file(self, sandbox, request).await.map_err(into_core)
+        Self::put_file(self, sandbox, request)
+            .await
+            .map_err(into_core)
     }
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         Self::get_file(self, sandbox, path).await.map_err(into_core)
     }
     async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
-        Self::list_files(self, sandbox, path).await.map_err(into_core)
+        Self::list_files(self, sandbox, path)
+            .await
+            .map_err(into_core)
     }
-    async fn delete_file(&self, sandbox: &Sandbox, request: DeleteFileRequest) -> Result<(), CoreError> {
-        Self::delete_file(self, sandbox, &request.path).await.map_err(into_core)
+    async fn delete_file(
+        &self,
+        sandbox: &Sandbox,
+        request: DeleteFileRequest,
+    ) -> Result<(), CoreError> {
+        Self::delete_file(self, sandbox, &request.path)
+            .await
+            .map_err(into_core)
     }
-    async fn make_directory(&self, sandbox: &Sandbox, request: MakeDirectoryRequest) -> Result<(), CoreError> {
-        Self::make_directory(self, sandbox, &request.path).await.map_err(into_core)
+    async fn make_directory(
+        &self,
+        sandbox: &Sandbox,
+        request: MakeDirectoryRequest,
+    ) -> Result<(), CoreError> {
+        Self::make_directory(self, sandbox, &request.path)
+            .await
+            .map_err(into_core)
+    }
+    async fn import_workspace_archive(
+        &self,
+        sandbox: &Sandbox,
+        archive: &[u8],
+    ) -> Result<(), CoreError> {
+        if archive.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
+            return Err(CoreError::LimitExceeded(
+                "workspace archive exceeds 64 MiB".into(),
+            ));
+        }
+        // The archive is written straight into the guest, so a sandbox adopted
+        // from another worker needs no shared state directory.
+        Self::import_workspace_archive(self, sandbox, archive)
+            .await
+            .map_err(into_core)
     }
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::destroy(self, sandbox).await.map_err(into_core)
     }
     async fn health(&self) -> RuntimeHealth {
-        if Self::health(self) { RuntimeHealth::healthy() } else { RuntimeHealth::unhealthy("Firecracker prerequisites unavailable") }
+        if Self::health(self) {
+            RuntimeHealth::healthy()
+        } else {
+            RuntimeHealth::unhealthy("Firecracker prerequisites unavailable")
+        }
     }
     fn capabilities(&self) -> RuntimeCapabilities {
-        firecracker_capabilities(self.network.as_ref())
+        firecracker_capabilities(self.network.as_ref(), self.config.guest_artifact.as_ref())
     }
 }
 
 #[async_trait]
 impl SnapshotProvider for FirecrackerRuntime {
     fn capabilities(&self) -> SnapshotCapabilities {
-        SnapshotCapabilities { virtual_machine: true, memory: true, workspace: false, cross_instance_restore: true }
-    }
-    async fn capture(&self, sandbox: &Sandbox, request: &SnapshotRequest) -> Result<CapturedSnapshot, CoreError> {
-        if request.kind == SnapshotKind::Workspace {
-            return Err(CoreError::Unsupported("Firecracker snapshots include VM state".into()));
+        SnapshotCapabilities {
+            virtual_machine: true,
+            memory: true,
+            workspace: true,
+            cross_instance_restore: true,
         }
-        let size = Self::snapshot(self, sandbox, &request.object_key).await.map_err(into_core)?;
+    }
+    async fn capture(
+        &self,
+        sandbox: &Sandbox,
+        request: &SnapshotRequest,
+    ) -> Result<CapturedSnapshot, CoreError> {
+        if request.kind == SnapshotKind::Workspace {
+            self.export_workspace(sandbox, &request.object_key)
+                .await
+                .map_err(into_core)?;
+            let bytes = tokio::fs::read(
+                self.config
+                    .snapshot_dir(&request.object_key)
+                    .join("workspace.json"),
+            )
+            .await
+            .map_err(CoreError::Io)?;
+            return Ok(CapturedSnapshot::from_archive(
+                Uuid::now_v7(),
+                request.kind,
+                request.object_key.clone(),
+                bytes,
+            ));
+        }
+        let size = Self::snapshot(self, sandbox, &request.object_key)
+            .await
+            .map_err(into_core)?;
         Ok(CapturedSnapshot {
-            id: Uuid::now_v7(), kind: request.kind, object_key: request.object_key.clone(), size_bytes: size,
+            id: Uuid::now_v7(),
+            kind: request.kind,
+            object_key: request.object_key.clone(),
+            size_bytes: size,
             checksum_sha256: hex::encode(Sha256::digest(request.object_key.as_bytes())),
+            // A full-VM capture stays on the worker's own disk; only a
+            // portable workspace archive is handed back for shared storage.
+            archive: Vec::new(),
         })
     }
-    async fn restore(&self, sandbox: &Sandbox, metadata: &SnapshotMetadata) -> Result<(), CoreError> {
-        Self::restore(self, sandbox, &metadata.object_key).await.map_err(into_core)
+    async fn restore(
+        &self,
+        sandbox: &Sandbox,
+        metadata: &SnapshotMetadata,
+    ) -> Result<(), CoreError> {
+        if metadata.kind == SnapshotKind::Workspace {
+            self.start(sandbox).await.map_err(into_core)?;
+            return self
+                .import_workspace(sandbox, &metadata.object_key)
+                .await
+                .map_err(into_core);
+        }
+        Self::restore(self, sandbox, &metadata.object_key)
+            .await
+            .map_err(into_core)
     }
 }
 
@@ -1425,18 +2205,23 @@ mod tests {
             guest_secret: vec![7; 32],
             guest_cid: 3,
             readiness_timeout: Duration::from_secs(1),
+            guest_artifact_dir: None,
+            guest_artifact: None,
+            require_coding_guest: false,
         }
     }
 
     #[test]
-    fn paths_are_per_vm_and_snapshot_keys_are_hashed() {
+    fn paths_use_short_socket_root_and_hash_snapshot_keys() {
         let config = config();
         let id = Uuid::now_v7();
         assert!(
             config
                 .api_socket(id)
-                .starts_with(config.state_dir.join("vms").join(id.to_string()))
+                .starts_with(std::env::temp_dir().join("agentforge-fc"))
         );
+        assert!(config.api_socket(id).as_os_str().len() < 108);
+        assert!(config.vsock_socket(id).as_os_str().len() < 108);
         assert_ne!(
             config.snapshot_dir("tenant/a"),
             config.snapshot_dir("tenant/b")
@@ -1457,12 +2242,18 @@ mod tests {
             disk_mb: 128,
             timeout_seconds,
             network: NetworkPolicy::default(),
+            environment: Default::default(),
             created_at: now,
             updated_at: now,
             runtime_path: None,
         }
     }
-
+    #[test]
+    fn firecracker_pause_is_not_reported_as_resource_reclamation() {
+        let capabilities = firecracker_capabilities(&LinuxNetworkManager::new(), None);
+        assert!(capabilities.pause);
+        assert!(!capabilities.pause_reclaims_resources);
+    }
 
     #[test]
     fn repeated_non_idempotent_requests_get_fresh_ids() {
@@ -1530,7 +2321,7 @@ mod tests {
             FirecrackerVm {
                 child,
                 api_socket: PathBuf::from("/unused/api.sock"),
-            network: None,
+                network: None,
                 vsock_socket: PathBuf::from("/unused/vsock.sock"),
                 rootfs: PathBuf::from("/unused/rootfs.ext4"),
                 start_token: token,
@@ -1541,6 +2332,38 @@ mod tests {
         let mut vm = runtime.vms.lock().await.remove(&sandbox.id).unwrap();
         let _ = vm.child.start_kill();
         let _ = vm.child.wait().await;
+    }
+
+    #[test]
+    fn local_reconciliation_only_reports_explicit_owner() {
+        let mut config = config();
+        let state = std::env::temp_dir().join(format!("af-reconcile-{}", Uuid::now_v7()));
+        config.state_dir = state.clone();
+        let runtime = FirecrackerRuntime::new(config);
+        let owner = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        let owned = Uuid::now_v7();
+        let foreign = Uuid::now_v7();
+        runtime.claim_local_vm(owned, owner).unwrap();
+        runtime.claim_local_vm(foreign, other).unwrap();
+        let report = runtime.reconcile_local(owner).unwrap();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.owned, 1);
+        assert_eq!(report.orphan_candidates, vec![owned]);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    #[test]
+    fn snapshot_portability_is_explicit_per_provider() {
+        let config = config();
+        let bwrap = BubblewrapRuntime::new(config.state_dir.clone());
+        let bwrap_caps = SnapshotProvider::capabilities(&bwrap);
+        let firecracker = FirecrackerRuntime::new(config);
+        let firecracker_caps = SnapshotProvider::capabilities(&firecracker);
+        assert!(bwrap_caps.workspace && bwrap_caps.cross_instance_restore);
+        assert!(!bwrap_caps.virtual_machine && !bwrap_caps.memory);
+        assert!(firecracker_caps.workspace && firecracker_caps.cross_instance_restore);
+        assert!(firecracker_caps.virtual_machine && firecracker_caps.memory);
     }
 
     #[tokio::test]
@@ -1563,7 +2386,7 @@ mod tests {
             FirecrackerVm {
                 child,
                 api_socket: PathBuf::from("/unused/api.sock"),
-            network: None,
+                network: None,
                 vsock_socket: PathBuf::from("/unused/vsock.sock"),
                 rootfs: PathBuf::from("/unused/rootfs.ext4"),
                 start_token: token,
@@ -1572,5 +2395,249 @@ mod tests {
         runtime.schedule_lifetime(&sandbox, token);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
+    }
+
+    #[tokio::test]
+    async fn workspace_archive_handoffs_between_bubblewrap_runtimes() {
+        let first_root = std::env::temp_dir().join(format!("af-export-{}", Uuid::now_v7()));
+        let second_root = std::env::temp_dir().join(format!("af-import-{}", Uuid::now_v7()));
+        let source = BubblewrapRuntime::new(&first_root);
+        let target = BubblewrapRuntime::new(&second_root);
+        let source_sandbox = sandbox(Uuid::now_v7(), 60);
+        let target_sandbox = sandbox(Uuid::now_v7(), 60);
+        source.create(&source_sandbox).await.unwrap();
+        source
+            .put_file(
+                &source_sandbox,
+                PutFileRequest {
+                    path: "/workspace/proof.txt".into(),
+                    content_base64: "cHJvdmVu".into(),
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+        let archive = source
+            .export_workspace_snapshot(&source_sandbox, "handoff")
+            .await
+            .unwrap();
+        target.create(&target_sandbox).await.unwrap();
+        target
+            .import_workspace_snapshot(&target_sandbox, &archive)
+            .await
+            .unwrap();
+        let file = target
+            .get_file(&target_sandbox, "/workspace/proof.txt")
+            .await
+            .unwrap();
+        assert_eq!(file.content_base64, "cHJvdmVu");
+        let _ = tokio::fs::remove_dir_all(first_root).await;
+        let _ = tokio::fs::remove_dir_all(second_root).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_archive_rejects_checksum_mismatch() {
+        let root = std::env::temp_dir().join(format!("af-checksum-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        let archive = WorkspaceArchive {
+            key: "bad".into(),
+            bytes: vec![1, 2, 3],
+            checksum_sha256: "0".repeat(64),
+        };
+        assert!(
+            runtime
+                .import_workspace_snapshot(&target, &archive)
+                .await
+                .is_err()
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn workspace_archive_rejects_unsafe_key() {
+        let root = std::env::temp_dir().join(format!("af-key-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let sandbox = sandbox(Uuid::now_v7(), 60);
+        assert!(
+            runtime
+                .export_workspace_snapshot(&sandbox, "../escape")
+                .await
+                .is_err()
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    fn attachment(host: &str, guest: &str) -> NetworkAttachment {
+        NetworkAttachment {
+            resource: "af0123456789ab".into(),
+            addresses: vec![host.into()],
+            guest_addresses: vec![guest.into()],
+        }
+    }
+
+    #[test]
+    fn boot_args_without_network_keep_the_bare_command_line() {
+        assert_eq!(
+            firecracker_boot_args(None),
+            "console=ttyS0 reboot=k panic=1 pci=off"
+        );
+        // A backend that cannot report in-guest addresses must not produce a
+        // command line that would leave the guest with an unusable interface.
+        let host_only = NetworkAttachment {
+            resource: "af0123456789ab".into(),
+            addresses: vec!["172.30.8.1".into()],
+            guest_addresses: Vec::new(),
+        };
+        assert_eq!(
+            firecracker_boot_args(Some(&host_only)),
+            "console=ttyS0 reboot=k panic=1 pci=off"
+        );
+    }
+
+    #[test]
+    fn boot_args_configure_the_guest_from_the_tap_subnet() {
+        let args = firecracker_boot_args(Some(&attachment("172.30.8.1", "172.30.8.2")));
+        assert!(args.starts_with("console=ttyS0 reboot=k panic=1 pci=off"));
+        assert!(args.contains("net.ifnames=0"));
+        assert!(
+            args.contains("ip=172.30.8.2::172.30.8.1:255.255.255.252:agentforge:eth0:off"),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn coding_guest_capability_follows_the_artifact_profile() {
+        let coding = guest_artifact::GuestArtifact {
+            artifact_version: "1.0.0".into(),
+            base: "debian:bookworm-slim".into(),
+            profile: "coding".into(),
+            capabilities: vec!["sh".into(), "git".into(), "ca-certificates".into()],
+            git_version: Some("git version 2.39.5".into()),
+            guest_agent_version: "0.1.0".into(),
+            rootfs_sha256: "a".repeat(64),
+            kernel_sha256: None,
+        };
+        let without_git = guest_artifact::GuestArtifact {
+            capabilities: vec!["sh".into()],
+            ..coding.clone()
+        };
+        let runtime = FirecrackerRuntime::new(FirecrackerConfig {
+            guest_artifact: Some(coding.clone()),
+            ..config()
+        });
+        assert!(SandboxRuntime::capabilities(&runtime).coding_guest);
+        let minimal = FirecrackerRuntime::new(FirecrackerConfig {
+            guest_artifact: Some(without_git),
+            ..config()
+        });
+        assert!(!SandboxRuntime::capabilities(&minimal).coding_guest);
+        let unrecorded = FirecrackerRuntime::new(config());
+        assert!(!SandboxRuntime::capabilities(&unrecorded).coding_guest);
+        assert!(firecracker_capabilities(&LinuxNetworkManager::new(), Some(&coding)).coding_guest);
+    }
+
+    fn artifact_config(dir: &Path, rootfs: &Path) -> FirecrackerConfig {
+        FirecrackerConfig {
+            kernel: dir.join("vmlinux"),
+            rootfs: rootfs.to_path_buf(),
+            guest_artifact_dir: Some(dir.to_path_buf()),
+            guest_artifact: Some(
+                guest_artifact::load_guest_artifact(&dir.join(guest_artifact::GUEST_ARTIFACT_FILE))
+                    .expect("artifact metadata"),
+            ),
+            ..config()
+        }
+    }
+
+    fn write_artifact_metadata(dir: &Path, rootfs: &Path, capabilities: &str, profile: &str) {
+        let digest = hex::encode(Sha256::digest(std::fs::read(rootfs).expect("rootfs")));
+        std::fs::write(
+            dir.join(guest_artifact::GUEST_ARTIFACT_FILE),
+            format!(
+                r#"{{"artifact_version":"1.0.0","base":"debian:bookworm-slim","profile":"{profile}","capabilities":{capabilities},"guest_agent_version":"0.1.0","rootfs_sha256":"{digest}"}}"#
+            ),
+        )
+        .expect("artifact metadata");
+    }
+
+    #[test]
+    fn guest_artifact_check_rejects_a_rootfs_that_does_not_match() {
+        let dir = std::env::temp_dir().join(format!("af-guest-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("artifact directory");
+        let rootfs = dir.join("agentforge-rootfs.ext4");
+        std::fs::write(&rootfs, b"root filesystem bytes").expect("rootfs");
+        std::fs::write(dir.join("vmlinux"), b"kernel bytes").expect("kernel");
+        write_artifact_metadata(&dir, &rootfs, r#"["git","ca-certificates"]"#, "coding");
+        artifact_config(&dir, &rootfs)
+            .check_guest_artifact()
+            .expect("matching artifact must pass");
+        std::fs::write(&rootfs, b"tampered root filesystem").expect("rootfs");
+        let error = artifact_config(&dir, &rootfs)
+            .check_guest_artifact()
+            .expect_err("a modified rootfs must fail the check");
+        assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+        std::fs::remove_file(&rootfs).expect("remove rootfs");
+        let error = artifact_config(&dir, &rootfs)
+            .check_guest_artifact()
+            .expect_err("a missing rootfs must fail the check");
+        assert!(error.to_string().contains("is missing"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_coding_guest_refuses_images_that_cannot_code() {
+        let dir = std::env::temp_dir().join(format!("af-coding-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("artifact directory");
+        let rootfs = dir.join("agentforge-rootfs.ext4");
+        std::fs::write(&rootfs, b"root filesystem bytes").expect("rootfs");
+        std::fs::write(dir.join("vmlinux"), b"kernel bytes").expect("kernel");
+
+        let demanded = FirecrackerConfig {
+            require_coding_guest: true,
+            ..config()
+        };
+        let error = demanded
+            .check_guest_artifact()
+            .expect_err("no metadata cannot satisfy a coding guest requirement");
+        assert!(
+            error
+                .to_string()
+                .contains("requires guest artifact metadata"),
+            "{error}"
+        );
+
+        write_artifact_metadata(&dir, &rootfs, r#"["sh"]"#, "minimal");
+        artifact_config(&dir, &rootfs)
+            .check_guest_artifact()
+            .expect("without the requirement flag any recorded image is accepted");
+        let error = FirecrackerConfig {
+            require_coding_guest: true,
+            ..artifact_config(&dir, &rootfs)
+        }
+        .check_guest_artifact()
+        .expect_err("a minimal profile cannot satisfy a coding guest requirement");
+        assert!(
+            error.to_string().contains("requires the coding profile"),
+            "{error}"
+        );
+
+        write_artifact_metadata(&dir, &rootfs, r#"["sh","git"]"#, "coding");
+        let error = FirecrackerConfig {
+            require_coding_guest: true,
+            ..artifact_config(&dir, &rootfs)
+        }
+        .check_guest_artifact()
+        .expect_err("git without CA certificates cannot validate HTTPS");
+        assert!(error.to_string().contains("ca-certificates"), "{error}");
+
+        write_artifact_metadata(&dir, &rootfs, r#"["sh","git","ca-certificates"]"#, "coding");
+        FirecrackerConfig {
+            require_coding_guest: true,
+            ..artifact_config(&dir, &rootfs)
+        }
+        .check_guest_artifact()
+        .expect("a coding guest with git and CA certificates satisfies the requirement");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

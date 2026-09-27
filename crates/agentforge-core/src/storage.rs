@@ -2,13 +2,13 @@
 
 use crate::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Snapshot,
-    UsageEvent, UsageSummary,
+    UsageEvent, UsageSummary, runtime::RuntimeCapabilities,
 };
-use uuid::Uuid;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 pub use crate::{LeaseId, RequestId, SandboxId, SnapshotId, TenantId, WorkerId};
 
@@ -49,6 +49,11 @@ pub trait ArtifactStore: Send + Sync {
     ) -> Result<Vec<u8>, CoreError>;
     /// Deletes an artifact.
     async fn delete(&self, key: &str) -> Result<(), CoreError>;
+    /// Lists metadata for objects beneath a key prefix.
+    ///
+    /// Implementations must return deterministic, key-sorted metadata and must not
+    /// expose objects outside the prefix.
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError>;
     /// Deletes an artifact only when its version tag matches.
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), CoreError>;
 }
@@ -127,6 +132,8 @@ pub struct WorkerRegistration {
     pub name: String,
     /// Runtime selected by the worker.
     pub runtime: RuntimeKind,
+    /// Capabilities advertised by the selected runtime.
+    pub capabilities: RuntimeCapabilities,
     /// Dispatch endpoint.
     pub control_endpoint: String,
     /// Total vCPU capacity.
@@ -214,6 +221,28 @@ pub struct WorkerLease {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Result of recovering a sandbox whose owning worker died.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Reassignment {
+    /// Replacement lease with a generation one higher than the expired lease.
+    pub lease: WorkerLease,
+    /// Sandbox as persisted after reassignment.
+    pub sandbox: Sandbox,
+}
+
+/// Current active lease ownership for a sandbox, regardless of expiry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxOwnership {
+    /// Worker holding the active lease.
+    pub node_id: WorkerId,
+    /// Active lease identifier.
+    pub lease_id: LeaseId,
+    /// Fencing generation of the active lease.
+    pub generation: i64,
+    /// Expiration timestamp of the active lease.
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Durable work assignment consumed by a worker.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WorkerAssignment {
@@ -297,6 +326,18 @@ pub trait MetadataStore: Send + Sync {
         next: SandboxState,
         runtime_path: Option<String>,
     ) -> Result<Sandbox, CoreError>;
+    /// Performs a compare-and-set state transition fenced by the sandbox lease generation.
+    ///
+    /// The transition is rejected unless the sandbox's current active, unexpired lease has
+    /// exactly `generation`, so a worker that lost its lease can never commit state.
+    async fn update_state_with_generation(
+        &self,
+        tenant: TenantId,
+        id: SandboxId,
+        expected: SandboxState,
+        next: SandboxState,
+        generation: i64,
+    ) -> Result<(), CoreError>;
     /// Deletes a tenant-owned sandbox.
     async fn delete_sandbox(&self, tenant: TenantId, id: SandboxId) -> Result<(), CoreError>;
     /// Creates an API key record and returns conflict if its ID already exists.
@@ -362,7 +403,8 @@ pub trait MetadataStore: Send + Sync {
     /// Registers a worker and its capacity.
     async fn register_worker(&self, value: WorkerRegistration) -> Result<(), CoreError>;
     /// Applies a worker heartbeat atomically.
-    async fn heartbeat_worker(&self, heartbeat: WorkerHeartbeat) -> Result<WorkerStatus, CoreError>;
+    async fn heartbeat_worker(&self, heartbeat: WorkerHeartbeat)
+    -> Result<WorkerStatus, CoreError>;
     /// Gets current worker state.
     async fn get_worker(&self, node_id: WorkerId) -> Result<WorkerStatus, CoreError>;
     /// Lists workers, optionally including unhealthy workers.
@@ -390,8 +432,11 @@ pub trait MetadataStore: Send + Sync {
         limit: u32,
     ) -> Result<Vec<WorkerAssignment>, CoreError>;
     /// Gets a tenant-owned lease.
-    async fn get_worker_lease(&self, tenant: TenantId, lease_id: LeaseId)
-        -> Result<WorkerLease, CoreError>;
+    async fn get_worker_lease(
+        &self,
+        tenant: TenantId,
+        lease_id: LeaseId,
+    ) -> Result<WorkerLease, CoreError>;
     /// Gets the active lease for a sandbox.
     async fn get_active_worker_lease(
         &self,
@@ -427,6 +472,19 @@ pub trait MetadataStore: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<ReconciliationAction>, CoreError>;
+    /// Expires a dead worker's lease and reassigns the sandbox to a healthy worker.
+    ///
+    /// Returns `None` when the lease is not an expired active lease, or when no healthy
+    /// worker currently has capacity for the sandbox.
+    async fn reassign_expired_lease(
+        &self,
+        lease_id: LeaseId,
+    ) -> Result<Option<Reassignment>, CoreError>;
+    /// Reads the current active lease ownership of a sandbox, regardless of expiry.
+    async fn sandbox_ownership(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<SandboxOwnership>, CoreError>;
     /// Lists pending repair actions for a tenant.
     async fn list_reconciliation_actions(
         &self,
