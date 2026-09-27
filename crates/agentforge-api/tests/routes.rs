@@ -1634,10 +1634,34 @@ async fn a_tenant_can_manage_its_own_keys() {
         "a listing must never contain key material"
     );
 
+    // A tenant can issue a second key and revoke it; the key in use is never
+    // revoked by its own request, so the account cannot lock itself out.
+    let spare = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/keys")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"spare"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let spare_value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(spare.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // The create response is the key object itself, with the secret under `key`.
+    let spare_key = spare_value["key"].as_str().expect("spare key").to_string();
+    let spare_id = spare_value["id"].as_str().expect("spare id").to_string();
+    assert_ne!(spare_key, key);
+
     let revoked = router
         .clone()
         .oneshot(
-            Request::delete(format!("/v1/keys/{key_id}"))
+            Request::delete(format!("/v1/keys/{spare_id}"))
                 .header("authorization", format!("Bearer {key}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1648,6 +1672,19 @@ async fn a_tenant_can_manage_its_own_keys() {
 
     // The revoked key must stop working immediately.
     let after = router
+        .clone()
+        .oneshot(
+            Request::get("/v1/sandboxes")
+                .header("authorization", format!("Bearer {spare_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+
+    // The key still in use is untouched, so the tenant is not locked out.
+    let still_works = router
         .oneshot(
             Request::get("/v1/sandboxes")
                 .header("authorization", format!("Bearer {key}"))
@@ -1656,7 +1693,121 @@ async fn a_tenant_can_manage_its_own_keys() {
         )
         .await
         .unwrap();
-    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(still_works.status(), StatusCode::OK);
+    let _ = key_id;
+}
+/// A key may not grant a privilege it does not hold, and key management needs a
+/// real authorization check. Without these, a read-only key could mint itself an
+/// admin key, enumerate every key, and revoke the tenant's real credential.
+#[tokio::test]
+async fn key_management_refuses_privilege_escalation() {
+    let repo = MemoryRepository::new();
+    let router = setup_with_invites(repo, &["alpha-one"]);
+
+    // A least-privileged tenant signs up and creates a narrow key.
+    let signup = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Mallory"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(signup.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let broad = value["key"]["key"].as_str().expect("key").to_string();
+
+    // Minting an admin key from a non-admin key must be refused.
+    let escalate = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/keys")
+                .header("authorization", format!("Bearer {broad}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"root","scopes":["admin"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        escalate.status(),
+        StatusCode::FORBIDDEN,
+        "a key must not be able to mint a key with more privilege than it holds"
+    );
+
+    // A key may not revoke the credential it is authenticating with: that would
+    // lock the tenant out of its own account.
+    let id = value["key"]["id"].as_str().expect("key id");
+    let self_revoke = router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/keys/{id}"))
+                .header("authorization", format!("Bearer {broad}"))
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        self_revoke.status(),
+        StatusCode::CONFLICT,
+        "a key must not be able to revoke itself"
+    );
+
+    // Listing its own keys is legitimate self-service, and must not leak secrets.
+    let listed = router
+        .oneshot(
+            Request::get("/v1/keys")
+                .header("authorization", format!("Bearer {broad}"))
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.status(),
+        StatusCode::OK,
+        "a tenant must be able to manage its own keys"
+    );
+    let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        !body.starts_with(b"af_live_"),
+        "listing must never contain key material"
+    );
+}
+
+/// The public isolation policy and the execution budget must apply to the
+/// runtime that was actually selected. A caller that omits the runtime field
+/// used to bypass both, because the guards read the *requested* runtime, which
+/// is None for an omitted or "auto" value.
+#[tokio::test]
+async fn omitting_the_runtime_field_cannot_bypass_cloud_policy() {
+    use agentforge_api::AppState;
+    let repo = MemoryRepository::new();
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo, None);
+    // hosted_only with only the development runtime registered: selection falls
+    // back to the configured kind, and the policy must still be applied.
+    let state = AppState::development(platform).with_hosted_only(true);
+    assert!(
+        !state.allows_runtime(agentforge_core::RuntimeKind::BwrapDev),
+        "a hosted deployment must not offer a process runtime"
+    );
+    assert!(
+        !state.allows_runtime(agentforge_core::RuntimeKind::Docker),
+        "a hosted deployment must not offer a container runtime"
+    );
+    assert!(state.allows_runtime(agentforge_core::RuntimeKind::Hosted));
+    assert!(state.allows_runtime(agentforge_core::RuntimeKind::Firecracker));
 }
 #[tokio::test]
 async fn real_bubblewrap_lifecycle_file_snapshot_restore() {

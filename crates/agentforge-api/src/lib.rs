@@ -511,11 +511,13 @@ fn default_rate_limit() -> ratelimit::RateLimit {
 /// address. Returns 429 with a machine-readable code and a `Retry-After`
 /// header so clients can back off correctly.
 async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    // `auth` inserts a `Principal`, not a bare tenant id; reading the wrong type
+    // meant every caller shared the anonymous bucket.
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|info| info.0.ip());
-    let tenant = request.extensions().get::<TenantId>().copied();
+    let tenant = request.extensions().get::<Principal>().map(|p| p.tenant_id);
     let key = ratelimit::limit_key(tenant, peer);
     let decision = state.limiter().check(&key);
     if !decision.allowed {
@@ -623,7 +625,6 @@ async fn list_keys(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Value> {
-    p.authorize(Scope::Admin).ok();
     let keys = account::list_keys_for(s.repository().as_ref(), p.tenant_id)
         .await
         .map_err(ApiFailure::from)?;
@@ -642,6 +643,25 @@ async fn create_key(
         let mut parsed = Vec::new();
         for scope in &body.scopes {
             parsed.push(Scope::parse(scope).map_err(ApiFailure::from)?);
+        }
+        // A key may not grant a privilege its holder does not have. Without
+        // this, a read-only key could mint itself an admin key and then revoke
+        // the tenant's real credentials.
+        if parsed.contains(&Scope::Admin) && !p.scopes.contains(&Scope::Admin) {
+            return Err(ApiFailure::new(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                "only a key that already holds admin may create another admin key",
+            ));
+        }
+        for scope in parsed.clone() {
+            p.authorize(scope.clone()).map_err(|_| {
+                ApiFailure::new(
+                    StatusCode::FORBIDDEN,
+                    "insufficient_scope",
+                    format!("this key cannot grant the {:?} scope", scope),
+                )
+            })?;
         }
         parsed
     };
@@ -679,6 +699,15 @@ async fn revoke_key(
     Extension(p): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Value> {
+    // A key may not revoke the credential it is currently authenticating with:
+    // that would lock the tenant out of its own account with no way back in.
+    if id == p.key_id {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "cannot_revoke_current_key",
+            "a key cannot revoke itself; create a replacement key first, then revoke this one",
+        ));
+    }
     s.repository()
         .revoke_key(p.tenant_id, id)
         .await
@@ -1482,25 +1511,23 @@ async fn create_sandbox(
             "bwrap-dev is not available in production",
         ));
     }
-    // Public policy: a tenant may not downgrade their own isolation. Container
-    // runtimes are refused for hosted workloads; only microVM-class runtimes
-    // are offered to an external caller.
-    if let Some(kind) = requested_runtime
-        && !s.allows_runtime(kind)
-    {
+    // Public policy: a tenant may not downgrade their own isolation. This is
+    // checked against the runtime that was actually *selected*, not the one that
+    // was requested: an omitted or "auto" field would otherwise bypass it.
+    if !s.allows_runtime(runtime_kind) {
         return Err(ApiFailure::new(
             StatusCode::FORBIDDEN,
             "runtime_not_permitted",
             format!(
                 "runtime {} is not available to this deployment; hosted workloads run on microVM isolation",
-                kind.as_str()
+                runtime_kind.as_str()
             ),
         ));
     }
     // Hosted execution is finite. When the configured global budget is spent,
     // new hosted sandboxes stop cleanly with a capacity error instead of
-    // silently becoming provider overage.
-    if requested_runtime == Some(RuntimeKind::Hosted) && s.execution_budget_exhausted() {
+    // silently becoming provider overage. Also keyed on the selected runtime.
+    if runtime_kind == RuntimeKind::Hosted && s.execution_budget_exhausted() {
         return Err(ApiFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporary_capacity_unavailable",
@@ -2799,7 +2826,9 @@ pub async fn serve_tls(
 ) -> Result<(), std::io::Error> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
-        .serve(app(state).into_make_service())
+        // Without ConnectInfo the limiter cannot see the peer address, so every
+        // unauthenticated caller collapsed into one shared bucket.
+        .serve(app(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
 }
 
@@ -2819,7 +2848,11 @@ pub async fn serve_worker_tls(
 ) -> Result<(), std::io::Error> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
-        .serve(service.router().into_make_service())
+        .serve(
+            service
+                .router()
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
         .await
 }
 
