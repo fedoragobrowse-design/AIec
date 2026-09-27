@@ -1632,10 +1632,16 @@ async fn create_sandbox(
     if x.state != SandboxState::Creating {
         return Ok(create_response(x, &_selection_reason));
     }
-    s.runtime_for(&x)?
-        .create(&x)
-        .await
-        .map_err(ApiFailure::from)?;
+    // If the runtime cannot bring the machine up, the row must not be left
+    // behind as Creating: it would count against the tenant's quota, appear in a
+    // console as running, and never be cleaned up. A provider that refuses
+    // capacity is a normal outcome, not a crash, so it is recorded as failed.
+    if let Err(error) = s.runtime_for(&x)?.create(&x).await {
+        let _ = s
+            .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
+            .await;
+        return Err(ApiFailure::from(error));
+    }
     s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
         .await
         .map_err(ApiFailure::from)?;

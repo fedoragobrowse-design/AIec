@@ -195,7 +195,10 @@
       list.appendChild(el("p", "empty", error.message));
       return;
     }
-    const sandboxes_ = Array.isArray(sandboxes) ? sandboxes : sandboxes.sandboxes || [];
+    const rows = Array.isArray(sandboxes) ? sandboxes : sandboxes.sandboxes || [];
+    // The API returns a tenant's full history; the console shows what is
+    // actually running, which is what someone checking for leaks needs.
+    const sandboxes_ = rows.filter((row) => row.state !== "destroyed" && row.state !== "failed");
     $("#box-count").textContent = `${sandboxes_.length} live`;
     if (!sandboxes_.length) {
       list.appendChild(

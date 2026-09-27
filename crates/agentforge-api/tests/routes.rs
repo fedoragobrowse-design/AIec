@@ -1809,6 +1809,136 @@ async fn omitting_the_runtime_field_cannot_bypass_cloud_policy() {
     assert!(state.allows_runtime(agentforge_core::RuntimeKind::Hosted));
     assert!(state.allows_runtime(agentforge_core::RuntimeKind::Firecracker));
 }
+/// Abuse resistance: a single tenant must not be able to exhaust the API for
+/// everyone, and a runaway agent must not run away with the platform.
+#[tokio::test]
+async fn a_single_tenant_cannot_exhaust_the_api_for_everyone() {
+    use agentforge_api::AppState;
+    use agentforge_api::ratelimit::RateLimit;
+    let repo = MemoryRepository::new();
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo, None);
+    // A deliberately small bucket so the limit is reached in a test, not in
+    // production traffic.
+    let state = AppState::development(platform).with_rate_limit(RateLimit::new(1.0, 3));
+    let router = agentforge_api::router(state);
+
+    let signup = || {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::post("/v1/account")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"invite":"alpha-one","name":"Flooder"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let mut limited = 0;
+    for _ in 0..12 {
+        if signup().await == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+        }
+    }
+    assert!(
+        limited > 0,
+        "a flood from one source must eventually be rate limited"
+    );
+
+    // The limit must be a refusal with machine-readable metadata, not a hang.
+    let response = router
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Flooder"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers().get("retry-after").is_some(),
+        "a limited client must be told how long to wait"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"]["code"], "rate_limited");
+}
+
+/// A rate-limited response must never be a silent success, and an admitted
+/// request must still work after the limiter recovers.
+#[tokio::test]
+async fn rate_limiting_refuses_without_corrupting_state() {
+    use agentforge_api::AppState;
+    use agentforge_api::ratelimit::RateLimit;
+    let repo = MemoryRepository::new();
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo, None);
+    let platform_for_check = platform.clone();
+    // A very slow refill (one token per ~100s) so the bucket cannot refill
+    // between the two requests and make the assertion meaningless.
+    let router = agentforge_api::router(
+        AppState::development(platform)
+            .with_rate_limit(RateLimit::new(0.01, 1))
+            .with_invites(vec!["alpha-one".to_string()]),
+    );
+
+    // The first request is admitted and does real work.
+    let first = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Real"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key = created["key"]["key"].as_str().expect("key").to_string();
+
+    // The burst is spent: this one is refused, and nothing is created.
+    let refused = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Blocked"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // The account created before the limit must still be intact. This is checked
+    // through a second router over the same store with a generous limit, so the
+    // assertion is about state, not about whether the bucket still has a token.
+    let unlimited = agentforge_api::router(
+        AppState::development(platform_for_check.clone())
+            .with_rate_limit(RateLimit::new(1000.0, 1000))
+            .with_invites(vec!["alpha-one".to_string()]),
+    );
+    let works = unlimited
+        .oneshot(
+            Request::get("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(works.status(), StatusCode::OK);
+}
 #[tokio::test]
 async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
     use agentforge_runtime::BubblewrapRuntime;

@@ -9,8 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       iproute2 nftables iptables \
       openssl curl jq ca-certificates \
       build-essential pkg-config libssl-dev \
-      git python3 procps postgresql-client \
+      git python3 procps iputils-ping postgresql-client \
     && rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL client matching the hosted database. The distro client is older
+# than the server, and pg_dump refuses to run across that gap; the drill needs
+# dump, restore and curl in one image.
+RUN install -d /usr/share/postgresql-common/pgdg \
+ && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+ && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update -qq && apt-get install -y -qq postgresql-client-18
 
 WORKDIR /work
 ENV CARGO_TERM_COLOR=never
