@@ -8,6 +8,7 @@ members = [
   "crates/aiec-api",
   "crates/aiec-client",
   "crates/aiec-cli",
+  "crates/aiec-mcp",
   "guest/aiec-guest",
 ]
 
@@ -24,6 +25,7 @@ aiec-runtime = { path = "crates/aiec-runtime" }
 aiec-network-linux = { path = "crates/aiec-network-linux" }
 aiec-client = { path = "crates/aiec-client" }
 aiec-api = { path = "crates/aiec-api" }
+aiec-mcp = { path = "crates/aiec-mcp" }
 bollard = "0.21.1"
 anyhow = "1.0"
 tar = "0.4"

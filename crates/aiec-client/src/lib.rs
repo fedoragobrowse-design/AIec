@@ -94,6 +94,31 @@ impl AIecClient {
         )
         .await
     }
+
+    /// Creates a sandbox, pinning the runtime rather than letting policy choose.
+    ///
+    /// The control plane flattens `runtime` alongside the request fields, so it
+    /// is merged in here. A caller that requires a specific isolation level
+    /// needs to be able to ask for one and to see which runtime it got.
+    pub async fn create_sandbox_with_runtime(
+        &self,
+        request: &CreateSandboxRequest,
+        runtime: &str,
+    ) -> Result<Sandbox, ClientError> {
+        let mut body = serde_json::to_value(request)
+            .map_err(|error| ClientError::Decode(error.to_string()))?;
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "runtime".to_owned(),
+                serde_json::Value::String(runtime.to_owned()),
+            );
+        }
+        self.send(
+            self.request(reqwest::Method::POST, "/v1/sandboxes")
+                .json(&body),
+        )
+        .await
+    }
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, ClientError> {
         self.send(self.request(reqwest::Method::GET, "/v1/sandboxes"))
             .await

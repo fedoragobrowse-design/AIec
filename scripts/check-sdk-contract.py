@@ -33,7 +33,7 @@ if "AIec" not in exported:
 # The site, the README and the examples are what a user copies from.
 documented = (
     list((root / "web/pages").glob("*.html"))
-    + [root / "README.md"]
+    + [root / "README.md", root / "docs/MCP.md"]
     + list((root / "examples").glob("*.py"))
 )
 

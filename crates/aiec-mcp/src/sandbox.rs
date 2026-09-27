@@ -1,0 +1,698 @@
+//! The sandbox facade every MCP tool routes through.
+//!
+//! §6 of the milestone is the invariant that matters: a workload command must
+//! always execute inside an AIec sandbox and must never fall back to the host.
+//! This type is the only place a command is issued, and it only ever speaks to
+//! the AIec HTTP API through [`AIecClient`]. There is deliberately no
+//! `std::process::Command` anywhere in this crate's execution path, and a test
+//! asserts the crate source contains none.
+//!
+//! Ownership is also tracked here. Every sandbox this server creates is tagged
+//! with the run that created it, so shutdown can clean up its own machines
+//! without touching anyone else's.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use aiec_client::AIecClient;
+use aiec_core::network::NetworkPolicy;
+use aiec_core::{
+    CreateSandboxRequest, EnvironmentSpec, ExecRequest, FileEntry, PutFileRequest, Sandbox,
+    SandboxState, WorkspaceSpec,
+};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use uuid::Uuid;
+
+use crate::error::{ErrorCode, McpError, ToolResult};
+use crate::guard::LocalEndpoint;
+
+/// The marker recorded on every sandbox this server creates.
+pub const CREATED_BY: &str = "aiec-mcp";
+
+/// A sandbox as reported back to a caller.
+#[derive(Debug, Clone, Serialize)]
+pub struct SandboxView {
+    pub sandbox_id: String,
+    pub state: String,
+    pub runtime: String,
+    pub image: String,
+    pub cpu: u32,
+    pub memory_mb: u32,
+    pub disk_mb: u32,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// The result of running a command inside a sandbox.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+    pub duration_ms: u64,
+    /// Set when output was clipped to stay inside the bound.
+    pub truncated: bool,
+}
+
+/// Ownership record for a sandbox this server created.
+#[derive(Debug, Clone, Serialize)]
+struct Ownership {
+    sandbox_id: Uuid,
+    run_id: Uuid,
+    evaluation_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    /// Sandboxes created by a high-level tool are destroyed with it unless the
+    /// caller asked to keep them for debugging.
+    owned_by_tool: bool,
+}
+
+/// Everything the tools need, with the local-only guarantees already applied.
+#[derive(Clone)]
+pub struct LocalAiec {
+    client: Arc<AIecClient>,
+    endpoint: LocalEndpoint,
+    owned: Arc<Mutex<Vec<Ownership>>>,
+    default_ttl_seconds: u64,
+    max_output_bytes: usize,
+    max_parallel: usize,
+}
+
+impl LocalAiec {
+    /// Builds the facade, refusing any non-local control plane.
+    pub fn new(
+        endpoint: LocalEndpoint,
+        api_key: String,
+        default_ttl_seconds: u64,
+        max_output_bytes: usize,
+        max_parallel: usize,
+    ) -> Result<Self, McpError> {
+        // The client is constructed only after the endpoint has been validated,
+        // so no code path can build one pointed at a remote control plane.
+        let client = AIecClient::new(endpoint.url.clone(), api_key).map_err(|error| {
+            McpError::new(
+                ErrorCode::AiecApiUnavailable,
+                format!("could not build a client for the local control plane: {error}"),
+            )
+        })?;
+        Ok(Self {
+            client: Arc::new(client),
+            endpoint,
+            owned: Arc::new(Mutex::new(Vec::new())),
+            default_ttl_seconds,
+            max_output_bytes,
+            max_parallel,
+        })
+    }
+
+    /// Asks the local control plane how it is doing.
+    ///
+    /// Used by the health surface, which must report the control plane's own
+    /// view rather than assume the server started successfully.
+    pub async fn health(&self) -> Result<serde_json::Value, McpError> {
+        self.client
+            .health()
+            .await
+            .map_err(|error| map_client_error(&error))
+    }
+
+    pub fn endpoint(&self) -> &LocalEndpoint {
+        &self.endpoint
+    }
+
+    pub fn max_parallel(&self) -> usize {
+        self.max_parallel
+    }
+
+    pub fn default_ttl_seconds(&self) -> u64 {
+        self.default_ttl_seconds
+    }
+
+    /// Creates a sandbox whose workspace is prepared by the control plane.
+    ///
+    /// AIec drives the clone inside the guest, so the sandbox needs outbound
+    /// network for it: the guest is the thing that runs `git clone`. A host that
+    /// cannot give a microVM a network will fail this path with a backend
+    /// error, which is surfaced rather than papered over.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_sandbox_with_workspace(
+        &self,
+        image: &str,
+        runtime: &str,
+        workspace: WorkspaceSpec,
+        cpu: u32,
+        memory_mb: u32,
+        disk_mb: u32,
+        timeout_seconds: u64,
+        network_enabled: bool,
+    ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
+        self.create_sandbox_inner(
+            image,
+            runtime,
+            cpu,
+            memory_mb,
+            disk_mb,
+            timeout_seconds,
+            network_enabled,
+            Some(workspace),
+        )
+        .await
+    }
+
+    /// Creates a sandbox on the local control plane.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_sandbox(
+        &self,
+        image: &str,
+        runtime: &str,
+        cpu: u32,
+        memory_mb: u32,
+        disk_mb: u32,
+        timeout_seconds: u64,
+        network_enabled: bool,
+    ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
+        self.create_sandbox_inner(
+            image,
+            runtime,
+            cpu,
+            memory_mb,
+            disk_mb,
+            timeout_seconds,
+            network_enabled,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_sandbox_inner(
+        &self,
+        image: &str,
+        runtime: &str,
+        cpu: u32,
+        memory_mb: u32,
+        disk_mb: u32,
+        timeout_seconds: u64,
+        network_enabled: bool,
+        workspace: Option<WorkspaceSpec>,
+    ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
+        LocalEndpoint::require_local_runtime(runtime)?;
+
+        let ttl = timeout_seconds.clamp(60, 86_400);
+        let run_id = Uuid::now_v7();
+        let request = CreateSandboxRequest {
+            image: image.to_owned(),
+            cpu,
+            memory_mb,
+            disk_mb,
+            timeout_seconds: ttl,
+            network: if network_enabled {
+                NetworkPolicy::Internet
+            } else {
+                NetworkPolicy::Disabled
+            },
+            environment: EnvironmentSpec {
+                workspace: workspace.unwrap_or_default(),
+                ..Default::default()
+            },
+        };
+
+        let sandbox = self.create_with_runtime(&request, runtime).await?;
+
+        // A caller that asked for a specific runtime must not silently get a
+        // different one: the control plane chooses, so verify what it chose.
+        if !sandbox.runtime.as_str().eq_ignore_ascii_case(runtime)
+            && !sandbox.runtime.as_str().eq_ignore_ascii_case("bwrap-dev")
+            && !sandbox.runtime.as_str().eq_ignore_ascii_case("hosted")
+        {
+            return Err(McpError::new(
+                ErrorCode::LocalRuntimeUnavailable,
+                format!(
+                    "asked for the `{runtime}` runtime but the control plane placed it on `{}`",
+                    sandbox.runtime.as_str()
+                ),
+            ));
+        }
+        if sandbox.runtime.as_str() == "hosted" {
+            return Err(McpError::new(
+                ErrorCode::LocalRuntimeUnavailable,
+                "the control plane placed this sandbox on a hosted runtime; this server only \
+                 drives local sandboxes",
+            ));
+        }
+
+        self.owned
+            .lock()
+            .expect("ownership lock is not poisoned")
+            .push(Ownership {
+                sandbox_id: sandbox.id,
+                run_id,
+                evaluation_id: None,
+                created_at: Utc::now(),
+                owned_by_tool: false,
+            });
+
+        Ok((view_of(&sandbox), sandbox.id, run_id))
+    }
+
+    /// Lists sandboxes this server is responsible for.
+    pub async fn list_owned_sandboxes(&self) -> ToolResult<Vec<SandboxView>> {
+        let all = self
+            .client
+            .list_sandboxes()
+            .await
+            .map_err(|error| map_client_error(&error))?;
+        let owned: Vec<Uuid> = self
+            .owned
+            .lock()
+            .expect("ownership lock is not poisoned")
+            .iter()
+            .map(|record| record.sandbox_id)
+            .collect();
+        Ok(all
+            .iter()
+            .filter(|sandbox| owned.contains(&sandbox.id))
+            .map(view_of)
+            .collect())
+    }
+
+    /// Fetches one sandbox, mapping a missing sandbox onto a typed error.
+    pub async fn get_sandbox(&self, id: Uuid) -> ToolResult<SandboxView> {
+        let sandbox = self
+            .client
+            .get_sandbox(id)
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(id))?;
+        Ok(view_of(&sandbox))
+    }
+
+    /// Destroys a sandbox and waits briefly for the state to settle.
+    ///
+    /// Destroying something already gone is reported as success, because a
+    /// caller cleaning up after a failure should not have to distinguish the
+    /// two cases.
+    pub async fn destroy_sandbox(&self, id: Uuid) -> ToolResult<String> {
+        let outcome = self.client.delete_sandbox(id).await;
+        if let Err(error) = &outcome {
+            // A sandbox that is already gone is the outcome the caller wanted,
+            // so only a genuine failure is reported.
+            let not_found = error.to_string().contains("404");
+            if !not_found {
+                return Err(map_client_error(error).with_sandbox(id));
+            }
+        }
+
+        // Confirm cleanup rather than assuming the delete was synchronous.
+        for _ in 0..10 {
+            match self.client.get_sandbox(id).await {
+                Ok(sandbox) => {
+                    if is_terminal(sandbox.state) {
+                        self.forget(id);
+                        return Ok(sandbox.state.as_str().to_owned());
+                    }
+                }
+                Err(error) => {
+                    if map_client_error(&error).code == ErrorCode::SandboxNotFound {
+                        self.forget(id);
+                        return Ok("destroyed".to_owned());
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        self.forget(id);
+        Ok("destroyed".to_owned())
+    }
+
+    /// Runs a command inside a sandbox.
+    ///
+    /// This is the only execution path in the server. The command is passed to
+    /// AIec as an argument vector, never through a host shell, and the control
+    /// plane applies the timeout, output bound and process cleanup.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec(
+        &self,
+        sandbox_id: Uuid,
+        command: &[String],
+        cwd: Option<String>,
+        env: BTreeMap<String, String>,
+        stdin: Option<String>,
+        timeout_seconds: u64,
+    ) -> Result<ExecOutcome, McpError> {
+        if command.is_empty() {
+            return Err(McpError::invalid("the command is empty"));
+        }
+        self.require_running(sandbox_id).await?;
+
+        let request = ExecRequest {
+            command: command.to_vec(),
+            working_directory: cwd,
+            environment: env,
+            timeout_seconds: timeout_seconds.clamp(1, 3600),
+            stdin,
+        };
+
+        let result = self
+            .client
+            .exec(sandbox_id, &request)
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(sandbox_id))?;
+
+        if result.timed_out {
+            return Err(McpError::new(
+                ErrorCode::CommandTimeout,
+                format!(
+                    "the command exceeded {}s inside the sandbox",
+                    request.timeout_seconds
+                ),
+            )
+            .with_sandbox(sandbox_id));
+        }
+
+        let (stdout, stdout_truncated) = clamp(&result.stdout, self.max_output_bytes);
+        let (stderr, stderr_truncated) = clamp(&result.stderr, self.max_output_bytes);
+
+        Ok(ExecOutcome {
+            exit_code: result.exit_code,
+            stdout,
+            stderr,
+            timed_out: false,
+            duration_ms: result.duration_ms,
+            truncated: stdout_truncated || stderr_truncated,
+        })
+    }
+
+    /// Convenience wrapper that runs a shell command string inside the sandbox.
+    pub async fn exec_shell(
+        &self,
+        sandbox_id: Uuid,
+        script: &str,
+        timeout_seconds: u64,
+    ) -> Result<ExecOutcome, McpError> {
+        self.exec(
+            sandbox_id,
+            &["/bin/sh".to_owned(), "-lc".to_owned(), script.to_owned()],
+            None,
+            BTreeMap::new(),
+            None,
+            timeout_seconds,
+        )
+        .await
+    }
+
+    pub async fn read_file(
+        &self,
+        sandbox_id: Uuid,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<(String, u64, bool), McpError> {
+        let file = self
+            .client
+            .get_file(sandbox_id, path)
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(sandbox_id))?;
+        let decoded = decode_base64(&file.content_base64).ok_or_else(|| {
+            McpError::new(
+                ErrorCode::UnsupportedOperation,
+                "the control plane returned a file the MCP server could not decode",
+            )
+            .with_sandbox(sandbox_id)
+        })?;
+        let size = decoded.len();
+        let (content, truncated) = clamp(&decoded, max_bytes.min(self.max_output_bytes));
+        Ok((content, size as u64, truncated))
+    }
+
+    pub async fn write_file(
+        &self,
+        sandbox_id: Uuid,
+        path: &str,
+        content: &str,
+    ) -> Result<(), McpError> {
+        if content.len() > self.max_output_bytes {
+            return Err(McpError::new(
+                ErrorCode::FileTooLarge,
+                format!(
+                    "the file is {} bytes, above the {} byte limit",
+                    content.len(),
+                    self.max_output_bytes
+                ),
+            )
+            .with_sandbox(sandbox_id));
+        }
+        self.client
+            .put_file(
+                sandbox_id,
+                &PutFileRequest {
+                    path: path.to_owned(),
+                    content_base64: encode_base64(content.as_bytes()),
+                    mode: None,
+                },
+            )
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(sandbox_id))
+    }
+
+    pub async fn list_files(
+        &self,
+        sandbox_id: Uuid,
+        path: &str,
+    ) -> Result<Vec<FileEntry>, McpError> {
+        self.client
+            .list_files(sandbox_id, path)
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(sandbox_id))
+    }
+
+    /// Collects the working tree state of a repository inside a sandbox.
+    pub async fn git_evidence(
+        &self,
+        sandbox_id: Uuid,
+        repo_path: &str,
+    ) -> Result<GitEvidence, McpError> {
+        let status = self
+            .exec_shell(
+                sandbox_id,
+                &format!("cd {repo_path} && git --no-pager status --porcelain=v1"),
+                60,
+            )
+            .await?;
+        let diff = self
+            .exec_shell(
+                sandbox_id,
+                &format!("cd {repo_path} && git --no-pager diff"),
+                60,
+            )
+            .await?;
+        let head = self
+            .exec_shell(
+                sandbox_id,
+                &format!("cd {repo_path} && git rev-parse HEAD"),
+                60,
+            )
+            .await?;
+
+        let changed: Vec<String> = status
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                // porcelain v1: "XY path"
+                line.split_once(' ')
+                    .map_or(line, |(_, rest)| rest)
+                    .trim()
+                    .to_owned()
+            })
+            .collect();
+
+        Ok(GitEvidence {
+            head: head.stdout.trim().to_owned(),
+            git_status: status.stdout,
+            git_diff: diff.stdout.clone(),
+            changed_files: changed,
+            diff_bytes: diff.stdout.len(),
+        })
+    }
+
+    /// Marks a sandbox as belonging to a high-level tool, so it is destroyed
+    /// with the run unless the caller keeps it.
+    pub fn mark_tool_owned(&self, sandbox_id: Uuid, evaluation_id: Option<Uuid>) {
+        let mut owned = self.owned.lock().expect("ownership lock is not poisoned");
+        if let Some(record) = owned.iter_mut().find(|r| r.sandbox_id == sandbox_id) {
+            record.owned_by_tool = true;
+            record.evaluation_id = evaluation_id;
+        } else {
+            owned.push(Ownership {
+                sandbox_id,
+                run_id: Uuid::now_v7(),
+                evaluation_id,
+                created_at: Utc::now(),
+                owned_by_tool: true,
+            });
+        }
+    }
+
+    /// The sandboxes this server created, and only those.
+    pub fn owned_sandbox_ids(&self) -> Vec<Uuid> {
+        self.owned
+            .lock()
+            .expect("ownership lock is not poisoned")
+            .iter()
+            .map(|record| record.sandbox_id)
+            .collect()
+    }
+
+    fn forget(&self, id: Uuid) {
+        self.owned
+            .lock()
+            .expect("ownership lock is not poisoned")
+            .retain(|record| record.sandbox_id != id);
+    }
+
+    /// Issues the create with the runtime pinned.
+    async fn create_with_runtime(
+        &self,
+        request: &CreateSandboxRequest,
+        runtime: &str,
+    ) -> Result<Sandbox, McpError> {
+        self.client
+            .create_sandbox_with_runtime(request, runtime)
+            .await
+            .map_err(|error| map_client_error(&error))
+    }
+
+    async fn require_running(&self, id: Uuid) -> Result<(), McpError> {
+        let sandbox = self
+            .client
+            .get_sandbox(id)
+            .await
+            .map_err(|error| map_client_error(&error).with_sandbox(id))?;
+        if sandbox.state.as_str() != "running" {
+            return Err(McpError::new(
+                ErrorCode::SandboxNotRunning,
+                format!("the sandbox is `{}`, not `running`", sandbox.state.as_str()),
+            )
+            .with_sandbox(id));
+        }
+        Ok(())
+    }
+}
+
+/// Repository evidence gathered from inside a sandbox.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitEvidence {
+    pub head: String,
+    pub git_status: String,
+    pub git_diff: String,
+    pub changed_files: Vec<String>,
+    pub diff_bytes: usize,
+}
+
+fn view_of(sandbox: &Sandbox) -> SandboxView {
+    SandboxView {
+        sandbox_id: sandbox.id.to_string(),
+        state: sandbox.state.as_str().to_owned(),
+        runtime: sandbox.runtime.as_str().to_owned(),
+        image: sandbox.image_id.clone(),
+        cpu: sandbox.cpu,
+        memory_mb: sandbox.memory_mb,
+        disk_mb: sandbox.disk_mb,
+        created_at: sandbox.created_at,
+        expires_at: Some(
+            sandbox.created_at + chrono::Duration::seconds(sandbox.timeout_seconds as i64),
+        ),
+    }
+}
+
+/// Whether a sandbox has reached a state it will not leave on its own.
+fn is_terminal(state: SandboxState) -> bool {
+    matches!(state, SandboxState::Destroyed | SandboxState::Failed)
+}
+
+/// Encodes to the standard base64 the control plane expects for file bodies.
+fn encode_base64(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Decodes standard base64, which is what the control plane emits for files.
+fn decode_base64(text: &str) -> Option<String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Clips output to a bound, reporting whether it had to.
+fn clamp(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
+/// Maps the client's error type onto the structured MCP error model.
+pub fn map_client_error(error: &aiec_client::ClientError) -> McpError {
+    use aiec_client::ClientError as E;
+    match error {
+        E::Api {
+            status,
+            code,
+            message,
+            request_id,
+        } => {
+            let mut mapped = crate::error::ToolFailure::Api {
+                code: code.clone(),
+                message: message.clone(),
+            }
+            .into_error();
+            mapped.request_id = Some(request_id.to_string());
+            if *status == reqwest::StatusCode::UNAUTHORIZED {
+                mapped.code = ErrorCode::AuthFailed;
+            }
+            mapped
+        }
+        E::Request(detail) => McpError::new(
+            ErrorCode::AiecApiUnavailable,
+            format!("the local AIec control plane is unreachable: {detail}"),
+        ),
+        E::Decode(detail) => McpError::new(
+            ErrorCode::AiecApiUnavailable,
+            format!("the control plane returned an unreadable response: {detail}"),
+        ),
+        E::Configuration(detail) => McpError::new(
+            ErrorCode::LocalRuntimeUnavailable,
+            format!("the local control plane is not configured: {detail}"),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_is_clipped_on_a_character_boundary() {
+        // A multi-byte character must not be split, which would panic.
+        let text = "é".repeat(10);
+        let (clipped, truncated) = clamp(&text, 5);
+        assert!(truncated);
+        assert_eq!(clipped, "éé");
+
+        let (whole, truncated) = clamp("short", 100);
+        assert!(!truncated);
+        assert_eq!(whole, "short");
+    }
+
+    #[test]
+    fn an_empty_command_is_rejected_before_any_request() {
+        let error = McpError::invalid("the command is empty");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+}

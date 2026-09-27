@@ -120,6 +120,29 @@ A complete agent workflow — clone, inspect, edit, validate, diff, destroy — 
 
 ---
 
+## Local MCP server
+
+Point any MCP-capable agent at your own cluster and it gets a disposable machine
+per task — a real microVM, created and destroyed on demand:
+
+```bash
+export AIEC_LOCAL_API_URL=https://127.0.0.1:18443
+export AIEC_LOCAL_API_KEY=af_live_...
+./target/release/aiec-mcp
+```
+
+| | |
+|---|---|
+| URL | `http://127.0.0.1:8765/mcp` |
+| Transport | Streamable HTTP |
+| Authorization | `Bearer <~/.config/aiec/mcp-token>` |
+
+It is local-only by construction: a remote AIec URL is refused at startup, and
+the `hosted` and `e2b` runtimes are unavailable, so a workload cannot escape to
+AIec Cloud or a third-party provider. See [`docs/MCP.md`](docs/MCP.md).
+
+---
+
 ## Self-hosting
 
 AIec OSS has no dependency on any managed provider. You need a Linux host with
@@ -152,6 +175,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [`docs/API.md`](docs/API.md) | Every endpoint, with request and response shapes |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation boundaries, reporting a vulnerability |
+| [`docs/MCP.md`](docs/MCP.md) | The local-only MCP server: giving an agent a disposable machine |
 | [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
 
 ---
