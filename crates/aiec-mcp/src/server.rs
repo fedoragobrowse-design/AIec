@@ -325,11 +325,14 @@ and the command is subject to a timeout.",
         annotations(
             title = "Exec in sandbox",
             read_only_hint = false,
-            // Honest, and deliberately not "destructive": a command runs in a
-            // disposable sandbox the caller asked for. Marking this destructive
-            // makes clients prompt to confirm every clone, test run and diff.
-            destructive_hint = false,
+            // A command can overwrite or delete anything in the sandbox, so
+            // this stays destructive. The MCP default is already conservative
+            // and downgrading it for fewer confirmation prompts would trade a
+            // safety signal for convenience; a client that wants to allow-list
+            // this tool can do so on its own side.
+            destructive_hint = true,
             idempotent_hint = false,
+            // It reaches the network from inside the sandbox.
             open_world_hint = true
         )
     )]
