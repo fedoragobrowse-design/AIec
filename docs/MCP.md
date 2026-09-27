@@ -147,6 +147,21 @@ deliberately does not hold model credentials for you.
 
 ---
 
+## Using it from an agent
+
+A ready-made skill is in
+[`docs/skills/aiec-sandboxes/SKILL.md`](docs/skills/aiec-sandboxes/SKILL.md).
+Copy it into your agent's skills directory to teach it the whole loop — which
+tool for which situation, how to keep the sandbox TTL honest, and which typed
+errors mean "wait" rather than "try somewhere else":
+
+```bash
+mkdir -p ~/.omp/agent/skills
+cp docs/skills/aiec-sandboxes/SKILL.md ~/.omp/agent/skills/aiec-sandboxes/
+```
+
+---
+
 ## Architecture
 
 ```
