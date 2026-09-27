@@ -10,14 +10,14 @@ set -Eeuo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 
-: "${AGENTFORGE_URL:?base URL of a running AgentForge, e.g. https://api.aiec.gobrowse.dev}"
-: "${AGENTFORGE_API_KEY:?an API key is required}"
-CA=${AGENTFORGE_CA_CERT:-}
-OPERATIONS=${AGENTFORGE_LOAD_OPERATIONS:-100}
-CONCURRENCY=${AGENTFORGE_LOAD_CONCURRENCY:-4}
-SOAK_SECONDS=${AGENTFORGE_SOAK_SECONDS:-0}
-IMAGE=${AGENTFORGE_LOAD_IMAGE:-base}
-TIMEOUT=${AGENTFORGE_LOAD_TIMEOUT:-180}
+: "${AIEC_URL:?base URL of a running AIec, e.g. https://api.aiec.gobrowse.dev}"
+: "${AIEC_API_KEY:?an API key is required}"
+CA=${AIEC_CA_CERT:-}
+OPERATIONS=${AIEC_LOAD_OPERATIONS:-100}
+CONCURRENCY=${AIEC_LOAD_CONCURRENCY:-4}
+SOAK_SECONDS=${AIEC_SOAK_SECONDS:-0}
+IMAGE=${AIEC_LOAD_IMAGE:-base}
+TIMEOUT=${AIEC_LOAD_TIMEOUT:-180}
 
 # Refuse to start a run that would exceed the tenant's own quota, so the result
 # measures the platform rather than the limiter.
@@ -26,7 +26,7 @@ MAX_IN_FLIGHT=$(( CONCURRENCY ))
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-curl_args=(-sS --max-time "$TIMEOUT" -H "Authorization: Bearer $AGENTFORGE_API_KEY"
+curl_args=(-sS --max-time "$TIMEOUT" -H "Authorization: Bearer $AIEC_API_KEY"
             -H 'content-type: application/json')
 [ -n "$CA" ] && curl_args=(--cacert "$CA" "${curl_args[@]}")
 
@@ -36,7 +36,7 @@ pct() { # pct <file> <p>
 }
 
 log "target"
-curl "${curl_args[@]}" "$AGENTFORGE_URL/ready"; echo
+curl "${curl_args[@]}" "$AIEC_URL/ready"; echo
 
 log "running $OPERATIONS lifecycles at concurrency $CONCURRENCY"
 : > "$WORK/create.ms"; : > "$WORK/exec.ms"; : > "$WORK/destroy.ms"
@@ -48,7 +48,7 @@ for i in $(seq 1 "$OPERATIONS"); do
     t0=$(date +%s%3N)
     box=$(curl "${curl_args[@]}" -X POST \
       -d "{\"image\":\"$IMAGE\",\"cpu\":1,\"memory_mb\":512,\"disk_mb\":2048,\"timeout_seconds\":300}" \
-      "$AGENTFORGE_URL/v1/sandboxes" 2>/dev/null || echo '{}')
+      "$AIEC_URL/v1/sandboxes" 2>/dev/null || echo '{}')
     id=$(printf '%s' "$box" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("id",""))
 except Exception: print("")' 2>/dev/null || echo "")
@@ -65,10 +65,10 @@ except Exception: print("unknown")' 2>/dev/null || echo unknown)
     echo $((t1 - t0)) >> "$WORK/create.ms"
     curl "${curl_args[@]}" -X POST \
       -d '{"command":["/bin/sh","-c","echo load"]}' \
-      "$AGENTFORGE_URL/v1/sandboxes/$id/exec" >/dev/null 2>&1 || true
+      "$AIEC_URL/v1/sandboxes/$id/exec" >/dev/null 2>&1 || true
     t2=$(date +%s%3N)
     echo $((t2 - t1)) >> "$WORK/exec.ms"
-    curl "${curl_args[@]}" -X DELETE "$AGENTFORGE_URL/v1/sandboxes/$id" >/dev/null 2>&1 || true
+    curl "${curl_args[@]}" -X DELETE "$AIEC_URL/v1/sandboxes/$id" >/dev/null 2>&1 || true
     t3=$(date +%s%3N)
     echo $((t3 - t2)) >> "$WORK/destroy.ms"
     printf 'done\n' >> "$WORK/ok"
@@ -99,7 +99,7 @@ fi
 
 # Leak check: a load test that leaves sandboxes behind is not a pass.
 log "leak check"
-remaining=$(curl "${curl_args[@]}" "$AGENTFORGE_URL/v1/sandboxes" \
+remaining=$(curl "${curl_args[@]}" "$AIEC_URL/v1/sandboxes" \
   | python3 -c 'import json,sys
 try:
     rows=json.load(sys.stdin)
@@ -115,14 +115,14 @@ if [ "$SOAK_SECONDS" -gt 0 ]; then
   while [ $(( $(date +%s) - soak_start )) -lt "$SOAK_SECONDS" ]; do
     box=$(curl "${curl_args[@]}" -X POST \
       -d "{\"image\":\"$IMAGE\",\"cpu\":1,\"memory_mb\":512,\"disk_mb\":2048,\"timeout_seconds\":120}" \
-      "$AGENTFORGE_URL/v1/sandboxes" 2>/dev/null || echo '{}')
+      "$AIEC_URL/v1/sandboxes" 2>/dev/null || echo '{}')
     id=$(printf '%s' "$box" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("id",""))
 except Exception: print("")' 2>/dev/null || echo "")
     if [ -n "$id" ]; then
       curl "${curl_args[@]}" -X POST -d '{"command":["/bin/sh","-c","true"]}' \
-        "$AGENTFORGE_URL/v1/sandboxes/$id/exec" >/dev/null 2>&1 || true
-      curl "${curl_args[@]}" -X DELETE "$AGENTFORGE_URL/v1/sandboxes/$id" >/dev/null 2>&1 || true
+        "$AIEC_URL/v1/sandboxes/$id/exec" >/dev/null 2>&1 || true
+      curl "${curl_args[@]}" -X DELETE "$AIEC_URL/v1/sandboxes/$id" >/dev/null 2>&1 || true
       soak_ops=$((soak_ops + 1))
     fi
     sleep 2

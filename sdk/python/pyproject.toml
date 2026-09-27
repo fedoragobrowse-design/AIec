@@ -1,8 +1,8 @@
 [project]
-name = "aiec-sdk"
+name = "agentforge-sdk"
 version = "0.1.0"
-description = "AIec — AI elastic compute: Python SDK"
+description = "AIec — AI elastic compute: Python SDK (from agentforge import AIec)"
 requires-python = ">=3.10"
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["aiec*"]
+include = ["agentforge*"]

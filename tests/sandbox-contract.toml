@@ -1,5 +1,5 @@
 version = 1
-product = "AIec / AgentForge private alpha"
+product = "AIec / AIec private alpha"
 policy = "PASS requires an executed behavioral test; PARTIAL is implemented but incomplete or lacks required integration evidence; UNSUPPORTED is intentionally not implemented; BLOCKED_BY_ENVIRONMENT requires the documented prerequisite"
 
 [creation]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AgentForge SAME_HOST_MULTI_WORKER_VALIDATION.
+# AIec SAME_HOST_MULTI_WORKER_VALIDATION.
 #
 # Proves distributed ownership with real PostgreSQL, a real API, real HTTPS
 # workers, real leases, and real fencing generations:
@@ -16,21 +16,21 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-ITERATIONS=${AGENTFORGE_RECOVERY_ITERATIONS:-3}
-OUT=${AGENTFORGE_RECOVERY_OUT:-$ROOT/.agentforge/recovery-validation}
-API_BIND=${AGENTFORGE_RECOVERY_BIND:-127.0.0.1:19844}
-BASE_PORT_A=${AGENTFORGE_RECOVERY_PORT_A:-29844}
+ITERATIONS=${AIEC_RECOVERY_ITERATIONS:-3}
+OUT=${AIEC_RECOVERY_OUT:-$ROOT/.aiec/recovery-validation}
+API_BIND=${AIEC_RECOVERY_BIND:-127.0.0.1:19844}
+BASE_PORT_A=${AIEC_RECOVERY_PORT_A:-29844}
 PORT_A=$BASE_PORT_A
 PORT_B=$((BASE_PORT_A + 1))
-LEASE_TTL=${AGENTFORGE_RECOVERY_LEASE_TTL:-180}
-KEEP=${AGENTFORGE_KEEP_FAILED_TEST_STATE:-0}
-RUNTIME=${AGENTFORGE_RECOVERY_RUNTIME:-docker}
+LEASE_TTL=${AIEC_RECOVERY_LEASE_TTL:-180}
+KEEP=${AIEC_KEEP_FAILED_TEST_STATE:-0}
+RUNTIME=${AIEC_RECOVERY_RUNTIME:-docker}
 
 : "${DATABASE_URL:?DATABASE_URL must point at a real PostgreSQL}"
-: "${AGENTFORGE_S3_ENDPOINT:?AGENTFORGE_S3_ENDPOINT is required}"
-: "${AGENTFORGE_S3_BUCKET:?AGENTFORGE_S3_BUCKET is required}"
-: "${AGENTFORGE_S3_ACCESS_KEY_ID:?AGENTFORGE_S3_ACCESS_KEY_ID is required}"
-: "${AGENTFORGE_S3_SECRET_ACCESS_KEY:?AGENTFORGE_S3_SECRET_ACCESS_KEY is required}"
+: "${AIEC_S3_ENDPOINT:?AIEC_S3_ENDPOINT is required}"
+: "${AIEC_S3_BUCKET:?AIEC_S3_BUCKET is required}"
+: "${AIEC_S3_ACCESS_KEY_ID:?AIEC_S3_ACCESS_KEY_ID is required}"
+: "${AIEC_S3_SECRET_ACCESS_KEY:?AIEC_S3_SECRET_ACCESS_KEY is required}"
 
 for tool in curl openssl jq psql; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -163,7 +163,7 @@ cleanup() {
   # Remove containers this harness created. A run that is interrupted before the
   # control plane destroys its sandboxes would otherwise leave them running.
   if [ "$HAVE_DOCKER" = 1 ]; then
-    "${DOCKER[@]}" ps -q --filter label=com.agentforge.managed=true 2>/dev/null \
+    "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null \
       | xargs -r "${DOCKER[@]}" rm -f 2>/dev/null || true
   fi
   if [ "$KEEP" = 1 ]; then
@@ -178,7 +178,7 @@ trap cleanup EXIT
 log "generating disposable CA and certificates for api, worker A and worker B"
 openssl genrsa -out "$OUT/pki/ca.key" 2048 2>/dev/null
 openssl req -x509 -new -nodes -key "$OUT/pki/ca.key" -sha256 -days 2 \
-  -subj '/CN=AgentForge recovery CA' -out "$OUT/pki/ca.crt" 2>/dev/null
+  -subj '/CN=AIec recovery CA' -out "$OUT/pki/ca.crt" 2>/dev/null
 for name in api worker-a worker-b; do
   openssl genrsa -out "$OUT/pki/$name.key" 2048 2>/dev/null
   openssl req -new -key "$OUT/pki/$name.key" -subj "/CN=$name" -out "$OUT/pki/$name.csr" 2>/dev/null
@@ -207,41 +207,41 @@ API_BASE="https://$API_BIND"
 WORKER_A_URL="https://127.0.0.1:$PORT_A"
 WORKER_B_URL="https://127.0.0.1:$PORT_B"
 
-export AGENTFORGE_TENANT_ID="$TENANT_ID"
-export AGENTFORGE_TENANT_NAME=recovery-validation
-export AGENTFORGE_API_KEY="$API_KEY"
-export AGENTFORGE_WORKER_TOKEN="$WORKER_TOKEN"
-export AGENTFORGE_BIND="$API_BIND"
-export AGENTFORGE_RUNTIMES="$RUNTIME"
-export AGENTFORGE_LEASE_TTL_SECONDS="$LEASE_TTL"
-export AGENTFORGE_TLS_CERT_FILE="$OUT/pki/api.crt"
-export AGENTFORGE_TLS_KEY_FILE="$OUT/pki/api.key"
-export AGENTFORGE_TLS_CA_CERT="$OUT/pki/ca.crt"
-export AGENTFORGE_S3_ENDPOINT AGENTFORGE_S3_REGION AGENTFORGE_S3_BUCKET
-export AGENTFORGE_S3_ACCESS_KEY_ID AGENTFORGE_S3_SECRET_ACCESS_KEY
+export AIEC_TENANT_ID="$TENANT_ID"
+export AIEC_TENANT_NAME=recovery-validation
+export AIEC_API_KEY="$API_KEY"
+export AIEC_WORKER_TOKEN="$WORKER_TOKEN"
+export AIEC_BIND="$API_BIND"
+export AIEC_RUNTIMES="$RUNTIME"
+export AIEC_LEASE_TTL_SECONDS="$LEASE_TTL"
+export AIEC_TLS_CERT_FILE="$OUT/pki/api.crt"
+export AIEC_TLS_KEY_FILE="$OUT/pki/api.key"
+export AIEC_TLS_CA_CERT="$OUT/pki/ca.crt"
+export AIEC_S3_ENDPOINT AIEC_S3_REGION AIEC_S3_BUCKET
+export AIEC_S3_ACCESS_KEY_ID AIEC_S3_SECRET_ACCESS_KEY
 export RUST_LOG=${RUST_LOG:-info}
 
-log "building agentforge binaries"
+log "building aiec binaries"
 # See firecracker-coding-dogfood.sh: never reuse host-linked artifacts here.
-export CARGO_TARGET_DIR=${AGENTFORGE_TARGET_DIR:-$ROOT/.agentforge/acceptance-target}
+export CARGO_TARGET_DIR=${AIEC_TARGET_DIR:-$ROOT/.aiec/acceptance-target}
 # sqlx::migrate! embeds migrations/ at compile time but Cargo does not track
 # that directory's contents, so a new migration is invisible to a cached build.
 # Touch the crate root whenever migrations/ is newer than the storage crate.
-if [ -n "$(find migrations -name '*.sql' -newer crates/agentforge-storage/src/lib.rs -print -quit 2>/dev/null)" ]; then
-  touch crates/agentforge-storage/src/lib.rs
+if [ -n "$(find migrations -name '*.sql' -newer crates/aiec-storage/src/lib.rs -print -quit 2>/dev/null)" ]; then
+  touch crates/aiec-storage/src/lib.rs
 fi
 # Release builds: the guest image digest is verified before a guest is
 # booted, and an unoptimized SHA-256 over a multi-gigabyte rootfs is slow enough
 # to blow the control plane's client timeout on the create path.
-cargo build -q --release -p agentforge-api --bin agentforge-server -p agentforge-cli --bin agentforge
+cargo build -q --release -p aiec-api --bin aiec-server -p aiec-cli --bin aiec
 
 # ------------------------------------------------------------- database
 # The scenario asserts on ownership and generation values, so it runs against a
 # database of its own. A shared database would carry expired leases and dead
 # nodes from earlier runs, and the reconcile pass would recover that debris
 # instead of this run's sandbox.
-ADMIN_URL=${AGENTFORGE_RECOVERY_ADMIN_URL:-${DATABASE_URL%/*}/postgres}
-DB_NAME=${AGENTFORGE_RECOVERY_DB:-agentforge_recovery}
+ADMIN_URL=${AIEC_RECOVERY_ADMIN_URL:-${DATABASE_URL%/*}/postgres}
+DB_NAME=${AIEC_RECOVERY_DB:-aiec_recovery}
 log "provisioning isolated database $DB_NAME"
 psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -q -c "DROP DATABASE IF EXISTS $DB_NAME" >/dev/null
 psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $DB_NAME" >/dev/null
@@ -249,7 +249,7 @@ export DATABASE_URL="${DATABASE_URL%/*}/$DB_NAME"
 
 # ------------------------------------------------------------------ API
 log "starting API on $API_BASE (lease TTL ${LEASE_TTL}s)"
-"$CARGO_TARGET_DIR"/release/agentforge-server >"$OUT/logs/api.log" 2>&1 &
+"$CARGO_TARGET_DIR"/release/aiec-server >"$OUT/logs/api.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 90); do
   curl --cacert "$OUT/pki/ca.crt" -fsS "$API_BASE/health" >/dev/null 2>&1 && break
@@ -270,9 +270,9 @@ start_worker() {
   # start_worker <label> <node> <port> <cert> <state-dir>
   local label=$1 node=$2 port=$3 cert=$4 state=$5
   mkdir -p "$state"
-  AGENTFORGE_TLS_CERT_FILE="$OUT/pki/$cert.crt" \
-  AGENTFORGE_TLS_KEY_FILE="$OUT/pki/$cert.key" \
-  "$CARGO_TARGET_DIR"/release/agentforge \
+  AIEC_TLS_CERT_FILE="$OUT/pki/$cert.crt" \
+  AIEC_TLS_KEY_FILE="$OUT/pki/$cert.key" \
+  "$CARGO_TARGET_DIR"/release/aiec \
     --url "$API_BASE" worker \
     --runtime "$RUNTIME" \
     --name "$label-$RUN_TAG" \
@@ -315,7 +315,7 @@ run_iteration() {
   log "iteration $iteration: creating sandbox on A"
   local create
   create=$(api -X POST -H 'content-type: application/json' -d '{
-    "image": "agentforge:latest",
+    "image": "aiec:latest",
     "cpu": 1,
     "memory_mb": 256,
     "disk_mb": 512,
@@ -418,9 +418,9 @@ run_iteration() {
   fi
 
   log "iteration $iteration: restarting stale worker A with its previous state dir"
-  AGENTFORGE_TLS_CERT_FILE="$OUT/pki/worker-a.crt" \
-  AGENTFORGE_TLS_KEY_FILE="$OUT/pki/worker-a.key" \
-  "$CARGO_TARGET_DIR"/release/agentforge \
+  AIEC_TLS_CERT_FILE="$OUT/pki/worker-a.crt" \
+  AIEC_TLS_KEY_FILE="$OUT/pki/worker-a.key" \
+  "$CARGO_TARGET_DIR"/release/aiec \
     --url "$API_BASE" worker --runtime "$RUNTIME" --name "worker-a-stale-iter$iteration-$RUN_TAG" \
     --node-id "$NODE_A" --state-dir "$state_a" --bind "127.0.0.1:$PORT_A" \
     --advertise-url "$WORKER_A_URL" --capacity 1 >>"$OUT/logs/worker-a-iter$iteration.log" 2>&1 &
@@ -511,7 +511,7 @@ run_iteration() {
   sleep 2
   local containers
   if [ "$HAVE_DOCKER" = 1 ]; then
-    containers=$({ "${DOCKER[@]}" ps -q --filter label=com.agentforge.managed=true 2>/dev/null || true; } | wc -l)
+    containers=$({ "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null || true; } | wc -l)
     check "iteration $iteration: no managed containers remain" test "$containers" -eq 0 || return 1
   fi
 
@@ -562,10 +562,10 @@ count_matches() {
     | wc -l
 }
 
-leftover_procs=$(count_matches "$CARGO_TARGET_DIR/release/agentforge")
+leftover_procs=$(count_matches "$CARGO_TARGET_DIR/release/aiec")
 leftover_containers=skipped
 if [ "$HAVE_DOCKER" = 1 ]; then
-  leftover_containers=$({ "${DOCKER[@]}" ps -q --filter label=com.agentforge.managed=true 2>/dev/null || true; } | wc -l)
+  leftover_containers=$({ "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null || true; } | wc -l)
 fi
 leftover_fc=$(count_matches "api-sock")
 leftover_taps=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l || echo 0)

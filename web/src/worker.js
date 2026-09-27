@@ -39,7 +39,7 @@ export default {
     const isApi = url.hostname.startsWith("api.");
 
     if (isApi) {
-      const origin = (env.AGENTFORGE_API_ORIGIN || DEFAULT_API_ORIGIN).replace(/\/+$/, "");
+      const origin = (env.AIEC_API_ORIGIN || DEFAULT_API_ORIGIN).replace(/\/+$/, "");
       // Fail closed rather than proxying to an unset or obviously wrong origin.
       if (!/^https:\/\//.test(origin)) {
         return withSecurityHeaders(

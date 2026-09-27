@@ -84,7 +84,7 @@
 
 af = AIec(api_key=<span class="str">"af_live_…"</span>)
 
-box = af.sandboxes.create(image=<span class="str">"agentforge:latest"</span>)
+box = af.sandboxes.create(image=<span class="str">"aiec-coding:latest"</span>)
 box.exec([<span class="str">"git"</span>, <span class="str">"clone"</span>, <span class="str">"--depth"</span>, <span class="str">"1"</span>, REPO, <span class="str">"/workspace/repo"</span>])
 box.exec([<span class="str">"sh"</span>, <span class="str">"-c"</span>, <span class="cm"># edit in place…</span>])
 box.exec([<span class="str">"python"</span>, <span class="str">"-m"</span>, <span class="str">"pytest"</span>, <span class="str">"-q"</span>])

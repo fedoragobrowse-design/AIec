@@ -6,7 +6,7 @@ file, runs the project's own validation, retrieves the diff, and destroys the
 sandbox. Everything goes through the public AIec API — no host-side
 shortcuts, no SSH, no direct provider access.
 
-    export AGENTFORGE_API_KEY="af_live_..."
+    export AIEC_API_KEY="af_live_..."
     python3 examples/coding_agent.py [repo-url]
 """
 
@@ -15,18 +15,18 @@ from __future__ import annotations
 import os
 import sys
 
-from aiec import AIec, AIecError
+from agentforge import AIec, AIecError
 
 DEFAULT_REPO = "https://github.com/octocat/Hello-World.git"
 
 
 def run() -> int:
     repo = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_REPO
-    af = AIec(api_key=os.environ.get("AGENTFORGE_API_KEY"))
+    af = AIec(api_key=os.environ.get("AIEC_API_KEY"))
     print(f"endpoint: {af.base_url}")
     print(f"repo:     {repo}")
 
-    box = af.sandboxes.create(image="agentforge:latest", timeout_seconds=900)
+    box = af.sandboxes.create(image="aiec-coding:latest", timeout_seconds=900)
     print(f"sandbox:  {box.id}")
 
     try:

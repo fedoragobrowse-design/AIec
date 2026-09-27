@@ -6,7 +6,7 @@ This report is evidence-based. `PASS` means the repository contains an executed 
 
 | Mechanism | Status | Evidence / boundary |
 |---|---|---|
-| Unified Core contracts | PASS | `cargo test -p agentforge-core`; `cargo run -p agentforge-api --example custom_core_platform` |
+| Unified Core contracts | PASS | `cargo test -p aiec-core`; `cargo run -p aiec-api --example custom_core_platform` |
 | Heterogeneous runtime capability discovery | PASS | `RuntimeCapabilities`; Bubblewrap and Firecracker report distinct capabilities |
 | Docker Engine runtime | PASS (current run) | The Docker daemon is reachable through the operator's `docker` group. The opt-in Docker suite passed real Alpine lifecycle/files/security, portable workspace snapshot/restore, and the separately flagged 100-container churn test. Restricted network allowlists remain `UNSUPPORTED`. |
 | Worker capability scheduling | PASS (current run) | Runtime capabilities are advertised, persisted, and included in scheduler predicates. Same-host HTTPS worker registration, placement and recovery all ran live in this run, and the Firecracker worker advertises `coding_guest` from the verified guest artifact. |
@@ -40,13 +40,13 @@ This report is evidence-based. `PASS` means the repository contains an executed 
 | `git diff --check` | PASS | Direct run completed successfully. |
 | Real Firecracker | PASS (current run) | Firecracker v1.17.0 direct runtime tests passed: 2 tests in 278.73s, including exec, files, pause/resume and portable workspace snapshot/restore against the rebuilt coding guest. |
 | Coding Firecracker guest artifact | PASS (current run) | `scripts/build-firecracker-guest.sh` builds a debian:bookworm-slim@sha256:3783cc01… guest with git 2.39.5, curl 7.88.1, Python 3.11.2, tar 1.34, CA certificates and the static musl guest agent. `scripts/guest_artifact_report.py` verified rootfs sha256 `71b72e9bd36cf715ad093db1fb66c6038a494740dcfb457eacbb483e9192227b`; `debugfs` confirmed `/usr/bin/git`, `libcrypto.so.3`, `libssl.so.3`, `libc.so.6`, `/usr/bin/python3` and the guest agent are present. |
-| Firecracker guest networking | PASS (current run) | A network-enabled sandbox received `ip=172.30.x.2::172.30.x.1:255.255.255.252:agentforge:eth0:off` from the Firecracker boot cmdline; the guest kernel logged `IP-Config: Complete` and the in-guest HTTPS clone succeeded through TAP + nftables masquerade. |
+| Firecracker guest networking | PASS (current run) | A network-enabled sandbox received `ip=172.30.x.2::172.30.x.1:255.255.255.252:aiec:eth0:off` from the Firecracker boot cmdline; the guest kernel logged `IP-Config: Complete` and the in-guest HTTPS clone succeeded through TAP + nftables masquerade. |
 | Firecracker coding-agent dogfood | PASS (current run) | `scripts/firecracker-coding-dogfood.sh` ran the full client → API → PostgreSQL → HTTPS worker → Firecracker → guest path. A real Firecracker sandbox was created and placed, `git --version` reported 2.39.5 inside the guest, `git clone https://github.com/octocat/Hello-World.git` succeeded with CA verification (no TLS bypass), `git status` and a file read succeeded, README was edited inside the guest, a real validation command printed `VALIDATION_OK`, `git diff` was retrieved and proven to contain the in-guest edit, the file API returned the edited bytes, and destroy plus cleanup (no VM, no container, no TAP) were verified. |
 | Live worker recovery and fencing | PASS (current run) | `scripts/worker-recovery-validation.sh` ran SAME_HOST_MULTI_WORKER_VALIDATION 3 consecutive iterations against real PostgreSQL (an isolated per-run database), a real API over HTTPS with a disposable CA, and two real worker processes with independent ids, ports and state dirs. Every iteration passed all 14 assertions: sandbox placed on worker A at generation N, durable marker written, workspace snapshotted, worker A SIGKILLed without deregistering, lease expired normally, control plane reassigned to worker B at a higher generation, B reconstructed the workspace marker and accepted a file write, and after stale A returned with its previous state dir every stale exec, file mutation, stop, destroy and lease completion was rejected with `conflict`. A late heartbeat that still claimed the lost sandbox was refused with `worker reports 1 running sandboxes but holds no active lease`, and ownership and generation were unchanged; a late completion from generation N could not overwrite N+1. Final cleanup line: `processes=0 containers=0 firecracker=0 taps=0 active_leases=0`. The recovery pass may retry placement a few times before succeeding, so the observed generation is typically 4 rather than exactly N+1; that is bounded retry, not a fencing defect. |
 | Real Bubblewrap lifecycle | PASS | Real API lifecycle/file/snapshot/restore test passed. |
 | PostgreSQL | PASS (current run) | `docker exec ... pg_isready` reported accepting connections; the live `DATABASE_URL` PostgreSQL suite passed, including quota and scheduler races, fenced state updates, lease reassignment and workspace snapshot round-trips. |
 | MinIO/S3 | PASS (current run) | The live S3 PUT/GET/DELETE test passed against the running MinIO service and cleaned up its object. Workspace archives are persisted to this shared object store, which is what makes a captured workspace readable by a different worker. |
-| Docker Engine lifecycle | PASS (current run) | The Docker suite ran 3 tests: 2 real lifecycle/security and portable snapshot/restore tests passed; the churn test returned early because its separate opt-in flag was unset. A separate run with `AGENTFORGE_RUN_DOCKER_CHURN=1` passed the real 100-container churn test in 37.98s. |
+| Docker Engine lifecycle | PASS (current run) | The Docker suite ran 3 tests: 2 real lifecycle/security and portable snapshot/restore tests passed; the churn test returned early because its separate opt-in flag was unset. A separate run with `AIEC_RUN_DOCKER_CHURN=1` passed the real 100-container churn test in 37.98s. |
 | Cross-runtime portability | PASS (current run) | The opt-in Docker→Firecracker→Docker workspace archive exchange passed in 7.19s with real Docker and Firecracker. |
 | Same-host two-worker HTTPS | PASS (current run) | Provisioned as a disposable same-host production-path cluster: real PostgreSQL (an isolated per-run database), a real API over HTTPS with a disposable CA, and two worker processes with independent node ids, ports and state dirs. This is same-host evidence and is not claimed as multi-host. |
 | Docker API benchmark | PARTIAL | Docker API benchmark completed 10/10 creates with concurrency 2: p50 440.471 ms, p95 479.521 ms, p99 479.521 ms, total 2086.778 ms. This is a 10-sandbox Docker development API benchmark, not a 100-sandbox or Docker/Firecracker production comparison. |
@@ -55,7 +55,7 @@ This report is evidence-based. `PASS` means the repository contains an executed 
 The historical `sg docker` churn command was:
 
 ```bash
-sg docker -c 'AGENTFORGE_RUN_DOCKER_CHURN=1 AGENTFORGE_DOCKER_TEST_IMAGE=alpine:3.21 cargo test -p agentforge-runtime --test docker real_docker_hundred_container_churn -- --nocapture'
+sg docker -c 'AIEC_RUN_DOCKER_CHURN=1 AIEC_DOCKER_TEST_IMAGE=alpine:3.21 cargo test -p aiec-runtime --test docker real_docker_hundred_container_churn -- --nocapture'
 ```
 
 That historical run completed 100 create/start/destroy cycles and reported zero managed containers afterward. It is not current-run evidence: the current shell's `docker info` failed with permission denied.
@@ -80,25 +80,25 @@ Both acceptance harnesses need a toolchain image and, for the Firecracker path, 
 
 ```bash
 # Firecracker coding-agent dogfood (real /dev/kvm and TAP, network host).
-sg docker -c 'docker build -t agentforge-acceptance scripts/acceptance-container.Dockerfile'
+sg docker -c 'docker build -t aiec-acceptance scripts/acceptance-container.Dockerfile'
 sg docker -c 'docker run --rm --privileged --network host \
   -v /dev/kvm:/dev/kvm -v "$PWD:$PWD" -w "$PWD" \
-  -e DATABASE_URL=postgresql://agentforge:agentforge-dev-only@127.0.0.1:5432/agentforge \
-  -e AGENTFORGE_S3_ENDPOINT=http://127.0.0.1:9000 -e AGENTFORGE_S3_REGION=us-east-1 \
-  -e AGENTFORGE_S3_BUCKET=agentforge -e AGENTFORGE_S3_ACCESS_KEY_ID=agentforge \
-  -e AGENTFORGE_S3_SECRET_ACCESS_KEY=agentforge-dev-only \
-  -e AGENTFORGE_GUEST_SECRET=0123456789abcdef0123456789abcdef \
-  agentforge-acceptance bash scripts/firecracker-coding-dogfood.sh'
+  -e DATABASE_URL=postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec \
+  -e AIEC_S3_ENDPOINT=http://127.0.0.1:9000 -e AIEC_S3_REGION=us-east-1 \
+  -e AIEC_S3_BUCKET=aiec -e AIEC_S3_ACCESS_KEY_ID=aiec \
+  -e AIEC_S3_SECRET_ACCESS_KEY=aiec-dev-only \
+  -e AIEC_GUEST_SECRET=0123456789abcdef0123456789abcdef \
+  aiec-acceptance bash scripts/firecracker-coding-dogfood.sh'
 
 # Live recovery and fencing, three iterations.
 sg docker -c 'docker run --rm --privileged --network host \
   -v /var/run/docker.sock:/var/run/docker.sock -v /dev/kvm:/dev/kvm \
-  -v "$PWD:$PWD" -w "$PWD" -e AGENTFORGE_RECOVERY_ITERATIONS=3 \
-  -e DATABASE_URL=postgresql://agentforge:agentforge-dev-only@127.0.0.1:5432/agentforge \
-  -e AGENTFORGE_S3_ENDPOINT=http://127.0.0.1:9000 -e AGENTFORGE_S3_REGION=us-east-1 \
-  -e AGENTFORGE_S3_BUCKET=agentforge -e AGENTFORGE_S3_ACCESS_KEY_ID=agentforge \
-  -e AGENTFORGE_S3_SECRET_ACCESS_KEY=agentforge-dev-only \
-  agentforge-acceptance bash scripts/worker-recovery-validation.sh'
+  -v "$PWD:$PWD" -w "$PWD" -e AIEC_RECOVERY_ITERATIONS=3 \
+  -e DATABASE_URL=postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec \
+  -e AIEC_S3_ENDPOINT=http://127.0.0.1:9000 -e AIEC_S3_REGION=us-east-1 \
+  -e AIEC_S3_BUCKET=aiec -e AIEC_S3_ACCESS_KEY_ID=aiec \
+  -e AIEC_S3_SECRET_ACCESS_KEY=aiec-dev-only \
+  aiec-acceptance bash scripts/worker-recovery-validation.sh'
 ```
 
 The recovery harness provisions and drops its own database, so run at most one instance at a time: the control plane binds fixed ports and concurrent runs collide.

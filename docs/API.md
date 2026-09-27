@@ -10,7 +10,7 @@ Base path `/v1`. Except health/metrics, send `Authorization: Bearer af_live_...`
 - `GET /v1/sandboxes/{id}` — tenant-scoped detail.
 - `DELETE /v1/sandboxes/{id}` — destroy.
 - `POST /v1/sandboxes/{id}/start|pause|stop|resume` — explicit lifecycle operations. `pause` is supported by Firecracker PATCH semantics; development Bubblewrap returns `501`.
-  Rust SDK: `AgentForgeClient::pause(id)` (crate `agentforge-client`) / `resume(id)`; Python SDK: `Sandbox.pause()` / `Sandbox.resume()`.
+  Rust SDK: `AIecClient::pause(id)` (crate `aiec-client`) / `resume(id)`; Python SDK: `Sandbox.pause()` / `Sandbox.resume()`.
 - `POST /v1/sandboxes/{id}/git/diff` — return bounded `git diff --binary` for a running Git workspace.
 - `POST /v1/sandboxes/{id}/exec` — body `command` argv, `working_directory`, `environment`, `timeout_seconds`, `stdin`. Returns exit code, bounded stdout/stderr, duration, timeout flag.
 - `PUT /v1/sandboxes/{id}/files` — body `path`, `content_base64`, optional `mode`.
@@ -28,7 +28,7 @@ Base path `/v1`. Except health/metrics, send `Authorization: Bearer af_live_...`
 
 The Python SDK exposes the same size-guarded partial path as `Sandbox.upload_artifact`, `download_artifact`, and `delete_artifact`; listing remains unsupported, and the production S3 path remains unverified.
 
-Operational endpoints: `/health`, `/ready`, `/metrics`. `POST /v1/keys`, `/v1/keys/{id}/revoke`, and `/v1/keys/{id}/rotate` are administrative bootstrap/management operations and are disabled unless `AGENTFORGE_DEV_API_KEY` bootstraps a local tenant.
+Operational endpoints: `/health`, `/ready`, `/metrics`. `POST /v1/keys`, `/v1/keys/{id}/revoke`, and `/v1/keys/{id}/rotate` are administrative bootstrap/management operations and are disabled unless `AIEC_DEV_API_KEY` bootstraps a local tenant.
 
 ## Status codes
 

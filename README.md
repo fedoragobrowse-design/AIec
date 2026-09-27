@@ -8,11 +8,11 @@ the diff, and destroys the environment — thousands of times an hour — withou
 touching the host.
 
 ```python
-from aiec import AIec
+from agentforge import AIec
 
 af = AIec(api_key="af_live_...")
 
-box = af.sandboxes.create(image="python:3.13")
+box = af.sandboxes.create(image="aiec-coding:latest")
 result = box.exec(["python", "-c", "print('hello from AIec')"])
 print(result["stdout"])
 box.destroy()
@@ -94,7 +94,7 @@ Details, including the limits we have not solved: [`SECURITY.md`](SECURITY.md).
 ## Quickstart
 
 ```bash
-pip install aiec-sdk
+pip install agentforge-sdk
 ```
 
 ```
@@ -103,13 +103,17 @@ copy your key
 ```
 
 ```python
-from aiec import AIec
+from agentforge import AIec
 
 af = AIec(api_key="af_live_...")          # defaults to https://api.aiec.gobrowse.dev
 box = af.sandboxes.create(image="aiec-coding:latest")
 print(box.exec(["git", "--version"])["stdout"])
 box.destroy()
 ```
+
+Available images: `aiec-coding:latest` (the default, with `git`, Python and a
+build toolchain), `python:3.13`, `node:24`, `rust:stable`, `ubuntu:24.04` and
+`alpine:3.21`.
 
 A complete agent workflow — clone, inspect, edit, validate, diff, destroy — is in
 [`examples/coding_agent.py`](examples/coding_agent.py).
@@ -125,10 +129,10 @@ KVM, PostgreSQL, and S3-compatible object storage.
 git clone https://github.com/fedoragobrowse-design/AIec.git
 cd AIec
 ./scripts/build-firecracker-guest.sh     # build the coding guest image
-agentforge doctor                        # check every prerequisite
+aiec doctor                        # check every prerequisite
 ```
 
-`agentforge doctor` validates KVM, the Firecracker binary, the guest artifact and
+`aiec doctor` validates KVM, the Firecracker binary, the guest artifact and
 its digest, the database, object storage, networking and TLS, and tells you
 exactly what is missing. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
@@ -136,8 +140,14 @@ exactly what is missing. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYME
 
 ## Documentation
 
+Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
+
 | Document | What it covers |
 |---|---|
+| [Docs](https://aiec.gobrowse.dev/docs) | Quickstart, images, sandbox lifecycle, self-hosting |
+| [Pricing](https://aiec.gobrowse.dev/pricing) | How AIec Cloud is metered and capped |
+| [Security](https://aiec.gobrowse.dev/security) | The same threat model as [`SECURITY.md`](SECURITY.md) |
+| [Status](https://aiec.gobrowse.dev/status) | Live platform status |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Architecture, and how it maps onto the DSec paper |
 | [`docs/API.md`](docs/API.md) | Every endpoint, with request and response shapes |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
@@ -150,17 +160,17 @@ exactly what is missing. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYME
 
 | Path | What it is |
 |---|---|
-| `crates/agentforge-core` | Domain model, protocols, runtime and storage traits |
-| `crates/agentforge-runtime` | Firecracker, hosted and Docker runtimes |
-| `crates/agentforge-api` | The control plane, worker service and HTTP API |
-| `crates/agentforge-storage` | PostgreSQL and S3-compatible persistence |
-| `crates/agentforge-network-linux` | TAP and nftables isolation |
-| `crates/agentforge-client` | Rust SDK |
-| `sdk/python` | Python SDK (`pip install aiec-sdk`) |
-| `guest/agentforge-guest` | The in-guest agent serving the control channel |
+| `crates/aiec-core` | Domain model, protocols, runtime and storage traits |
+| `crates/aiec-runtime` | Firecracker, hosted and Docker runtimes |
+| `crates/aiec-api` | The control plane, worker service and HTTP API |
+| `crates/aiec-storage` | PostgreSQL and S3-compatible persistence |
+| `crates/aiec-network-linux` | TAP and nftables isolation |
+| `crates/aiec-client` | Rust SDK |
+| `sdk/python` | Python SDK (`pip install agentforge-sdk`) |
+| `guest/aiec-guest` | The in-guest agent serving the control channel |
 | `web` | Website and Cloud console |
 
-The Rust crate names keep the `agentforge-` prefix: they are code identifiers that
+The Rust crate names keep the `aiec-` prefix: they are code identifiers that
 would break every consumer if renamed, and they are not the product's name.
 
 ---
@@ -168,11 +178,15 @@ would break every consumer if renamed, and they are not the product's name.
 ## Development
 
 ```bash
-cargo fmt --check
-cargo check --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+./scripts/gate.sh
 ```
+
+That runs formatting, clippy with `-D warnings`, the full test suite, and the
+documentation contract check, and it fails on any of them. The contract check is
+part of the gate because the website, this file and the SDK can otherwise drift
+apart: it fails if any documented import is not the real one (`from agentforge
+import AIec`), if a documented name is not exported, or if a sample names an
+image the API cannot resolve.
 
 ## Licence
 

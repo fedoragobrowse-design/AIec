@@ -9,7 +9,7 @@
   "use strict";
 
   const API = "/v1";
-  const TOKEN_KEY = "agentforge.session";
+  const TOKEN_KEY = "aiec.session";
 
   const $ = (selector) => document.querySelector(selector);
   const el = (tag, className, text) => {

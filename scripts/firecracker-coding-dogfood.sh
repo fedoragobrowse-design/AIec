@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# AgentForge Firecracker coding-agent dogfood (production path).
+# AIec Firecracker coding-agent dogfood (production path).
 #
-# client -> AgentForge API -> PostgreSQL scheduling/state -> HTTPS worker
+# client -> AIec API -> PostgreSQL scheduling/state -> HTTPS worker
 #   -> Firecracker -> guest -> coding workflow
 #
-# Requires: built agentforge binaries, .agentforge/bin/firecracker-v1.17.0-x86_64,
+# Requires: built aiec binaries, .aiec/bin/firecracker-v1.17.0-x86_64,
 # a kernel, a coding guest rootfs, docker services (postgres, minio), and
-# AGENTFORGE_REQUIRE_CODING_GUEST=1 so the runtime refuses a non-coding image.
+# AIEC_REQUIRE_CODING_GUEST=1 so the runtime refuses a non-coding image.
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
-OUT=${1:-"$ROOT/.agentforge/fc-coding-dogfood"}
-API_BIND=${AGENTFORGE_DOGFOOD_BIND:-127.0.0.1:19843}
-WORKER_BIND=${AGENTFORGE_DOGFOOD_WORKER_BIND:-127.0.0.1:29843}
-LEASE_TTL=${AGENTFORGE_DOGFOOD_LEASE_TTL:-900}
-CURL_MAX=${AGENTFORGE_DOGFOOD_CURL_MAX:-600}
-KEEP=${AGENTFORGE_KEEP_FAILED_TEST_STATE:-0}
-CLONE_URL=${AGENTFORGE_DOGFOOD_CLONE_URL:-https://github.com/octocat/Hello-World.git}
+OUT=${1:-"$ROOT/.aiec/fc-coding-dogfood"}
+API_BIND=${AIEC_DOGFOOD_BIND:-127.0.0.1:19843}
+WORKER_BIND=${AIEC_DOGFOOD_WORKER_BIND:-127.0.0.1:29843}
+LEASE_TTL=${AIEC_DOGFOOD_LEASE_TTL:-900}
+CURL_MAX=${AIEC_DOGFOOD_CURL_MAX:-600}
+KEEP=${AIEC_KEEP_FAILED_TEST_STATE:-0}
+CLONE_URL=${AIEC_DOGFOOD_CLONE_URL:-https://github.com/octocat/Hello-World.git}
 
 : "${DATABASE_URL:?DATABASE_URL must point at a real PostgreSQL}"
-: "${AGENTFORGE_S3_ENDPOINT:?AGENTFORGE_S3_ENDPOINT is required}"
-: "${AGENTFORGE_S3_BUCKET:?AGENTFORGE_S3_BUCKET is required}"
-: "${AGENTFORGE_S3_ACCESS_KEY_ID:?AGENTFORGE_S3_ACCESS_KEY_ID is required}"
-: "${AGENTFORGE_S3_SECRET_ACCESS_KEY:?AGENTFORGE_S3_SECRET_ACCESS_KEY is required}"
+: "${AIEC_S3_ENDPOINT:?AIEC_S3_ENDPOINT is required}"
+: "${AIEC_S3_BUCKET:?AIEC_S3_BUCKET is required}"
+: "${AIEC_S3_ACCESS_KEY_ID:?AIEC_S3_ACCESS_KEY_ID is required}"
+: "${AIEC_S3_SECRET_ACCESS_KEY:?AIEC_S3_SECRET_ACCESS_KEY is required}"
 
-FC_BIN=${AGENTFORGE_FIRECRACKER_BIN:-$ROOT/.agentforge/bin/firecracker-v1.17.0-x86_64}
-KERNEL=${AGENTFORGE_KERNEL:-$ROOT/.agentforge/images/vmlinux}
-ROOTFS=${AGENTFORGE_ROOTFS:-$ROOT/.agentforge/images/agentforge-rootfs.ext4}
-ARTIFACT_DIR=${AGENTFORGE_GUEST_ARTIFACT_DIR:-$(dirname "$ROOTFS")}
+FC_BIN=${AIEC_FIRECRACKER_BIN:-$ROOT/.aiec/bin/firecracker-v1.17.0-x86_64}
+KERNEL=${AIEC_KERNEL:-$ROOT/.aiec/images/vmlinux}
+ROOTFS=${AIEC_ROOTFS:-$ROOT/.aiec/images/aiec-rootfs.ext4}
+ARTIFACT_DIR=${AIEC_GUEST_ARTIFACT_DIR:-$(dirname "$ROOTFS")}
 
 for tool in curl openssl jq sha256sum python3; do
   command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -55,9 +55,9 @@ done
 # Reads sandbox/lease state from the backing PostgreSQL when the harness runs
 # on a host with the docker CLI; a no-op elsewhere.
 pg_state() {
-  local c=${AGENTFORGE_PG_CONTAINER:-deecopensource-postgres-1}
-  sg docker -c "docker exec $c psql -U ${PGUSER:-agentforge} -d ${PGDATABASE:-agentforge} -c \"select id, state, runtime, node_id, created_at from sandboxes order by created_at desc limit 5\"" >&2
-  sg docker -c "docker exec $c psql -U ${PGUSER:-agentforge} -d ${PGDATABASE:-agentforge} -c \"select sandbox_id, node_id, generation, status, expires_at from sandbox_leases order by created_at desc limit 5\"" >&2
+  local c=${AIEC_PG_CONTAINER:-deecopensource-postgres-1}
+  sg docker -c "docker exec $c psql -U ${PGUSER:-aiec} -d ${PGDATABASE:-aiec} -c \"select id, state, runtime, node_id, created_at from sandboxes order by created_at desc limit 5\"" >&2
+  sg docker -c "docker exec $c psql -U ${PGUSER:-aiec} -d ${PGDATABASE:-aiec} -c \"select sandbox_id, node_id, generation, status, expires_at from sandbox_leases order by created_at desc limit 5\"" >&2
 }
 worker_log() { cat "$OUT/logs/worker.log" 2>/dev/null; }
 
@@ -102,7 +102,7 @@ trap cleanup EXIT
 log "generating disposable CA and server certificates"
 openssl genrsa -out "$OUT/pki/ca.key" 2048 2>/dev/null
 openssl req -x509 -new -nodes -key "$OUT/pki/ca.key" -sha256 -days 2 \
-  -subj '/CN=AgentForge dogfood CA' -out "$OUT/pki/ca.crt" 2>/dev/null
+  -subj '/CN=AIec dogfood CA' -out "$OUT/pki/ca.crt" 2>/dev/null
 for name in api worker; do
   openssl genrsa -out "$OUT/pki/$name.key" 2048 2>/dev/null
   openssl req -new -key "$OUT/pki/$name.key" -subj "/CN=$name" -out "$OUT/pki/$name.csr" 2>/dev/null
@@ -125,20 +125,20 @@ ARTIFACT_SUMMARY=$(python3 scripts/guest_artifact_report.py "$ARTIFACT_DIR" 2>&1
 printf '%s\n' "$ARTIFACT_SUMMARY"
 
 # ------------------------------------------------------------- binaries
-log "building agentforge binaries"
+log "building aiec binaries"
 # Build into a container-local target directory: a bind-mounted host target/ would
 # reuse host-linked artifacts that do not run against the container libc.
-export CARGO_TARGET_DIR=${AGENTFORGE_TARGET_DIR:-$ROOT/.agentforge/acceptance-target}
+export CARGO_TARGET_DIR=${AIEC_TARGET_DIR:-$ROOT/.aiec/acceptance-target}
 # sqlx::migrate! embeds migrations/ at compile time but Cargo does not track
 # that directory's contents, so a new migration is invisible to a cached build.
 # Touch the crate root whenever migrations/ is newer than the storage crate.
-if [ -n "$(find migrations -name '*.sql' -newer crates/agentforge-storage/src/lib.rs -print -quit 2>/dev/null)" ]; then
-  touch crates/agentforge-storage/src/lib.rs
+if [ -n "$(find migrations -name '*.sql' -newer crates/aiec-storage/src/lib.rs -print -quit 2>/dev/null)" ]; then
+  touch crates/aiec-storage/src/lib.rs
 fi
 # Release builds: the guest image digest is verified before a guest is
 # booted, and an unoptimized SHA-256 over a multi-gigabyte rootfs is slow enough
 # to blow the control plane's client timeout on the create path.
-cargo build -q --release -p agentforge-api --bin agentforge-server -p agentforge-cli --bin agentforge
+cargo build -q --release -p aiec-api --bin aiec-server -p aiec-cli --bin aiec
 
 # ------------------------------------------------------------ environment
 API_KEY="af_live_$(openssl rand -hex 24)"
@@ -150,7 +150,7 @@ ROOTFS_SHA=$(sha256sum "$ROOTFS" | cut -d' ' -f1)
 python3 - "$OUT/guest-manifest.json" "$MANIFEST_SECRET" "$ROOTFS_SHA" <<'PY'
 import hashlib, hmac, json, sys
 out, secret, digest = sys.argv[1], sys.argv[2], sys.argv[3]
-reference = "agentforge:latest"
+reference = "aiec:latest"
 payload = reference.encode() + b"\0" + digest.encode()
 json.dump(
     {
@@ -162,33 +162,33 @@ json.dump(
 )
 PY
 
-export AGENTFORGE_TENANT_ID="$TENANT_ID"
-export AGENTFORGE_TENANT_NAME=dogfood
-export AGENTFORGE_API_KEY="$API_KEY"
-export AGENTFORGE_WORKER_TOKEN="$WORKER_TOKEN"
-export AGENTFORGE_BIND="$API_BIND"
-export AGENTFORGE_RUNTIMES=firecracker
-export AGENTFORGE_LEASE_TTL_SECONDS="$LEASE_TTL"
-export AGENTFORGE_TLS_CERT_FILE="$OUT/pki/api.crt"
-export AGENTFORGE_TLS_KEY_FILE="$OUT/pki/api.key"
-export AGENTFORGE_TLS_CA_CERT="$OUT/pki/ca.crt"
-export AGENTFORGE_IMAGE_MANIFEST="$OUT/guest-manifest.json"
-export AGENTFORGE_IMAGE_MANIFEST_SECRET="$MANIFEST_SECRET"
-export AGENTFORGE_FIRECRACKER_BIN="$FC_BIN"
-export AGENTFORGE_KERNEL="$KERNEL"
-export AGENTFORGE_ROOTFS="$ROOTFS"
-export AGENTFORGE_GUEST_ARTIFACT_DIR="$ARTIFACT_DIR"
-export AGENTFORGE_REQUIRE_CODING_GUEST=1
-export AGENTFORGE_GUEST_SECRET=${AGENTFORGE_GUEST_SECRET:-$(openssl rand -hex 32)}
-export AGENTFORGE_STATE_DIR="$OUT/state"
-export AGENTFORGE_S3_ENDPOINT AGENTFORGE_S3_REGION AGENTFORGE_S3_BUCKET
-export AGENTFORGE_S3_ACCESS_KEY_ID AGENTFORGE_S3_SECRET_ACCESS_KEY
+export AIEC_TENANT_ID="$TENANT_ID"
+export AIEC_TENANT_NAME=dogfood
+export AIEC_API_KEY="$API_KEY"
+export AIEC_WORKER_TOKEN="$WORKER_TOKEN"
+export AIEC_BIND="$API_BIND"
+export AIEC_RUNTIMES=firecracker
+export AIEC_LEASE_TTL_SECONDS="$LEASE_TTL"
+export AIEC_TLS_CERT_FILE="$OUT/pki/api.crt"
+export AIEC_TLS_KEY_FILE="$OUT/pki/api.key"
+export AIEC_TLS_CA_CERT="$OUT/pki/ca.crt"
+export AIEC_IMAGE_MANIFEST="$OUT/guest-manifest.json"
+export AIEC_IMAGE_MANIFEST_SECRET="$MANIFEST_SECRET"
+export AIEC_FIRECRACKER_BIN="$FC_BIN"
+export AIEC_KERNEL="$KERNEL"
+export AIEC_ROOTFS="$ROOTFS"
+export AIEC_GUEST_ARTIFACT_DIR="$ARTIFACT_DIR"
+export AIEC_REQUIRE_CODING_GUEST=1
+export AIEC_GUEST_SECRET=${AIEC_GUEST_SECRET:-$(openssl rand -hex 32)}
+export AIEC_STATE_DIR="$OUT/state"
+export AIEC_S3_ENDPOINT AIEC_S3_REGION AIEC_S3_BUCKET
+export AIEC_S3_ACCESS_KEY_ID AIEC_S3_SECRET_ACCESS_KEY
 export RUST_LOG=${RUST_LOG:-info}
 API_BASE="https://$API_BIND"
 
 # ------------------------------------------------------------------ API
-log "starting AgentForge API on $API_BASE"
-"$CARGO_TARGET_DIR"/release/agentforge-server >"$OUT/logs/api.log" 2>&1 &
+log "starting AIec API on $API_BASE"
+"$CARGO_TARGET_DIR"/release/aiec-server >"$OUT/logs/api.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 90); do
   curl --cacert "$OUT/pki/ca.crt" -fsS "$API_BASE/health" >/dev/null 2>&1 && break
@@ -199,7 +199,7 @@ curl --cacert "$OUT/pki/ca.crt" -fsS "$API_BASE/health" >/dev/null 2>&1 \
 
 # ---------------------------------------------------------------- worker
 log "starting Firecracker worker $NODE_ID on $WORKER_BIND"
-"$CARGO_TARGET_DIR"/release/agentforge \
+"$CARGO_TARGET_DIR"/release/aiec \
   --url "$API_BASE" worker \
   --runtime firecracker \
   --name "fc-dogfood-$NODE_ID" \
@@ -207,7 +207,7 @@ log "starting Firecracker worker $NODE_ID on $WORKER_BIND"
   --state-dir "$OUT/state/worker" \
   --bind "$WORKER_BIND" \
   --advertise-url "https://$WORKER_BIND" \
-  --capacity "${AGENTFORGE_DOGFOOD_CAPACITY:-4}" >"$OUT/logs/worker.log" 2>&1 &
+  --capacity "${AIEC_DOGFOOD_CAPACITY:-4}" >"$OUT/logs/worker.log" 2>&1 &
 WORKER_PID=$!
 for _ in $(seq 1 90); do
   code=$(curl --cacert "$OUT/pki/ca.crt" -sS -o /dev/null -w '%{http_code}' \
@@ -224,7 +224,7 @@ stage() { printf '\n== %s\n' "$*"; }
 # -------------------------------------------------------------- create
 stage "creating Firecracker sandbox (network enabled for the HTTPS clone)"
 CREATE=$(api -X POST -H 'content-type: application/json' -d '{
-  "image": "agentforge:latest",
+  "image": "aiec:latest",
   "cpu": 2,
   "memory_mb": 1024,
   "disk_mb": 2048,
@@ -283,14 +283,14 @@ printf '%s\n' "$LIST"
 # ---------------------------------------------- edit + validation + diff
 stage "editing a tracked file inside the guest and running real validation"
 EDIT=$(api -X POST -H 'content-type: application/json' \
-  -d '{"command":["/bin/sh","-c","cd /workspace/repo && printf \"\\nAgentForge dogfood edit\\n\" >> README && cat README"]}' \
+  -d '{"command":["/bin/sh","-c","cd /workspace/repo && printf \"\\nAIec dogfood edit\\n\" >> README && cat README"]}' \
   "$API_BASE/v1/sandboxes/$SANDBOX_ID/exec")
 printf '%s\n' "$EDIT"
-printf '%s' "$EDIT" | jq -e '.stdout | test("AgentForge dogfood edit")' >/dev/null \
+printf '%s' "$EDIT" | jq -e '.stdout | test("AIec dogfood edit")' >/dev/null \
   || fail "in-guest edit did not land"
 
 VALIDATE=$(api -X POST -H 'content-type: application/json' \
-  -d '{"command":["/bin/sh","-c","cd /workspace/repo && test -s README && grep -q \"AgentForge dogfood edit\" README && git diff --check && echo VALIDATION_OK"]}' \
+  -d '{"command":["/bin/sh","-c","cd /workspace/repo && test -s README && grep -q \"AIec dogfood edit\" README && git diff --check && echo VALIDATION_OK"]}' \
   "$API_BASE/v1/sandboxes/$SANDBOX_ID/exec")
 printf '%s\n' "$VALIDATE"
 printf '%s' "$VALIDATE" | jq -e '.stdout | test("VALIDATION_OK")' >/dev/null \
@@ -301,18 +301,18 @@ DIFF=$(api -X POST -H 'content-type: application/json' \
   "$API_BASE/v1/sandboxes/$SANDBOX_ID/exec")
 printf '%s\n' "$DIFF"
 DIFF_TEXT=$(printf '%s' "$DIFF" | jq -r '.stdout')
-printf '%s' "$DIFF_TEXT" | grep -q '^+.*AgentForge dogfood edit' \
+printf '%s' "$DIFF_TEXT" | grep -q '^+.*AIec dogfood edit' \
   || fail "retrieved git diff does not prove the in-guest edit"
-printf '%s' "$DIFF_TEXT" | grep -q '^-.*AgentForge dogfood edit' \
+printf '%s' "$DIFF_TEXT" | grep -q '^-.*AIec dogfood edit' \
   && fail "diff shows the edit as a deletion"
 git --version >/dev/null 2>&1 || true
 printf '%s\n' "$DIFF_TEXT" | grep -q '^\+\+\+ b/README' || fail "diff is not a README modification"
 
 # ---------------------------------------- diff also through the file API
-stage "retrieving the edited file through the AgentForge file API"
+stage "retrieving the edited file through the AIec file API"
 FILE=$(api "$API_BASE/v1/sandboxes/$SANDBOX_ID/files/content?path=/workspace/repo/README")
 printf '%s\n' "$FILE"
-printf '%s' "$FILE" | jq -r '.content_base64' | base64 -d | grep -q 'AgentForge dogfood edit' \
+printf '%s' "$FILE" | jq -r '.content_base64' | base64 -d | grep -q 'AIec dogfood edit' \
   || fail "file API did not return the edited file content"
 
 # ------------------------------------------------------------ destroy
@@ -324,7 +324,7 @@ SANDBOX_ID=''
 sleep 2
 pgrep -f "api-sock $OUT" >/dev/null 2>&1 && fail "a Firecracker process survived destroy"
 if [ "${HAVE_DOCKER:-0}" = 1 ]; then
-  left=$(sg docker -c "docker ps -q --filter label=com.agentforge.managed=true" | wc -l)
+  left=$(sg docker -c "docker ps -q --filter label=com.aiec.managed=true" | wc -l)
   [ "$left" -eq 0 ] || fail "managed containers remain after destroy: $left"
 fi
 leftover_taps=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l)
@@ -332,7 +332,7 @@ leftover_taps=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}'
 
 cat <<EOF
 
-AgentForge Firecracker coding-agent dogfood: PASS
+AIec Firecracker coding-agent dogfood: PASS
 sandbox:          $SANDBOX_ID
 worker placement: $PLACED_NODE
 git version:      $GIT_VERSION

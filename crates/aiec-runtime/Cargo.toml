@@ -1,0 +1,26 @@
+[package]
+name = "aiec-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bollard.workspace = true
+aiec-core.workspace = true
+aiec-network-linux = { path = "../aiec-network-linux" }
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tar.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true

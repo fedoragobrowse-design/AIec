@@ -39,7 +39,7 @@ Implement the traits required by the product, then pass `Arc<dyn Trait>` values 
 Run it with:
 
 ```bash
-cargo run -p agentforge-api --example custom_core_platform
+cargo run -p aiec-api --example custom_core_platform
 ```
 
 ## Compatibility and versioning

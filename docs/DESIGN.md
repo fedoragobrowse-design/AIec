@@ -28,7 +28,7 @@ sandbox runtime. Two consequences shape AIec:
 
 | DSec mechanism | AIec implementation |
 |---|---|
-| Unified SDK across FnCall / container / microVM / full-VM backends | `SandboxRuntime` in `crates/agentforge-core/src/runtime.rs`, implemented by Firecracker, the hosted E2B adapter, and Docker |
+| Unified SDK across FnCall / container / microVM / full-VM backends | `SandboxRuntime` in `crates/aiec-core/src/runtime.rs`, implemented by Firecracker, the hosted E2B adapter, and Docker |
 | Heterogeneous, capability-aware placement | `RuntimeCapabilities` advertised per worker, persisted, and matched by the scheduler before placement |
 | Bursty arrival and resource admission | Per-tenant quotas enforced inside the placement transaction, per-tenant rate limiting, and a global execution budget |
 | Sandbox lifecycle with recoverable state | Leased ownership with a monotonic fencing generation; workspace archives in shared object storage, restored on a new owner |

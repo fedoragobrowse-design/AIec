@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${AGENTFORGE_API_KEY:?set AGENTFORGE_API_KEY}"
-base="${AGENTFORGE_URL:-http://127.0.0.1:8080}"
-auth=(-H "Authorization: Bearer $AGENTFORGE_API_KEY" -H 'Content-Type: application/json')
+: "${AIEC_API_KEY:?set AIEC_API_KEY}"
+base="${AIEC_URL:-http://127.0.0.1:8080}"
+auth=(-H "Authorization: Bearer $AIEC_API_KEY" -H 'Content-Type: application/json')
 create=$(curl -fsS "${auth[@]}" -X POST "$base/v1/sandboxes" -d '{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300,"network":{"enabled":false}}')
 id=$(jq -r .id <<<"$create")
 test "$id" != null
@@ -16,4 +16,4 @@ restored=$(curl -fsS "${auth[@]}" -X POST "$base/v1/snapshots/$snapshot_id/resto
 restored_id=$(jq -r .id <<<"$restored")
 curl -fsS "${auth[@]}" -X DELETE "$base/v1/sandboxes/$restored_id" | jq -e '.status == "destroyed"'
 curl -fsS "${auth[@]}" -X DELETE "$base/v1/sandboxes/$id" | jq -e '.status == "destroyed"'
-printf 'AgentForge smoke test passed for sandbox %s\n' "$id"
+printf 'AIec smoke test passed for sandbox %s\n' "$id"

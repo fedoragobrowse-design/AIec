@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Builds the AgentForge Firecracker guest root filesystem from a pinned Debian
+# Builds the AIec Firecracker guest root filesystem from a pinned Debian
 # base image and records the verified artifact description in
 # guest-capabilities.json. See docs/FIRECRACKER_GUEST.md.
 #
 # Env contract:
-#   AGENTFORGE_GUEST_SECRET        required, at least 32 bytes, baked into the rootfs
-#   AGENTFORGE_KERNEL              uncompressed kernel (default .agentforge/images/vmlinux)
-#   AGENTFORGE_GUEST_BASE_IMAGE    default debian:bookworm-slim
-#   AGENTFORGE_GUEST_ROOTFS_SIZE   default 4G
-# Positional arg 1 is the output directory (default .agentforge/images).
+#   AIEC_GUEST_SECRET        required, at least 32 bytes, baked into the rootfs
+#   AIEC_KERNEL              uncompressed kernel (default .aiec/images/vmlinux)
+#   AIEC_GUEST_BASE_IMAGE    default debian:bookworm-slim
+#   AIEC_GUEST_ROOTFS_SIZE   default 4G
+# Positional arg 1 is the output directory (default .aiec/images).
 # Exit code 2 means the rootfs was built but no kernel was found.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT=${1:-"$ROOT/.agentforge/images"}
-SECRET=${AGENTFORGE_GUEST_SECRET:?set AGENTFORGE_GUEST_SECRET to at least 32 random bytes}
+OUT=${1:-"$ROOT/.aiec/images"}
+SECRET=${AIEC_GUEST_SECRET:?set AIEC_GUEST_SECRET to at least 32 random bytes}
 if [ "${#SECRET}" -lt 32 ]; then
-  echo "AGENTFORGE_GUEST_SECRET must contain at least 32 bytes" >&2
+  echo "AIEC_GUEST_SECRET must contain at least 32 bytes" >&2
   exit 1
 fi
-BASE_IMAGE=${AGENTFORGE_GUEST_BASE_IMAGE:-debian:bookworm-slim}
-KERNEL=${AGENTFORGE_KERNEL:-$ROOT/.agentforge/images/vmlinux}
-ROOTFS_SIZE=${AGENTFORGE_GUEST_ROOTFS_SIZE:-4G}
+BASE_IMAGE=${AIEC_GUEST_BASE_IMAGE:-debian:bookworm-slim}
+KERNEL=${AIEC_KERNEL:-$ROOT/.aiec/images/vmlinux}
+ROOTFS_SIZE=${AIEC_GUEST_ROOTFS_SIZE:-4G}
 for cmd in cargo mke2fs e2fsck resize2fs tar sha256sum awk date; do command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 1; }; done
 
 step() { printf '==> %s\n' "$*"; }
@@ -59,16 +59,16 @@ trap cleanup EXIT
 mkdir -p "$OUT"
 
 # ------------------------------------------------------- guest agent build --
-GUEST_CARGO="$ROOT/guest/agentforge-guest/Cargo.toml"
+GUEST_CARGO="$ROOT/guest/aiec-guest/Cargo.toml"
 if grep -qE '^[[:space:]]*version\.workspace[[:space:]]*=[[:space:]]*true' "$GUEST_CARGO"; then
   GUEST_AGENT_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$ROOT/Cargo.toml")
 else
   GUEST_AGENT_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$GUEST_CARGO")
 fi
-[ -n "$GUEST_AGENT_VERSION" ] || fail "could not read the agentforge-guest version from $GUEST_CARGO"
-step "building agentforge-guest $GUEST_AGENT_VERSION (musl)"
-cargo build --release -p agentforge-guest --target x86_64-unknown-linux-musl
-[ -x "$ROOT/target/x86_64-unknown-linux-musl/release/agentforge-guest" ] || fail "guest agent binary was not produced"
+[ -n "$GUEST_AGENT_VERSION" ] || fail "could not read the aiec-guest version from $GUEST_CARGO"
+step "building aiec-guest $GUEST_AGENT_VERSION (musl)"
+cargo build --release -p aiec-guest --target x86_64-unknown-linux-musl
+[ -x "$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest" ] || fail "guest agent binary was not produced"
 
 # ------------------------------------------------------------ base image ----
 if ! docker_cmd pull "$BASE_IMAGE" >/dev/null 2>&1; then
@@ -84,7 +84,7 @@ fi
 step "base image: $BASE_DIGEST"
 
 # ------------------------------------------------- provision the container --
-CONTAINER="agentforge-guest-build-$$"
+CONTAINER="aiec-guest-build-$$"
 docker_cmd rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker_cmd run -d --name "$CONTAINER" "$BASE_IMAGE" sleep infinity >/dev/null
 step "installing guest packages in $CONTAINER"
@@ -142,12 +142,12 @@ find "$TMP/rootfs/dev" -mindepth 1 ! -type d -delete 2>/dev/null || true
 rm -f "$TMP/rootfs/etc/resolv.conf"
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$TMP/rootfs/etc/resolv.conf"
 mkdir -p "$TMP/rootfs/usr/local/bin" "$TMP/rootfs/workspace" "$TMP/rootfs/proc" "$TMP/rootfs/sys" "$TMP/rootfs/dev" "$TMP/rootfs/run" "$TMP/rootfs/dev/pts"
-install -m 0755 "$ROOT/target/x86_64-unknown-linux-musl/release/agentforge-guest" "$TMP/rootfs/usr/local/bin/agentforge-guest"
-printf '%s' "$SECRET" > "$TMP/rootfs/etc/agentforge-guest-secret"
-chmod 0600 "$TMP/rootfs/etc/agentforge-guest-secret"
+install -m 0755 "$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest" "$TMP/rootfs/usr/local/bin/aiec-guest"
+printf '%s' "$SECRET" > "$TMP/rootfs/etc/aiec-guest-secret"
+chmod 0600 "$TMP/rootfs/etc/aiec-guest-secret"
 ln -sf /sbin/init "$TMP/rootfs/init"
 
-ROOTFS="$OUT/agentforge-rootfs.ext4"
+ROOTFS="$OUT/aiec-rootfs.ext4"
 rm -f "$ROOTFS"
 truncate -s "$ROOTFS_SIZE" "$ROOTFS"
 step "building $ROOTFS ($(du -h "$ROOTFS" | cut -f1))"
@@ -173,7 +173,7 @@ fi
 
 if [ ! -f "$KERNEL" ]; then
   echo "guest image built at $ROOTFS"
-  echo "kernel not built: set AGENTFORGE_KERNEL to an uncompressed Linux kernel or bzImage with virtio, vsock and ext4 support"
+  echo "kernel not built: set AIEC_KERNEL to an uncompressed Linux kernel or bzImage with virtio, vsock and ext4 support"
   exit 2
 fi
 sha256sum "$ROOTFS" "$KERNEL" > "$OUT/SHA256SUMS"

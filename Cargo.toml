@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-  "crates/agentforge-core",
-  "crates/agentforge-storage",
-  "crates/agentforge-runtime",
-  "crates/agentforge-network-linux",
-  "crates/agentforge-api",
-  "crates/agentforge-client",
-  "crates/agentforge-cli",
-  "guest/agentforge-guest",
+  "crates/aiec-core",
+  "crates/aiec-storage",
+  "crates/aiec-runtime",
+  "crates/aiec-network-linux",
+  "crates/aiec-api",
+  "crates/aiec-client",
+  "crates/aiec-cli",
+  "guest/aiec-guest",
 ]
 
 [workspace.package]
@@ -18,12 +18,12 @@ license = "Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
-agentforge-core = { path = "crates/agentforge-core" }
-agentforge-storage = { path = "crates/agentforge-storage" }
-agentforge-runtime = { path = "crates/agentforge-runtime" }
-agentforge-network-linux = { path = "crates/agentforge-network-linux" }
-agentforge-client = { path = "crates/agentforge-client" }
-agentforge-api = { path = "crates/agentforge-api" }
+aiec-core = { path = "crates/aiec-core" }
+aiec-storage = { path = "crates/aiec-storage" }
+aiec-runtime = { path = "crates/aiec-runtime" }
+aiec-network-linux = { path = "crates/aiec-network-linux" }
+aiec-client = { path = "crates/aiec-client" }
+aiec-api = { path = "crates/aiec-api" }
 bollard = "0.21.1"
 anyhow = "1.0"
 tar = "0.4"

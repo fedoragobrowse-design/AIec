@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a short, verifiable summary of an AgentForge Firecracker guest artifact.
+"""Print a short, verifiable summary of an AIec Firecracker guest artifact.
 
 Used by scripts/firecracker-coding-dogfood.sh before booting a VM so a broken
 or non-coding image fails fast with a precise message instead of producing a
@@ -51,7 +51,7 @@ def main() -> int:
             fail(f"{metadata_path} is missing required key {key!r}")
 
     rootfs = Path(sys.argv[2]) if len(sys.argv) > 2 else directory / metadata.get(
-        "rootfs", "agentforge-rootfs.ext4"
+        "rootfs", "aiec-rootfs.ext4"
     )
     if not rootfs.is_file():
         fail(f"missing rootfs image {rootfs}")

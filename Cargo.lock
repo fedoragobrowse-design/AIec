@@ -3,13 +3,22 @@
 version = 4
 
 [[package]]
-name = "agentforge-api"
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "aiec-api"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
- "agentforge-network-linux",
- "agentforge-runtime",
- "agentforge-storage",
+ "aiec-core",
+ "aiec-network-linux",
+ "aiec-runtime",
+ "aiec-storage",
  "async-trait",
  "axum",
  "axum-server",
@@ -37,14 +46,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-cli"
+name = "aiec-cli"
 version = "0.1.0"
 dependencies = [
- "agentforge-api",
- "agentforge-client",
- "agentforge-core",
- "agentforge-runtime",
- "agentforge-storage",
+ "aiec-api",
+ "aiec-client",
+ "aiec-core",
+ "aiec-runtime",
+ "aiec-storage",
  "anyhow",
  "base64",
  "chrono",
@@ -59,10 +68,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-client"
+name = "aiec-client"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
+ "aiec-core",
  "chrono",
  "reqwest",
  "serde",
@@ -72,7 +81,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-core"
+name = "aiec-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -90,10 +99,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-guest"
+name = "aiec-guest"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
+ "aiec-core",
  "base64",
  "libc",
  "serde",
@@ -103,10 +112,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-network-linux"
+name = "aiec-network-linux"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
+ "aiec-core",
  "async-trait",
  "chrono",
  "tokio",
@@ -114,11 +123,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-runtime"
+name = "aiec-runtime"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
- "agentforge-network-linux",
+ "aiec-core",
+ "aiec-network-linux",
  "async-trait",
  "base64",
  "bollard",
@@ -139,10 +148,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentforge-storage"
+name = "aiec-storage"
 version = "0.1.0"
 dependencies = [
- "agentforge-core",
+ "aiec-core",
  "async-trait",
  "base64",
  "bytes",
@@ -157,15 +166,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "aho-corasick"
-version = "1.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
-dependencies = [
- "memchr",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ command -v nft >/dev/null || { echo "nft is required" >&2; exit 1; }
 command -v ip >/dev/null || { echo "iproute2 is required" >&2; exit 1; }
 
 NS=af-iso-$$
-TABLE=agentforge_isolation_probe
+TABLE=aiec_isolation_probe
 TAP=afprobe0
 HOST_VETH=afprobe-host
 NET=172.30.250.0/30
@@ -43,16 +43,16 @@ log() { printf '\n== %s\n' "$*"; }
 
 # 1. Render the exact ruleset the runtime would load.
 log "1. render the runtime ruleset"
-BIN=target/debug/agentforge-network-linux-probe
+BIN=target/debug/aiec-network-linux-probe
 if [ ! -x "$BIN" ]; then
-  cargo build -q -p agentforge-network-linux 2>/dev/null || true
+  cargo build -q -p aiec-network-linux 2>/dev/null || true
 fi
-if ! cargo run -q -p agentforge-network-linux --example render-rules -- "$TABLE" "$TAP" "$SUBNET" > "$TMP/rules.nft" 2>/dev/null; then
+if ! cargo run -q -p aiec-network-linux --example render-rules -- "$TABLE" "$TAP" "$SUBNET" > "$TMP/rules.nft" 2>/dev/null; then
   # No dedicated example: fall back to asserting the template's content, which is
   # what the runtime actually loads.
-  grep -q 'fn firewall_rules' crates/agentforge-network-linux/src/lib.rs \
+  grep -q 'fn firewall_rules' crates/aiec-network-linux/src/lib.rs \
     || { bad "could not locate the network ruleset"; exit 1; }
-  rules=$(sed -n '/fn firewall_rules/,/^}/p' crates/agentforge-network-linux/src/lib.rs)
+  rules=$(sed -n '/fn firewall_rules/,/^}/p' crates/aiec-network-linux/src/lib.rs)
   {
     echo "add table inet $TABLE;"
     echo "add chain inet $TABLE input { type filter hook input priority -10; policy accept; };"

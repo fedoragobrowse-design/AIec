@@ -1,5 +1,3 @@
 advisors:
   - name: default
     model: opencode-zen/space-bunny-free
-  - name: Advisor 2
-    model: openai-codex/gpt-6-sol

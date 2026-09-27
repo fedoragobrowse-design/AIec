@@ -20,12 +20,12 @@ infrastructure of your own.</p>
 
 af = AIec(api_key="af_live_...")   # defaults to https://api.aiec.gobrowse.dev
 
-box = af.sandboxes.create(image="python:3.13")
+box = af.sandboxes.create(image="aiec-coding:latest")
 print(box.exec(["python", "-c", "print('hello from AIec')"])["stdout"])
 box.destroy()</code></pre>
 <p>If you are self-hosting, pass your own endpoint instead:</p>
 <pre><code>af = AIec(
-    base_url="https://agentforge.example.com",
+    base_url="https://aiec.example.com",
     api_key="af_live_...",
 )</code></pre>
 
@@ -79,7 +79,7 @@ escapes are rejected by the guest agent, not by the caller.</p>
   newest complete snapshot on the new owner.
 </p>
 <pre><code>snap = box.snapshot()
-box2 = af.sandboxes.create(image="agentforge:latest")
+box2 = af.sandboxes.create(image="aiec-coding:latest")
 box2.restore(snap)</code></pre>
 <div class="note">
   <p>
@@ -109,7 +109,7 @@ box2.restore(snap)</code></pre>
   <tr><td>429</td><td><code>rate_limited</code></td><td>Too many requests; see <code>Retry-After</code></td></tr>
   <tr><td>503</td><td><code>backend_unavailable</code></td><td>No capacity or a dependency is down</td></tr>
 </table>
-<p>The Python SDK raises <code>AgentForgeError</code> with <code>code</code>,
+<p>The Python SDK raises <code>AIecError</code> with <code>code</code>,
 <code>request_id</code> and <code>retry_after</code> populated. Quote the
 <code>request_id</code> in a support report — it correlates with the server logs.</p>
 
@@ -126,15 +126,15 @@ cd AIec
 docker compose up -d postgres minio
 ./scripts/build-firecracker-guest.sh
 
-export DATABASE_URL='postgresql://agentforge:...@127.0.0.1:5432/agentforge'
-export AGENTFORGE_S3_ENDPOINT='http://127.0.0.1:9000'
-export AGENTFORGE_S3_BUCKET='agentforge'
+export DATABASE_URL='postgresql://aiec:...@127.0.0.1:5432/aiec'
+export AIEC_S3_ENDPOINT='http://127.0.0.1:9000'
+export AIEC_S3_BUCKET='aiec'
 # ... TLS paths ...
 
-agentforge doctor      # validates every prerequisite, with actionable errors
-agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
+aiec doctor      # validates every prerequisite, with actionable errors
+aiec --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
 <p>
-  <code>agentforge doctor</code> checks KVM, the Firecracker binary, the guest
+  <code>aiec doctor</code> checks KVM, the Firecracker binary, the guest
   artifact and its digest, the database, object storage, networking tooling and
   TLS, and tells you precisely what is missing rather than failing later.
 </p>
@@ -173,6 +173,6 @@ agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
 <table class="kv">
   <tr><th>Language</th><th>Install</th><th>Import</th></tr>
   <tr><td>Python</td><td><code>pip install agentforge-sdk</code></td><td><code>from agentforge import AIec</code></td></tr>
-  <tr><td>Rust</td><td><code>cargo add agentforge-client</code></td><td><code>use agentforge_client::AgentForgeClient</code></td></tr>
+  <tr><td>Rust</td><td><code>cargo add aiec-client</code></td><td><code>use aiec_client::AIecClient</code></td></tr>
   <tr><td>HTTP</td><td>—</td><td><code>curl</code> / any HTTP client</td></tr>
 </table>

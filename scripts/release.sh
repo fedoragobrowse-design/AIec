@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Produce a tagged AgentForge public-alpha release.
+# Produce a tagged AIec public-alpha release.
 #
 # Builds the server, worker and CLI, records the guest artifact metadata, runs
 # the static gates, and writes release notes. It refuses to publish anything that
@@ -9,7 +9,7 @@ set -Eeuo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 
-VERSION=${1:-${AGENTFORGE_RELEASE_TAG:-}}
+VERSION=${1:-${AIEC_RELEASE_TAG:-}}
 if [ -z "$VERSION" ]; then
   echo "usage: release.sh <tag>   (for example v0.2.0-alpha.1)" >&2
   exit 2
@@ -30,25 +30,25 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 git diff --check
 
 log "build release binaries"
-cargo build --release -p agentforge-api --bin agentforge-server -p agentforge-cli --bin agentforge
-install -m 0755 target/release/agentforge-server "$DIST/agentforge-server"
-install -m 0755 target/release/agentforge "$DIST/agentforge"
+cargo build --release -p aiec-api --bin aiec-server -p aiec-cli --bin aiec
+install -m 0755 target/release/aiec-server "$DIST/aiec-server"
+install -m 0755 target/release/aiec "$DIST/aiec"
 # The worker is the same binary as the CLI, invoked with the worker subcommand;
 # a named copy makes the artifact self-describing.
-install -m 0755 target/release/agentforge "$DIST/agentforge-worker"
+install -m 0755 target/release/aiec "$DIST/aiec-worker"
 
 log "guest artifact metadata"
-if [ -f .agentforge/images/guest-capabilities.json ]; then
-  cp .agentforge/images/guest-capabilities.json "$DIST/guest-capabilities.json"
-  sha256sum .agentforge/images/agentforge-rootfs.ext4 > "$DIST/guest-rootfs.sha256" 2>/dev/null || true
-  log "guest: $(python3 -c 'import json;d=json.load(open(".agentforge/images/guest-capabilities.json"));print(d.get("base"),d.get("git_version"))' 2>/dev/null || echo unknown)"
+if [ -f .aiec/images/guest-capabilities.json ]; then
+  cp .aiec/images/guest-capabilities.json "$DIST/guest-capabilities.json"
+  sha256sum .aiec/images/aiec-rootfs.ext4 > "$DIST/guest-rootfs.sha256" 2>/dev/null || true
+  log "guest: $(python3 -c 'import json;d=json.load(open(".aiec/images/guest-capabilities.json"));print(d.get("base"),d.get("git_version"))' 2>/dev/null || echo unknown)"
 else
   echo "no guest artifact metadata present; the Firecracker guest image has not been built" >&2
 fi
 
 log "release notes"
 cat > "$DIST/RELEASE_NOTES.md" <<EOF
-# AgentForge $VERSION
+# AIec $VERSION
 
 Public alpha. Invite-only, limited capacity, no SLA.
 
@@ -58,7 +58,7 @@ Public alpha. Invite-only, limited capacity, no SLA.
 - Tenant self-service for API keys, with scope escalation refused.
 - Cloud console for keys, sandboxes, usage and service health.
 - Hosted Firecracker execution behind the existing runtime abstraction, with
-  AgentForge keeping ownership of every public sandbox identifier.
+  AIec keeping ownership of every public sandbox identifier.
 - Public workloads are restricted to microVM isolation.
 - Append-only security audit log, worker drain, and a global execution budget.
 - Per-tenant rate limiting with Retry-After.
@@ -66,9 +66,9 @@ Public alpha. Invite-only, limited capacity, no SLA.
 ## Known limitations
 
 - Invite-only signup, single region, no SLA.
-- Hosted capacity is provided by a third party; AgentForge's own native Firecracker
+- Hosted capacity is provided by a third party; AIec's own native Firecracker
   runtime is complete and is what self-hosted deployments run, but the hosted
-  fleet is not AgentForge-operated hardware.
+  fleet is not AIec-operated hardware.
 - Multi-host (separate control and worker machines) is not yet validated.
 - Snapshots preserve the workspace filesystem, not running VM memory.
 - Public API stability is not guaranteed before 1.0.

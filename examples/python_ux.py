@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Minimal AIec API UX example.
 
-Set AGENTFORGE_API_KEY and optionally AGENTFORGE_URL before running.
+Set AIEC_API_KEY and optionally AIEC_URL before running.
 The example intentionally uses urllib so it has no third-party dependencies.
 """
 import base64, json, os, urllib.request
 
-BASE = os.getenv("AGENTFORGE_URL", "http://127.0.0.1:8080").rstrip("/")
-KEY = os.environ["AGENTFORGE_API_KEY"]
+BASE = os.getenv("AIEC_URL", "http://127.0.0.1:8080").rstrip("/")
+KEY = os.environ["AIEC_API_KEY"]
 
 def call(method, path, body=None):
     payload = None if body is None else json.dumps(body).encode()

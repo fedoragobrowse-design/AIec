@@ -49,7 +49,7 @@
 
 af = AIec(api_key="af_live_...")
 
-box = af.sandboxes.create(image="python:3.13")
+box = af.sandboxes.create(image="aiec-coding:latest")
 box.exec(["python", "-c", "print('hello from AIec')"])
 box.destroy()</code></pre>
 <p>

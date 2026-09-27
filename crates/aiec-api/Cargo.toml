@@ -1,0 +1,47 @@
+[package]
+name = "aiec-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "aiec_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aiec-server"
+path = "src/main.rs"
+
+[dependencies]
+aiec-core.workspace = true
+aiec-runtime.workspace = true
+aiec-storage.workspace = true
+aiec-network-linux.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+rustls.workspace = true
+chrono.workspace = true
+clap.workspace = true
+http.workspace = true
+metrics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+sqlx.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+futures.workspace = true
+parking_lot = "0.12"
+tower = { version = "0.5", features = ["util"] }

@@ -1,5 +1,5 @@
 #!/bin/sh
-# PID 1 for the AgentForge Firecracker guest (Debian bookworm-slim rootfs).
+# PID 1 for the AIec Firecracker guest (Debian bookworm-slim rootfs).
 #
 # The guest address, gateway and DNS server come from the Firecracker boot
 # cmdline (the kernel does IP autoconfiguration); this script only brings up
@@ -14,7 +14,7 @@ log() {
   if [ -w /dev/console ]; then
     printf '%s\n' "$*" >/dev/console 2>/dev/null || true
   fi
-  printf '%s\n' "$*" >>/run/agentforge-init.log 2>/dev/null || true
+  printf '%s\n' "$*" >>/run/aiec-init.log 2>/dev/null || true
 }
 
 mount -t proc proc /proc 2>/dev/null || log "WARN: could not mount /proc"
@@ -38,14 +38,14 @@ if [ ! -s /etc/resolv.conf ]; then
   exec /bin/sh
 fi
 
-if [ ! -s /etc/agentforge-guest-secret ]; then
+if [ ! -s /etc/aiec-guest-secret ]; then
   log "FATAL: guest secret is missing"
   exec /bin/sh
 fi
-AGENTFORGE_GUEST_SECRET=$(cat /etc/agentforge-guest-secret)
-export AGENTFORGE_GUEST_SECRET
+AIEC_GUEST_SECRET=$(cat /etc/aiec-guest-secret)
+export AIEC_GUEST_SECRET
 
-AGENT=/usr/local/bin/agentforge-guest
+AGENT=/usr/local/bin/aiec-guest
 if [ ! -x "$AGENT" ]; then
   log "FATAL: $AGENT is missing"
   exec /bin/sh
@@ -55,16 +55,16 @@ start_agent() {
   # Agent stderr goes to the console as well as the log: the console is the
   # only channel the host can read when the control path is the thing that is
   # broken, and a guest agent that dies silently is undiagnosable.
-  "$AGENT" >>/run/agentforge-guest.log 2>>/dev/console &
-  echo $! >/run/agentforge-guest.pid
+  "$AGENT" >>/run/aiec-guest.log 2>>/dev/console &
+  echo $! >/run/aiec-guest.pid
 }
 
 start_agent
-log "agentforge-guest started (pid $(cat /run/agentforge-guest.pid)), control port 1024"
+log "aiec-guest started (pid $(cat /run/aiec-guest.pid)), control port 1024"
 while :; do
-  pid=$(cat /run/agentforge-guest.pid 2>/dev/null || echo 0)
+  pid=$(cat /run/aiec-guest.pid 2>/dev/null || echo 0)
   if ! kill -0 "$pid" 2>/dev/null; then
-    log "agentforge-guest exited; restarting"
+    log "aiec-guest exited; restarting"
     start_agent
   fi
   sleep 1
