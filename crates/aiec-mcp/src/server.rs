@@ -142,6 +142,9 @@ pub struct ListFilesArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PrepareRepoArgs {
     pub repo_url: String,
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    #[serde(default)]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub reference: Option<String>,
     #[serde(default)]
@@ -151,6 +154,9 @@ pub struct PrepareRepoArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunRepoTaskArgs {
     pub repo_url: String,
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    #[serde(default)]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub reference: Option<String>,
     /// Commands run in order before the task, each as an argument vector.
@@ -171,6 +177,9 @@ pub struct RunRepoTaskArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TestOmpArgs {
     pub omp_repo: String,
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    #[serde(default)]
+    pub runtime: Option<String>,
     pub omp_ref: String,
     pub target_repo: String,
     #[serde(default)]
@@ -191,6 +200,9 @@ pub struct TestOmpArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CompareOmpArgs {
     pub omp_repo: String,
+    /// Runtime for every sandbox the comparison creates.
+    #[serde(default)]
+    pub runtime: Option<String>,
     pub baseline_ref: String,
     pub candidate_ref: String,
     pub target_repo: String,
@@ -417,6 +429,7 @@ check out a revision. The host filesystem is never touched.",
                 &self.aiec,
                 crate::eval::PrepareRepoRequest {
                     repo_url: args.repo_url,
+                    runtime: args.runtime,
                     reference: args.reference,
                     image: args.image.or_else(|| Some(self.default_image.clone())),
                 },
@@ -447,6 +460,7 @@ keep_sandbox is set.",
                 &self.aiec,
                 crate::eval::RunRepoTaskRequest {
                     repo_url: args.repo_url,
+                    runtime: args.runtime,
                     reference: args.reference,
                     setup_commands: args.setup_commands.unwrap_or_default(),
                     task_command: args.task_command,
@@ -481,6 +495,7 @@ Set keep_sandbox to leave the machine for debugging.",
             crate::eval::run_omp_once(
                 &self.aiec,
                 &crate::eval::OmpRunRequest {
+                    runtime: args.runtime,
                     omp_repo: args.omp_repo,
                     omp_ref: args.omp_ref,
                     target_repo: args.target_repo,
@@ -520,6 +535,7 @@ measurements. Returns measurements only, never a judgement about which is better
             crate::eval::compare_omp(
                 &self.aiec,
                 crate::eval::CompareOmpRequest {
+                    runtime: args.runtime,
                     omp_repo: args.omp_repo,
                     baseline_ref: args.baseline_ref,
                     candidate_ref: args.candidate_ref,

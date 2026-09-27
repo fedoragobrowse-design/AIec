@@ -137,6 +137,8 @@ fn succeeded(outcome: &ExecOutcome) -> bool {
 pub struct PrepareRepoRequest {
     /// An `https://`, `git@host:path` or `ssh://` git URL.
     pub repo_url: String,
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    pub runtime: Option<String>,
     /// A branch, tag or commit. The remote default when absent.
     pub reference: Option<String>,
     /// Overrides [`DEFAULT_IMAGE`].
@@ -166,8 +168,15 @@ pub async fn prepare_repo(
 
     let image = request.image.as_deref().unwrap_or(DEFAULT_IMAGE);
     let timeout = DEFAULT_TIMEOUT_SECONDS;
-    let (view, sandbox_id, _) =
-        create_sandbox_with_repo(aiec, image, &repo_url, reference.as_deref(), timeout).await?;
+    let (view, sandbox_id, _) = create_sandbox_with_repo(
+        aiec,
+        image,
+        request.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
+        &repo_url,
+        reference.as_deref(),
+        timeout,
+    )
+    .await?;
     aiec.mark_tool_owned(sandbox_id, None);
 
     let mut guard = SandboxGuard::new(aiec, sandbox_id, false);
@@ -197,6 +206,8 @@ pub async fn prepare_repo(
 #[derive(Debug, Clone)]
 pub struct RunRepoTaskRequest {
     pub repo_url: String,
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    pub runtime: Option<String>,
     pub reference: Option<String>,
     /// Commands run in order before the task, each as an argument vector.
     pub setup_commands: Vec<Vec<String>>,
@@ -249,8 +260,15 @@ pub async fn run_repo_task(
     let timeout = resolve_timeout(request.timeout_seconds);
     let image = request.image.as_deref().unwrap_or(DEFAULT_IMAGE);
 
-    let (_, sandbox_id, _) =
-        create_sandbox_with_repo(aiec, image, &repo_url, reference.as_deref(), timeout).await?;
+    let (_, sandbox_id, _) = create_sandbox_with_repo(
+        aiec,
+        image,
+        request.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
+        &repo_url,
+        reference.as_deref(),
+        timeout,
+    )
+    .await?;
     aiec.mark_tool_owned(sandbox_id, None);
     let guard = SandboxGuard::new(aiec, sandbox_id, request.keep_sandbox);
 
@@ -283,7 +301,9 @@ async fn repo_task_workflow(
     timeout: u64,
 ) -> Result<RunRepoTaskResult, McpError> {
     let started = Instant::now();
-    let commit = clone_revision(aiec, sandbox_id, repo_url, reference, REPO_PATH, timeout).await?;
+    // The repository is already in place, materialised during create.
+    let commit = head_revision(aiec, sandbox_id, REPO_PATH, timeout).await?;
+    let _ = (repo_url, reference);
 
     let environment = BTreeMap::new();
     for command in &request.setup_commands {
@@ -351,6 +371,8 @@ async fn repo_task_workflow(
 
 #[derive(Debug, Clone)]
 pub struct OmpRunRequest {
+    /// Runtime for the sandbox. Defaults to a local microVM.
+    pub runtime: Option<String>,
     /// The OMP repository, cloned and checked out at `omp_ref`.
     pub omp_repo: String,
     /// The OMP revision under test: a branch, tag or commit.
@@ -409,6 +431,7 @@ pub async fn run_omp_once(
     let (view, sandbox_id, _) = create_sandbox_with_repo(
         aiec,
         DEFAULT_IMAGE,
+        request.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
         &target_url,
         target_ref.as_deref(),
         timeout,
@@ -542,6 +565,8 @@ async fn omp_workflow(
 #[derive(Debug, Clone)]
 pub struct CompareOmpRequest {
     pub omp_repo: String,
+    /// Runtime for every sandbox this comparison creates.
+    pub runtime: Option<String>,
     /// The revision in use today.
     pub baseline_ref: String,
     /// The revision under evaluation.
@@ -675,6 +700,7 @@ pub async fn compare_omp(
     for chunk in plan.chunks(max_parallel) {
         let runs = chunk.iter().map(|(side, omp_ref)| {
             let run = OmpRunRequest {
+                runtime: request.runtime.clone(),
                 omp_repo: request.omp_repo.clone(),
                 omp_ref: (*omp_ref).to_owned(),
                 target_repo: request.target_repo.clone(),
@@ -751,9 +777,13 @@ impl<'a> SandboxGuard<'a> {
         self.keep = true;
     }
 
-    /// The sandbox id, for a result that should report it.
+    /// The id to report back, and only when the machine still exists.
+    ///
+    /// Returning the id of a sandbox that was just destroyed invites the caller
+    /// to drive a machine that is already gone, so a run that cleaned up after
+    /// itself reports nothing here.
     fn sandbox_id(&self) -> Option<Uuid> {
-        Some(self.sandbox_id)
+        self.keep.then_some(self.sandbox_id)
     }
 
     /// Destroys the sandbox unless the caller asked to keep it.
@@ -785,13 +815,14 @@ impl<'a> SandboxGuard<'a> {
 async fn create_sandbox_with_repo(
     aiec: &LocalAiec,
     image: &str,
+    runtime: &str,
     repo_url: &str,
     reference: Option<&str>,
     timeout_seconds: u64,
 ) -> Result<(crate::sandbox::SandboxView, Uuid, Uuid), McpError> {
     aiec.create_sandbox_with_workspace(
         image,
-        DEFAULT_RUNTIME,
+        runtime,
         aiec_core::WorkspaceSpec::Git {
             repo: repo_url.to_owned(),
             reference: reference.map(str::to_owned),
@@ -1593,6 +1624,7 @@ mod tests {
 
     fn omp_request() -> OmpRunRequest {
         OmpRunRequest {
+            runtime: None,
             omp_repo: "https://github.com/owner/omp".to_owned(),
             omp_ref: "main".to_owned(),
             target_repo: "https://github.com/owner/repo".to_owned(),
