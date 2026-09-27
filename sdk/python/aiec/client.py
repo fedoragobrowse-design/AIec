@@ -6,8 +6,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-class AgentForgeError(RuntimeError):
-    """An error returned by the AgentForge API.
+class AIecError(RuntimeError):
+    """An error returned by the AIec API.
 
     ``code`` is stable and machine-readable; ``request_id`` is echoed in the
     server logs, so quoting it makes a support report actionable.
@@ -34,15 +34,15 @@ class AgentForgeError(RuntimeError):
         return " | ".join(parts)
 
 
-class AgentForge:
-    """Client for the AgentForge API.
+class AIec:
+    """Client for the AIec API.
 
-    With no arguments beyond a key, this talks to AgentForge Cloud. Self-hosted
+    With no arguments beyond a key, this talks to AIec Cloud. Self-hosted
     deployments pass ``base_url`` (or set ``AGENTFORGE_URL``); both use the same
     API and the same methods.
     """
 
-    #: AgentForge Cloud. Self-hosted deployments override this per client.
+    #: AIec Cloud. Self-hosted deployments override this per client.
     DEFAULT_BASE_URL = "https://api.aiec.gobrowse.dev"
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
@@ -76,7 +76,7 @@ class AgentForge:
                 error_payload = json.loads(error.read())
             except Exception:
                 error_payload = {"error": {"message": str(error)}}
-            failure = AgentForgeError(error.code, error_payload)
+            failure = AIecError(error.code, error_payload)
             # A rate-limited client must be able to back off without guessing.
             retry_after = error.headers.get("Retry-After") if error.headers else None
             if retry_after:
@@ -95,7 +95,7 @@ class AgentForge:
 
 
 class _Sandboxes:
-    def __init__(self, client: AgentForge):
+    def __init__(self, client: AIec):
         self.client = client
 
     def create(self, **kwargs: Any) -> "Sandbox":
@@ -107,7 +107,7 @@ class _Sandboxes:
 
 @dataclass
 class Sandbox:
-    client: AgentForge
+    client: AIec
     data: dict
 
     def __getattr__(self, name: str) -> Any:

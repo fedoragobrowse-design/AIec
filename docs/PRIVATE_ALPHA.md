@@ -27,7 +27,7 @@ This report is evidence-based. `PASS` means the repository contains an executed 
 | TLS worker transport admission | PARTIAL | Plaintext Firecracker endpoints are rejected, but native TLS/mTLS identity verification is not implemented |
 | Warm pools | UNSUPPORTED | No warm-pool implementation exists. At the current single-host development scale there is no measured cold-versus-warm baseline justifying added state-isolation complexity; defer until production density measurements establish a benefit. |
 | Portable VM memory recovery | UNSUPPORTED | Firecracker snapshot metadata remains worker-local because device paths are host-specific |
-| DSec EROFS/3FS/overlaybd | UNSUPPORTED | AgentForge uses a deliberately smaller private-alpha ext4 + workspace model; toolkit setup commands are not independent layers. |
+| DSec EROFS/3FS/overlaybd | UNSUPPORTED | AIec uses a deliberately smaller private-alpha ext4 + workspace model; toolkit setup commands are not independent layers. |
 
 ## Verification gates
 

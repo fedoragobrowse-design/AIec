@@ -6,7 +6,7 @@ Use dedicated Linux worker hosts with:
 
 - readable/writable `/dev/kvm` for the worker service account;
 - Firecracker v1.17+ and optional jailer;
-- an AgentForge-compatible Linux guest kernel and ext4 rootfs;
+- an AIec-compatible Linux guest kernel and ext4 rootfs;
 - `ip(8)`, `nft`, `e2fsck`, and `resize2fs` for network/disk enforcement;
 - a cgroup-v2-enabled kernel for predictable Firecracker snapshot performance;
 - private connectivity among API, PostgreSQL, S3, and workers.
@@ -49,7 +49,7 @@ agentforge-server
 
 The production API accepts `AGENTFORGE_RUNTIME=docker` without Firecracker image-manifest variables in that mode. A Docker worker still requires a reachable Docker daemon and a worker registration; the API itself remains a scheduler/control plane. The production launcher does not silently substitute another backend.
 Docker containers use an explicit long-lived `sh -c 'sleep 3600'` process rather than preserving the image entrypoint. The private-alpha Docker test image is Alpine and verifies exec, binary files, nested workspace creation, pause/resume, security settings, and cleanup. Operators using other images must provide a shell and `sleep` compatible with that image until configurable process supervision is implemented.
-Docker containers use a TTY and keep stdin open to support common image-provided REPL entrypoints. This does not change the runtime API contract: AgentForge exec remains buffered rather than a streaming PTY protocol.
+Docker containers use a TTY and keep stdin open to support common image-provided REPL entrypoints. This does not change the runtime API contract: AIec exec remains buffered rather than a streaming PTY protocol.
 Docker exec requests are buffered and time-bounded at the API response level, but timeout handling does not yet kill the process tree inside the container. Treat Docker exec process-tree timeout and cleanup as unsupported until container-level termination is implemented.
 
 The systemd API unit starts `agentforge-server`. The shorter `agentforge server` command supports explicit `bwrap-dev` and `docker` single-process development distributions.
@@ -74,7 +74,7 @@ The example units are starting points. A Firecracker worker needs narrowly scope
 
 
 Firecracker worker advertisements must use `https://`. The API/PostgreSQL registration path rejects plaintext Firecracker control endpoints, and the CLI rejects plaintext `--advertise-url` before launch. Terminate TLS with a private-network trust boundary or add native mTLS before treating bearer authentication alone as sufficient identity verification.
-Firecracker snapshot memory and VM-state files reference the disk path active when the snapshot was created. AgentForge stores a checksummed manifest and restores that compatible local disk path before loading state. Do not move snapshots between hosts or Firecracker versions until a supported block-path override is available and verified. S3 supplies durable artifact storage; reconcile completed object uploads whose database transaction failed before relying on automatic crash recovery.
+Firecracker snapshot memory and VM-state files reference the disk path active when the snapshot was created. AIec stores a checksummed manifest and restores that compatible local disk path before loading state. Do not move snapshots between hosts or Firecracker versions until a supported block-path override is available and verified. S3 supplies durable artifact storage; reconcile completed object uploads whose database transaction failed before relying on automatic crash recovery.
 
 ## Network policy
 

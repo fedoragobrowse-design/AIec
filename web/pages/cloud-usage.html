@@ -1,5 +1,5 @@
 <!-- meta:title=Usage and quotas -->
-<!-- meta:description=AgentForge usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents. -->
+<!-- meta:description=AIec usage, quotas and spend safeguards. What you have used, what you have left, and how we stop runaway agents. -->
 
 <h1>Usage and quotas</h1>
 <p class="lead">
@@ -19,7 +19,7 @@
 </table>
 
 <h2>Reading your usage</h2>
-<pre><code>af = AgentForge(api_key="af_live_...")
+<pre><code>af = AIec(api_key="af_live_...")
 usage = af.usage()
 print(usage)</code></pre>
 <pre><code>curl https://api.aiec.gobrowse.dev/v1/usage \
@@ -66,7 +66,7 @@ the request rate returns <code>429 rate_limited</code> with a
 <h2>We never overage silently</h2>
 <div class="note">
   <p>
-    If capacity or the budget runs out, AgentForge stops creating sandboxes and
+    If capacity or the budget runs out, AIec stops creating sandboxes and
     tells you. It does not enable automatic overage, upgrade a plan, or add a
     payment method. Existing sandboxes follow the documented policy for their
     remaining lifetime.

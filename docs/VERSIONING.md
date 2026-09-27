@@ -1,6 +1,6 @@
 # Versioning and compatibility
 
-AgentForge is pre-1.0. Core source compatibility is not promised yet, and extension authors must pin the workspace version while Core contracts evolve.
+AIec is pre-1.0. Core source compatibility is not promised yet, and extension authors must pin the workspace version while Core contracts evolve.
 
 ## Independently versioned boundaries
 

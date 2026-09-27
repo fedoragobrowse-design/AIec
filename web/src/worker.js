@@ -1,10 +1,10 @@
-// AgentForge website + Cloudflare Worker.
+// AIec website + Cloudflare Worker.
 //
 // Serves the static site from the assets binding and proxies the public API
-// hostname to the AgentForge control plane. Two hostnames, one Worker:
+// hostname to the AIec control plane. Two hostnames, one Worker:
 //
 //   aiec.gobrowse.dev    -> the static site
-//   api.aiec.gobrowse.dev -> proxy to the private AgentForge origin
+//   api.aiec.gobrowse.dev -> proxy to the private AIec origin
 //
 // The origin is configured as a secret-bounded service binding or a custom
 // domain; it is never exposed directly to the internet, which is the point.

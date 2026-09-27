@@ -4,7 +4,7 @@ Near-term production gates: complete Firecracker vsock guest operations; S3/MinI
 
 ## DSec-derived future architecture
 
-The following are future parity targets from *DeepSeek Elastic Compute (DSec): A Sandbox Infrastructure for Effective Agentic Training at Scale*, not claims about the current AgentForge implementation. They are derived from DSec §§3.3, 5.1, 5.2, and 5.3:
+The following are future parity targets from *DeepSeek Elastic Compute (DSec): A Sandbox Infrastructure for Effective Agentic Training at Scale*, not claims about the current AIec implementation. They are derived from DSec §§3.3, 5.1, 5.2, and 5.3:
 
 - **Nested isolation boundary:** evaluate QEMU/libvirt as the isolation boundary for container workloads rather than running Docker directly on the host kernel (DSec §3.3).
 - **Node-local admission and session model:** add an edge-local admission/launcher component plus aether/chronus-equivalent session proxies, health monitoring, concurrent sessions, and process-tree termination (DSec §3.3).

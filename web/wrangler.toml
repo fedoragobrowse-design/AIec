@@ -1,4 +1,4 @@
-# AgentForge website — Cloudflare Workers with static assets.
+# AIec website — Cloudflare Workers with static assets.
 #
 # Build the site first:  python3 web/build.py
 # Deploy with:           npx wrangler deploy
@@ -25,7 +25,7 @@ binding = "ASSETS"
 html_handling = "auto-trailing-slash"
 not_found_handling = "404-page"
 
-# The AgentForge control plane is reached privately (Cloudflare Tunnel or an
+# The AIec control plane is reached privately (Cloudflare Tunnel or an
 # origin-only route), never as a public origin URL. Override in production with
 # `wrangler secret put AGENTFORGE_API_ORIGIN`.
 [vars]

@@ -173,7 +173,7 @@
       });
       reveal.appendChild(copy);
       reveal.appendChild(
-        el("p", "", "AgentForge stores only a hash, so this is the only time it is shown."),
+        el("p", "", "AIec stores only a hash, so this is the only time it is shown."),
       );
       $("#key-name").value = "";
       await loadKeys();

@@ -1,6 +1,6 @@
-# Extending AgentForge Core
+# Extending AIec Core
 
-AgentForge Core is the compile-time extension boundary for infrastructure backends. The default AgentForge server, worker, scheduler, storage, image resolver, network manager, snapshot provider, and policy are selected through the same public `Platform` composition used by custom products.
+AIec Core is the compile-time extension boundary for infrastructure backends. The default AIec server, worker, scheduler, storage, image resolver, network manager, snapshot provider, and policy are selected through the same public `Platform` composition used by custom products.
 
 ## Dependency direction
 
@@ -8,10 +8,10 @@ AgentForge Core is the compile-time extension boundary for infrastructure backen
 custom runtimes/schedulers/stores/networks/images/policies
                          |
                          v
-                  AgentForge Core
+                  AIec Core
                          ^
                          |
-       AgentForge API / worker / CLI composition
+       AIec API / worker / CLI composition
 ```
 
 Backend crates depend on Core. Core does not depend on Firecracker, Linux networking, SQLx/PostgreSQL, S3, Axum, or AWS. Products depend on Core and select concrete backends.

@@ -1,9 +1,9 @@
 <!-- meta:title=API keys -->
-<!-- meta:description=Create, rotate and revoke AgentForge API keys. Keys are shown once, stored hashed, and scoped to specific operations. -->
+<!-- meta:description=Create, rotate and revoke AIec API keys. Keys are shown once, stored hashed, and scoped to specific operations. -->
 
 <h1>API keys</h1>
 <p class="lead">
-  An API key is how your agent talks to AgentForge. It is shown once, stored
+  An API key is how your agent talks to AIec. It is shown once, stored
   hashed, and can be rotated or revoked at any time.
 </p>
 
@@ -23,7 +23,7 @@
   <li>Select the scopes it needs. Least privilege is the default: a key that
       only creates and execs should not be able to read billing or rotate
       other keys.</li>
-  <li>Copy the key. <strong>It is shown exactly once</strong> — AgentForge stores
+  <li>Copy the key. <strong>It is shown exactly once</strong> — AIec stores
       only a hash and cannot show it again.</li>
 </ol>
 
@@ -43,8 +43,8 @@
 <h2>Using a key</h2>
 <pre><code>curl https://api.aiec.gobrowse.dev/v1/sandboxes \
   -H "Authorization: Bearer af_live_..."</code></pre>
-<pre><code>from agentforge import AgentForge
-af = AgentForge(api_key="af_live_...")</code></pre>
+<pre><code>from agentforge import AIec
+af = AIec(api_key="af_live_...")</code></pre>
 <pre><code># or, without hardcoding it
 export AGENTFORGE_API_KEY="af_live_..."
 export AGENTFORGE_URL="https://api.aiec.gobrowse.dev"</code></pre>
@@ -81,7 +81,7 @@ export AGENTFORGE_URL="https://api.aiec.gobrowse.dev"</code></pre>
 
 <div class="note">
   <p>
-    Keys are transmitted only over TLS. AgentForge stores a hash, never a
+    Keys are transmitted only over TLS. AIec stores a hash, never a
     recoverable value, and never logs a key. If you believe a key has been
     exposed, revoke it and report it — see
     <a href="/security">security</a>.

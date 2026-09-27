@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Docs — AgentForge</title>
-<meta name="description" content="AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance.">
-<meta property="og:title" content="Docs — AgentForge">
-<meta property="og:description" content="AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance.">
+<title>Docs — AIec</title>
+<meta name="description" content="AIec documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance.">
+<meta property="og:title" content="Docs — AIec">
+<meta property="og:description" content="AIec documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#edf0f4">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -18,7 +18,7 @@
 <body>
 <header class="masthead">
   <div class="masthead__inner">
-    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
     <nav class="masthead__nav">
       <a href="/">Home</a>
       <a href="/docs" aria-current="page">Docs</a>
@@ -56,7 +56,7 @@
   </aside>
   <main class="content">
 <!-- meta:title=Docs -->
-<!-- meta:description=AgentForge documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance. -->
+<!-- meta:description=AIec documentation: five-minute quickstart, API reference, SDK usage, self-hosting and operational guidance. -->
 
 <h1>Docs</h1>
 <p class="lead">From nothing to a running sandbox in about five minutes, with no
@@ -73,15 +73,15 @@ infrastructure of your own.</p>
       <pre><code>pip install agentforge-sdk</code></pre></li>
   <li><strong>Run something.</strong></li>
 </ol>
-<pre><code>from agentforge import AgentForge
+<pre><code>from agentforge import AIec
 
-af = AgentForge(api_key="af_live_...")   # defaults to https://api.aiec.gobrowse.dev
+af = AIec(api_key="af_live_...")   # defaults to https://api.aiec.gobrowse.dev
 
 box = af.sandboxes.create(image="python:3.13")
-print(box.exec(["python", "-c", "print('hello from AgentForge')"])["stdout"])
+print(box.exec(["python", "-c", "print('hello from AIec')"])["stdout"])
 box.destroy()</code></pre>
 <p>If you are self-hosting, pass your own endpoint instead:</p>
-<pre><code>af = AgentForge(
+<pre><code>af = AIec(
     base_url="https://agentforge.example.com",
     api_key="af_live_...",
 )</code></pre>
@@ -171,7 +171,7 @@ box2.restore(snap)</code></pre>
 <code>request_id</code> in a support report — it correlates with the server logs.</p>
 
 <h2 id="self-host">Self-hosting</h2>
-<p>AgentForge OSS needs no managed provider. You need:</p>
+<p>AIec OSS needs no managed provider. You need:</p>
 <ul class="tight">
   <li>a Linux host with <code>/dev/kvm</code> and nested virtualisation,</li>
   <li>PostgreSQL 14+,</li>
@@ -229,7 +229,7 @@ agentforge --url https://127.0.0.1:8080 sandbox --image python:3.13</code></pre>
 <h2>SDKs</h2>
 <table class="kv">
   <tr><th>Language</th><th>Install</th><th>Import</th></tr>
-  <tr><td>Python</td><td><code>pip install agentforge-sdk</code></td><td><code>from agentforge import AgentForge</code></td></tr>
+  <tr><td>Python</td><td><code>pip install agentforge-sdk</code></td><td><code>from agentforge import AIec</code></td></tr>
   <tr><td>Rust</td><td><code>cargo add agentforge-client</code></td><td><code>use agentforge_client::AgentForgeClient</code></td></tr>
   <tr><td>HTTP</td><td>—</td><td><code>curl</code> / any HTTP client</td></tr>
 </table>

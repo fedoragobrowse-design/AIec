@@ -1,5 +1,5 @@
-<!-- meta:title=AgentForge Cloud -->
-<!-- meta:description=AgentForge Cloud: managed Firecracker sandboxes for AI agents. We run the infrastructure, you use the API. -->
+<!-- meta:title=AIec Cloud -->
+<!-- meta:description=AIec Cloud: managed Firecracker sandboxes for AI agents. We run the infrastructure, you use the API. -->
 
 <h1>Managed sandboxes, one API</h1>
 <p class="lead">
@@ -38,23 +38,23 @@
 
 <h2>How it fits together</h2>
 <pre><code>your agent
-  -> AgentForge API        auth, tenants, quotas, policy
+  -> AIec API        auth, tenants, quotas, policy
   -> scheduler             fenced leases, capability-aware placement
   -> worker                HTTPS control channel
   -> runtime               Firecracker microVM, or hosted capacity
   -> sandbox               your code, isolated</code></pre>
 
 <h2>Using it</h2>
-<pre><code>from agentforge import AgentForge
+<pre><code>from agentforge import AIec
 
-af = AgentForge(api_key="af_live_...")
+af = AIec(api_key="af_live_...")
 
 box = af.sandboxes.create(image="python:3.13")
-box.exec(["python", "-c", "print('hello from AgentForge')"])
+box.exec(["python", "-c", "print('hello from AIec')"])
 box.destroy()</code></pre>
 <p>
   Prefer to run the platform yourself instead? It is the same software:
-  <a href="/docs#self-host">self-host AgentForge</a>.
+  <a href="/docs#self-host">self-host AIec</a>.
 </p>
 
 <h2>Alpha status</h2>

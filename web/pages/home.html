@@ -1,5 +1,5 @@
 <!-- meta:title=Computers for AI agents -->
-<!-- meta:description=AgentForge gives autonomous AI agents isolated, disposable computers. Managed Firecracker sandboxes through one API, or self-host the same platform for free. -->
+<!-- meta:description=AIec gives autonomous AI agents isolated, disposable computers. Managed Firecracker sandboxes through one API, or self-host the same platform for free. -->
 <!-- wide -->
 
 <!-- block:rail -->
@@ -28,7 +28,7 @@
 
 <p class="lede">
   An agent needs somewhere to run code that nobody else can reach and nobody
-  has to clean up. AgentForge hands it a real machine — its own kernel, its own
+  has to clean up. AIec hands it a real machine — its own kernel, its own
   filesystem, its own network — and takes it away when the work is done.
 </p>
 
@@ -80,9 +80,9 @@
   access, and nothing for an operator to repair afterwards.
 </p>
 
-<pre><code><span class="kw">from</span> agentforge <span class="kw">import</span> AgentForge
+<pre><code><span class="kw">from</span> agentforge <span class="kw">import</span> AIec
 
-af = AgentForge(api_key=<span class="str">"af_live_…"</span>)
+af = AIec(api_key=<span class="str">"af_live_…"</span>)
 
 box = af.sandboxes.create(image=<span class="str">"agentforge:latest"</span>)
 box.exec([<span class="str">"git"</span>, <span class="str">"clone"</span>, <span class="str">"--depth"</span>, <span class="str">"1"</span>, REPO, <span class="str">"/workspace/repo"</span>])
@@ -98,7 +98,7 @@ box.destroy()</code></pre>
     <h3>Cloud, we operate it</h3>
     <p>
       Firecracker capacity, PostgreSQL, object storage, TLS, backups and upgrades
-      are ours to run. You use the API. See <a href="/cloud">AgentForge Cloud</a>.
+      are ours to run. You use the API. See <a href="/cloud">AIec Cloud</a>.
     </p>
   </div>
   <div class="block">
@@ -162,7 +162,7 @@ box.destroy()</code></pre>
 <h2>What it is not</h2>
 
 <p>
-  AgentForge is not a notebook, not a CI runner, and not durable storage. It is a
+  AIec is not a notebook, not a CI runner, and not durable storage. It is a
   control plane for short-lived, untrusted, agent-driven computers. If work has
   to survive a run, take a <a href="/docs">snapshot</a>.
 </p>

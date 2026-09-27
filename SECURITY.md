@@ -1,12 +1,12 @@
 # Security Policy
 
-AgentForge runs untrusted, agent-generated code. Isolation is the product, so
+AIec runs untrusted, agent-generated code. Isolation is the product, so
 this document describes exactly where the boundaries are, what is enforced, and
 what is not yet true.
 
 ## Supported versions
 
-AgentForge is in **public alpha**. Security fixes land on the `main` branch and
+AIec is in **public alpha**. Security fixes land on the `main` branch and
 in the latest tagged release. Older alpha tags are not patched.
 
 | Version | Supported |
@@ -25,7 +25,7 @@ Email **security@gobrowse.dev** with:
 - what an attacker can do, and what they need in order to do it;
 - the affected component (API, runtime, guest, SDK, dashboard, deployment);
 - reproduction steps, or a proof of concept;
-- the AgentForge version, runtime (`firecracker`, `docker`, hosted), and
+- the AIec version, runtime (`firecracker`, `docker`, hosted), and
   deployment mode (Cloud or self-hosted) if relevant;
 - any logs or request IDs, with secrets redacted.
 
@@ -38,7 +38,7 @@ disclosure strategy that depends on one.
 
 ## Threat model
 
-AgentForge assumes:
+AIec assumes:
 
 - **Workload code is hostile.** Anything an agent writes and executes is
   attacker-controlled.
@@ -57,7 +57,7 @@ infrastructure itself.
 
 ### Public workloads run on Firecracker
 
-AgentForge Cloud forces Firecracker microVMs for untrusted tenant workloads. A
+AIec Cloud forces Firecracker microVMs for untrusted tenant workloads. A
 tenant cannot request `runtime=docker` and downgrade their own isolation
 boundary; the control plane's runtime policy is authoritative.
 
@@ -88,7 +88,7 @@ blocks:
 
 - the host LAN and RFC1918 ranges,
 - link-local and cloud metadata addresses (`169.254.169.254`),
-- the AgentForge control plane,
+- the AIec control plane,
 - the worker's management endpoints,
 - other tenants' sandboxes.
 

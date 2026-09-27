@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end coding-agent workflow against a real AgentForge API.
+"""End-to-end coding-agent workflow against a real AIec API.
 
 Creates a sandbox, clones a repository over HTTPS, inspects it, edits a tracked
 file, runs the project's own validation, retrieves the diff, and destroys the
-sandbox. Everything goes through the public AgentForge API — no host-side
+sandbox. Everything goes through the public AIec API — no host-side
 shortcuts, no SSH, no direct provider access.
 
     export AGENTFORGE_API_KEY="af_live_..."
@@ -15,14 +15,14 @@ from __future__ import annotations
 import os
 import sys
 
-from agentforge import AgentForge, AgentForgeError
+from aiec import AIec, AIecError
 
 DEFAULT_REPO = "https://github.com/octocat/Hello-World.git"
 
 
 def run() -> int:
     repo = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_REPO
-    af = AgentForge(api_key=os.environ.get("AGENTFORGE_API_KEY"))
+    af = AIec(api_key=os.environ.get("AGENTFORGE_API_KEY"))
     print(f"endpoint: {af.base_url}")
     print(f"repo:     {repo}")
 
@@ -50,7 +50,7 @@ def run() -> int:
         print(sh("cd /workspace/repo && ls -1 | head -10"))
 
         print("\n== edit ==")
-        print(sh("cd /workspace/repo && printf '\\nAgentForge example edit\\n' >> README"))
+        print(sh("cd /workspace/repo && printf '\\nAIec example edit\\n' >> README"))
         print(sh("cd /workspace/repo && tail -3 README"))
 
         print("\n== validate ==")
@@ -58,18 +58,18 @@ def run() -> int:
         # must be present, and git must consider the tree clean of whitespace
         # damage.
         print(sh("cd /workspace/repo && git diff --check && echo 'diff is well formed'"))
-        print(sh("cd /workspace/repo && grep -q 'AgentForge example edit' README && echo 'edit present'"))
+        print(sh("cd /workspace/repo && grep -q 'AIec example edit' README && echo 'edit present'"))
 
         print("\n== diff ==")
         diff = sh("cd /workspace/repo && git --no-pager diff")
         print(diff)
-        if "AgentForge example edit" not in diff:
+        if "AIec example edit" not in diff:
             print("expected edit is not in the diff", file=sys.stderr)
             return 1
         print("\nOK: clone, edit, validate and diff all succeeded inside the sandbox.")
         return 0
-    except AgentForgeError as error:
-        print(f"AgentForge error: {error}", file=sys.stderr)
+    except AIecError as error:
+        print(f"AIec error: {error}", file=sys.stderr)
         return 1
     finally:
         box.destroy()

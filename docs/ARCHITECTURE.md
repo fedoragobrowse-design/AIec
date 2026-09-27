@@ -1,14 +1,14 @@
 # Production architecture
 
 ```text
-                    AgentForge Core
+                    AIec Core
        domain + runtime/scheduler/storage/network
        image/snapshot/policy contracts + Platform
                               ^
                               |
         +---------------------+---------------------+
         |                                           |
-AgentForge API / worker / CLI              custom Core products
+AIec API / worker / CLI              custom Core products
         |
         +-- WorkerRuntime ---------------------- Core SandboxRuntime
         +-- PostgreSQL scheduler/metadata ----- Core Scheduler/MetadataStore
@@ -19,11 +19,11 @@ AgentForge API / worker / CLI              custom Core products
         +-- default policy -------------------- Core Policy
 ```
 
-The dependency direction is acyclic. Core contains generic sandbox, worker, resource, storage, network, image, snapshot, and policy contracts. Backend crates depend on Core; AgentForge's API, worker, and CLI select and consume those backends. Core does not import SQLx, Firecracker, Axum, AWS, or Linux implementation types.
+The dependency direction is acyclic. Core contains generic sandbox, worker, resource, storage, network, image, snapshot, and policy contracts. Backend crates depend on Core; AIec's API, worker, and CLI select and consume those backends. Core does not import SQLx, Firecracker, Axum, AWS, or Linux implementation types.
 
 ## Control plane
 
-`agentforge-server` builds an AgentForge `Platform` from Core trait objects before constructing API state. Its production modes use the worker RPC runtime, storage-backed scheduler, PostgreSQL metadata, S3 artifacts, Linux networking, configured runtime policy, and the selected Firecracker or Docker backend. Firecracker mode adds signed image resolution; Docker mode uses normal OCI references and worker-advertised capabilities.
+`agentforge-server` builds an AIec `Platform` from Core trait objects before constructing API state. Its production modes use the worker RPC runtime, storage-backed scheduler, PostgreSQL metadata, S3 artifacts, Linux networking, configured runtime policy, and the selected Firecracker or Docker backend. Firecracker mode adds signed image resolution; Docker mode uses normal OCI references and worker-advertised capabilities.
 
 The production API requires an explicit `AGENTFORGE_RUNTIME` (`firecracker` or `docker`) and does not silently select a local fallback. Firecracker mode requires signed image-manifest configuration; Docker mode uses the worker-advertised container capabilities and normal OCI image references. PostgreSQL remains authoritative for tenants, keys, sandboxes, transitions, worker capacity, assignments, fenced leases, operation idempotency, snapshots, images, usage, and tenant quota policy.
 
@@ -38,7 +38,7 @@ Docker workers register `container` isolation plus `exec` and `files` capabiliti
 
 ## DSec parity boundary
 
-AgentForge is inspired by DSec and preserves its Core/runtime split, but the Docker backend is not DSec-equivalent. DSec §3.3 places container workloads inside a QEMU/libvirt VM, with an edge node-local admission path, EROFS/overlayfs composable layers, aether/chronus session proxies, 3FS on-demand image data, and OverlayBD-backed writable storage. AgentForge currently uses a direct host Docker Engine API with a managed workspace bind mount, archive transfer, capability advertisement, and restrictive container settings. It does not implement DSec's nested isolation VM, aether/chronus, 3FS, EROFS, overlayfs layer composition, OverlayBD, or DSec's local edge admission protocol. These are roadmap gaps, not implemented mechanisms.
+AIec is inspired by DSec and preserves its Core/runtime split, but the Docker backend is not DSec-equivalent. DSec §3.3 places container workloads inside a QEMU/libvirt VM, with an edge node-local admission path, EROFS/overlayfs composable layers, aether/chronus session proxies, 3FS on-demand image data, and OverlayBD-backed writable storage. AIec currently uses a direct host Docker Engine API with a managed workspace bind mount, archive transfer, capability advertisement, and restrictive container settings. It does not implement DSec's nested isolation VM, aether/chronus, 3FS, EROFS, overlayfs layer composition, OverlayBD, or DSec's local edge admission protocol. These are roadmap gaps, not implemented mechanisms.
 
 ## Firecracker and guest control
 

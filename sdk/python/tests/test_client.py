@@ -2,12 +2,12 @@ import base64
 import json
 import unittest
 
-from agentforge.client import AgentForge, Sandbox
+from aiec.client import AIec, Sandbox
 
 
 class ClientContractTest(unittest.TestCase):
     def test_context_manager_and_file_operations_use_api_contract(self):
-        client = AgentForge(api_key="af_live_" + "0" * 48, base_url="http://example")
+        client = AIec(api_key="af_live_" + "0" * 48, base_url="http://example")
         sandbox = Sandbox(client, {"id": "sandbox-1"})
         calls = []
 

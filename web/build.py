@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the AgentForge site from page fragments.
+"""Render the AIec site from page fragments.
 
 The site is static HTML with no framework: a stranger should be able to read the
 markup, and a reviewer should be able to change a page without a build step.
@@ -50,7 +50,7 @@ DASHBOARD_SHELL = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — AgentForge</title>
+<title>{title} — AIec</title>
 <meta name="description" content="{description}">
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="#edf0f4">
@@ -64,7 +64,7 @@ DASHBOARD_SHELL = """<!doctype html>
 <body>
 <header class="masthead">
   <div class="masthead__inner">
-    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
     <nav class="masthead__nav">{nav}</nav>
   </div>
 </header>
@@ -112,9 +112,9 @@ SHELL = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — AgentForge</title>
+<title>{title} — AIec</title>
 <meta name="description" content="{description}">
-<meta property="og:title" content="{title} — AgentForge">
+<meta property="og:title" content="{title} — AIec">
 <meta property="og:description" content="{description}">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#edf0f4">
@@ -127,7 +127,7 @@ SHELL = """<!doctype html>
 <body>
 <header class="masthead">
   <div class="masthead__inner">
-    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AgentForge</a>
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
     <nav class="masthead__nav">
       {nav}
     </nav>
@@ -244,7 +244,7 @@ def main() -> int:
             shell.format(
                 title=html.escape(_meta(fragment, "title", route)),
                 description=html.escape(
-                    _meta(fragment, "description", "AgentForge — computers for AI agents.")
+                    _meta(fragment, "description", "AIec — computers for AI agents.")
                 ),
                 nav=render_console_nav(route) if is_console else render_nav(route),
                 footer_nav=render_footer_nav(),

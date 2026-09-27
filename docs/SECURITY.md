@@ -1,6 +1,6 @@
 # Security and threat model
 
-AgentForge treats every tenant workload as hostile. `bwrap-dev` is retained only for local development and is not a production boundary.
+AIec treats every tenant workload as hostile. `bwrap-dev` is retained only for local development and is not a production boundary.
 
 ## Implemented controls
 
