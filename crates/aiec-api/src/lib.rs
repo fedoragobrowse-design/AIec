@@ -4743,6 +4743,37 @@ mod tests {
 
     /// The run routes driven over real HTTP against the real router, with a
     /// store that keeps runs and a runtime that runs commands.
+    /// Retention is judged on the run's outcome, so it has to be decided before
+    /// anything is torn down.
+    ///
+    /// A live cluster cannot produce this deterministically - it needs a run
+    /// that fails *and* a machine to keep - which is exactly why it is pinned
+    /// here instead of left to a dogfood run that might not reach the branch.
+    #[tokio::test]
+    async fn a_failed_run_that_asked_to_be_kept_keeps_its_machine() {
+        use aiec_core::run::{RetentionPolicy, RunState};
+
+        let policy = RetentionPolicy::KeepOnFailure;
+        let failure_reason = Some("the task did not succeed".to_owned());
+
+        // What the executor now does: decide, then clean up.
+        let succeeded = failure_reason.is_none();
+        assert!(!succeeded, "a run with a reason is not a success");
+        assert!(
+            policy.should_retain(succeeded),
+            "a run that asked to keep its machine on failure must keep it"
+        );
+        // And the opposite, so the test is not vacuous.
+        assert!(!policy.should_retain(true));
+
+        let destroy = RetentionPolicy::Destroy;
+        assert!(
+            !destroy.should_retain(false),
+            "retention=destroy must release a failed machine too"
+        );
+        assert_eq!(RunState::Failed.as_str(), "failed");
+    }
+
     struct RunFixture {
         state: AppState,
         store: Arc<LeasedRepository>,

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Traces sandboxes that outlived the run that created them.
+
+The cleanup guarantee says a run's machine does not outlive it, so this asks the
+database directly which sandboxes are still alive, which run owned them, and
+whether that run is finished. Anything in the last group is a leak.
+"""
+import os
+import paramiko
+
+nc = paramiko.SSHClient()
+nc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+nc.connect("192.168.1.250", username="gobrowse",
+           key_filename=os.path.expanduser("~/.ssh/id_ed25519"), timeout=30)
+
+script = r'''
+set -a; . /home/gobrowse/aiec/env.systemd; set +a
+psql_out() {
+  podman run --rm --network host docker.io/library/postgres:16 \
+    psql "$DATABASE_URL" -t -A -F ' | ' -c "$1" 2>/dev/null
+}
+
+echo "== live sandboxes, their owning run, and whether that run is finished"
+psql_out "
+select s.id, s.state, coalesce(r.state, 'no-run'),
+       coalesce(r.retention, '-'), r.id is not null and r.state in ('succeeded','failed','cancelled') as run_finished
+from sandboxes s
+left join run_sandboxes rs on rs.sandbox_id = s.id
+left join runs r on r.id = rs.run_id
+where s.state not in ('destroyed','failed')
+order by s.created_at"
+
+echo
+echo "== LEAKS: finished run, retention=destroy, machine still alive"
+psql_out "
+select r.id, r.state, r.retention, rs.sandbox_id, s.state
+from runs r
+join run_sandboxes rs on rs.run_id = r.id
+join sandboxes s on s.id = rs.sandbox_id
+where r.state in ('succeeded','failed','cancelled')
+  and r.retention = 'destroy'
+  and s.state not in ('destroyed','failed')"
+
+echo
+echo "== capacity"
+psql_out "select name, available_vcpus, total_vcpus, sandbox_count from nodes order by name"
+'''
+
+i, o, e = nc.exec_command("bash -s", timeout=600)
+i.write(script)
+i.channel.shutdown_write()
+print(o.read().decode() + e.read().decode())
+nc.close()

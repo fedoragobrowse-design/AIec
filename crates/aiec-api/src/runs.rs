@@ -502,7 +502,21 @@ async fn execute(
     );
 
     // -- outcome -------------------------------------------------------------
+    // The outcome is decided *before* anything is cleaned up, because retention
+    // is judged on it. Cleaning up first meant a failed run still looked
+    // successful to `should_retain`, so a `keep_on_failure` run had its machine
+    // destroyed - the one case the caller asked to be able to open.
     let succeeded = task_ok && results.validations.iter().all(|v| v.ok);
+    let reason = (!succeeded).then(|| {
+        results
+            .task
+            .as_ref()
+            .filter(|task| !task.ok)
+            .map(|_| "the task did not succeed".to_owned())
+            .unwrap_or_else(|| "a validation failed".to_owned())
+    });
+    run.failure_reason = reason.clone();
+
     let cleanup_started = Instant::now();
     cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
     phases.insert(
@@ -512,12 +526,6 @@ async fn execute(
     if succeeded {
         settle(state, tenant, &mut run, &mut results, &mut phases).await?;
     } else {
-        let reason = results
-            .task
-            .as_ref()
-            .filter(|t| !t.ok)
-            .map(|_| "the task did not succeed".to_owned())
-            .or_else(|| Some("a validation failed".to_owned()));
         fail(state, tenant, &mut run, reason, &mut results, &mut phases).await?;
     }
 
