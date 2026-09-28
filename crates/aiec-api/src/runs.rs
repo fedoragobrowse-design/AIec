@@ -1034,12 +1034,39 @@ async fn cleanup(
     let succeeded = run.failure_reason.is_none();
     if run.retention.should_retain(succeeded) {
         let until = Utc::now() + Duration::seconds(DEFAULT_RETENTION_SECONDS);
-        run.retained_sandbox_id = sandbox_ids.first().copied();
-        run.retained_until = Some(until);
-        let _ = state
-            .repository()
-            .record_run_results(tenant, run.id, results.clone(), run.state)
-            .await;
+        let kept = sandbox_ids.first().copied();
+        // Persisted, not just set on the in-memory run. `record_run_results`
+        // writes only results and state, so before this the fields stayed null
+        // in the database: the sweeper selects on `retained_until` and never saw
+        // the run, so a kept machine was never reclaimed, and the response
+        // carried `retained_sandbox_id: null`, telling the caller there was
+        // nothing to open.
+        if let Some(kept) = kept {
+            match state
+                .repository()
+                .retain_run_sandbox(tenant, run.id, kept, until)
+                .await
+            {
+                Ok(updated) => {
+                    run.retained_sandbox_id = updated.retained_sandbox_id;
+                    run.retained_until = updated.retained_until;
+                }
+                Err(error) => {
+                    // The machine is held on the caller's behalf and nothing
+                    // will find it later, so say so rather than losing it.
+                    tracing::warn!(
+                        run_id = %run.id,
+                        sandbox_id = %kept,
+                        error = %error,
+                        "could not record a retained sandbox, so nothing will reclaim it"
+                    );
+                    results.cleanup_failed = Some(CleanupReport {
+                        sandbox_id: kept,
+                        error: format!("could not record the retained sandbox: {error}"),
+                    });
+                }
+            }
+        }
         event(
             state,
             run,

@@ -3041,6 +3041,28 @@ impl PostgresRepository {
         Ok(value)
     }
 
+    async fn retain_run_sandbox(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Run, StoreError> {
+        let row = sqlx::query(
+            "UPDATE runs SET retained_sandbox_id=$1, retained_until=$2 \
+             WHERE tenant_id=$3 AND id=$4 RETURNING *",
+        )
+        .bind(sandbox_id)
+        .bind(until)
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        run_from_row(&row)
+    }
+
     async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
         let result = sqlx::query("DELETE FROM runs WHERE tenant_id = $1 AND id = $2")
             .bind(tenant)
@@ -3677,6 +3699,17 @@ impl MetadataStore for PostgresRepository {
         state: RunState,
     ) -> Result<Run, CoreError> {
         Self::record_run_results(self, tenant, id, results, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn retain_run_sandbox(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Run, CoreError> {
+        Self::retain_run_sandbox(self, tenant, id, sandbox_id, until)
             .await
             .map_err(core_error)
     }

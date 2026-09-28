@@ -676,6 +676,22 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Persists which machine a run kept, and until when.
+    ///
+    /// Separate from `record_run_results` because it is the only thing that
+    /// makes a retained machine findable. It used to be set on the in-memory
+    /// run and never written, so the sweeper - which selects on
+    /// `retained_until` - never saw the run, the machine was never reclaimed,
+    /// and the caller was handed a `null` sandbox id and told nothing.
+    async fn retain_run_sandbox(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _sandbox_id: Uuid,
+        _until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Deletes a tenant-owned run.
     ///
     /// A run whose history has been recorded is retained: the record of what
