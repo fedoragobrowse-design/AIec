@@ -116,12 +116,25 @@ impl<'a> Agent<'a> {
         })
     }
 
-    /// Runs the session to completion and returns what leaves the VM.
     /// Registers a file this run created, so it is not reported as agent work.
+    ///
+    /// A relative path is resolved against the workspace root rather than
+    /// dropped. A caller passing `--events events.jsonl` is doing the obvious
+    /// thing, and `strip_prefix` against an absolute root simply fails for it,
+    /// which silently put the event stream back into the agent's changed files.
     pub fn note_artifact(&mut self, path: &Path) {
-        if let Ok(relative) = path.strip_prefix(&self.root) {
-            self.own_artifacts
-                .push(relative.to_string_lossy().into_owned());
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        // Compared lexically: the file may not exist yet, and canonicalising
+        // would mean refusing to register a file for that reason.
+        if let Ok(relative) = absolute.strip_prefix(&self.root) {
+            let name = relative.to_string_lossy().into_owned();
+            if !name.is_empty() {
+                self.own_artifacts.push(name);
+            }
         }
     }
 

@@ -88,6 +88,54 @@ The result document, verbatim:
 model. A second run with the model claiming success over a failing validation
 returns `"status": "failed"`; there is a test for exactly that.
 
+## Inside a real AIec sandbox
+
+The brief asks for the harness to run through the real control plane, not only
+on the host. It does. A sandbox was created through the running AIec API, the
+4,110,168-byte release binary was shipped in as seven base64 chunks, a git
+repository with the `split_bill` defect was built inside it, and the model
+endpoint was run inside it as well — a guest cannot reach the host's LAN
+address, so the loop fixture has to live where the harness runs.
+
+```
+before: FAILED (failures=1)
+after:  OK
+status    success | stop: model_finished
+changed   ['calc.py', '__pycache__/']
+artifacts ['.aiec-agent/', 'events.jsonl', 'task.json']
+metrics   {'wall_ms': 648, 'harness_cpu_ms': 3, 'peak_rss_bytes': 5898240,
+           'model_requests': 4}
+```
+
+Event stream, complete and in order: `session_started`, `repository_inspected`,
+4 × `model_request_started`/`finished`, 3 × `tool_started`/`finished`,
+`validations_started`, `validation_finished`, `session_completed`.
+
+**In-sandbox footprint is lower than on the host**, which is the expected
+direction and worth stating rather than glossing: 5.6 MiB peak RSS against
+16.0 MiB on the developer machine, and 3 ms of harness CPU for the whole
+session. The host figure includes a build tree and a development environment;
+the guest figure is what a fleet would actually pay.
+
+### What this is not
+
+The sandbox ran the `docker` runtime, **not** Firecracker. Firecracker was
+attempted first and is genuinely unavailable in this environment:
+
+```
+TAP setup failed: ioctl(TUNSETIFF): Operation not permitted
+```
+
+The cause is a privilege limit, not a misconfiguration. The calling process
+holds `cap_wake_alarm` and nothing else; `cap_net_admin` is in the bounding set
+but cannot be acquired by uid 1000, and a direct `TUNSETIFF` ioctl probe fails
+the same way. A microVM needs a TAP device, so no microVM can be created here.
+Fixing it means running the AIec worker with `CAP_NET_ADMIN`, which is a change
+to the operator's host and not something this repository should do to itself.
+
+So the honest position: the harness is proven inside a real AIec sandbox, and
+the Firecracker path is unproven and blocked on host privileges.
+
 ## Failure case
 
 A task that cannot succeed, with a validation of `false` and a two-request
@@ -107,7 +155,7 @@ outcome a collector can be handed.
 ```
 cargo fmt --check                                     clean
 cargo clippy --all-targets -- -D warnings             0 errors
-cargo test                                           123 passed, 0 failed
+cargo test                                           124 passed, 0 failed
 ```
 
 ## Bugs the tests found

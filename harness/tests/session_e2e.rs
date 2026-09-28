@@ -686,3 +686,27 @@ async fn steering_is_consumed_once_and_reaches_the_model_once() {
     std::fs::write(&path, "   \n\t ").expect("write");
     assert!(take_steering(&path).is_none());
 }
+
+#[tokio::test]
+async fn a_relative_artifact_path_is_still_treated_as_the_harness_own() {
+    let dir = repo_with_bug();
+    let task = task_for(dir.path(), vec![vec!["true"]]);
+    let log = EventLog::open(None).expect("event log");
+
+    // The obvious invocation: relative paths, as a caller would type them.
+    let provider = Scripted::new(vec![Step::Done("nothing to do")]);
+    let mut agent = Agent::new(&task, &provider, &log, None).expect("agent");
+    for artifact in ["events.jsonl", "result.json", "task.json"] {
+        agent.note_artifact(std::path::Path::new(artifact));
+    }
+    let document = agent.run(Path::new(".aiec-agent/session.json")).await;
+
+    for noise in ["events.jsonl", "result.json", "task.json"] {
+        assert!(
+            !document.git.changed_files.iter().any(|f| f == noise),
+            "a relative artifact path was not registered, so `{noise}` was \
+             reported as agent work: {:?}",
+            document.git.changed_files
+        );
+    }
+}
