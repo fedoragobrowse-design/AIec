@@ -646,11 +646,22 @@ impl AiecMcp {
                     result = "error",
                     "mcp tool call failed"
                 );
+                // Built from the error's own details rather than replaced by a
+                // fresh object: a tool that could not clean up attaches that
+                // fact to the error, and dropping it here would leave the caller
+                // holding a dead sandbox id and no idea.
+                let mut details = if error.details.is_object() {
+                    error.details.clone()
+                } else {
+                    json!({})
+                };
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("code".to_owned(), json!(error.code.as_str()));
+                    object.insert("request_id".to_owned(), json!(request_id.to_string()));
+                }
                 Err(McpErrorData::invalid_params(
                     error.message.clone(),
-                    Some(
-                        json!({ "code": error.code.as_str(), "request_id": request_id.to_string() }),
-                    ),
+                    Some(details),
                 ))
             }
         }

@@ -2232,8 +2232,13 @@ async fn stop_sandbox(
     Extension(p): Extension<Principal>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Sandbox> {
-    p.authorize(Scope::SandboxesWrite)
-        .map_err(ApiFailure::from)?;
+    if let Err(error) = p.authorize(Scope::SandboxesWrite) {
+        // Recorded before returning: a refusal by policy is the most
+        // security-relevant event a handler can produce, and audit_log is
+        // append-only, so an unrecorded refusal cannot be reconstructed later.
+        record_sandbox_action(&s, &p, id, "sandbox.stop", "denied", &json!({})).await;
+        return Err(ApiFailure::from(error));
+    }
     let x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2284,6 +2289,33 @@ async fn resume_sandbox(
         .map_err(ApiFailure::from)?;
     Ok(Json(x))
 }
+/// Records a sandbox lifecycle action, notably a policy refusal.
+async fn record_sandbox_action(
+    state: &AppState,
+    principal: &Principal,
+    sandbox_id: Uuid,
+    action: &str,
+    result: &str,
+    detail: &Value,
+) {
+    let _ = state
+        .repository()
+        .append_audit_event(aiec_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(principal.tenant_id),
+            actor: format!("key:{}", principal.key_id),
+            action: action.to_string(),
+            subject_type: "sandbox".to_string(),
+            subject_id: Some(sandbox_id.to_string()),
+            result: result.to_string(),
+            request_id: None,
+            remote_addr: None,
+            detail: detail.clone(),
+        })
+        .await;
+}
+
 /// Records a sandbox file operation in the audit trail.
 ///
 /// Whether the operation succeeded is reported; its payload never is.
@@ -2358,8 +2390,22 @@ async fn exec_sandbox(
     Path(id): Path<Uuid>,
     Json(b): Json<ExecBody>,
 ) -> ApiResult<ExecResult> {
-    p.authorize(Scope::SandboxesWrite)
-        .map_err(ApiFailure::from)?;
+    if let Err(error) = p.authorize(Scope::SandboxesWrite) {
+        // Recorded before returning: a refusal by policy is the most
+        // security-relevant event a handler can produce, and audit_log is
+        // append-only, so an unrecorded refusal cannot be reconstructed later.
+        record_sandbox_exec(
+            &s,
+            &p,
+            id,
+            "denied",
+            None,
+            None,
+            &json!({ "denied": "sandboxes:write", "command": b.command }),
+        )
+        .await;
+        return Err(ApiFailure::from(error));
+    }
     let x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2524,8 +2570,18 @@ async fn put_file(
     Path(id): Path<Uuid>,
     Json(r): Json<PutFileRequest>,
 ) -> ApiResult<Value> {
-    p.authorize(Scope::SandboxesWrite)
-        .map_err(ApiFailure::from)?;
+    if let Err(error) = p.authorize(Scope::SandboxesWrite) {
+        record_sandbox_file(
+            &s,
+            &p,
+            id,
+            "sandbox.file.write",
+            false,
+            &json!({ "denied": "sandboxes:write", "path": r.path }),
+        )
+        .await;
+        return Err(ApiFailure::from(error));
+    }
     let x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2533,7 +2589,15 @@ async fn put_file(
         .map_err(ApiFailure::from)?;
     // The path and the size, never the content: what was written is the payload
     // and may be a secret the caller is staging inside the sandbox.
-    let detail = json!({ "path": r.path, "bytes": r.content_base64.len() });
+    // The decoded size, not the base64 length: a reader comparing this against
+    // a diff or an object-store listing would otherwise be off by a third.
+    let decoded_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &r.content_base64,
+    )
+    .map(|bytes| bytes.len())
+    .unwrap_or(r.content_base64.len());
+    let detail = json!({ "path": r.path, "bytes": decoded_bytes });
     let outcome = s.runtime_for(&x)?.put_file(&x, r).await;
     record_sandbox_file(&s, &p, id, "sandbox.file.write", outcome.is_ok(), &detail).await;
     outcome.map_err(ApiFailure::from)?;
