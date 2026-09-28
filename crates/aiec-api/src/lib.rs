@@ -2,19 +2,21 @@ use aiec_core::*;
 use aiec_core::{
     platform::Platform,
     policy::PolicyOperation,
+    run::{CleanupReport, Run, RunArtifactRef, RunEvent, RunState},
     runtime::SandboxRuntime,
     snapshots::{SnapshotKind, SnapshotMetadata, SnapshotRequest, verify_archive_checksum},
     storage::{ArtifactStore, GetObjectOptions, MetadataStore},
 };
 pub mod account;
 mod composition;
+pub mod eval_matrix;
 pub mod ratelimit;
 pub mod runs;
 mod worker;
 use axum::{
     Json, Router,
     extract::{Extension, Path, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -768,6 +770,12 @@ fn protected_routes() -> Router<AppState> {
         .route("/snapshots/{id}/restore", post(restore_snapshot))
         .route("/snapshots/{id}", delete(delete_snapshot))
         .route("/usage", get(usage))
+        .route("/runs", post(create_run).get(list_runs))
+        .route("/runs/{id}", get(get_run))
+        .route("/runs/{id}/events", get(list_run_events))
+        .route("/runs/{id}/artifacts", get(list_run_artifacts))
+        .route("/runs/{id}/artifacts/{name}", get(download_run_artifact))
+        .route("/runs/{id}/cancel", post(cancel_run))
 }
 pub fn app(state: AppState) -> Router {
     router(state)
@@ -2993,6 +3001,354 @@ async fn usage(
             .collect(),
     ))
 }
+
+// -- runs ---------------------------------------------------------------------
+
+/// Carries the id of the run a request produced, so a client can log or
+/// follow it without parsing the document that carries it too.
+const RUN_ID_HEADER: &str = "x-aiec-run-id";
+
+/// Run page size when the caller states none.
+const DEFAULT_RUN_PAGE: u32 = 50;
+
+/// Ceiling on a run page. A caller asking for their whole history in one
+/// response is asking the control plane to hold it all in memory, and the
+/// tenant's own history is not a reason to skip the bound.
+const MAX_RUN_PAGE: u32 = 200;
+
+#[derive(Deserialize)]
+struct ListRunsQuery {
+    state: Option<String>,
+    limit: Option<u32>,
+}
+
+/// A run's artifact plus where its bytes are.
+#[derive(Serialize)]
+struct RunArtifactResponse {
+    #[serde(flatten)]
+    artifact: RunArtifactRef,
+    /// Absolute within the API, so it can be handed to anything that speaks
+    /// HTTP rather than being reassembled by the caller.
+    download_url: String,
+}
+
+/// Starts a run and returns it settled.
+///
+/// This handler is synchronous on purpose, and that is not an oversight to be
+/// tidied away: `submit_and_execute` creates the run, drives it and destroys
+/// the machine it used before it returns, and the state it hands back is the
+/// only record that the work actually happened. Answering early and finishing
+/// in the background would detach the run's lifetime from the request that
+/// asked for it, and with it the caller's ability to see a machine that
+/// outlived its run.
+async fn create_run(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    headers: HeaderMap,
+    Json(mut request): Json<runs::RunRequest>,
+) -> Result<Response, ApiFailure> {
+    p.authorize(Scope::SandboxesWrite)
+        .map_err(ApiFailure::from)?;
+    // The header only fills a gap: a key stated in the body is the more
+    // specific of the two, and quietly overriding it would execute neither
+    // request the caller thought they were making.
+    if request.idempotency_key.is_none()
+        && let Some(key) = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+    {
+        request.idempotency_key = Some(key.to_owned());
+    }
+    let run = runs::submit_and_execute(&s, p.tenant_id, request)
+        .await
+        .map_err(ApiFailure::from)?;
+    run_response(StatusCode::CREATED, &run)
+}
+
+/// Lists the caller's runs, newest first.
+async fn list_runs(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Query(query): Query<ListRunsQuery>,
+) -> ApiResult<Vec<Run>> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    let state = match query.state.as_deref() {
+        Some(raw) => Some(RunState::parse(raw.trim()).ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("unknown run state `{raw}`"),
+            )
+        })?),
+        None => None,
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_RUN_PAGE)
+        .clamp(1, MAX_RUN_PAGE);
+    Ok(Json(
+        s.repository()
+            .list_runs(p.tenant_id, state, limit)
+            .await
+            .map_err(ApiFailure::from)?,
+    ))
+}
+
+/// Reads one of the caller's runs.
+async fn get_run(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Run> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    // The tenant is part of the lookup, not a check afterwards: a run that
+    // belongs to somebody else has to read as missing, because a 403 would
+    // confirm the id exists and hand out a directory of other people's work.
+    Ok(Json(
+        s.repository()
+            .get_run(p.tenant_id, id)
+            .await
+            .map_err(ApiFailure::from)?,
+    ))
+}
+
+/// A run's history, in the order it happened.
+async fn list_run_events(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Vec<RunEvent>> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    // The event table carries no tenant of its own, so ownership is settled
+    // first: without this, a run belonging to another tenant would answer with
+    // an empty history and read as "this run has no events".
+    s.repository()
+        .get_run(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(
+        s.repository()
+            .list_run_events(p.tenant_id, id)
+            .await
+            .map_err(ApiFailure::from)?,
+    ))
+}
+
+/// The artifacts a run collected, with a URL for each one's bytes.
+async fn list_run_artifacts(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Vec<RunArtifactResponse>> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    s.repository()
+        .get_run(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let artifacts = s
+        .repository()
+        .list_run_artifacts(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(
+        artifacts
+            .into_iter()
+            .map(|artifact| RunArtifactResponse {
+                download_url: format!("/v1/runs/{id}/artifacts/{}", artifact.name),
+                artifact,
+            })
+            .collect(),
+    ))
+}
+
+/// Fetches one artifact's bytes.
+async fn download_run_artifact(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Result<Response, ApiFailure> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    s.repository()
+        .get_run(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let artifact = s
+        .repository()
+        .list_run_artifacts(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?
+        .into_iter()
+        // The name is matched against the run's own records rather than turned
+        // into an object key: a caller-supplied path must not be able to name a
+        // key the run never collected.
+        .find(|artifact| artifact.name == name)
+        .ok_or_else(|| ApiFailure::from(CoreError::NotFound("run artifact not found".into())))?;
+    let store = s.artifact_store().ok_or_else(|| {
+        ApiFailure::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "artifacts_unavailable",
+            "artifact storage is not configured",
+        )
+    })?;
+    let bytes = match store.get(&artifact.object_key).await {
+        Ok(bytes) => bytes,
+        Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiFailure::from(CoreError::NotFound(
+                "run artifact not found".into(),
+            )));
+        }
+        Err(error) => return Err(ApiFailure::from(error)),
+    };
+    if bytes.len() > ARTIFACT_MAX_BYTES {
+        return Err(ApiFailure::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit_exceeded",
+            "artifact exceeds the 64 MiB limit",
+        ));
+    }
+    // The recorded content type is a stored string, so it is used only if it
+    // is still a legal header value; otherwise the bytes are served as the
+    // opaque thing they are.
+    let content_type = artifact
+        .content_type
+        .filter(|value| HeaderValue::from_str(value).is_ok())
+        .and_then(|value| HeaderValue::from_str(&value).ok())
+        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    Ok(response)
+}
+
+/// Stops a run and reclaims the machine it was holding.
+///
+/// Cancelling a run that has already finished is not a failure. The caller's
+/// intent -- no machine of mine is still working -- is already true, and a
+/// second cancel after a first one succeeded must not look like a mistake.
+async fn cancel_run(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiFailure> {
+    p.authorize(Scope::SandboxesWrite)
+        .map_err(ApiFailure::from)?;
+    let store = s.repository();
+    let run = store
+        .get_run(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    if run.state.is_terminal() {
+        return run_response(StatusCode::OK, &run);
+    }
+    let cancelled = match store
+        .update_run_state(p.tenant_id, id, run.state, RunState::Cancelled)
+        .await
+    {
+        Ok(cancelled) => cancelled,
+        // The run moved while this request was in flight. If it finished in the
+        // meantime the caller gets the outcome they asked for; if it is still
+        // live, the state genuinely changed under us and saying so is more
+        // honest than cancelling a run nobody can identify any more.
+        Err(CoreError::Conflict(_)) | Err(CoreError::NotFound(_)) => {
+            let current = store
+                .get_run(p.tenant_id, id)
+                .await
+                .map_err(ApiFailure::from)?;
+            if current.state.is_terminal() {
+                return run_response(StatusCode::OK, &current);
+            }
+            return Err(ApiFailure::from(CoreError::Conflict(
+                "run state changed".into(),
+            )));
+        }
+        Err(error) => return Err(ApiFailure::from(error)),
+    };
+    let (cancelled, released) = release_run_sandboxes(&s, &cancelled).await;
+    runs::event(
+        &s,
+        &cancelled,
+        "run.cancelled",
+        json!({ "destroyed_sandboxes": released }),
+    )
+    .await;
+    run_response(StatusCode::OK, &cancelled)
+}
+
+/// Destroys the machines a cancelled run was holding.
+///
+/// The run is cancelled before this runs, so a machine that will not go is
+/// reported on the run's results rather than logged and forgotten: capacity
+/// nobody believes is still held is capacity nobody reclaims.
+///
+/// The run to show the caller, and the machines that were actually reclaimed,
+/// both come back: "cancelled" on its own does not say whether the compute went
+/// with it.
+async fn release_run_sandboxes(state: &AppState, run: &Run) -> (Run, Vec<Uuid>) {
+    let mut released = Vec::new();
+    let mut results = run.results.clone();
+    let held = state
+        .repository()
+        .list_run_sandboxes(run.tenant_id, run.id)
+        .await
+        .unwrap_or_default();
+    for link in held {
+        match state
+            .repository()
+            .delete_sandbox(run.tenant_id, link.sandbox_id)
+            .await
+        {
+            Ok(()) => released.push(link.sandbox_id),
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    sandbox_id = %link.sandbox_id,
+                    error = %error,
+                    "could not destroy a cancelled run's sandbox"
+                );
+                results.cleanup_failed = Some(CleanupReport {
+                    sandbox_id: link.sandbox_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    let settled = match state
+        .repository()
+        .record_run_results(run.tenant_id, run.id, results, run.state)
+        .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run.id,
+                error = %error,
+                "could not record a cancelled run's results"
+            );
+            run.clone()
+        }
+    };
+    (settled, released)
+}
+
+/// Renders a run with its id in a header as well as in the body.
+fn run_response(status: StatusCode, run: &Run) -> Result<Response, ApiFailure> {
+    let id = HeaderValue::from_str(&run.id.to_string()).map_err(|error| {
+        ApiFailure::from(CoreError::Backend(format!(
+            "run id is not a header value: {error}"
+        )))
+    })?;
+    let mut response = (status, Json(run)).into_response();
+    response.headers_mut().insert(RUN_ID_HEADER, id);
+    Ok(response)
+}
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await
@@ -3040,7 +3396,7 @@ pub async fn serve_worker_tls(
 mod tests {
     use super::*;
     use aiec_core::run::{
-        Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState,
+        RetentionPolicy, Run, RunArtifactRef, RunEvent, RunResults, RunSandbox, RunState,
     };
     use aiec_core::storage::{
         AuditEvent, MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot,
@@ -3053,12 +3409,26 @@ mod tests {
     use tower::util::ServiceExt;
 
     /// Metadata store double: the in-memory repository plus a lease table with
-    /// generation compare-and-set, so the fencing routes can be exercised
-    /// without a database.
+    /// generation compare-and-set and a run table, so the fencing and run
+    /// routes can be exercised without a database.
+    ///
+    /// The run tables are here rather than in `MemoryRepository` because that
+    /// store keeps no runs: a double that answered `Unsupported` could not show
+    /// a cross-tenant read at all, which is the one thing the run routes exist
+    /// to guarantee. The tenant filter is the point, so it is implemented the
+    /// way the real store does it -- a row keyed by id, readable only by its
+    /// owner, and missing to everyone else.
     #[derive(Default)]
     struct LeasedRepository {
         inner: Arc<aiec_storage::MemoryRepository>,
         leases: TestMutex<TestMap<Uuid, WorkerLease>>,
+        runs: TestMutex<TestMap<Uuid, Run>>,
+        run_events: TestMutex<TestMap<Uuid, Vec<RunEvent>>>,
+        run_sandboxes: TestMutex<TestMap<Uuid, Vec<RunSandbox>>>,
+        run_artifacts: TestMutex<TestMap<Uuid, Vec<RunArtifactRef>>>,
+        /// Sandboxes created for a run, keyed by the request id that asked for
+        /// them, so a retried request joins the machine it already has.
+        sandbox_requests: TestMutex<TestMap<(Uuid, Uuid), SandboxId>>,
     }
 
     impl LeasedRepository {
@@ -3066,11 +3436,45 @@ mod tests {
             Arc::new(Self {
                 inner: aiec_storage::MemoryRepository::new(),
                 leases: TestMutex::new(TestMap::new()),
+                runs: TestMutex::new(TestMap::new()),
+                run_events: TestMutex::new(TestMap::new()),
+                run_sandboxes: TestMutex::new(TestMap::new()),
+                run_artifacts: TestMutex::new(TestMap::new()),
+                sandbox_requests: TestMutex::new(TestMap::new()),
             })
         }
 
         async fn insert(&self, lease: WorkerLease) {
             self.leases.lock().await.insert(lease.id, lease);
+        }
+
+        /// Puts a run in the table as though it had been created earlier, so a
+        /// test can act on a run in a state no reachable amount of waiting would
+        /// produce.
+        async fn seed(&self, run: Run) {
+            self.runs.lock().await.insert(run.id, run);
+        }
+
+        async fn stored_run(&self, tenant: Uuid, id: Uuid) -> Result<Run, CoreError> {
+            self.runs
+                .lock()
+                .await
+                .get(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))
+        }
+
+        /// The run a child row hangs off. Child rows carry no tenant of their
+        /// own, so this settles existence only; every read of them still goes
+        /// through the tenant-scoped run first.
+        async fn stored_run_for_child(&self, id: Uuid) -> Result<Run, CoreError> {
+            self.runs
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))
         }
     }
 
@@ -3442,9 +3846,18 @@ mod tests {
             request_id: RequestId,
             sandbox: Sandbox,
         ) -> Result<Sandbox, CoreError> {
-            self.inner
-                .create_sandbox_idempotent(tenant, request_id, sandbox)
-                .await
+            // A run asks for its machine by the run's own id, so a retried
+            // placement has to join the machine it already has rather than
+            // take a second one.
+            let mut requests = self.sandbox_requests.lock().await;
+            let key = (tenant, request_id);
+            if let Some(existing) = requests.get(&key) {
+                return self.inner.get_sandbox(tenant, *existing).await;
+            }
+            let id = sandbox.id;
+            self.inner.create_sandbox(sandbox).await?;
+            requests.insert(key, id);
+            self.inner.get_sandbox(tenant, id).await
         }
         async fn register_worker(&self, value: RegistrationRecord) -> Result<Uuid, CoreError> {
             self.inner.register_worker(value).await
@@ -3684,11 +4097,23 @@ mod tests {
             self.inner.get_image(id).await
         }
         async fn create_run(&self, run: Run) -> Result<Run, CoreError> {
-            self.inner.create_run(run).await
+            let mut runs = self.runs.lock().await;
+            // A retried request carrying a key it already used joins the run
+            // that key produced rather than starting a second one.
+            if let Some(key) = run.idempotency_key.as_deref()
+                && let Some(existing) = runs.values().find(|stored| {
+                    stored.tenant_id == run.tenant_id
+                        && stored.idempotency_key.as_deref() == Some(key)
+                })
+            {
+                return Ok(existing.clone());
+            }
+            runs.insert(run.id, run.clone());
+            Ok(run)
         }
 
         async fn get_run(&self, tenant: TenantId, id: Uuid) -> Result<Run, CoreError> {
-            self.inner.get_run(tenant, id).await
+            self.stored_run(tenant, id).await
         }
 
         async fn list_runs(
@@ -3697,7 +4122,19 @@ mod tests {
             state: Option<RunState>,
             limit: u32,
         ) -> Result<Vec<Run>, CoreError> {
-            self.inner.list_runs(tenant, state, limit).await
+            let mut page: Vec<Run> = self
+                .runs
+                .lock()
+                .await
+                .values()
+                .filter(|run| {
+                    run.tenant_id == tenant && state.is_none_or(|state| run.state == state)
+                })
+                .cloned()
+                .collect();
+            page.sort_by(|a, b| b.requested_at.cmp(&a.requested_at).then(b.id.cmp(&a.id)));
+            page.truncate(limit as usize);
+            Ok(page)
         }
 
         async fn update_run_state(
@@ -3707,7 +4144,22 @@ mod tests {
             from: RunState,
             to: RunState,
         ) -> Result<Run, CoreError> {
-            self.inner.update_run_state(tenant, id, from, to).await
+            if !from.can_transition_to(to) {
+                return Err(CoreError::Conflict("invalid run state transition".into()));
+            }
+            let mut runs = self.runs.lock().await;
+            let run = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            if run.state != from {
+                return Err(CoreError::Conflict("run state changed".into()));
+            }
+            run.state = to;
+            if to.is_terminal() && run.completed_at.is_none() {
+                run.completed_at = Some(Utc::now());
+            }
+            Ok(run.clone())
         }
 
         async fn record_run_results(
@@ -3717,17 +4169,29 @@ mod tests {
             results: RunResults,
             state: RunState,
         ) -> Result<Run, CoreError> {
-            self.inner
-                .record_run_results(tenant, id, results, state)
-                .await
-        }
-
-        async fn delete_run(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError> {
-            self.inner.delete_run(tenant, id).await
+            let mut runs = self.runs.lock().await;
+            let run = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            if run.state != state && !run.state.can_transition_to(state) {
+                return Err(CoreError::Conflict("invalid run state transition".into()));
+            }
+            run.results = results;
+            run.state = state;
+            if state.is_terminal() && run.completed_at.is_none() {
+                run.completed_at = Some(Utc::now());
+            }
+            Ok(run.clone())
         }
 
         async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
-            self.inner.append_run_event(event).await
+            self.stored_run_for_child(event.run_id).await?;
+            let mut events = self.run_events.lock().await;
+            let history = events.entry(event.run_id).or_default();
+            history.push(event);
+            history.sort_by_key(|event| (event.occurred_at, event.id));
+            Ok(())
         }
 
         async fn list_run_events(
@@ -3735,11 +4199,23 @@ mod tests {
             tenant: TenantId,
             run: Uuid,
         ) -> Result<Vec<RunEvent>, CoreError> {
-            self.inner.list_run_events(tenant, run).await
+            self.stored_run(tenant, run).await?;
+            Ok(self
+                .run_events
+                .lock()
+                .await
+                .get(&run)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn link_run_sandbox(&self, link: RunSandbox) -> Result<(), CoreError> {
-            self.inner.link_run_sandbox(link).await
+            self.stored_run_for_child(link.run_id).await?;
+            let mut links = self.run_sandboxes.lock().await;
+            let held = links.entry(link.run_id).or_default();
+            held.retain(|held| held.sandbox_id != link.sandbox_id);
+            held.push(link);
+            Ok(())
         }
 
         async fn list_run_sandboxes(
@@ -3747,19 +4223,14 @@ mod tests {
             tenant: TenantId,
             run: Uuid,
         ) -> Result<Vec<RunSandbox>, CoreError> {
-            self.inner.list_run_sandboxes(tenant, run).await
-        }
-
-        async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
-            self.inner.record_run_attempt(attempt).await
-        }
-
-        async fn list_run_attempts(
-            &self,
-            tenant: TenantId,
-            run: Uuid,
-        ) -> Result<Vec<RunAttempt>, CoreError> {
-            self.inner.list_run_attempts(tenant, run).await
+            self.stored_run(tenant, run).await?;
+            Ok(self
+                .run_sandboxes
+                .lock()
+                .await
+                .get(&run)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn put_run_artifacts(
@@ -3768,7 +4239,9 @@ mod tests {
             run: Uuid,
             artifacts: Vec<RunArtifactRef>,
         ) -> Result<(), CoreError> {
-            self.inner.put_run_artifacts(tenant, run, artifacts).await
+            self.stored_run(tenant, run).await?;
+            self.run_artifacts.lock().await.insert(run, artifacts);
+            Ok(())
         }
 
         async fn list_run_artifacts(
@@ -3776,15 +4249,14 @@ mod tests {
             tenant: TenantId,
             run: Uuid,
         ) -> Result<Vec<RunArtifactRef>, CoreError> {
-            self.inner.list_run_artifacts(tenant, run).await
-        }
-
-        async fn retained_runs_due(
-            &self,
-            now: chrono::DateTime<chrono::Utc>,
-            limit: u32,
-        ) -> Result<Vec<Run>, CoreError> {
-            self.inner.retained_runs_due(now, limit).await
+            self.stored_run(tenant, run).await?;
+            Ok(self
+                .run_artifacts
+                .lock()
+                .await
+                .get(&run)
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -4115,5 +4587,675 @@ mod tests {
             .await
             .expect("empty recovery");
         assert!(fixture.runtime.imported.lock().await.is_empty());
+    }
+
+    /// Runtime double that runs commands successfully, so a run submitted
+    /// through the API is driven all the way to a terminal state rather than
+    /// stopping at the first capability the cluster does not have.
+    struct RunRuntime;
+
+    #[async_trait::async_trait]
+    impl SandboxRuntime for RunRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout: request.command.join(" "),
+                stderr: String::new(),
+                duration_ms: 1,
+                timed_out: false,
+            })
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_file(&self, _: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
+            Ok(FileContent {
+                path: path.to_owned(),
+                content_base64: format!("contents of {path}"),
+            })
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
+            aiec_core::runtime::RuntimeHealth::healthy()
+        }
+        /// Advertises what the executor requires of a machine. Without exec and
+        /// files here, placement refuses the runtime and no run ever reaches a
+        /// command, which would test the scheduler rather than these routes.
+        fn capabilities(&self) -> aiec_core::runtime::RuntimeCapabilities {
+            aiec_core::runtime::RuntimeCapabilities {
+                exec: true,
+                files: true,
+                docker_image: true,
+                isolation: aiec_core::runtime::RuntimeIsolation::Container,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// An API key of the shape the auth middleware accepts.
+    fn run_api_key() -> String {
+        format!("af_live_{}", "ab".repeat(24))
+    }
+
+    /// A run as an earlier attempt would have left it.
+    fn settled_run(tenant: Uuid, state: RunState) -> Run {
+        let now = Utc::now();
+        Run {
+            id: new_id(),
+            tenant_id: tenant,
+            state,
+            requested_at: now,
+            queued_at: Some(now),
+            started_at: Some(now),
+            completed_at: state.is_terminal().then_some(now),
+            workload: Default::default(),
+            resources: Default::default(),
+            requirements: Default::default(),
+            placement: Default::default(),
+            results: Default::default(),
+            failure_reason: None,
+            retention: RetentionPolicy::Destroy,
+            retained_sandbox_id: None,
+            retained_until: None,
+            idempotency_key: None,
+            parent_run_id: None,
+            matrix_id: None,
+        }
+    }
+
+    /// The run routes driven over real HTTP against the real router, with a
+    /// store that keeps runs and a runtime that runs commands.
+    struct RunFixture {
+        state: AppState,
+        store: Arc<LeasedRepository>,
+        objects: Arc<dyn ArtifactStore>,
+        tenant: Uuid,
+        key: String,
+        root: std::path::PathBuf,
+    }
+
+    impl RunFixture {
+        fn new() -> Self {
+            let store = LeasedRepository::new();
+            let tenant = new_id();
+            let key = run_api_key();
+            let root = std::env::temp_dir().join(format!("af-runs-{}", new_id()));
+            let objects: Arc<dyn ArtifactStore> =
+                Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
+            let runtime = Arc::new(RunRuntime);
+            let metadata: Arc<dyn MetadataStore> = store.clone();
+            let platform = Platform::builder()
+                .runtime(runtime.clone())
+                .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                    RuntimeKind::Docker,
+                    runtime,
+                )))
+                .metadata_store(metadata)
+                .scheduler(Arc::new(DevelopmentScheduler))
+                .artifact_store(objects.clone())
+                .policy(Arc::new(DefaultPolicy))
+                .build()
+                .expect("platform");
+            let state = AppState::development(platform).with_worker_token("worker-token");
+            Self {
+                state,
+                store,
+                objects,
+                tenant,
+                key,
+                root,
+            }
+        }
+
+        /// Issues a key for `tenant`. Each tenant gets its own, because a
+        /// request is only ever seen as the principal its key resolves to.
+        async fn issue_key(&self, tenant: Uuid, key: &str) {
+            self.store
+                .put_key(ApiKeyRecord {
+                    id: new_id(),
+                    tenant_id: tenant,
+                    digest: key_digest(key),
+                    scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+                    expires_at: None,
+                    revoked_at: None,
+                    name: "runs".to_owned(),
+                    created_at: Utc::now(),
+                    last_used_at: None,
+                })
+                .await
+                .expect("put key");
+        }
+
+        async fn call(
+            &self,
+            method: axum::http::Method,
+            path: &str,
+            key: &str,
+            body: Value,
+        ) -> (StatusCode, HeaderMap, Vec<u8>) {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("run request");
+            let response = app(self.state.clone())
+                .oneshot(request)
+                .await
+                .expect("run response");
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("run body");
+            (status, headers, bytes.to_vec())
+        }
+
+        async fn call_json(
+            &self,
+            method: axum::http::Method,
+            path: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            let (status, _, bytes) = self.call(method, path, &self.key, body).await;
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+
+        /// Submits a run that does nothing, and returns it as the caller saw it.
+        async fn submit(&self) -> Value {
+            let (status, value) = self
+                .call_json(
+                    axum::http::Method::POST,
+                    "/v1/runs",
+                    json!({ "workload": { "command": ["true"] } }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "submit: {value}");
+            value
+        }
+    }
+
+    impl Drop for RunFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn run_document(value: &Value) -> Run {
+        serde_json::from_value(value.clone()).expect("run document")
+    }
+
+    /// Submitting a run creates it, runs it, and answers with the settled
+    /// document -- the caller is told what happened rather than that something
+    /// was started.
+    #[tokio::test]
+    async fn a_submitted_run_comes_back_settled_with_its_id() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let value = fixture.submit().await;
+        let run = run_document(&value);
+        assert_eq!(run.tenant_id, fixture.tenant);
+        assert_eq!(run.state, RunState::Succeeded);
+        assert_eq!(
+            run.results.task.as_ref().map(|task| task.exit_code),
+            Some(0)
+        );
+    }
+
+    /// The id is in a header so a client can follow the run from a log line,
+    /// and it has to be the run that was just created.
+    #[tokio::test]
+    async fn a_created_run_reports_its_id_in_a_header() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, headers, bytes) = fixture
+            .call(
+                axum::http::Method::POST,
+                "/v1/runs",
+                &fixture.key,
+                json!({ "workload": { "command": ["true"] } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let value: Value = serde_json::from_slice(&bytes).expect("run document");
+        assert_eq!(
+            headers.get(RUN_ID_HEADER).map(|value| value.to_str().ok()),
+            Some(Some(value["id"].as_str().unwrap_or_default()))
+        );
+    }
+
+    /// A retried request must not run the work twice; the key it already used
+    /// brings back the run that key produced.
+    #[tokio::test]
+    async fn a_retried_request_with_the_same_idempotency_key_reuses_the_run() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let submit_with_key = |key: Option<String>| {
+            let (state, raw) = (fixture.state.clone(), fixture.key.clone());
+            async move {
+                let mut builder = Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/runs")
+                    .header("authorization", format!("Bearer {raw}"))
+                    .header("content-type", "application/json");
+                if let Some(key) = key.as_deref() {
+                    builder = builder.header("idempotency-key", key);
+                }
+                let request = builder
+                    .body(Body::from(
+                        json!({ "workload": { "command": ["true"] } }).to_string(),
+                    ))
+                    .expect("run request");
+                let response = app(state).oneshot(request).await.expect("run response");
+                assert_eq!(response.status(), StatusCode::CREATED);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("run body");
+                serde_json::from_slice::<Value>(&body).expect("run document")
+            }
+        };
+
+        let first = submit_with_key(Some("retry-me".to_owned())).await;
+        let retried = submit_with_key(Some("retry-me".to_owned())).await;
+        assert_eq!(
+            first["id"], retried["id"],
+            "a retried request executed the work a second time"
+        );
+        let unkeyed = submit_with_key(None).await;
+        assert_ne!(
+            unkeyed["id"], retried["id"],
+            "a request without the key joined a run it never named"
+        );
+    }
+
+    /// The run a caller submitted is the run they read back.
+    #[tokio::test]
+    async fn a_run_can_be_read_back_by_id() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}", created["id"].as_str().unwrap_or_default()),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["id"], created["id"]);
+        assert_eq!(value["state"], created["state"]);
+    }
+
+    /// A run belonging to somebody else has to read as missing. A 403 would
+    /// confirm the id exists, which turns the run ids into a directory of other
+    /// tenants' work.
+    #[tokio::test]
+    async fn another_tenants_run_reads_as_missing_rather_than_forbidden() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let stranger_key = run_api_key().replace("ab", "cd");
+        let stranger = new_id();
+        fixture.issue_key(stranger, &stranger_key).await;
+
+        let (status, _, bytes) = fixture
+            .call(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}", created["id"].as_str().unwrap_or_default()),
+                &stranger_key,
+                Value::Null,
+            )
+            .await;
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {value}");
+        assert_eq!(value["error"]["code"], "not_found");
+    }
+
+    /// The list is a tenant's own history, and only its own.
+    #[tokio::test]
+    async fn a_tenant_does_not_see_another_tenants_runs() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let stranger_key = run_api_key().replace("ab", "cd");
+        fixture.issue_key(new_id(), &stranger_key).await;
+
+        let (status, mine) = fixture
+            .call_json(axum::http::Method::GET, "/v1/runs", Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<Value> = serde_json::from_value(mine).expect("run list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], created["id"]);
+
+        let (_, _, theirs) = fixture
+            .call(
+                axum::http::Method::GET,
+                "/v1/runs",
+                &stranger_key,
+                Value::Null,
+            )
+            .await;
+        let listed: Vec<Value> = serde_json::from_slice(&theirs).expect("run list");
+        assert!(
+            listed.is_empty(),
+            "another tenant's runs leaked: {listed:?}"
+        );
+    }
+
+    /// A state filter narrows the page, and a limit below the floor is clamped
+    /// rather than rejected: the caller asked for runs, not for a refusal.
+    #[tokio::test]
+    async fn a_run_page_is_filtered_by_state() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        fixture.submit().await;
+        fixture
+            .store
+            .seed(settled_run(fixture.tenant, RunState::Running))
+            .await;
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                "/v1/runs?state=running&limit=0",
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<Run> = serde_json::from_value(value).expect("run list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, RunState::Running);
+
+        let (status, _) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                "/v1/runs?state=nonsense",
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The history of a run reads in the order it happened, starting with the
+    /// creation the executor records before any work starts.
+    #[tokio::test]
+    async fn a_runs_events_are_returned_in_order() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let id = created["id"].as_str().unwrap_or_default().to_owned();
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{id}/events"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<RunEvent> = serde_json::from_value(value).expect("event list");
+        assert!(!events.is_empty(), "a run with no history is undebuggable");
+        assert_eq!(
+            events.first().map(|event| event.event_type.as_str()),
+            Some("run.created")
+        );
+        assert!(events.iter().all(|event| event.run_id.to_string() == id));
+    }
+
+    /// An artifact is listed with the URL its bytes are served from, and that
+    /// URL returns those bytes.
+    #[tokio::test]
+    async fn a_runs_artifact_is_listed_with_a_url_and_served_from_it() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let run = settled_run(fixture.tenant, RunState::Succeeded);
+        let object_key = format!("tenants/{}/runs/{}/report.txt", fixture.tenant, run.id);
+        fixture
+            .objects
+            .put(&object_key, b"run output")
+            .await
+            .expect("store artifact");
+        fixture.store.seed(run.clone()).await;
+        fixture
+            .store
+            .put_run_artifacts(
+                fixture.tenant,
+                run.id,
+                vec![RunArtifactRef {
+                    name: "report.txt".to_owned(),
+                    object_key,
+                    size_bytes: 10,
+                    checksum_sha256: None,
+                    content_type: Some("text/plain".to_owned()),
+                }],
+            )
+            .await
+            .expect("record artifacts");
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}/artifacts", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<Value> = serde_json::from_value(value).expect("artifact list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "report.txt");
+        let url = listed[0]["download_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+
+        let (status, headers, bytes) = fixture
+            .call(axum::http::Method::GET, &url, &fixture.key, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, b"run output");
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.to_str().ok()),
+            Some(Some("text/plain"))
+        );
+    }
+
+    /// Cancelling a finished run is not a failure: the caller wanted no machine
+    /// of theirs left working, and there already is none.
+    #[tokio::test]
+    async fn cancelling_a_finished_run_returns_it_unchanged() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let id = created["id"].as_str().unwrap_or_default().to_owned();
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{id}/cancel"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["id"], created["id"]);
+        assert_eq!(value["state"], created["state"]);
+        assert_eq!(value["state"], "succeeded");
+        assert_eq!(value["completed_at"], created["completed_at"]);
+    }
+
+    /// Cancelling a run that is still working stops it and reclaims the machine
+    /// it was holding. The sandbox is the expensive part: a cancelled run that
+    /// left one behind would be holding capacity nobody is paying for.
+    #[tokio::test]
+    async fn cancelling_a_live_run_stops_it_and_reclaims_its_machine() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let run = settled_run(fixture.tenant, RunState::Running);
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "aiec-coding:latest".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: 1024,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            runtime_path: None,
+        };
+        fixture
+            .store
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+        fixture.store.seed(run.clone()).await;
+        fixture
+            .store
+            .link_run_sandbox(RunSandbox {
+                run_id: run.id,
+                sandbox_id: sandbox.id,
+                role: "primary".into(),
+            })
+            .await
+            .expect("link sandbox");
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "cancel: {value}");
+        assert_eq!(value["state"], "cancelled");
+        // Deleting a sandbox is a state change, not a row removal: what matters
+        // is that the machine is no longer running the work.
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .map(|sandbox| sandbox.state)
+                .expect("sandbox row"),
+            SandboxState::Destroyed,
+            "a cancelled run left its machine running"
+        );
+    }
+
+    /// A tenant that cannot see a run cannot cancel it either: the ownership
+    /// check is the same one the read uses, so cancellation is not a way to
+    /// stop somebody else's work.
+    #[tokio::test]
+    async fn cancelling_another_tenants_run_reads_as_missing() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let stranger_key = run_api_key().replace("ab", "cd");
+        fixture.issue_key(new_id(), &stranger_key).await;
+
+        let (status, _, bytes) = fixture
+            .call(
+                axum::http::Method::POST,
+                &format!(
+                    "/v1/runs/{}/cancel",
+                    created["id"].as_str().unwrap_or_default()
+                ),
+                &stranger_key,
+                Value::Null,
+            )
+            .await;
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {value}");
+        assert_eq!(
+            fixture
+                .store
+                .stored_run(fixture.tenant, run_document(&created).id)
+                .await
+                .map(|run| run.state)
+                .expect("run"),
+            RunState::Succeeded
+        );
+    }
+
+    /// The read scope is enough to read a run and its history, and a key
+    /// without it is refused before any run is touched.
+    #[tokio::test]
+    async fn a_key_without_the_read_scope_cannot_read_a_run() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let created = fixture.submit().await;
+        let reader_key = run_api_key().replace("ab", "cd");
+        fixture
+            .store
+            .put_key(ApiKeyRecord {
+                id: new_id(),
+                tenant_id: fixture.tenant,
+                digest: key_digest(&reader_key),
+                scopes: vec![Scope::SnapshotsRead],
+                expires_at: None,
+                revoked_at: None,
+                name: "snapshots only".to_owned(),
+                created_at: Utc::now(),
+                last_used_at: None,
+            })
+            .await
+            .expect("put key");
+
+        let (status, _, _) = fixture
+            .call(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}", created["id"].as_str().unwrap_or_default()),
+                &reader_key,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
