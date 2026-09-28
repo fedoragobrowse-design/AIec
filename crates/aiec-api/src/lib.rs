@@ -3805,7 +3805,8 @@ mod tests {
         async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+        async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+            let _ = sandbox;
             Ok(())
         }
         async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
@@ -4689,7 +4690,41 @@ mod tests {
     /// Runtime double that runs commands successfully, so a run submitted
     /// through the API is driven all the way to a terminal state rather than
     /// stopping at the first capability the cluster does not have.
-    struct RunRuntime;
+    #[derive(Default, Clone)]
+    struct DestroyRecorder {
+        destroyed: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+    }
+
+    impl DestroyRecorder {
+        fn destroyed(&self) -> Vec<Uuid> {
+            self.destroyed
+                .lock()
+                .map(|log| log.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// A double that records which sandboxes were actually stopped.
+    ///
+    /// The bug this exists for was a cleanup that set the row to `destroyed`
+    /// and never stopped the machine, leaving containers running while the
+    /// control plane reported them gone. Assertions about rows and capacity all
+    /// passed while that was happening; the observable that would have caught
+    /// it is the one the old code never produced.
+    #[derive(Clone, Default)]
+    struct RunRuntime {
+        recorder: Option<DestroyRecorder>,
+    }
+
+    impl RunRuntime {
+        /// Records into a recorder the caller owns, so the test reads the same
+        /// log the runtime wrote to.
+        fn recording(recorder: DestroyRecorder) -> Self {
+            Self {
+                recorder: Some(recorder),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl SandboxRuntime for RunRuntime {
@@ -4742,7 +4777,12 @@ mod tests {
         async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
             Ok(())
         }
-        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+        async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+            if let Some(recorder) = &self.recorder
+                && let Ok(mut log) = recorder.destroyed.lock()
+            {
+                log.push(sandbox.id);
+            }
             Ok(())
         }
         async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
@@ -4826,6 +4866,95 @@ mod tests {
         assert_eq!(RunState::Failed.as_str(), "failed");
     }
 
+    /// A finished run must stop its machine, not merely forget it.
+    ///
+    /// The bug this pins shipped twice. Cleanup called
+    /// `repository().delete_sandbox`, which sets the row to `destroyed` and
+    /// credits the node's capacity back, so every assertion about rows and
+    /// capacity passed while seventeen containers kept running on the worker.
+    /// The observable that would have caught it is the one the old code never
+    /// produced: the runtime being told to stop.
+    #[tokio::test]
+    async fn finishing_a_run_stops_the_machine_it_used() {
+        let store = LeasedRepository::new();
+        let tenant = new_id();
+        let key = run_api_key();
+        let root = std::env::temp_dir().join(format!("af-teardown-{}", new_id()));
+        let objects: Arc<dyn ArtifactStore> =
+            Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
+        let recorder = DestroyRecorder::default();
+        let runtime: Arc<dyn SandboxRuntime> = Arc::new(RunRuntime::recording(recorder.clone()));
+        let metadata: Arc<dyn MetadataStore> = store.clone();
+        let platform = Platform::builder()
+            .runtime(runtime.clone())
+            .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                RuntimeKind::Docker,
+                runtime,
+            )))
+            .metadata_store(metadata)
+            .scheduler(Arc::new(DevelopmentScheduler))
+            .artifact_store(objects)
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        let state = AppState::development(platform).with_worker_token("worker-token");
+
+        // The key has to exist before the request, exactly as a tenant's would.
+        store
+            .put_key(ApiKeyRecord {
+                id: new_id(),
+                tenant_id: tenant,
+                digest: key_digest(&key),
+                scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+                expires_at: None,
+                revoked_at: None,
+                name: "teardown".to_owned(),
+                created_at: Utc::now(),
+                last_used_at: None,
+            })
+            .await
+            .expect("put key");
+
+        // Through the HTTP layer, so this exercises the path a caller uses
+        // rather than a private entry point that might diverge from it.
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/runs")
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "workload": {"image": "python:3.13", "command": ["/bin/sh", "-lc", "true"]},
+                    "requested_runtime": "docker",
+                    "retention": "destroy",
+                })
+                .to_string(),
+            ))
+            .expect("run request");
+        let response = app(state.clone()).oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let run: Run = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!("run json: {} / {}", status, String::from_utf8_lossy(&bytes))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(run.state, RunState::Succeeded);
+        let stopped = recorder.destroyed();
+        assert_eq!(
+            stopped.len(),
+            1,
+            "a finished run must stop exactly the machine it used"
+        );
+        let linked = store
+            .list_run_sandboxes(tenant, run.id)
+            .await
+            .expect("run sandboxes");
+        assert_eq!(stopped, vec![linked[0].sandbox_id]);
+    }
+
     struct RunFixture {
         state: AppState,
         store: Arc<LeasedRepository>,
@@ -4843,7 +4972,7 @@ mod tests {
             let root = std::env::temp_dir().join(format!("af-runs-{}", new_id()));
             let objects: Arc<dyn ArtifactStore> =
                 Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
-            let runtime = Arc::new(RunRuntime);
+            let runtime = Arc::new(RunRuntime::default());
             let metadata: Arc<dyn MetadataStore> = store.clone();
             let platform = Platform::builder()
                 .runtime(runtime.clone())
