@@ -2,7 +2,9 @@
 
 use crate::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Snapshot,
-    UsageEvent, UsageSummary, runtime::RuntimeCapabilities,
+    UsageEvent, UsageSummary,
+    run::{Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState},
+    runtime::RuntimeCapabilities,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -617,4 +619,135 @@ pub trait MetadataStore: Send + Sync {
         action: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AuditEvent>, CoreError>;
+
+    // Run storage. A Run is durable work rather than compute, so it has its own
+    // records, but it lives in the same store and behind the same tenant
+    // scoping: nothing here is readable without the owning tenant.
+    //
+    // The methods below have no default implementation on purpose -- a store
+    // that cannot keep runs must not pretend to -- except that they are declared
+    // with bodies so that a store which only persists sandboxes still
+    // implements the trait, answering `Unsupported` rather than failing to
+    // compile. `PostgresRepository` implements every one of them.
+
+    /// Creates a run, or returns the run this idempotency key already produced.
+    ///
+    /// Two requests carrying the same `(tenant, idempotency_key)` are one run:
+    /// a retried request must not double-execute or double-bill. The stored run
+    /// is returned unchanged, so a caller that retries after a timeout learns
+    /// what actually happened instead of creating a second run.
+    async fn create_run(&self, _run: Run) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Gets a tenant-owned run.
+    async fn get_run(&self, _tenant: TenantId, _id: Uuid) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists a tenant's runs newest first, optionally filtered by state.
+    async fn list_runs(
+        &self,
+        _tenant: TenantId,
+        _state: Option<RunState>,
+        _limit: u32,
+    ) -> Result<Vec<Run>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Moves a run from one state to another, only if it is still in `from`.
+    ///
+    /// The expected state is part of the write, so two callers racing the same
+    /// transition cannot both win: the loser is told the state moved rather
+    /// than silently overwriting it. A terminal run never moves again.
+    async fn update_run_state(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _from: RunState,
+        _to: RunState,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Records what a run produced and the state that outcome put it in.
+    async fn record_run_results(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _results: RunResults,
+        _state: RunState,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Deletes a tenant-owned run.
+    ///
+    /// A run whose history has been recorded is retained: the record of what
+    /// happened is not deletable, and deleting the run would take it with it.
+    async fn delete_run(&self, _tenant: TenantId, _id: Uuid) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Appends one event to a run's history.
+    ///
+    /// Events are append-only in storage: there is no update or delete path, so
+    /// a mistake is answered by appending a correcting event.
+    async fn append_run_event(&self, _event: RunEvent) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists a run's history in the order it happened.
+    async fn list_run_events(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+    ) -> Result<Vec<RunEvent>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Records that a run used a machine, and what for.
+    async fn link_run_sandbox(&self, _link: RunSandbox) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists the machines a run used.
+    async fn list_run_sandboxes(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+    ) -> Result<Vec<RunSandbox>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Records one attempt of a run.
+    async fn record_run_attempt(&self, _attempt: RunAttempt) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists every attempt of a run, including the ones that did not work.
+    async fn list_run_attempts(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+    ) -> Result<Vec<RunAttempt>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Replaces the artifacts collected for a run.
+    async fn put_run_artifacts(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+        _artifacts: Vec<RunArtifactRef>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists the artifacts collected for a run, by name.
+    async fn list_run_artifacts(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+    ) -> Result<Vec<RunArtifactRef>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Lists runs whose retained machine has passed its expiry.
+    ///
+    /// This is the sweeper's read, and it crosses tenants on purpose: expiry is
+    /// a property of a machine, not of a tenant, so no tenant is passed.
+    async fn retained_runs_due(
+        &self,
+        _now: DateTime<Utc>,
+        _limit: u32,
+    ) -> Result<Vec<Run>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
 }

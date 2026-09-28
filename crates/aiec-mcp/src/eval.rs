@@ -291,9 +291,16 @@ pub async fn run_repo_task(
     // The one exit point: the machine is released before the result is
     // propagated, so a `?` on the way out cannot skip the cleanup.
     let cleanup_failed = guard.release().await;
-    let mut result = outcome?;
-    result.cleanup_failed = cleanup_failed;
-    Ok(result)
+    match outcome {
+        Ok(mut result) => {
+            result.cleanup_failed = cleanup_failed;
+            Ok(result)
+        }
+        // The error path still has to carry the cleanup report. Discarding it
+        // here is what let a leaked machine go unreported: the run failed, the
+        // destroy failed too, and the caller was told only about the first.
+        Err(error) => Err(attach_cleanup_failure(error, cleanup_failed)),
+    }
 }
 
 /// Everything that happens inside a task sandbox, after it exists.
@@ -668,6 +675,29 @@ impl SideSummary {
         summary.changed_file_count = changed.len();
         summary
     }
+}
+
+/// Carries a cleanup failure out on the error path.
+///
+/// A machine that outlived its run is the more urgent fact than the workflow
+/// error, so it is attached to the error's details rather than dropped.
+fn attach_cleanup_failure(error: McpError, cleanup: Option<CleanupFailure>) -> McpError {
+    let Some(cleanup) = cleanup else {
+        return error;
+    };
+    let mut details = if error.details.is_object() {
+        error.details
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "cleanup_failed".to_owned(),
+            serde_json::json!({ "sandbox_id": cleanup.sandbox_id, "error": cleanup.error }),
+        );
+        object.insert("sandbox_still_running".to_owned(), serde_json::json!(true));
+    }
+    McpError { details, ..error }
 }
 
 /// A sandbox this server created and could not destroy.

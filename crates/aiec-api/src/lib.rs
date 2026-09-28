@@ -2284,6 +2284,74 @@ async fn resume_sandbox(
         .map_err(ApiFailure::from)?;
     Ok(Json(x))
 }
+/// Records a sandbox file operation in the audit trail.
+///
+/// Whether the operation succeeded is reported; its payload never is.
+async fn record_sandbox_file(
+    state: &AppState,
+    principal: &Principal,
+    sandbox_id: Uuid,
+    action: &str,
+    ok: bool,
+    detail: &Value,
+) {
+    let _ = state
+        .repository()
+        .append_audit_event(aiec_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(principal.tenant_id),
+            actor: format!("key:{}", principal.key_id),
+            action: action.to_string(),
+            subject_type: "sandbox".to_string(),
+            subject_id: Some(sandbox_id.to_string()),
+            result: if ok { "success" } else { "failure" }.to_string(),
+            request_id: None,
+            remote_addr: None,
+            detail: detail.clone(),
+        })
+        .await;
+}
+
+/// Records one sandbox exec in the audit trail.
+///
+/// The detail is passed in already scrubbed by the caller. An audit write never
+/// fails the operation it describes: losing the record is bad, refusing the
+/// user's command because the record could not be written is worse.
+async fn record_sandbox_exec(
+    state: &AppState,
+    principal: &Principal,
+    sandbox_id: Uuid,
+    result: &str,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    detail: &Value,
+) {
+    let mut detail = detail.clone();
+    if let Some(object) = detail.as_object_mut() {
+        object.insert("exit_code".to_owned(), json!(exit_code));
+        object.insert("duration_ms".to_owned(), json!(duration_ms));
+    }
+    let _ = state
+        .repository()
+        .append_audit_event(aiec_core::storage::AuditEvent {
+            id: new_id(),
+            occurred_at: Utc::now(),
+            tenant_id: Some(principal.tenant_id),
+            actor: format!("key:{}", principal.key_id),
+            action: "sandbox.exec".to_string(),
+            subject_type: "sandbox".to_string(),
+            subject_id: Some(sandbox_id.to_string()),
+            result: result.to_string(),
+            // The principal carries no request id; correlation is by sandbox id
+            // and time, which is what this log is for.
+            request_id: None,
+            remote_addr: None,
+            detail,
+        })
+        .await;
+}
+
 async fn exec_sandbox(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -2304,13 +2372,51 @@ async fn exec_sandbox(
     }
     let mut r = b.into_request()?;
     validate_exec(&r).map_err(ApiFailure::from)?;
+
+    // Recorded before the tenant's secrets are merged in, and deliberately as
+    // shapes rather than values: `audit_log.detail` is not a secret store, and
+    // logging the request wholesale would write every injected secret to disk in
+    // plaintext. Environment keys are named so a reader can see what the command
+    // was given, never what those values were.
+    let audit_detail = json!({
+        "command": r.command,
+        "cwd": r.working_directory,
+        "timeout_seconds": r.timeout_seconds,
+        "env_keys": r.environment.keys().collect::<Vec<_>>(),
+        "stdin_bytes": r.stdin.as_deref().map(str::len),
+    });
+
     r.environment.extend(s.secret_values(p.tenant_id, id).await);
-    Ok(Json(
-        s.runtime_for(&x)?
-            .exec(&x, r)
-            .await
-            .map_err(ApiFailure::from)?,
-    ))
+    let started = std::time::Instant::now();
+    let outcome = s.runtime_for(&x)?.exec(&x, r).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match &outcome {
+        Ok(result) => {
+            record_sandbox_exec(
+                &s,
+                &p,
+                id,
+                "success",
+                Some(result.exit_code),
+                Some(duration_ms),
+                &audit_detail,
+            )
+            .await;
+        }
+        Err(_) => {
+            record_sandbox_exec(
+                &s,
+                &p,
+                id,
+                "failure",
+                None,
+                Some(duration_ms),
+                &audit_detail,
+            )
+            .await;
+        }
+    }
+    Ok(Json(outcome.map_err(ApiFailure::from)?))
 }
 
 async fn git_diff(
@@ -2425,10 +2531,12 @@ async fn put_file(
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    s.runtime_for(&x)?
-        .put_file(&x, r)
-        .await
-        .map_err(ApiFailure::from)?;
+    // The path and the size, never the content: what was written is the payload
+    // and may be a secret the caller is staging inside the sandbox.
+    let detail = json!({ "path": r.path, "bytes": r.content_base64.len() });
+    let outcome = s.runtime_for(&x)?.put_file(&x, r).await;
+    record_sandbox_file(&s, &p, id, "sandbox.file.write", outcome.is_ok(), &detail).await;
+    outcome.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status":"written"})))
 }
 async fn get_file(

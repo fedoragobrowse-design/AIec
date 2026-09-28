@@ -13,6 +13,7 @@ pub mod images;
 pub mod network;
 pub mod platform;
 pub mod policy;
+pub mod run;
 pub mod runtime;
 pub mod scheduler;
 pub mod snapshots;
