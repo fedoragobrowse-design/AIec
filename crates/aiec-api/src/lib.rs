@@ -9,6 +9,7 @@ use aiec_core::{
 pub mod account;
 mod composition;
 pub mod ratelimit;
+pub mod runs;
 mod worker;
 use axum::{
     Json, Router,
