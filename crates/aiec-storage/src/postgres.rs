@@ -4,6 +4,10 @@ use crate::{
 use aiec_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
     Snapshot, UsageEvent, UsageSummary, new_id,
+    run::{
+        RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox,
+        RunState, WorkloadSpec,
+    },
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
     storage::{
         AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
@@ -244,6 +248,112 @@ fn audit_event_from_row(row: &sqlx::postgres::PgRow) -> Result<AuditEvent, Store
     })
 }
 
+fn invalid_run_state(value: &str) -> StoreError {
+    StoreError::Conflict(format!("invalid persisted run state: {value}"))
+}
+
+fn run_state_from_str(value: &str) -> Result<RunState, StoreError> {
+    RunState::parse(value).ok_or_else(|| invalid_run_state(value))
+}
+
+/// The states a stored attempt may be in.
+///
+/// An attempt is one try at a run, so only a try that is under way or has
+/// finished is a thing that can be recorded. A run in `queued` or `preparing`
+/// has not made an attempt yet, and writing that here would be a claim about
+/// work that never started.
+fn attempt_state_as_str(value: RunState) -> Result<&'static str, StoreError> {
+    match value {
+        RunState::Running => Ok("running"),
+        RunState::Succeeded => Ok("succeeded"),
+        RunState::Failed => Ok("failed"),
+        RunState::Cancelled => Ok("cancelled"),
+        state => Err(StoreError::Conflict(format!(
+            "an attempt cannot be recorded in the {} state",
+            state.as_str()
+        ))),
+    }
+}
+
+fn run_from_row(row: &sqlx::postgres::PgRow) -> Result<Run, StoreError> {
+    let state: String = row.try_get("state")?;
+    let retention: String = row.try_get("retention")?;
+    let environment: Value = row.try_get("environment")?;
+    // A run's environment is written twice: inside the workload document, which
+    // is what gets executed, and as its own column so a query can find a run by
+    // an environment name without unnesting the whole workload. The column is
+    // the one a query reads, so it is also the one that wins on the way back and
+    // a round trip cannot hand back a workload that disagrees with the row.
+    let mut workload: WorkloadSpec = serde_json::from_value(row.try_get("workload")?)?;
+    workload.environment = serde_json::from_value(environment)?;
+    Ok(Run {
+        id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
+        state: run_state_from_str(&state)?,
+        requested_at: row.try_get("requested_at")?,
+        queued_at: row.try_get("queued_at")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+        workload,
+        resources: serde_json::from_value(row.try_get("resources")?)?,
+        requirements: serde_json::from_value(row.try_get("requirements")?)?,
+        placement: serde_json::from_value(row.try_get("placement")?)?,
+        results: serde_json::from_value(row.try_get("results")?)?,
+        failure_reason: row.try_get("failure_reason")?,
+        retention: RetentionPolicy::parse(&retention).ok_or_else(|| {
+            StoreError::Conflict(format!("invalid persisted run retention: {retention}"))
+        })?,
+        retained_sandbox_id: row.try_get("retained_sandbox_id")?,
+        retained_until: row.try_get("retained_until")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        parent_run_id: row.try_get("parent_run_id")?,
+        matrix_id: row.try_get("matrix_id")?,
+    })
+}
+
+fn run_event_from_row(row: &sqlx::postgres::PgRow) -> Result<RunEvent, StoreError> {
+    Ok(RunEvent {
+        id: row.try_get("id")?,
+        run_id: row.try_get("run_id")?,
+        sandbox_id: row.try_get("sandbox_id")?,
+        event_type: row.try_get("type")?,
+        occurred_at: row.try_get("occurred_at")?,
+        detail: row.try_get("detail")?,
+    })
+}
+
+fn run_sandbox_from_row(row: &sqlx::postgres::PgRow) -> Result<RunSandbox, StoreError> {
+    Ok(RunSandbox {
+        run_id: row.try_get("run_id")?,
+        sandbox_id: row.try_get("sandbox_id")?,
+        role: row.try_get("role")?,
+    })
+}
+
+fn run_attempt_from_row(row: &sqlx::postgres::PgRow) -> Result<RunAttempt, StoreError> {
+    let state: String = row.try_get("state")?;
+    Ok(RunAttempt {
+        id: row.try_get("id")?,
+        run_id: row.try_get("run_id")?,
+        attempt_number: row.try_get("attempt_number")?,
+        sandbox_id: row.try_get("sandbox_id")?,
+        state: run_state_from_str(&state)?,
+        failure_reason: row.try_get("failure_reason")?,
+        started_at: row.try_get("started_at")?,
+        completed_at: row.try_get("completed_at")?,
+    })
+}
+
+fn run_artifact_from_row(row: &sqlx::postgres::PgRow) -> Result<RunArtifactRef, StoreError> {
+    Ok(RunArtifactRef {
+        name: row.try_get("name")?,
+        object_key: row.try_get("object_key")?,
+        size_bytes: row.try_get("size_bytes")?,
+        checksum_sha256: row.try_get("checksum_sha256")?,
+        content_type: row.try_get("content_type")?,
+    })
+}
+
 fn scope_values(scopes: &[Scope]) -> Result<Value, StoreError> {
     serde_json::to_value(scopes).map_err(StoreError::Json)
 }
@@ -274,6 +384,70 @@ async fn fetch_sandbox(
         .map_err(database_error)?
         .ok_or(StoreError::NotFound)?;
     sandbox_from_row(&row)
+}
+
+/// Reads one run on behalf of a tenant.
+///
+/// Every run read goes through here, so a run belonging to another tenant is
+/// indistinguishable from one that does not exist.
+async fn fetch_run(
+    executor: impl sqlx::Executor<'_, Database = Postgres>,
+    tenant: Uuid,
+    id: Uuid,
+) -> Result<Run, StoreError> {
+    let row = sqlx::query("SELECT * FROM runs WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(executor)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+    run_from_row(&row)
+}
+
+/// Confirms a run is reachable by this tenant before a child record is written.
+async fn ensure_tenant_run(
+    executor: impl sqlx::Executor<'_, Database = Postgres>,
+    tenant: Uuid,
+    run: Uuid,
+) -> Result<(), StoreError> {
+    fetch_run(executor, tenant, run).await.map(|_| ())
+}
+
+/// Confirms a run exists before an append that names no tenant of its own.
+///
+/// The child tables carry no tenant column, so the run is the only thing that
+/// scopes them. Checking first turns a naming mistake into [`StoreError::NotFound`]
+/// instead of handing the caller a foreign-key violation it cannot act on.
+async fn ensure_run(
+    executor: impl sqlx::Executor<'_, Database = Postgres>,
+    run: Uuid,
+) -> Result<(), StoreError> {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM runs WHERE id = $1")
+        .bind(run)
+        .fetch_optional(executor)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+    Ok(())
+}
+
+/// A hard delete of a run cascades into `run_events`, whose triggers reject any
+/// mutation of the record of what happened.
+///
+/// The record outranks the request to erase it, so the caller is told the run is
+/// kept rather than handed the raw `RAISE` from a trigger it has no way to act
+/// on. The delete is still the thing that decides: a run with no recorded
+/// history is removed normally, and this only rewrites the error.
+fn run_history_is_append_only(error: sqlx::Error) -> StoreError {
+    if let sqlx::Error::Database(database) = &error
+        && database.code().as_deref() == Some("P0001")
+    {
+        return StoreError::Conflict(
+            "a run's recorded history is append-only and cannot be deleted".into(),
+        );
+    }
+    database_error(error)
 }
 
 async fn insert_sandbox_event(
@@ -2642,6 +2816,415 @@ impl PostgresRepository {
             created_at: row.try_get("created_at")?,
         })
     }
+
+    /// Creates a run, or returns the run this idempotency key already produced.
+    async fn create_run(&self, value: Run) -> Result<Run, StoreError> {
+        if value.tenant_id.is_nil() {
+            return Err(StoreError::Conflict("run tenant is required".into()));
+        }
+        let workload = serde_json::to_value(&value.workload)?;
+        // The environment is stored twice on purpose: once inside the workload
+        // document, which is what actually executes, and once in its own column
+        // so a run can be found by an environment name without unnesting every
+        // workload in the tenant. `run_from_row` reads the column back into the
+        // document, so the two can never disagree.
+        let environment = serde_json::to_value(&value.workload.environment)?;
+        let requirements = serde_json::to_value(&value.requirements)?;
+        let resources = serde_json::to_value(&value.resources)?;
+        let placement = serde_json::to_value(&value.placement)?;
+        let results = serde_json::to_value(&value.results)?;
+        // The conflict target names the partial unique index, so a retry
+        // carrying the same key collides here instead of inserting a second run.
+        // `DO UPDATE` with a write that changes nothing is what brings the row
+        // back in this same statement: `DO NOTHING` would return no row and cost
+        // a second round trip to read a run the caller already knows exists, and
+        // a read-then-insert pair would let two concurrent retries both insert.
+        let row = sqlx::query(
+            "INSERT INTO runs (id, tenant_id, state, requested_at, queued_at, started_at, \
+             completed_at, workload, environment, requirements, resources, placement, results, \
+             failure_reason, retention, retained_sandbox_id, retained_until, idempotency_key, \
+             parent_run_id, matrix_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
+             ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL \
+             DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
+        )
+        .bind(value.id)
+        .bind(value.tenant_id)
+        .bind(value.state.as_str())
+        .bind(value.requested_at)
+        .bind(value.queued_at)
+        .bind(value.started_at)
+        .bind(value.completed_at)
+        .bind(&workload)
+        .bind(&environment)
+        .bind(&requirements)
+        .bind(&resources)
+        .bind(&placement)
+        .bind(&results)
+        .bind(&value.failure_reason)
+        .bind(value.retention.as_str())
+        .bind(value.retained_sandbox_id)
+        .bind(value.retained_until)
+        .bind(&value.idempotency_key)
+        .bind(value.parent_run_id)
+        .bind(value.matrix_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        run_from_row(&row)
+    }
+
+    async fn get_run(&self, tenant: Uuid, id: Uuid) -> Result<Run, StoreError> {
+        fetch_run(&self.pool, tenant, id).await
+    }
+
+    async fn list_runs(
+        &self,
+        tenant: Uuid,
+        state: Option<RunState>,
+        limit: u32,
+    ) -> Result<Vec<Run>, StoreError> {
+        // The tenant leads so `runs_tenant_created_idx` drives the page, which
+        // is the index that answers "this tenant's runs, newest first". The
+        // state stays an `OR` on a nullable parameter so one statement serves
+        // both the filtered and the unfiltered page, and a filter that matches
+        // few rows of a tenant's own page costs less than a second scan shape.
+        let rows = sqlx::query(
+            "SELECT * FROM runs \
+             WHERE tenant_id = $1 AND ($2::text IS NULL OR state = $2) \
+             ORDER BY requested_at DESC, id DESC LIMIT $3",
+        )
+        .bind(tenant)
+        .bind(state.map(RunState::as_str))
+        .bind(i64::from(limit.clamp(1, 1_000)))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    async fn update_run_state(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        from: RunState,
+        to: RunState,
+    ) -> Result<Run, StoreError> {
+        if !from.can_transition_to(to) {
+            return Err(StoreError::Conflict("invalid run state transition".into()));
+        }
+        // The expected state is part of the write rather than a check made in
+        // Rust before it: two callers racing the same transition both pass any
+        // local check, and only one of them can still match `state = $4`. The
+        // lifecycle edge above is the one thing checked here, because
+        // `RunState::can_transition_to` is the only definition of the lifecycle
+        // and a second copy of it in SQL would be a second thing to keep true.
+        // The lifecycle timestamps move with the state, because a run that
+        // succeeded with no completion time cannot be aged or reported on.
+        let row = sqlx::query(
+            "UPDATE runs SET state = $1, \
+               queued_at = CASE WHEN $1 <> 'queued' THEN COALESCE(queued_at, now()) \
+                 ELSE queued_at END, \
+               started_at = CASE WHEN $1 IN ('running','validating','collecting') \
+                 THEN COALESCE(started_at, now()) ELSE started_at END, \
+               completed_at = CASE WHEN $1 IN ('succeeded','failed','cancelled') \
+                 THEN now() ELSE completed_at END \
+             WHERE tenant_id = $2 AND id = $3 AND state = $4 RETURNING *",
+        )
+        .bind(to.as_str())
+        .bind(tenant)
+        .bind(id)
+        .bind(from.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = row {
+            return run_from_row(&row);
+        }
+        // No row updated is two different failures, and the caller acts on them
+        // differently: a run this tenant cannot see is missing, while a run that
+        // is visible but no longer in `from` was moved by someone else.
+        if self.get_run(tenant, id).await.is_ok() {
+            return Err(StoreError::Conflict("run state changed".into()));
+        }
+        Err(StoreError::NotFound)
+    }
+
+    async fn record_run_results(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        results: RunResults,
+        state: RunState,
+    ) -> Result<Run, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query("SELECT * FROM runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::NotFound)?;
+        let current = run_from_row(&row)?;
+        // Results arrive with the state they put the run in, and unlike
+        // `update_run_state` that state is the caller's claim rather than a
+        // compare-and-set. It is still held to the lifecycle here, so a late
+        // write cannot talk a finished run back into running.
+        if current.state != state && !current.state.can_transition_to(state) {
+            return Err(StoreError::Conflict("invalid run state transition".into()));
+        }
+        let updated = sqlx::query(
+            "UPDATE runs SET results = $1, state = $2, \
+               completed_at = CASE WHEN $2 IN ('succeeded','failed','cancelled') \
+                 THEN COALESCE(completed_at, now()) ELSE completed_at END \
+             WHERE tenant_id = $3 AND id = $4 RETURNING *",
+        )
+        .bind(serde_json::to_value(&results)?)
+        .bind(state.as_str())
+        .bind(tenant)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let value = run_from_row(&updated)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(value)
+    }
+
+    async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
+        let result = sqlx::query("DELETE FROM runs WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(run_history_is_append_only)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Appends one run event. There is deliberately no update or delete path:
+    /// the table's triggers reject both, so a mistake has to be answered with a
+    /// correcting event rather than an edit to the record of what happened.
+    async fn append_run_event(&self, value: RunEvent) -> Result<(), StoreError> {
+        if value.event_type.trim().is_empty() {
+            return Err(StoreError::Conflict("a run event needs a type".into()));
+        }
+        if !value.detail.is_object() {
+            return Err(StoreError::Conflict(
+                "a run event detail must be a JSON object".into(),
+            ));
+        }
+        ensure_run(&self.pool, value.run_id).await?;
+        sqlx::query(
+            "INSERT INTO run_events (id, run_id, sandbox_id, type, occurred_at, detail) \
+             VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(value.id)
+        .bind(value.run_id)
+        .bind(value.sandbox_id)
+        .bind(value.event_type)
+        .bind(value.occurred_at)
+        .bind(value.detail)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn list_run_events(&self, tenant: Uuid, run: Uuid) -> Result<Vec<RunEvent>, StoreError> {
+        // The child tables carry no tenant of their own, so the run is joined in
+        // to keep a tenant from reading another tenant's history.
+        let rows = sqlx::query(
+            "SELECT e.* FROM run_events e JOIN runs r ON r.id = e.run_id \
+             WHERE r.tenant_id = $1 AND e.run_id = $2 ORDER BY e.occurred_at, e.id",
+        )
+        .bind(tenant)
+        .bind(run)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_event_from_row).collect()
+    }
+
+    async fn link_run_sandbox(&self, value: RunSandbox) -> Result<(), StoreError> {
+        if value.role.trim().is_empty() {
+            return Err(StoreError::Conflict("a run sandbox needs a role".into()));
+        }
+        ensure_run(&self.pool, value.run_id).await?;
+        // Relinking the same machine is a change of purpose -- a retry takes
+        // over the role its first attempt had -- so the link is restated rather
+        // than duplicated, and a retried link of the same machine and role is a
+        // no-op instead of a unique violation.
+        sqlx::query(
+            "INSERT INTO run_sandboxes (run_id, sandbox_id, role) VALUES ($1,$2,$3) \
+             ON CONFLICT (run_id, sandbox_id) DO UPDATE SET role = EXCLUDED.role",
+        )
+        .bind(value.run_id)
+        .bind(value.sandbox_id)
+        .bind(value.role)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn list_run_sandboxes(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunSandbox>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT s.run_id, s.sandbox_id, s.role FROM run_sandboxes s \
+             JOIN runs r ON r.id = s.run_id \
+             WHERE r.tenant_id = $1 AND s.run_id = $2 ORDER BY s.created_at, s.sandbox_id",
+        )
+        .bind(tenant)
+        .bind(run)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_sandbox_from_row).collect()
+    }
+
+    /// Records one attempt of a run. Attempts are evidence of a try, so they are
+    /// written once and never edited: a second write for the same attempt number
+    /// is refused rather than allowed to rewrite what the first try did.
+    async fn record_run_attempt(&self, value: RunAttempt) -> Result<(), StoreError> {
+        if value.attempt_number <= 0 {
+            return Err(StoreError::Conflict(
+                "a run attempt number must be positive".into(),
+            ));
+        }
+        let state = attempt_state_as_str(value.state)?;
+        ensure_run(&self.pool, value.run_id).await?;
+        sqlx::query(
+            "INSERT INTO run_attempts \
+             (id, run_id, attempt_number, sandbox_id, state, failure_reason, started_at, \
+              completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        )
+        .bind(value.id)
+        .bind(value.run_id)
+        .bind(value.attempt_number)
+        .bind(value.sandbox_id)
+        .bind(state)
+        .bind(&value.failure_reason)
+        .bind(value.started_at)
+        .bind(value.completed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn list_run_attempts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunAttempt>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT a.* FROM run_attempts a JOIN runs r ON r.id = a.run_id \
+             WHERE r.tenant_id = $1 AND a.run_id = $2 ORDER BY a.attempt_number",
+        )
+        .bind(tenant)
+        .bind(run)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_attempt_from_row).collect()
+    }
+
+    async fn put_run_artifacts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+        artifacts: Vec<RunArtifactRef>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        ensure_tenant_run(&mut *tx, tenant, run).await?;
+        // Replacing rather than appending: a run's artifacts are what the
+        // collection pass found, and a re-run that collects fewer files must not
+        // leave the files it no longer produced listed against the run.
+        sqlx::query("DELETE FROM run_artifacts WHERE run_id = $1")
+            .bind(run)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        for artifact in artifacts {
+            if artifact.name.trim().is_empty() || artifact.object_key.trim().is_empty() {
+                return Err(StoreError::Conflict(
+                    "a run artifact needs a name and an object key".into(),
+                ));
+            }
+            if artifact.size_bytes < 0 {
+                return Err(StoreError::Conflict(
+                    "a run artifact cannot have a negative size".into(),
+                ));
+            }
+            sqlx::query(
+                "INSERT INTO run_artifacts \
+                 (id, run_id, name, object_key, size_bytes, checksum_sha256, content_type) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            )
+            .bind(new_id())
+            .bind(run)
+            .bind(&artifact.name)
+            .bind(&artifact.object_key)
+            .bind(artifact.size_bytes)
+            .bind(&artifact.checksum_sha256)
+            .bind(&artifact.content_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        }
+        tx.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn list_run_artifacts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunArtifactRef>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT f.name, f.object_key, f.size_bytes, f.checksum_sha256, f.content_type \
+             FROM run_artifacts f JOIN runs r ON r.id = f.run_id \
+             WHERE r.tenant_id = $1 AND f.run_id = $2 ORDER BY f.name",
+        )
+        .bind(tenant)
+        .bind(run)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_artifact_from_row).collect()
+    }
+
+    /// Lists the runs whose retained machine has passed its expiry.
+    ///
+    /// This is the one run read with no tenant: expiry is a property of a
+    /// machine, and a machine that was retained for debugging is still capacity
+    /// the cluster is holding whether or not anybody is still asking. The
+    /// predicate mirrors `Run::retention_expired` exactly, and it is written so
+    /// `runs_retained_until_idx` can answer it: the partial index's predicate is
+    /// restated here and nothing else narrows the scan, so the sweep is an index
+    /// range rather than a full pass over every run ever recorded.
+    async fn retained_runs_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Run>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM runs WHERE retained_until IS NOT NULL AND retained_until <= $1 \
+             ORDER BY retained_until LIMIT $2",
+        )
+        .bind(now)
+        .bind(i64::from(limit.clamp(1, 1_000)))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(run_from_row).collect()
+    }
 }
 
 #[async_trait]
@@ -2987,6 +3570,111 @@ impl MetadataStore for PostgresRepository {
     async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError> {
         Self::get_image(self, id).await.map_err(core_error)
     }
+    async fn create_run(&self, run: Run) -> Result<Run, CoreError> {
+        Self::create_run(self, run).await.map_err(core_error)
+    }
+    async fn get_run(&self, tenant: Uuid, id: Uuid) -> Result<Run, CoreError> {
+        Self::get_run(self, tenant, id).await.map_err(core_error)
+    }
+    async fn list_runs(
+        &self,
+        tenant: Uuid,
+        state: Option<RunState>,
+        limit: u32,
+    ) -> Result<Vec<Run>, CoreError> {
+        Self::list_runs(self, tenant, state, limit)
+            .await
+            .map_err(core_error)
+    }
+    async fn update_run_state(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        from: RunState,
+        to: RunState,
+    ) -> Result<Run, CoreError> {
+        Self::update_run_state(self, tenant, id, from, to)
+            .await
+            .map_err(core_error)
+    }
+    async fn record_run_results(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        results: RunResults,
+        state: RunState,
+    ) -> Result<Run, CoreError> {
+        Self::record_run_results(self, tenant, id, results, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
+        Self::delete_run(self, tenant, id).await.map_err(core_error)
+    }
+    async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
+        Self::append_run_event(self, event)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_run_events(&self, tenant: Uuid, run: Uuid) -> Result<Vec<RunEvent>, CoreError> {
+        Self::list_run_events(self, tenant, run)
+            .await
+            .map_err(core_error)
+    }
+    async fn link_run_sandbox(&self, link: RunSandbox) -> Result<(), CoreError> {
+        Self::link_run_sandbox(self, link).await.map_err(core_error)
+    }
+    async fn list_run_sandboxes(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunSandbox>, CoreError> {
+        Self::list_run_sandboxes(self, tenant, run)
+            .await
+            .map_err(core_error)
+    }
+    async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
+        Self::record_run_attempt(self, attempt)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_run_attempts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunAttempt>, CoreError> {
+        Self::list_run_attempts(self, tenant, run)
+            .await
+            .map_err(core_error)
+    }
+    async fn put_run_artifacts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+        artifacts: Vec<RunArtifactRef>,
+    ) -> Result<(), CoreError> {
+        Self::put_run_artifacts(self, tenant, run, artifacts)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_run_artifacts(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+    ) -> Result<Vec<RunArtifactRef>, CoreError> {
+        Self::list_run_artifacts(self, tenant, run)
+            .await
+            .map_err(core_error)
+    }
+    async fn retained_runs_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Run>, CoreError> {
+        Self::retained_runs_due(self, now, limit)
+            .await
+            .map_err(core_error)
+    }
 }
 
 async fn update_operation(
@@ -3119,6 +3807,7 @@ async fn release_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     #[test]
@@ -4548,5 +5237,672 @@ mod tests {
             matching, 1,
             "a restarting worker must not accumulate duplicate node records"
         );
+    }
+
+    /// A queued run, with everything else left at its defaults so a test can say
+    /// exactly which field it is exercising.
+    fn run(tenant: Uuid) -> Run {
+        Run {
+            id: new_id(),
+            tenant_id: tenant,
+            state: RunState::Queued,
+            // Postgres keeps microseconds, so a fixture carrying nanoseconds
+            // could never compare equal to the run that comes back out.
+            requested_at: whole_microsecond_ago(0),
+            queued_at: None,
+            started_at: None,
+            completed_at: None,
+            workload: WorkloadSpec {
+                command: vec!["echo".into(), "hello".into()],
+                ..Default::default()
+            },
+            resources: Default::default(),
+            requirements: Default::default(),
+            placement: Default::default(),
+            results: Default::default(),
+            failure_reason: None,
+            retention: RetentionPolicy::Destroy,
+            retained_sandbox_id: None,
+            retained_until: None,
+            idempotency_key: None,
+            parent_run_id: None,
+            matrix_id: None,
+        }
+    }
+
+    fn run_event(run: Uuid, event_type: &str, offset_seconds: i64) -> RunEvent {
+        RunEvent {
+            id: new_id(),
+            run_id: run,
+            sandbox_id: None,
+            event_type: event_type.into(),
+            occurred_at: Utc::now() + chrono::Duration::seconds(offset_seconds),
+            detail: json!({ "step": offset_seconds }),
+        }
+    }
+
+    fn run_artifact(name: &str) -> RunArtifactRef {
+        RunArtifactRef {
+            name: name.into(),
+            object_key: format!("runs/artifacts/{name}"),
+            size_bytes: 4_096,
+            checksum_sha256: None,
+            content_type: Some("application/json".into()),
+        }
+    }
+
+    /// The repository as a caller reaches it.
+    ///
+    /// The run methods exist twice on `PostgresRepository` -- once returning the
+    /// store's own error, once as the trait -- and a bare call resolves to the
+    /// inherent one. These tests assert on the `CoreError` an API handler
+    /// receives, so the error paths go through the trait.
+    fn store(repository: &PostgresRepository) -> &dyn MetadataStore {
+        repository
+    }
+
+    /// A second tenant, for the isolation checks. `repository_and_tenant` only
+    /// ever hands back one tenant, and every run read is tenant-scoped, so an
+    /// outsider has to exist before "the wrong tenant cannot see it" means
+    /// anything.
+    async fn other_tenant(repository: &PostgresRepository) -> Uuid {
+        let tenant = new_id();
+        repository
+            .put_tenant(TenantRecord {
+                id: tenant,
+                name: format!("run-outsider-{tenant}"),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        tenant
+    }
+
+    #[tokio::test]
+    async fn a_run_round_trips_with_every_field_intact() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let parent = repository.create_run(run(tenant)).await.unwrap();
+        let moment = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("the current time is representable");
+        let mut value = run(tenant);
+        value.state = RunState::Failed;
+        value.queued_at = Some(moment);
+        value.started_at = Some(moment + chrono::Duration::seconds(1));
+        value.completed_at = Some(moment + chrono::Duration::seconds(9));
+        value.workload = WorkloadSpec {
+            image: Some("afimg1_base".into()),
+            repo: Some(aiec_core::run::RepoSpec {
+                url: "https://example.invalid/repo.git".into(),
+                reference: Some("main".into()),
+                path: "/workspace/repository".into(),
+            }),
+            setup: vec![vec!["apt-get".into(), "update".into()]],
+            command: vec!["cargo".into(), "test".into()],
+            validations: vec![vec!["cargo".into(), "clippy".into()]],
+            artifacts: vec!["target/report.json".into()],
+            environment: BTreeMap::from([("CI".to_owned(), "true".to_owned())]),
+            secrets: vec!["NPM_TOKEN".into()],
+            timeout_seconds: Some(900),
+            git_evidence: true,
+        };
+        value.resources = aiec_core::run::ResourceRequirements {
+            cpu: 4,
+            memory_mb: 2_048,
+            disk_mb: 8_192,
+            network: aiec_core::network::NetworkPolicy::Internet,
+        };
+        value.requirements = aiec_core::run::CapabilityRequirements {
+            full_kernel_isolation: true,
+            coding_guest: true,
+            ..Default::default()
+        };
+        value.placement = aiec_core::run::Placement {
+            runtime: Some("firecracker".into()),
+            worker: Some("node-1".into()),
+            reasons: vec!["the only worker offering a pty".into()],
+        };
+        value.results = RunResults {
+            task: Some(aiec_core::run::CommandOutcome {
+                command: vec!["cargo".into(), "test".into()],
+                exit_code: 1,
+                stdout: "running 3 tests".into(),
+                stderr: "one test failed".into(),
+                duration_ms: 1_200,
+                truncated: false,
+                ok: false,
+            }),
+            validations: vec![aiec_core::run::CommandOutcome {
+                command: vec!["cargo".into(), "fmt".into()],
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 40,
+                truncated: false,
+                ok: true,
+            }],
+            setup: Vec::new(),
+            commit: Some("0f1e2d3".into()),
+            git_status: " M src/main.rs".into(),
+            git_diff: "+ println!();".into(),
+            changed_files: vec!["src/main.rs".into()],
+            artifacts: vec![run_artifact("report.json")],
+            phase_ms: BTreeMap::from([("collect".to_owned(), 90)]),
+            cleanup_failed: None,
+        };
+        value.failure_reason = Some("the task exited 1".into());
+        value.retention = RetentionPolicy::KeepOnFailure;
+        value.retained_sandbox_id = Some(new_id());
+        value.retained_until = Some(moment + chrono::Duration::hours(2));
+        value.idempotency_key = Some(format!("round-trip-{tenant}"));
+        value.parent_run_id = Some(parent.id);
+        value.matrix_id = Some(new_id());
+
+        let created = repository.create_run(value.clone()).await.unwrap();
+        assert_eq!(
+            created, value,
+            "a created run reads back exactly as it was written"
+        );
+        assert_eq!(repository.get_run(tenant, value.id).await.unwrap(), value);
+
+        let listed = repository.list_runs(tenant, None, 50).await.unwrap();
+        assert!(listed.contains(&value));
+        let queued = repository
+            .list_runs(tenant, Some(RunState::Queued), 50)
+            .await
+            .unwrap();
+        assert!(queued.contains(&parent));
+        assert!(
+            !queued.contains(&value),
+            "a state filter must not hand back runs in another state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_create_with_the_same_key_returns_the_first_run() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let outsider = other_tenant(&repository).await;
+        let key = format!("retry-{tenant}");
+        let mut first = run(tenant);
+        first.idempotency_key = Some(key.clone());
+        let created = repository.create_run(first.clone()).await.unwrap();
+
+        let mut retry = run(tenant);
+        retry.idempotency_key = Some(key.clone());
+        retry.workload.command = vec!["rm".into(), "-rf".into(), "/".into()];
+        let again = repository.create_run(retry).await.unwrap();
+        assert_eq!(
+            again, created,
+            "a retried request is handed the run it already created, not a second one"
+        );
+        assert_eq!(
+            repository.list_runs(tenant, None, 50).await.unwrap().len(),
+            1
+        );
+
+        // The key is the tenant's, not the cluster's: another tenant asking for
+        // the same key is a different run, not a collision.
+        let mut elsewhere = run(outsider);
+        elsewhere.idempotency_key = Some(key);
+        let theirs = repository.create_run(elsewhere).await.unwrap();
+        assert_ne!(theirs.id, created.id);
+        assert_eq!(
+            repository
+                .list_runs(outsider, None, 50)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The property every other run read depends on: a run is unreachable
+    /// without the tenant that owns it, and every path that takes a tenant says
+    /// so rather than falling back to the owner's view.
+    #[tokio::test]
+    async fn a_run_belonging_to_another_tenant_is_not_found() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let outsider = other_tenant(&repository).await;
+        let value = repository.create_run(run(tenant)).await.unwrap();
+        repository
+            .append_run_event(run_event(value.id, "run.created", 0))
+            .await
+            .unwrap();
+        repository
+            .put_run_artifacts(tenant, value.id, vec![run_artifact("report.json")])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store(&repository).get_run(outsider, value.id).await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store(&repository)
+                .update_run_state(outsider, value.id, RunState::Queued, RunState::Preparing)
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store(&repository)
+                .record_run_results(outsider, value.id, RunResults::default(), RunState::Failed,)
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store(&repository).delete_run(outsider, value.id).await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store(&repository)
+                .put_run_artifacts(outsider, value.id, vec![run_artifact("stolen.json")])
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(
+            repository
+                .list_run_events(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .list_run_artifacts(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .list_run_attempts(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .list_run_sandboxes(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .list_runs(outsider, None, 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // None of that cost the owner access to their own run.
+        assert_eq!(repository.get_run(tenant, value.id).await.unwrap(), value);
+    }
+
+    #[tokio::test]
+    async fn a_stale_state_transition_is_refused() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let value = repository.create_run(run(tenant)).await.unwrap();
+        let preparing = repository
+            .update_run_state(tenant, value.id, RunState::Queued, RunState::Preparing)
+            .await
+            .unwrap();
+        assert_eq!(preparing.state, RunState::Preparing);
+        assert!(
+            preparing.started_at.is_none(),
+            "a preparing run has not started executing yet"
+        );
+
+        // The winner of a race is the only one that moves the run; the loser is
+        // told the state moved rather than being allowed to overwrite it.
+        assert!(matches!(
+            store(&repository)
+                .update_run_state(tenant, value.id, RunState::Queued, RunState::Running)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store(&repository)
+                .get_run(tenant, value.id)
+                .await
+                .unwrap()
+                .state,
+            RunState::Preparing,
+            "a refused transition must leave the run where the winner put it"
+        );
+
+        // An edge the lifecycle does not have is refused before the write is
+        // issued at all, the same way a sandbox transition is: the caller hears
+        // about an impossible move rather than about a row that did not change.
+        assert!(matches!(
+            store(&repository)
+                .update_run_state(tenant, value.id, RunState::Preparing, RunState::Collecting,)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recording_results_settles_the_run_and_will_not_restart_it() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let mut value = run(tenant);
+        value.state = RunState::Collecting;
+        value.queued_at = Some(whole_microsecond_ago(9));
+        value.started_at = Some(whole_microsecond_ago(3));
+        let created = repository.create_run(value).await.unwrap();
+        let results = RunResults {
+            task: Some(aiec_core::run::CommandOutcome {
+                command: vec!["cargo".into(), "test".into()],
+                exit_code: 0,
+                stdout: "ok".into(),
+                stderr: String::new(),
+                duration_ms: 900,
+                truncated: false,
+                ok: true,
+            }),
+            commit: Some("0f1e2d3".into()),
+            ..Default::default()
+        };
+
+        let settled = repository
+            .record_run_results(tenant, created.id, results.clone(), RunState::Succeeded)
+            .await
+            .unwrap();
+        assert_eq!(settled.state, RunState::Succeeded);
+        assert_eq!(settled.results, results);
+        assert!(
+            settled.completed_at.is_some(),
+            "a run that finished without a completion time cannot be aged"
+        );
+
+        // Results carry the state they put the run in rather than a
+        // compare-and-set, so a late write must not be able to restart a run
+        // that has already finished.
+        assert!(matches!(
+            store(&repository)
+                .record_run_results(tenant, created.id, RunResults::default(), RunState::Running,)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert_eq!(
+            repository.get_run(tenant, created.id).await.unwrap(),
+            settled
+        );
+    }
+
+    #[tokio::test]
+    async fn run_events_append_in_order_and_cannot_be_deleted() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let value = repository.create_run(run(tenant)).await.unwrap();
+        for (offset, kind) in ["run.created", "sandbox.assigned", "task.started"]
+            .iter()
+            .enumerate()
+        {
+            repository
+                .append_run_event(run_event(value.id, kind, offset as i64))
+                .await
+                .unwrap();
+        }
+
+        let events = repository.list_run_events(tenant, value.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run.created", "sandbox.assigned", "task.started"],
+            "a run's history reads back in the order it happened"
+        );
+        assert_eq!(events[2].detail, json!({ "step": 2 }));
+
+        // An event naming a run that is not there is a naming mistake, not a
+        // database failure the caller cannot act on.
+        assert!(matches!(
+            store(&repository)
+                .append_run_event(run_event(new_id(), "run.created", 0))
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_artifacts_round_trip_within_their_tenant() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let outsider = other_tenant(&repository).await;
+        let value = repository.create_run(run(tenant)).await.unwrap();
+        let mut large = run_artifact("target.tar");
+        large.size_bytes = 1_073_741_824;
+        let artifacts = vec![run_artifact("report.json"), large];
+        repository
+            .put_run_artifacts(tenant, value.id, artifacts.clone())
+            .await
+            .unwrap();
+
+        let listed = repository
+            .list_run_artifacts(tenant, value.id)
+            .await
+            .unwrap();
+        let mut expected = artifacts;
+        expected.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(listed, expected);
+        assert!(
+            repository
+                .list_run_artifacts(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A collection pass that finds fewer files must not leave the files it
+        // no longer produced listed against the run.
+        repository
+            .put_run_artifacts(tenant, value.id, vec![run_artifact("report.json")])
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .list_run_artifacts(tenant, value.id)
+                .await
+                .unwrap(),
+            vec![run_artifact("report.json")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_records_the_machines_it_used_and_every_attempt() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let outsider = other_tenant(&repository).await;
+        let machine = sandbox(tenant);
+        let sandbox_id = machine.id;
+        repository.create_sandbox(machine).await.unwrap();
+        let value = repository.create_run(run(tenant)).await.unwrap();
+        repository
+            .link_run_sandbox(RunSandbox {
+                run_id: value.id,
+                sandbox_id,
+                role: "primary".into(),
+            })
+            .await
+            .unwrap();
+
+        for (number, state, reason) in [
+            (1, RunState::Failed, Some("the machine died")),
+            (2, RunState::Succeeded, None),
+        ] {
+            repository
+                .record_run_attempt(RunAttempt {
+                    id: new_id(),
+                    run_id: value.id,
+                    attempt_number: number,
+                    sandbox_id: Some(sandbox_id),
+                    state,
+                    failure_reason: reason.map(str::to_owned),
+                    started_at: Utc::now(),
+                    completed_at: Some(Utc::now()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let attempts = repository
+            .list_run_attempts(tenant, value.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "a retried run keeps the attempt that did not work"
+        );
+        assert_eq!(attempts[0].state, RunState::Failed);
+        assert_eq!(
+            attempts[0].failure_reason.as_deref(),
+            Some("the machine died")
+        );
+        let linked = repository
+            .list_run_sandboxes(tenant, value.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            linked,
+            vec![RunSandbox {
+                run_id: value.id,
+                sandbox_id,
+                role: "primary".into(),
+            }]
+        );
+        assert!(
+            repository
+                .list_run_attempts(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repository
+                .list_run_sandboxes(outsider, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // An attempt is evidence of a try, so it cannot be recorded for a state
+        // that is not a try, and a second attempt cannot rewrite the first.
+        assert!(matches!(
+            store(&repository)
+                .record_run_attempt(RunAttempt {
+                    id: new_id(),
+                    run_id: value.id,
+                    attempt_number: 3,
+                    sandbox_id: None,
+                    state: RunState::Queued,
+                    failure_reason: None,
+                    started_at: Utc::now(),
+                    completed_at: None,
+                })
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            store(&repository)
+                .record_run_attempt(RunAttempt {
+                    id: new_id(),
+                    run_id: value.id,
+                    attempt_number: 1,
+                    sandbox_id: None,
+                    state: RunState::Succeeded,
+                    failure_reason: None,
+                    started_at: Utc::now(),
+                    completed_at: None,
+                })
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert_eq!(
+            repository
+                .list_run_attempts(tenant, value.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_recorded_history_is_kept_and_one_without_it_is_removed() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let with_history = repository.create_run(run(tenant)).await.unwrap();
+        repository
+            .append_run_event(run_event(with_history.id, "run.created", 0))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store(&repository).delete_run(tenant, with_history.id).await,
+                Err(CoreError::Conflict(_))
+            ),
+            "a run whose history has been recorded is not erasable"
+        );
+        assert!(repository.get_run(tenant, with_history.id).await.is_ok());
+
+        let bare = repository.create_run(run(tenant)).await.unwrap();
+        repository.delete_run(tenant, bare.id).await.unwrap();
+        assert!(matches!(
+            store(&repository).get_run(tenant, bare.id).await,
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_runs_due_returns_only_runs_whose_retention_expired() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let now = whole_microsecond_ago(0);
+        let mut expired = run(tenant);
+        expired.retained_sandbox_id = Some(new_id());
+        expired.retained_until = Some(now - chrono::Duration::hours(1));
+        let mut held = run(tenant);
+        held.retained_sandbox_id = Some(new_id());
+        held.retained_until = Some(now + chrono::Duration::hours(1));
+        let released = run(tenant);
+        for value in [&expired, &held, &released] {
+            repository.create_run(value.clone()).await.unwrap();
+        }
+
+        // The sweeper is the one run read that crosses tenants, so the check is
+        // scoped to the runs this test made rather than to the whole table.
+        let due = repository.retained_runs_due(now, 100).await.unwrap();
+        assert!(due.contains(&expired));
+        assert!(
+            !due.contains(&held),
+            "a machine kept for debugging is not due before its own expiry"
+        );
+        assert!(
+            !due.contains(&released),
+            "a run that retained nothing has nothing to sweep"
+        );
+        assert!(expired.retention_expired(now));
+        assert!(!held.retention_expired(now));
+        assert!(!released.retention_expired(now));
     }
 }

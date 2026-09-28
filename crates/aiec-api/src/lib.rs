@@ -3038,6 +3038,9 @@ pub async fn serve_worker_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aiec_core::run::{
+        Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState,
+    };
     use aiec_core::storage::{
         AuditEvent, MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot,
         TenantRecord, WorkerHeartbeat as HeartbeatRecord, WorkerLease,
@@ -3678,6 +3681,109 @@ mod tests {
         }
         async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError> {
             self.inner.get_image(id).await
+        }
+        async fn create_run(&self, run: Run) -> Result<Run, CoreError> {
+            self.inner.create_run(run).await
+        }
+
+        async fn get_run(&self, tenant: TenantId, id: Uuid) -> Result<Run, CoreError> {
+            self.inner.get_run(tenant, id).await
+        }
+
+        async fn list_runs(
+            &self,
+            tenant: TenantId,
+            state: Option<RunState>,
+            limit: u32,
+        ) -> Result<Vec<Run>, CoreError> {
+            self.inner.list_runs(tenant, state, limit).await
+        }
+
+        async fn update_run_state(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            from: RunState,
+            to: RunState,
+        ) -> Result<Run, CoreError> {
+            self.inner.update_run_state(tenant, id, from, to).await
+        }
+
+        async fn record_run_results(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            results: RunResults,
+            state: RunState,
+        ) -> Result<Run, CoreError> {
+            self.inner
+                .record_run_results(tenant, id, results, state)
+                .await
+        }
+
+        async fn delete_run(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError> {
+            self.inner.delete_run(tenant, id).await
+        }
+
+        async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
+            self.inner.append_run_event(event).await
+        }
+
+        async fn list_run_events(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+        ) -> Result<Vec<RunEvent>, CoreError> {
+            self.inner.list_run_events(tenant, run).await
+        }
+
+        async fn link_run_sandbox(&self, link: RunSandbox) -> Result<(), CoreError> {
+            self.inner.link_run_sandbox(link).await
+        }
+
+        async fn list_run_sandboxes(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+        ) -> Result<Vec<RunSandbox>, CoreError> {
+            self.inner.list_run_sandboxes(tenant, run).await
+        }
+
+        async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
+            self.inner.record_run_attempt(attempt).await
+        }
+
+        async fn list_run_attempts(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+        ) -> Result<Vec<RunAttempt>, CoreError> {
+            self.inner.list_run_attempts(tenant, run).await
+        }
+
+        async fn put_run_artifacts(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+            artifacts: Vec<RunArtifactRef>,
+        ) -> Result<(), CoreError> {
+            self.inner.put_run_artifacts(tenant, run, artifacts).await
+        }
+
+        async fn list_run_artifacts(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+        ) -> Result<Vec<RunArtifactRef>, CoreError> {
+            self.inner.list_run_artifacts(tenant, run).await
+        }
+
+        async fn retained_runs_due(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            limit: u32,
+        ) -> Result<Vec<Run>, CoreError> {
+            self.inner.retained_runs_due(now, limit).await
         }
     }
 
