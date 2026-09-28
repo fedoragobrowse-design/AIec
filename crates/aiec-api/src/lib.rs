@@ -10,6 +10,7 @@ use aiec_core::{
 pub mod account;
 mod composition;
 pub mod eval_matrix;
+pub mod omp;
 pub mod ratelimit;
 pub mod runs;
 mod worker;

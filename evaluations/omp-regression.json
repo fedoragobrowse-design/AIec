@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "An OMP regression suite. Reviewable JSON rather than a bespoke language:",
+    "a suite nobody can read is a suite nobody reviews in a pull request.",
+    "",
+    "Both sides run the same task against the same target repository, each in",
+    "its own clean machine. Change `omp_ref` on the candidate to compare a",
+    "revision, and raise `repetitions` before believing a single result: an",
+    "agent that passes twice by luck is not one that passes reliably."
+  ],
+
+  "repetitions": 3,
+  "max_parallel": 2,
+
+  "baseline": {
+    "omp_repo": "https://github.com/can1357/oh-my-pi",
+    "omp_ref": "v18.3.5",
+    "task": "Add a regression test that covers truncated command output, and make it pass.",
+    "target_repo": "https://github.com/octocat/Hello-World",
+    "target_ref": null,
+    "setup_command": [
+      "/bin/sh", "-lc",
+      "set -e; git clone --depth 1 --branch v18.3.5 https://github.com/can1357/oh-my-pi /workspace/omp"
+    ],
+    "omp_command": ["/bin/sh", "-lc", "export PATH=/workspace/omp:$PATH; cd /workspace/repository && omp run"],
+    "validations": [
+      ["git", "status", "--porcelain=v1"],
+      ["test", "-f", "README"]
+    ],
+    "timeout_seconds": 1800
+  },
+
+  "candidate": {
+    "omp_repo": "https://github.com/can1357/oh-my-pi",
+    "omp_ref": "v18.4.0",
+    "task": "Add a regression test that covers truncated command output, and make it pass.",
+    "target_repo": "https://github.com/octocat/Hello-World",
+    "target_ref": null,
+    "setup_command": [
+      "/bin/sh", "-lc",
+      "set -e; git clone --depth 1 --branch v18.4.0 https://github.com/can1357/oh-my-pi /workspace/omp"
+    ],
+    "omp_command": ["/bin/sh", "-lc", "export PATH=/workspace/omp:$PATH; cd /workspace/repository && omp run"],
+    "validations": [
+      ["git", "status", "--porcelain=v1"],
+      ["test", "-f", "README"]
+    ],
+    "timeout_seconds": 1800
+  }
+}
