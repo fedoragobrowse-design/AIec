@@ -207,11 +207,13 @@ async fn execute(
     let placement_started = Instant::now();
     let (sandbox, placement) = match acquire_sandbox(state, tenant, &run, &request).await {
         Ok(pair) => pair,
-        Err(error) => {
+        Err((error, reasons)) => {
+            run.placement.reasons = reasons;
             // Refusing to place is a real outcome, not an internal error: the
             // requirement could not be met and the run is not going to happen.
             fail(
                 state,
+                tenant,
                 &mut run,
                 Some(error.to_string()),
                 &mut results,
@@ -267,6 +269,7 @@ async fn execute(
                 // from a machine that is not the one asked for.
                 fail(
                     state,
+                    tenant,
                     &mut run,
                     Some("a setup command failed".to_owned()),
                     &mut results,
@@ -364,7 +367,7 @@ async fn execute(
             .filter(|t| !t.ok)
             .map(|_| "the task did not succeed".to_owned())
             .or_else(|| Some("a validation failed".to_owned()));
-        fail(state, &mut run, reason, &mut results, &mut phases).await?;
+        fail(state, tenant, &mut run, reason, &mut results, &mut phases).await?;
     }
 
     store.get_run(tenant, run.id).await
@@ -373,6 +376,7 @@ async fn execute(
 /// Marks a run failed and records why.
 async fn fail(
     state: &AppState,
+    tenant: TenantId,
     run: &mut Run,
     reason: Option<String>,
     results: &mut RunResults,
@@ -387,6 +391,27 @@ async fn fail(
     .await;
     run.failure_reason = reason;
     results.phase_ms = phases.clone();
+    // Persisted rather than held in memory. Two separate omissions showed up as
+    // a failed run with a blank reason: the outcome was only ever recorded on a
+    // local copy that was then re-read from the store, and the reason column
+    // had no writer at all.
+    if let Err(error) = state
+        .repository()
+        .record_run_results(tenant, run.id, results.clone(), run.state)
+        .await
+    {
+        tracing::warn!(run_id = %run.id, error = %error, "could not record a run's results");
+    }
+    if let Err(error) = state
+        .repository()
+        .set_run_failure(tenant, run.id, run.failure_reason.clone(), RunState::Failed)
+        .await
+    {
+        tracing::warn!(run_id = %run.id, error = %error, "could not record why a run failed");
+    }
+    if let Ok(updated) = state.repository().get_run(tenant, run.id).await {
+        *run = updated;
+    }
     Ok(())
 }
 
@@ -433,7 +458,7 @@ async fn acquire_sandbox(
     tenant: TenantId,
     run: &Run,
     request: &RunRequest,
-) -> Result<(Sandbox, Placement), CoreError> {
+) -> Result<(Sandbox, Placement), (CoreError, Vec<String>)> {
     let reasons = run.requirements.reasons();
     let required = required_capabilities(&run.requirements);
     let minimum = if run.requirements.full_kernel_isolation {
@@ -443,13 +468,16 @@ async fn acquire_sandbox(
     };
 
     let requested = match &request.requested_runtime {
-        Some(raw) => Some(parse_runtime(raw)?),
+        Some(raw) => Some(parse_runtime(raw).map_err(|error| (error, reasons.clone()))?),
         None => None,
     };
 
     let (runtime_kind, reason) = match state.runtime_registry() {
         Some(registry) => {
-            let selection = registry.select(requested, &required, minimum).await?;
+            let selection = registry
+                .select(requested, &required, minimum)
+                .await
+                .map_err(|error| (error, reasons.clone()))?;
             (selection.runtime, selection.reason)
         }
         None => {
@@ -507,11 +535,16 @@ async fn acquire_sandbox(
         runtime_path: None,
     };
 
-    let placed = state
-        .repository()
-        .create_sandbox_idempotent(tenant, run.id, sandbox)
-        .await?;
+    // The shared path: schedule or create, then create, start, prepare the
+    // workspace and lease. Going straight to the repository took the development
+    // route, which takes no worker lease, so every command afterwards failed
+    // with "active sandbox lease not found".
+    let placed = crate::provision_sandbox(state, tenant, run.id, sandbox)
+        .await
+        .map_err(|failure| (CoreError::Unavailable(failure.message), reasons.clone()))?;
 
+    // The reasons are kept on the run: a refused placement is otherwise the
+    // hardest thing to answer without re-running the scheduler by hand.
     let mut placement_reasons = reasons;
     placement_reasons.push(reason);
     if request.workload.repo.is_some() {

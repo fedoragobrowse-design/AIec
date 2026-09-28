@@ -1190,6 +1190,29 @@ async fn fetch_lease_for_sandbox(
 }
 
 impl PostgresRepository {
+    /// Creates a run, or returns the run this idempotency key already produced.
+    async fn set_run_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        failure_reason: Option<String>,
+        state: RunState,
+    ) -> Result<Run, StoreError> {
+        let updated = sqlx::query(
+            "UPDATE runs SET failure_reason = $1, state = $2, \
+               completed_at = COALESCE(completed_at, now()) \
+             WHERE tenant_id = $3 AND id = $4 RETURNING *",
+        )
+        .bind(failure_reason.as_deref())
+        .bind(state.as_str())
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        run_from_row(&updated)
+    }
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         insert_sandbox(&mut tx, &value).await?;
@@ -2817,7 +2840,6 @@ impl PostgresRepository {
         })
     }
 
-    /// Creates a run, or returns the run this idempotency key already produced.
     async fn create_run(&self, value: Run) -> Result<Run, StoreError> {
         if value.tenant_id.is_nil() {
             return Err(StoreError::Conflict("run tenant is required".into()));
@@ -3569,6 +3591,17 @@ impl MetadataStore for PostgresRepository {
     }
     async fn get_image(&self, id: &str) -> Result<ImageRecord, CoreError> {
         Self::get_image(self, id).await.map_err(core_error)
+    }
+    async fn set_run_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        failure_reason: Option<String>,
+        state: RunState,
+    ) -> Result<Run, CoreError> {
+        Self::set_run_failure(self, tenant, id, failure_reason, state)
+            .await
+            .map_err(core_error)
     }
     async fn create_run(&self, run: Run) -> Result<Run, CoreError> {
         Self::create_run(self, run).await.map_err(core_error)

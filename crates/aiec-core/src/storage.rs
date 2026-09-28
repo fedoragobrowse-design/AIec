@@ -743,6 +743,21 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// This is the sweeper's read, and it crosses tenants on purpose: expiry is
     /// a property of a machine, not of a tenant, so no tenant is passed.
+    /// Records why a run failed and settles it.
+    ///
+    /// Separate from `record_run_results` because the reason is its own column:
+    /// a caller reading a failed run should not have to know that it also landed
+    /// in the results document to find it.
+    async fn set_run_failure(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _failure_reason: Option<String>,
+        _state: RunState,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+
     async fn retained_runs_due(
         &self,
         _now: DateTime<Utc>,

@@ -1446,6 +1446,103 @@ struct CreateSandboxBody {
     isolation: Option<String>,
 }
 
+/// Brings a sandbox from a row to a running machine.
+///
+/// One path for the sandbox API and for runs, deliberately. A run that
+/// reproduced only part of this took no worker lease, so every command it tried
+/// to run failed with "active sandbox lease not found" - which looks like a
+/// runtime bug and is actually a missing scheduling step.
+///
+/// Capacity is reserved before anything expensive starts, so a refused
+/// placement never leaves a half-built machine behind.
+pub(crate) async fn provision_sandbox(
+    s: &AppState,
+    tenant: TenantId,
+    request_id: Uuid,
+    x: Sandbox,
+) -> Result<Sandbox, ApiFailure> {
+    let mut x = x;
+    // Hosted capacity is reached through the provider inside the runtime, not
+    // through a leased worker node, so there is nothing for the worker
+    // scheduler to place. Worker-backed runtimes are scheduled as before.
+    if s.is_production() && x.runtime != RuntimeKind::Hosted {
+        x = s
+            .scheduler()
+            .schedule(aiec_core::scheduler::ScheduleRequest {
+                tenant_id: tenant,
+                request_id,
+                sandbox: x,
+                preferred_worker: None,
+                lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
+            })
+            .await
+            .map_err(|error| match error {
+                CoreError::QuotaExceeded(message) => {
+                    ApiFailure::new(StatusCode::TOO_MANY_REQUESTS, "quota_exceeded", message)
+                }
+                other => ApiFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "scheduler_unavailable",
+                    other.to_string(),
+                ),
+            })?
+            .sandbox;
+    } else {
+        s.repository()
+            .create_sandbox(x.clone())
+            .await
+            .map_err(ApiFailure::from)?;
+    }
+    if x.state != SandboxState::Creating {
+        return Ok(x);
+    }
+    // If the runtime cannot bring the machine up, the row must not be left
+    // behind as Creating: it would count against the tenant's quota, appear in a
+    // console as running, and never be cleaned up. A provider that refuses
+    // capacity is a normal outcome, not a crash, so it is recorded as failed.
+    if let Err(error) = s.runtime_for(&x)?.create(&x).await {
+        let _ = s
+            .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
+            .await;
+        return Err(ApiFailure::from(error));
+    }
+    s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
+        .await
+        .map_err(ApiFailure::from)?;
+    x.state = SandboxState::Starting;
+    s.runtime_for(&x)?
+        .start(&x)
+        .await
+        .map_err(ApiFailure::from)?;
+    if let Err(error) = prepare_environment(s, &x, &x.environment).await {
+        let _ = s.runtime_for(&x)?.destroy(&x).await;
+        let _ = s
+            .commit_state(&x, SandboxState::Starting, SandboxState::Failed)
+            .await;
+        // Hosted capacity is not leased from a worker, so there is nothing to
+        // release; asking the scheduler would fail for a lease that never
+        // existed.
+        if s.is_production() && x.runtime != RuntimeKind::Hosted {
+            let _ = s.scheduler().release(tenant, x.id).await;
+        }
+        return Err(error);
+    }
+
+    s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
+        .await
+        .map_err(ApiFailure::from)?;
+    x.state = SandboxState::Running;
+    // A hosted sandbox is charged one vCPU-second unit per allocated vCPU per
+    // hour of requested lifetime. This is a stop-loss against a finite provider
+    // allowance, not a bill: the durable usage ledger remains the record.
+    if x.runtime == RuntimeKind::Hosted {
+        let seconds = i64::try_from(x.timeout_seconds).unwrap_or(i64::MAX);
+        let units = i64::from(x.cpu) * ((seconds + 3599) / 3600);
+        s.charge_execution(units.max(1));
+    }
+    Ok(x)
+}
+
 fn create_response(sandbox: Sandbox, reason: &str) -> Response {
     ([("x-aiec-selection-reason", reason)], Json(sandbox)).into_response()
 }
@@ -1547,7 +1644,6 @@ async fn create_sandbox(
         ));
     }
     let r = body.request;
-    let environment = r.environment.clone();
     validate_create(&r, MAX_LIFETIME_SECONDS).map_err(ApiFailure::from)?;
     if let Some(policy) = s.platform.policy() {
         let decision = policy.evaluate(PolicyOperation::CreateSandbox(&r));
@@ -1592,7 +1688,7 @@ async fn create_sandbox(
     } else {
         Utc::now()
     };
-    let mut x = Sandbox {
+    let x = Sandbox {
         id: request_id,
         tenant_id: p.tenant_id,
         runtime: runtime_kind,
@@ -1609,87 +1705,9 @@ async fn create_sandbox(
         updated_at: now,
         runtime_path: None,
     };
-    // Hosted capacity is reached through the provider inside the runtime, not
-    // through a leased worker node, so there is nothing for the worker
-    // scheduler to place. Worker-backed runtimes are scheduled as before.
-    if s.is_production() && x.runtime != RuntimeKind::Hosted {
-        x = s
-            .scheduler()
-            .schedule(aiec_core::scheduler::ScheduleRequest {
-                tenant_id: p.tenant_id,
-                request_id,
-                sandbox: x,
-                preferred_worker: None,
-                lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
-            })
-            .await
-            .map_err(|error| match error {
-                CoreError::QuotaExceeded(message) => {
-                    ApiFailure::new(StatusCode::TOO_MANY_REQUESTS, "quota_exceeded", message)
-                }
-                other => ApiFailure::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "scheduler_unavailable",
-                    other.to_string(),
-                ),
-            })?
-            .sandbox;
-    } else {
-        s.repository()
-            .create_sandbox(x.clone())
-            .await
-            .map_err(ApiFailure::from)?;
-    }
-    if x.state != SandboxState::Creating {
-        return Ok(create_response(x, &_selection_reason));
-    }
-    // If the runtime cannot bring the machine up, the row must not be left
-    // behind as Creating: it would count against the tenant's quota, appear in a
-    // console as running, and never be cleaned up. A provider that refuses
-    // capacity is a normal outcome, not a crash, so it is recorded as failed.
-    if let Err(error) = s.runtime_for(&x)?.create(&x).await {
-        let _ = s
-            .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
-            .await;
-        return Err(ApiFailure::from(error));
-    }
-    s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
-        .await
-        .map_err(ApiFailure::from)?;
-    x.state = SandboxState::Starting;
-    s.runtime_for(&x)?
-        .start(&x)
-        .await
-        .map_err(ApiFailure::from)?;
-    if let Err(error) = prepare_environment(&s, &x, &environment).await {
-        let _ = s.runtime_for(&x)?.destroy(&x).await;
-        let _ = s
-            .commit_state(&x, SandboxState::Starting, SandboxState::Failed)
-            .await;
-        // Hosted capacity is not leased from a worker, so there is nothing to
-        // release; asking the scheduler would fail for a lease that never
-        // existed.
-        if s.is_production() && x.runtime != RuntimeKind::Hosted {
-            let _ = s.scheduler().release(p.tenant_id, x.id).await;
-        }
-        return Err(error);
-    }
-
-    s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
-        .await
-        .map_err(ApiFailure::from)?;
-    x.state = SandboxState::Running;
-    // A hosted sandbox is charged one vCPU-second unit per allocated vCPU per
-    // hour of requested lifetime. This is a stop-loss against a finite provider
-    // allowance, not a bill: the durable usage ledger remains the record.
-    if x.runtime == RuntimeKind::Hosted {
-        let seconds = i64::try_from(x.timeout_seconds).unwrap_or(i64::MAX);
-        let units = i64::from(x.cpu) * ((seconds + 3599) / 3600);
-        s.charge_execution(units.max(1));
-    }
+    let x = provision_sandbox(&s, p.tenant_id, request_id, x).await?;
     Ok(create_response(x, &_selection_reason))
 }
-
 async fn prepare_environment(
     state: &AppState,
     sandbox: &Sandbox,
