@@ -57,9 +57,11 @@ infrastructure itself.
 
 ### Public workloads run on Firecracker
 
-AIec Cloud forces Firecracker microVMs for untrusted tenant workloads. A
+AIec's runtime policy forces Firecracker microVMs for untrusted workloads. A
 tenant cannot request `runtime=docker` and downgrade their own isolation
-boundary; the control plane's runtime policy is authoritative.
+boundary; the control plane's policy is authoritative. There is no hosted
+deployment, so this is a property of the software you run rather than a promise
+about someone else's cluster.
 
 Docker remains available for:
 
@@ -132,11 +134,11 @@ yet using per-VM mutual TLS identity.
 
 These are real and are not hidden:
 
-- No SLA, and no guaranteed availability.
-- Invite-only, limited-capacity signup during alpha.
-- Single execution region.
-- Public workloads are Firecracker-only; Docker is not offered to public tenants.
-- The API surface is not yet stable; alpha endpoints may change.
+- No SLA, and no guaranteed availability. You run the cluster.
+- There is no hosted offering, so availability is entirely yours to provide.
+- Recovery and fencing are proven with two workers on one host. Genuinely
+  distributed operation across separate machines is not yet demonstrated.
+- The API surface is not yet stable; endpoints may change.
 - Guest control channel uses a shared build-time secret rather than mutual TLS.
 - Per-tenant **snapshot and persistent-storage byte quotas** are not yet
   enforced; per-request size ceilings are.

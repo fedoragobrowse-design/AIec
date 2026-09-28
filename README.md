@@ -54,23 +54,30 @@ diverges is in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ---
 
-## Two ways to run it
+## How it runs
 
-| | **AIec Cloud** | **AIec OSS** |
-|---|---|---|
-| Who runs it | We do | You do |
-| Cost | Usage-based | Free, open source |
-| Compute | Hosted Firecracker capacity | Your own KVM host |
-| Database | Managed PostgreSQL (Neon) | Your own PostgreSQL |
-| Object storage | Managed S3 | Your own S3 or MinIO |
-| Operations | We upgrade, patch, back up, monitor | You own the host |
+AIec is open source and self-hosted. There is no hosted version and no hosted
+API: the control plane, the workers and the sandboxes run on hardware you
+choose.
 
-They are the same API, the same SDK, the same runtime model. Customers pay for
-convenience, managed infrastructure, capacity and operations — **not** for access
-to the source code.
+| | |
+|---|---|
+| Who runs it | You do |
+| Cost | Free, Apache 2.0 |
+| Compute | Your own KVM hosts |
+| Database | Your own PostgreSQL |
+| Object storage | Your own S3 or MinIO |
+| Operations | You own upgrades, backups and monitoring |
 
-- Cloud: `https://aiec.gobrowse.dev` · API `https://api.aiec.gobrowse.dev`
-- OSS: `https://github.com/fedoragobrowse-design/AIec`
+Usage is still metered against your own tenants and exported, so you can see
+what the cluster is doing and what it would cost elsewhere — nobody bills you
+for it.
+
+A hosted AIec may be offered later. It would be optional, would not change a
+line of your code, and would not change the licence. Nothing here depends on it.
+
+→ [github.com/fedoragobrowse-design/AIec](https://github.com/fedoragobrowse-design/AIec) ·
+[aiec.gobrowse.dev](https://aiec.gobrowse.dev)
 
 ---
 
@@ -97,19 +104,18 @@ Details, including the limits we have not solved: [`SECURITY.md`](SECURITY.md).
 pip install agentforge-sdk
 ```
 
-```
-open https://aiec.gobrowse.dev/cloud/keys
-copy your key
-```
+Create a key against your own control plane (`aiec key create`), then:
 
 ```python
 from agentforge import AIec
 
-af = AIec(api_key="af_live_...")          # defaults to https://api.aiec.gobrowse.dev
+af = AIec(base_url="https://127.0.0.1:8080", api_key="af_live_...")
 box = af.sandboxes.create(image="aiec-coding:latest")
 print(box.exec(["git", "--version"])["stdout"])
 box.destroy()
 ```
+
+There is no account to sign up for and no key to request from anyone.
 
 Available images: `aiec-coding:latest` (the default, with `git`, Python and a
 build toolchain), `python:3.13`, `node:24`, `rust:stable`, `ubuntu:24.04` and
@@ -139,8 +145,8 @@ export AIEC_LOCAL_API_KEY=af_live_...
 
 It is local-only by construction: a remote AIec URL is refused at startup, and
 the `hosted` and `e2b` runtimes are unavailable, so a workload cannot escape to
-AIec Cloud or a third-party provider. A busy local worker reports
-`LOCAL_CAPACITY_UNAVAILABLE` rather than quietly sending work elsewhere.
+a hosted provider. A busy local worker reports `LOCAL_CAPACITY_UNAVAILABLE`
+rather than quietly sending work elsewhere.
 
 Thirteen tools cover the lifecycle, exec and files, plus higher-level ones that
 clone a repo, run a task and return the diff, and that run a coding agent — or
@@ -176,7 +182,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | Document | What it covers |
 |---|---|
 | [Docs](https://aiec.gobrowse.dev/docs) | Quickstart, images, sandbox lifecycle, self-hosting |
-| [Pricing](https://aiec.gobrowse.dev/pricing) | How AIec Cloud is metered and capped |
+| [Pricing](https://aiec.gobrowse.dev/pricing) | What running it yourself costs |
 | [Security](https://aiec.gobrowse.dev/security) | The same threat model as [`SECURITY.md`](SECURITY.md) |
 | [Status](https://aiec.gobrowse.dev/status) | Live platform status |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Architecture, and how it maps onto the DSec paper |

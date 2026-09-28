@@ -46,8 +46,9 @@ These are choices, not omissions of the paper.
   the two claims are reported separately rather than merged.
 - **Only workspace state is portable.** A snapshot preserves `/workspace`. Running
   VM memory does not survive a worker failure, and AIec does not claim it does.
-- **One execution region, invite-only.** The paper describes a large cluster. AIec
-  is an alpha serving a small number of invited developers.
+- **One cluster, self-hosted.** The paper describes a large multi-region fleet.
+  AIec is a single self-hosted cluster that one team runs; there is no hosted
+  service and no multi-region story.
 - **No multi-host validation yet.** Recovery and fencing are proven with two
   workers on one host. Genuinely distributed operation is not yet demonstrated.
 

@@ -1,185 +1,70 @@
-<!-- meta:title=Computers for AI agents -->
-<!-- meta:description=AIec gives autonomous AI agents isolated, disposable computers. Managed Firecracker sandboxes through one API, or self-host the same platform for free. -->
-<!-- wide -->
-
-<!-- block:rail -->
-    <div class="rail__group">
-      <span class="rail__caption">One sandbox</span>
-      <dl>
-        <dt>isolation</dt><dd>microVM</dd>
-        <dt>kernel</dt><dd>own, per guest</dd>
-        <dt>rootfs</dt><dd>4 GiB ext4</dd>
-        <dt>lifetime</dt><dd>minutes</dd>
-        <dt>egress</dt><dd>filtered</dd>
-      </dl>
-    </div>
-    <div class="rail__group">
-      <span class="rail__caption">Platform</span>
-      <dl>
-        <dt>signup</dt><dd>invite only</dd>
-        <dt>regions</dt><dd>1</dd>
-        <dt>SLA</dt><dd>none in alpha</dd>
-        <dt>billing</dt><dd>usage, capped</dd>
-      </dl>
-    </div>
-<!-- /block:rail -->
+<!-- meta:title=AIec — isolated sandboxes for AI agents -->
+<!-- meta:description=AIec gives AI agents disposable, isolated computers — each with its own kernel, filesystem and network — on hardware you control. Open source, self-hosted. -->
 
 <h1>Computers for AI agents.</h1>
+<p class="lead">An agent needs somewhere to run code that nobody else can reach
+and nobody has to clean up. AIec hands it a real machine — its own kernel, its
+own filesystem, its own network — and takes it away when the work is done.</p>
 
-<p class="lede">
-  An agent needs somewhere to run code that nobody else can reach and nobody
-  has to clean up. AIec hands it a real machine — its own kernel, its own
-  filesystem, its own network — and takes it away when the work is done.
-</p>
-
-<!-- The one memorable element: a leased machine's whole life, with the real
-     resource draw it costs while it exists. -->
-<div class="lifecycle">
-  <div class="lifecycle__head">
-    <span class="lifecycle__state">
-      <span class="lifecycle__pulse" aria-hidden="true"></span>
-      sandbox running
-    </span>
-    <span>agent-7f3c · created 41s ago</span>
-  </div>
-  <div class="lifecycle__track">
-    <div class="stage" style="--progress: 100%">
-      <span class="stage__name">allocated</span>
-      <span class="stage__value">2</span>
-      <span class="stage__unit">vCPU</span>
-    </div>
-    <div class="stage" style="--progress: 100%">
-      <span class="stage__name">memory</span>
-      <span class="stage__value">1</span>
-      <span class="stage__unit">GiB</span>
-    </div>
-    <div class="stage" style="--progress: 34%">
-      <span class="stage__name">elapsed</span>
-      <span class="stage__value">41</span>
-      <span class="stage__unit">seconds</span>
-    </div>
-    <div class="stage stage--spent" style="--progress: 0%">
-      <span class="stage__name">on destroy</span>
-      <span class="stage__value">0</span>
-      <span class="stage__unit">billed</span>
-    </div>
-  </div>
-</div>
-<div class="rule" aria-hidden="true"></div>
+<p><strong>AIec is open source and self-hosted.</strong> There is no hosted
+version and no hosted API: the control plane, the workers and the sandboxes run
+on hardware you choose. Clone it, run it on a machine with KVM, and point your
+agent at it.</p>
 
 <div class="actions">
-  <a class="btn btn--solid" href="/cloud">Start building</a>
+  <a class="btn btn--solid" href="https://github.com/fedoragobrowse-design/AIec">Clone the repository</a>
   <a class="btn" href="/docs">Read the docs</a>
   <a class="btn" href="/mcp">Local MCP</a>
-  <a class="btn" href="/pricing">Pricing</a>
 </div>
 
-<h2>Bring your own agent</h2>
-<p>The <a href="/mcp">local MCP server</a> hands any MCP-capable coding agent a
-disposable machine on a cluster you run yourself. It is local-only by
-construction: it refuses to start against a remote AIec endpoint, and it cannot
-reach AIec Cloud or a third-party provider, so a workload cannot escape the
-hardware you control.</p>
-
-<h2>The whole workflow is six calls</h2>
-
-<p>
-  Everything below runs through the public API. There is no SSH, no worker
-  access, and nothing for an operator to repair afterwards.
-</p>
-
-<pre><code><span class="kw">from</span> agentforge <span class="kw">import</span> AIec
-
-af = AIec(api_key=<span class="str">"af_live_…"</span>)
-
-box = af.sandboxes.create(image=<span class="str">"aiec-coding:latest"</span>)
-box.exec([<span class="str">"git"</span>, <span class="str">"clone"</span>, <span class="str">"--depth"</span>, <span class="str">"1"</span>, REPO, <span class="str">"/workspace/repo"</span>])
-box.exec([<span class="str">"sh"</span>, <span class="str">"-c"</span>, <span class="cm"># edit in place…</span>])
-box.exec([<span class="str">"python"</span>, <span class="str">"-m"</span>, <span class="str">"pytest"</span>, <span class="str">"-q"</span>])
-diff = box.exec([<span class="str">"sh"</span>, <span class="str">"-c"</span>, <span class="str">"git --no-pager diff"</span>])
-box.destroy()</code></pre>
-
-<h2>Two ways to run it</h2>
+<div class="rule" aria-hidden="true"></div>
 
 <div class="grid-2">
   <div class="block">
-    <h3>Cloud, we operate it</h3>
-    <p>
-      Firecracker capacity, PostgreSQL, object storage, TLS, backups and upgrades
-      are ours to run. You use the API. See <a href="/cloud">AIec Cloud</a>.
-    </p>
+    <h3>Isolation you can point at</h3>
+    <p>Public workloads run on Firecracker microVMs. Each sandbox gets its own
+       guest kernel, its own root filesystem, and a network namespace whose
+       egress policy blocks the host LAN, RFC1918 ranges, link-local and cloud
+       metadata addresses, the control plane, and other tenants. The guest
+       control channel is a vsock socket that never touches the network.</p>
   </div>
   <div class="block">
-    <h3>OSS, you operate it</h3>
-    <p>
-      The same platform on your own KVM host, with your own database and object
-      storage. No managed provider required. See
-      <a href="/docs">the self-host guide</a>.
-    </p>
+    <h3>Disposable by default</h3>
+    <p>A sandbox is leased from a scheduler, billed to your own accounting while
+       it runs, and destroyed when you are done. Snapshots restore a workspace
+       onto a different worker after a failure, fenced by a monotonic
+       generation so a superseded owner is rejected.</p>
+  </div>
+  <div class="block">
+    <h3>Yours to operate</h3>
+    <p>PostgreSQL for metadata, S3-compatible storage for artifacts, and your own
+       KVM hosts. You choose the capacity, the retention, and the blast radius.
+       Nothing you run is metered by anyone else.</p>
+  </div>
+  <div class="block">
+    <h3>Bring your own agent</h3>
+    <p>The <a href="/mcp">local MCP server</a> hands any MCP-capable coding agent
+       a disposable machine, and can run a coding agent in a clean sandbox or
+       compare two revisions of one, each side isolated.</p>
   </div>
 </div>
 
-<h2>Why the machine can be thrown away safely</h2>
+<h2>Built on a published design</h2>
+<p>The architecture follows <strong>DeepSeek Elastic Compute (DSec)</strong> —
+<em>“A Sandbox Infrastructure for Effective Agentic Training at Scale”</em>,
+DeepSeek-AI &amp; Tsinghua University, 2026
+(<a href="https://arxiv.org/abs/2609.22978">arXiv:2609.22978</a>). DSec argues
+that agent workloads arrive in bursts, need heterogeneous isolation, and keep
+state across long interactions — which calls for an elastic execution platform
+rather than a single sandbox runtime. AIec implements the parts of that which
+survive contact with a small team.</p>
 
-<div class="grid-3">
-  <div class="block">
-    <h3>Nothing is shared</h3>
-    <p>
-      Each sandbox has its own guest kernel and root filesystem. A bug in one
-      guest never reaches another, and the host kernel is not exposed at all.
-    </p>
-  </div>
-  <div class="block">
-    <h3>Egress is filtered</h3>
-    <p>
-      A sandbox cannot reach your LAN, cloud metadata, the control plane or
-      another tenant. Restricted mode fails closed rather than quietly allowing
-      traffic.
-    </p>
-  </div>
-  <div class="block">
-    <h3>Ownership is fenced</h3>
-    <p>
-      Sandboxes are leased with a monotonic generation. If a worker dies the
-      sandbox is reassigned at a higher generation, and the old owner is refused.
-    </p>
-  </div>
-  <div class="block">
-    <h3>Real repos work</h3>
-    <p>
-      Git, CA certificates, Python, curl and tar are in the image. Clone over
-      HTTPS with genuine certificate validation, not a disabled check.
-    </p>
-  </div>
-  <div class="block">
-    <h3>Runaway agents are capped</h3>
-    <p>
-      Quotas, rate limits, a maximum lifetime and a global execution budget mean
-      a runaway workload cannot exhaust the platform or your allowance.
-    </p>
-  </div>
-  <div class="block">
-    <h3>One API either side</h3>
-    <p>
-      Moving between Cloud and your own host is a base URL, not a rewrite. The
-      same SDK, the same sandbox identifiers, the same behaviour.
-    </p>
-  </div>
-</div>
+<h2>Cloud, later</h2>
+<p>A hosted AIec is something we may offer eventually. It is not what exists
+today and nothing on this site depends on it. If it happens, the interface will
+be this one: the same API, the same SDK, the same runtime model, running on
+somebody else's machines. The source will stay open either way.</p>
 
-<h2>What it is not</h2>
-
-<p>
-  AIec is not a notebook, not a CI runner, and not durable storage. It is a
-  control plane for short-lived, untrusted, agent-driven computers. If work has
-  to survive a run, take a <a href="/docs">snapshot</a>.
-</p>
-
-<div class="callout">
-  <span class="callout__head">Public alpha</span>
-  <p>
-    Invite-only, limited capacity, no SLA. Everything that is not yet finished is
-    listed on the <a href="/status">status</a> page, including the parts we
-    cannot yet claim.
-  </p>
-</div>
+<h2>No invented numbers</h2>
+<p>Benchmarks, throughput and latency figures are in the documentation only when
+they have actually been measured. If it is not measured, it is not claimed.</p>

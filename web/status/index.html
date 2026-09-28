@@ -24,13 +24,8 @@
       <a href="/docs">Docs</a>
       <a href="/mcp">MCP</a>
       <a href="/pricing">Pricing</a>
-      <a href="/cloud">Cloud</a>
-      <a href="/cloud/keys">API keys</a>
-      <a href="/cloud/usage">Usage</a>
-      <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security">Security</a>
       <a href="/status" aria-current="page">Status</a>
-      <a href="/cloud/console">Console</a>
     </nav>
   </div>
 </header>
@@ -98,22 +93,22 @@
   <li>A control-plane <strong>sandbox lifetime reaper</strong>. Lifetime is enforced by the runtime; a worker restart resets the in-process timer.</li>
   <li><strong>Multi-host</strong> validation with separate control and worker machines. Same-host multi-worker recovery is proven; genuinely distributed operation is not yet.</li>
   <li>An <strong>audit log viewer</strong> in the dashboard. Events are recorded, the UI is not built.</li>
-  <li><strong>Self-service billing.</strong> Usage is metered and displayed; payment collection is behind a manual activation step.</li>
+  <li><strong>Usage is recorded but not billed.</strong> Every metric is exported for your own capacity planning; there is no payment path.</li>
 </ul>
 
 <h2>Hosting model</h2>
 <p>
-  Cloud execution is provided by a hosted sandbox provider with Firecracker-based
-  isolation. AIec's <em>own</em> native Firecracker implementation is
-  complete and is what self-hosted deployments run — but the hosted capacity is
-  not AIec operating its own hardware. We report these separately rather
-  than merging them into one claim.
+  AIec is open source and self-hosted. There is no hosted execution capacity
+  and no cloud provider in the path: the control plane, the workers and the
+  sandboxes are the ones you deploy. What is claimed below is what runs on
+  hardware you control.
 </p>
 <table class="kv">
   <tr><th>Claim</th><th>Status</th></tr>
   <tr><td>AIec native Firecracker runtime</td><td>Complete and verified</td></tr>
-  <tr><td>Hosted Cloud execution capacity</td><td>Provided by a third-party Firecracker provider</td></tr>
-  <tr><td>AIec-operated multi-host worker fleet</td><td>Not deployed</td></tr>
+  <tr><td>Self-hosted single-host operation</td><td>Proven end to end</td></tr>
+  <tr><td>Multi-host fleet across separate machines</td><td>Not validated</td></tr>
+  <tr><td>Hosted capacity from a provider</td><td>Does not exist, by design</td></tr>
 </table>
 
 <h2>Security posture</h2>
@@ -135,7 +130,6 @@
       <a href="/mcp">MCP</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="/cloud/console">Console</a>
     </nav>
   </div>
 </footer>

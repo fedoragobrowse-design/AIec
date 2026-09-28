@@ -23,27 +23,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 PAGES = ROOT / "pages"
 
-CONSOLE_ROUTES = {"/cloud/console"}
+CONSOLE_ROUTES: set[str] = set()
 
 NAV = [
     ("/", "Home"),
     ("/docs", "Docs"),
     ("/mcp", "MCP"),
     ("/pricing", "Pricing"),
-    ("/cloud", "Cloud"),
-    ("/cloud/keys", "API keys"),
-    ("/cloud/usage", "Usage"),
-    ("/cloud/sandboxes", "Sandboxes"),
     ("/security", "Security"),
     ("/status", "Status"),
-    ("/cloud/console", "Console"),
 ]
 FOOTER_NAV = [
     ("/docs", "Docs"),
     ("/mcp", "MCP"),
     ("/security", "Security"),
     ("/status", "Status"),
-    ("/cloud/console", "Console"),
 ]
 
 
@@ -82,7 +76,7 @@ DASHBOARD_SHELL = """<!doctype html>
 </html>
 """
 
-FOOTER_CONSOLE_ROUTES = {"/cloud/console"}
+FOOTER_CONSOLE_ROUTES: set[str] = set()
 
 CONSOLE_NAV = [
     ("/docs", "Docs"),
@@ -240,7 +234,7 @@ ERROR_PAGES: dict[int, dict[str, str]] = {
 presented is not scoped for it. AIec never reveals whether a resource exists
 to a caller who cannot see it.</p>""",
         "actions": '<a class="btn btn--solid" href="/docs">Read the docs</a>'
-        '<a class="btn" href="/cloud/keys">Check your key scopes</a>',
+        '<a class="btn" href="https://github.com/fedoragobrowse-design/AIec">Repository</a>',
     },
     404: {
         "title": "404 — Not found",

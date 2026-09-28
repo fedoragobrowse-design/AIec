@@ -37,13 +37,15 @@ class AIecError(RuntimeError):
 class AIec:
     """Client for the AIec API.
 
-    With no arguments beyond a key, this talks to AIec Cloud. Self-hosted
-    deployments pass ``base_url`` (or set ``AIEC_URL``); both use the same
-    API and the same methods.
+    AIec is open source and self-hosted, so the default points at a control
+    plane on this machine. A control plane elsewhere is selected with
+    ``base_url`` or the ``AIEC_URL`` environment variable; the API and the
+    methods are the same either way.
     """
 
-    #: AIec Cloud. Self-hosted deployments override this per client.
-    DEFAULT_BASE_URL = "https://api.aiec.gobrowse.dev"
+    #: A control plane on this machine. There is no hosted default, because
+    #: there is no hosted AIec.
+    DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
         resolved = base_url or os.environ.get("AIEC_URL") or self.DEFAULT_BASE_URL

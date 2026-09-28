@@ -10,12 +10,11 @@ name = "aiec-site"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
-# Public hostnames. The API hostname is proxied to the private origin by the
-# Worker; the origin itself is never exposed to the internet.
+# One hostname: the documentation site. AIec is open source, so there is no
+# hosted API to route to — a reader runs the control plane on their own hardware.
 # Note: TOML tables are greedy, so `routes` must appear before any [table].
 routes = [
   { pattern = "aiec.gobrowse.dev", custom_domain = true },
-  { pattern = "api.aiec.gobrowse.dev", custom_domain = true },
 ]
 
 [assets]
@@ -25,8 +24,3 @@ binding = "ASSETS"
 html_handling = "auto-trailing-slash"
 not_found_handling = "404-page"
 
-# The AIec control plane is reached privately (Cloudflare Tunnel or an
-# origin-only route), never as a public origin URL. Override in production with
-# `wrangler secret put AIEC_API_ORIGIN`.
-[vars]
-AIEC_API_ORIGIN = "https://origin.aiec.gobrowse.dev"

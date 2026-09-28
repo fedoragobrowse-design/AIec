@@ -3,10 +3,10 @@
 An MCP server that hands any MCP-capable agent a disposable computer on **your
 own** AIec cluster.
 
-> **This server uses LOCAL AIEC COMPUTE.** It does not use AIec Cloud, and it
-> does not use an external sandbox provider. Every command runs inside a sandbox
-> on a control plane you control. The server refuses to start if it is pointed at
-> a remote endpoint.
+> **This server uses LOCAL AIEC COMPUTE.** AIec is open source and self-hosted;
+> there is no hosted API. This server does not use an external sandbox provider
+> either. Every command runs inside a sandbox on a control plane you control,
+> and it refuses to start if it is pointed at a remote endpoint.
 
 ---
 
@@ -81,7 +81,7 @@ These are enforced in code, with tests, not just documented:
 
 - **Local only.** A non-loopback AIec URL is refused at startup. A private
   network address additionally requires `AIEC_MCP_ALLOW_PRIVATE_NETWORK=1`;
-  `https://api.aiec.gobrowse.dev` is refused outright and cannot be enabled.
+  A public cloud endpoint would be refused outright and cannot be enabled.
 - **No host execution.** Workload commands are sent to AIec as an argument
   vector. There is no `std::process::Command` anywhere in the execution path, and
   a test asserts the crate contains none.

@@ -7,7 +7,7 @@ disposable computer per task — a real machine, created and destroyed on demand
 
 <p>Everything below runs on <strong>your</strong> hardware. The server is
 local-only by construction: it refuses to start against a remote AIec endpoint,
-and it cannot reach AIec Cloud or a third-party provider, so a workload cannot
+and it cannot reach a hosted provider, so a workload cannot
 escape the cluster you control.</p>
 
 <h2 id="connect">Connecting a client</h2>
@@ -27,7 +27,7 @@ escape the cluster you control.</p>
 </div>
 
 <pre><code>export AIEC_LOCAL_API_URL=https://127.0.0.1:18443
-export AIEC_LOCAL_API_KEY=af_live_...
+export AIEC_LOCAL_API_KEY=af_live_...   # a key you created on your own control plane
 ./target/release/aiec-mcp</code></pre>
 
 <h2 id="tools">What the agent gets</h2>
@@ -82,7 +82,7 @@ a verdict. All sandboxes are cleaned up afterwards.</p>
 
 <h2 id="guarantees">What it will not do</h2>
 <ul>
-  <li><strong>No cloud, no external provider.</strong> <code>hosted</code> and
+  <li><strong>No external provider.</strong> <code>hosted</code> and
       <code>e2b</code> are refused. A busy local worker returns
       <code>LOCAL_CAPACITY_UNAVAILABLE</code> rather than quietly sending your
       workload somewhere else.</li>

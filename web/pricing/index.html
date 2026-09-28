@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pricing — AIec</title>
-<meta name="description" content="AIec Cloud pricing for public alpha: invite-only, usage-based, no lock-in. Self-hosting is free and open source.">
-<meta property="og:title" content="Pricing — AIec">
-<meta property="og:description" content="AIec Cloud pricing for public alpha: invite-only, usage-based, no lock-in. Self-hosting is free and open source.">
+<title>AIec — pricing — AIec</title>
+<meta name="description" content="AIec is open source and free to run. There is no hosted version, no metering and no bill. Here is what it costs you to operate it yourself.">
+<meta property="og:title" content="AIec — pricing — AIec">
+<meta property="og:description" content="AIec is open source and free to run. There is no hosted version, no metering and no bill. Here is what it costs you to operate it yourself.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#edf0f4">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -24,13 +24,8 @@
       <a href="/docs">Docs</a>
       <a href="/mcp">MCP</a>
       <a href="/pricing" aria-current="page">Pricing</a>
-      <a href="/cloud">Cloud</a>
-      <a href="/cloud/keys">API keys</a>
-      <a href="/cloud/usage">Usage</a>
-      <a href="/cloud/sandboxes">Sandboxes</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="/cloud/console">Console</a>
     </nav>
   </div>
 </header>
@@ -56,99 +51,52 @@
 
   </aside>
   <main class="content">
-<!-- meta:title=Pricing -->
-<!-- meta:description=AIec Cloud pricing for public alpha: invite-only, usage-based, no lock-in. Self-hosting is free and open source. -->
+<!-- meta:title=AIec — pricing -->
+<!-- meta:description=AIec is open source and free to run. There is no hosted version, no metering and no bill. Here is what it costs you to operate it yourself. -->
 
-<h1>Pay for capacity, not for access</h1>
-<p class="lead">
-  AIec is open source and free to self-host. Cloud is a paid, managed
-  service: you pay for the infrastructure and the people who operate it.
-</p>
+<h1>Pricing</h1>
+<p class="lead">AIec is open source. There is no hosted version, so there is
+nothing to charge you for and nothing to meter.</p>
 
 <div class="grid-2">
   <div class="block">
-    <h3>AIec OSS</h3>
-    <p><strong>$0</strong> in software cost, forever.</p>
-    <p>You run it on your own hardware. Bring your own compute, PostgreSQL,
-       object storage, networking, domains and TLS.</p>
-    <ul class="tight">
-      <li>Full platform, no feature gates</li>
-      <li>Native Firecracker and Docker runtimes</li>
-      <li>Same API, same SDKs, same docs</li>
-      <li>No Cloudflare, Neon or AIec account required</li>
-    </ul>
-    <p><a href="/docs#self-host">Self-host guide </a></p>
+    <h3>Software</h3>
+    <p><strong>Free.</strong> Apache 2.0. Clone it, run it, fork it, audit it.
+       The repository is the product.</p>
   </div>
-
   <div class="block">
-    <h3>AIec Cloud</h3>
-    <p><strong>Usage-based.</strong> Billed for the sandboxes you run.</p>
-    <p>We operate the Firecracker capacity, the database, object storage, TLS,
-       backups, monitoring and upgrades.</p>
-    <ul class="tight">
-      <li>Public workloads run on Firecracker</li>
-      <li>Invite-only during alpha, with limited capacity</li>
-      <li>Per-tenant quotas and a global spend ceiling</li>
-      <li>Hard spend safeguards: we never silently overage</li>
-    </ul>
-    <p><a href="/cloud">Explore Cloud </a></p>
+    <h3>Compute</h3>
+    <p>Yours. The hosts you run workers on, with the CPU, RAM and disk your
+       workloads need. That is the entire cost model.</p>
+  </div>
+  <div class="block">
+    <h3>Storage</h3>
+    <p>Yours. PostgreSQL and any S3-compatible object store, sized by how long
+       you keep artifacts and workspace snapshots.</p>
+  </div>
+  <div class="block">
+    <h3>Your time</h3>
+    <p>The real cost. Upgrades, patching, backups, monitoring and capacity
+       planning are yours, which is also why the deployment path is documented
+       rather than hidden behind a control panel.</p>
   </div>
 </div>
 
-<h2>How Cloud usage is measured</h2>
-<p>
-  You are charged for the sandboxes you actually run, for the time they run.
-  Storage for snapshots and artifacts is tracked separately and is cheap.
-</p>
-<table class="kv">
-  <tr><th>Resource</th><th>Unit</th><th>Notes</th></tr>
-  <tr><td>Sandbox compute</td><td>vCPU-second</td><td>Charged from creation until destroy</td></tr>
-  <tr><td>Sandbox memory</td><td>GiB-second</td><td>Allocated size, not peak</td></tr>
-  <tr><td>Workspace storage</td><td>GB-day</td><td>Only while the sandbox exists</td></tr>
-  <tr><td>Snapshots and artifacts</td><td>GB-month</td><td>Retained until you delete them</td></tr>
-  <tr><td>Requests</td><td>included</td><td>Rate limited, not billed</td></tr>
-</table>
-<p>
-  Public alpha prices are not yet final. Invited users are quoted a fixed
-  allowance rather than a per-second rate, and the exact figure is confirmed
-  before your account is enabled.
-</p>
+<h2 id="accounting">What you still get</h2>
+<p>AIec records usage against your own tenants even though nobody bills for it:
+sandbox runtime seconds, vCPU seconds, GB-seconds of memory, disk, snapshot
+bytes, network where measurable, and commands executed. It is exposed through
+<code>GET /v1/usage</code> and exported to Prometheus, so you can see what your
+cluster is actually doing and what it would cost you elsewhere.</p>
+<p>Quotas and rate limits are enforced the same way, because a self-hosted
+cluster still has to survive a runaway agent.</p>
 
-<h2>Spend safeguards</h2>
-<div class="grid-3">
-  <div class="block">
-    <h3>Hard quotas</h3>
-    <p>Per-tenant limits on active sandboxes, vCPU, memory and disk, enforced at
-       placement time rather than billed after the fact.</p>
-  </div>
-  <div class="block">
-    <h3>Global budget</h3>
-    <p>Cloud runs against a global execution budget. When it is reached, new
-       sandbox creation stops cleanly instead of turning into a charge.</p>
-  </div>
-  <div class="block">
-    <h3>No surprise overage</h3>
-    <p>When capacity is exhausted you get
-       <code>TEMPORARY_CAPACITY_UNAVAILABLE</code>. We do not enable automatic
-       overages and we do not upgrade a plan behind your back.</p>
-  </div>
-</div>
-
-<h2>What is not charged</h2>
-<ul class="tight">
-  <li>Creating and destroying a sandbox that never ran code.</li>
-  <li>Requests to the API.</li>
-  <li>Anything at all, if you self-host.</li>
-</ul>
-
-<div class="note">
-  <p>
-    <strong>Alpha pricing is provisional.</strong> We do not have a published
-    rate card yet, and prices can change while we learn what a sandbox actually
-    costs to run. Invited accounts are told their allowance and price before
-    they are switched on, and nothing bills without your approval.
-  </p>
-</div>
+<h2 id="cloud">Cloud, later</h2>
+<p>A hosted AIec is something we may offer eventually. If it happens it will be
+optional, priced by the same usage numbers you can already export, and running
+it would not change a line of your code — the API, the SDK and the runtime model
+are the ones in this repository.</p>
+<p>It does not exist today, and nothing here depends on it.</p>
 
   </main>
 </div>
@@ -161,7 +109,6 @@
       <a href="/mcp">MCP</a>
       <a href="/security">Security</a>
       <a href="/status">Status</a>
-      <a href="/cloud/console">Console</a>
     </nav>
   </div>
 </footer>
