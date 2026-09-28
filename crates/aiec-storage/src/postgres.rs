@@ -1276,15 +1276,15 @@ impl PostgresRepository {
 
     async fn delete_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
-        let row =
-            sqlx::query("SELECT * FROM sandboxes WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
-                .bind(tenant)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(database_error)?
-                .ok_or(StoreError::NotFound)?;
-        let sandbox = sandbox_from_row(&row)?;
+        // The lease is locked before the sandbox, and the order is not
+        // incidental. Every path that releases capacity - the reconciler, a
+        // worker handing a lease back, recovery - takes the lease row first and
+        // then the sandbox row. Locking the sandbox first here made this the
+        // other half of a textbook ABBA deadlock: one transaction holding the
+        // sandbox and waiting for the lease, the other holding the lease and
+        // waiting for the sandbox. It surfaced as a 40P01 that aborted whichever
+        // side lost, which on the reconciler meant a whole batch of expiries
+        // deferred, and on a destroy meant the machine was never released.
         let lease_row = sqlx::query(
             "SELECT * FROM sandbox_leases WHERE tenant_id=$1 AND sandbox_id=$2 \
              AND status IN ('active', 'completed') ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
@@ -1294,6 +1294,15 @@ impl PostgresRepository {
         .fetch_optional(&mut *tx)
         .await
         .map_err(database_error)?;
+        let row =
+            sqlx::query("SELECT * FROM sandboxes WHERE tenant_id = $1 AND id = $2 FOR UPDATE")
+                .bind(tenant)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::NotFound)?;
+        let sandbox = sandbox_from_row(&row)?;
         if let Some(row) = lease_row {
             let lease = lease_from_row(&row)?;
             release_capacity(&mut tx, &lease, "released", "sandbox deleted").await?;
