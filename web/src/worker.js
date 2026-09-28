@@ -21,13 +21,14 @@ const ERROR_COPY = {
     retry: false,
   },
   500: {
-    headline: "Something broke on our side",
-    detail: "A fault in AIec, not in your request. Running sandboxes are unaffected.",
+    headline: "The site failed to build a page",
+    detail:
+      "This is a fault in the website, not in your request and not in your cluster.",
     retry: true,
   },
   503: {
-    headline: "No local worker can take a sandbox right now",
-    detail: "Every worker is at capacity or draining. Work is not moved to a cloud provider.",
+    headline: "The site is not serving pages right now",
+    detail: "Try again shortly. Your AIec deployment is unaffected by this.",
     retry: true,
   },
 };

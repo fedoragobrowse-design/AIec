@@ -247,21 +247,19 @@ typed by hand. The sections below are the ones people usually want.</p>""",
     },
     429: {
         "title": "429 — Too many requests",
-        "headline": "You are going faster than the cluster can go",
-        "body": """<p class="lede">The request was refused before it reached a sandbox.
-Public alpha meters per tenant, so a burst is rejected rather than queued
-indefinitely.</p>""",
+        "headline": "Too many requests",
+        "body": """<p class="lede">The site is being asked for more than it will
+answer at once. Wait a moment and try again.</p>""",
         "actions": '<a class="btn btn--solid" href="/docs">Read the docs</a>'
-        '<a class="btn" href="/status">Service status</a>',
+        '<a class="btn" href="/">Home</a>',
     },
     500: {
         "title": "500 — Internal error",
-        "headline": "Something broke on our side",
-        "body": """<p class="lede">This is a fault in AIec, not in your request. Sandboxes
-already running are unaffected: they are leased from the scheduler and their
-guests keep working while the control plane recovers.</p>""",
-        "actions": '<a class="btn btn--solid" href="/status">Service status</a>'
-        '<a class="btn" href="/">Home</a>',
+        "headline": "The site failed to build a page",
+        "body": """<p class="lede">This is a fault in the website, not in your
+request and not in your cluster. Try again shortly.</p>""",
+        "actions": '<a class="btn btn--solid" href="/">Home</a>'
+        '<a class="btn" href="/docs">Read the docs</a>',
     },
     503: {
         "title": "503 — Unavailable",
@@ -269,8 +267,8 @@ guests keep working while the control plane recovers.</p>""",
         "body": """<p class="lede">Every worker in the cluster is out of capacity or
 draining. AIec does not quietly move a workload to a cloud provider when the
 local cluster is full, so the request failed here instead.</p>""",
-        "actions": '<a class="btn btn--solid" href="/status">Service status</a>'
-        '<a class="btn" href="/docs">Read the docs</a>',
+        "actions": '<a class="btn btn--solid" href="/docs">Read the docs</a>'
+        '<a class="btn" href="/status">Status</a>',
     },
 }
 

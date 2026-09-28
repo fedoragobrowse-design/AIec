@@ -53,8 +53,8 @@ class AIec:
         self.api_key = api_key or os.environ.get("AIEC_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "set api_key or AIEC_API_KEY; create a key at "
-                "https://aiec.gobrowse.dev/cloud/keys"
+                "set api_key or AIEC_API_KEY; create a key against your own "
+                "control plane with `aiec key create`"
             )
         self.sandboxes = _Sandboxes(self)
 
