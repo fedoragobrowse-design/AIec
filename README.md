@@ -184,6 +184,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation boundaries, reporting a vulnerability |
 | [`docs/MCP.md`](docs/MCP.md) | The local-only MCP server: giving an agent a disposable machine |
+| [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) | Defects found by running the server against a live cluster |
 | [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
 
 ---

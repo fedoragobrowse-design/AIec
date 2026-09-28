@@ -22,6 +22,7 @@
 //! as `"; rm -rf /"` is inert data rather than syntax.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::Instant;
 
 use futures::future::join_all;
@@ -570,6 +571,12 @@ pub struct CompareOmpRequest {
     pub target_repo: String,
     pub target_ref: Option<String>,
     pub task: String,
+    /// Installs or prepares the agent before it runs, exactly as for
+    /// `aiec_test_omp`. Without it a comparison can only run whatever the
+    /// default command is, which is not a comparison of anything.
+    pub setup_command: Option<Vec<String>>,
+    /// The command that runs the agent. Defaults to `["omp", "run"]`.
+    pub omp_command: Option<Vec<String>>,
     pub validation_commands: Vec<Vec<String>>,
     /// Repetitions per side. One when absent.
     pub repetitions: Option<u32>,
@@ -601,6 +608,14 @@ pub struct SideSummary {
     pub exit_codes: Vec<i32>,
     /// Distinct files changed by at least one run on this side.
     pub changed_file_count: usize,
+    /// The tail of the last run's output, from the agent and then the
+    /// validations.
+    ///
+    /// Without this a side can only report that it failed and the exit code
+    /// that says so, which leaves "why" as guesswork. It is clipped, because an
+    /// agent that dumped a build log should not be able to blow up the report.
+    #[serde(default)]
+    pub last_output: String,
     /// Diff size summed over the runs on this side.
     pub total_diff_bytes: usize,
 }
@@ -619,6 +634,7 @@ impl SideSummary {
             exit_codes: Vec::with_capacity(runs.len()),
             changed_file_count: 0,
             total_diff_bytes: 0,
+            last_output: String::new(),
         };
 
         // A file touched by three of four runs is still one file the candidate
@@ -636,6 +652,11 @@ impl SideSummary {
             summary.exit_codes.push(run.omp.exit_code);
             summary.total_diff_bytes = summary.total_diff_bytes.saturating_add(run.git_diff.len());
             changed.extend(run.changed_files.iter().map(String::as_str));
+            // The most recent run stands in for the side, so a repeated failure
+            // shows its reason rather than a bare exit code.
+            if run.omp.exit_code != 0 || !run.omp.ok {
+                summary.last_output = tail_of(&format!("{}\n{}", run.omp.stdout, run.omp.stderr));
+            }
         }
         summary.changed_file_count = changed.len();
         summary
@@ -652,6 +673,20 @@ pub struct CompareOmpResult {
     pub sandbox_ids: Vec<Uuid>,
     /// The concurrency actually used.
     pub max_parallel: usize,
+}
+
+/// The last few kilobytes of a run's output, so a failing comparison says why
+/// without letting an agent's build log dominate the report.
+fn tail_of(text: &str) -> String {
+    const LIMIT: usize = 2048;
+    if text.len() <= LIMIT {
+        return text.trim().to_owned();
+    }
+    let mut start = text.len() - LIMIT;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", text[start..].trim())
 }
 
 /// Which side of a comparison a run belongs to.
@@ -702,8 +737,8 @@ pub async fn compare_omp(
                 target_repo: request.target_repo.clone(),
                 target_ref: request.target_ref.clone(),
                 task: request.task.clone(),
-                setup_command: None,
-                omp_command: None,
+                setup_command: request.setup_command.clone(),
+                omp_command: request.omp_command.clone(),
                 validation_commands: request.validation_commands.clone(),
                 timeout_seconds: Some(timeout),
                 // A comparison owns its sandboxes: they exist to be measured.
@@ -1194,8 +1229,19 @@ fn validate_command(command: &[String], what: &str) -> Result<(), McpError> {
             command[0]
         )));
     }
-    for argument in command {
-        if let Some(bad) = argument.chars().find(|c| c.is_control()) {
+    // A caller that explicitly asks for a shell is asking for a script, and a
+    // script has line breaks. That is a deliberate signal rather than an
+    // accident, and it changes nothing about isolation: the script still runs
+    // inside the sandbox. Any other argument, and any control character other
+    // than a newline or tab, is still refused.
+    let script_argument = explicit_shell_script(command).map(|index| index + 1);
+
+    for (index, argument) in command.iter().enumerate() {
+        let allow_newlines = script_argument == Some(index);
+        if let Some(bad) = argument
+            .chars()
+            .find(|c| c.is_control() && !(allow_newlines && matches!(c, '\n' | '\t')))
+        {
             return Err(McpError::invalid(format!(
                 "the {what} contains the control character `{}`",
                 bad.escape_debug()
@@ -1203,6 +1249,29 @@ fn validate_command(command: &[String], what: &str) -> Result<(), McpError> {
         }
     }
     Ok(())
+}
+
+/// Returns the index of the script argument when `command` is an explicit
+/// invocation of a shell with a `-c` flag, e.g. `["sh", "-lc", "<script>"]`.
+///
+/// The flag may carry bundling letters (`-lc`), which is how `sh -lc` and
+/// `bash -c` are normally written.
+fn explicit_shell_script(command: &[String]) -> Option<usize> {
+    let program = Path::new(&command[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !matches!(program, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+        return None;
+    }
+    let flag = command.get(1)?;
+    if !flag.starts_with('-') || flag.starts_with("--") {
+        return None;
+    }
+    // The flag must actually request a command string. Testing that every
+    // letter is in {c,l,i} is not enough: `-l` alone would pass vacuously.
+    let letters = flag.trim_start_matches('-');
+    (letters.contains('c') && letters.chars().all(|c| matches!(c, 'c' | 'l' | 'i'))).then_some(1)
 }
 
 /// Checks the task handed to OMP.
@@ -1614,6 +1683,60 @@ mod tests {
         assert!(summary.exit_codes.is_empty());
         assert_eq!(summary.changed_file_count, 0);
         assert_eq!(summary.total_diff_bytes, 0);
+    }
+
+    // -- command validation --------------------------------------------------
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    /// A caller that explicitly asks for a shell is asking for a script, and a
+    /// script has line breaks. Refusing those made the high-level tools
+    /// unusable, because installing a toolchain needs more than one line.
+    #[test]
+    fn an_explicit_shell_invocation_may_carry_a_multiline_script() {
+        let command = argv(&["sh", "-lc", "set -e\necho one\necho two"]);
+        assert!(validate_command(&command, "setup command").is_ok());
+
+        for shell in ["bash", "zsh", "dash", "ksh"] {
+            let command = argv(&[shell, "-c", "a\nb"]);
+            assert!(
+                validate_command(&command, "setup command").is_ok(),
+                "{shell} -c should accept a script"
+            );
+        }
+    }
+
+    /// The relaxation is only for the script argument of an explicit shell. An
+    /// ordinary argument, or a different program, is still refused.
+    #[test]
+    fn a_newline_outside_an_explicit_script_is_still_refused() {
+        for command in [
+            argv(&["python", "a\nb"]),
+            argv(&["echo", "hello", "wor\nld"]),
+            // A program that merely starts with "sh" is not a shell invocation.
+            argv(&["shape-tool", "-c", "a\nb"]),
+            // A flag without `c` is not a script request.
+            argv(&["sh", "-l", "a\nb"]),
+        ] {
+            assert!(
+                validate_command(&command, "task command").is_err(),
+                "{command:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn other_control_characters_stay_refused_even_in_a_script() {
+        let command = argv(&["sh", "-lc", "echo \u{0}done"]);
+        assert!(validate_command(&command, "setup command").is_err());
+    }
+
+    #[test]
+    fn an_option_like_program_is_still_refused() {
+        assert!(validate_command(&argv(&["--version"]), "task command").is_err());
+        assert!(validate_command(&argv(&[]), "task command").is_err());
     }
 
     // -- request validation --------------------------------------------------

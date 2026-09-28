@@ -200,6 +200,12 @@ pub struct TestOmpArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CompareOmpArgs {
     pub omp_repo: String,
+    /// Prepares the agent before it runs, exactly as for `aiec_test_omp`.
+    #[serde(default)]
+    pub setup_command: Option<Vec<String>>,
+    /// The command that runs the agent. Defaults to `["omp", "run"]`.
+    #[serde(default)]
+    pub omp_command: Option<Vec<String>>,
     /// Runtime for every sandbox the comparison creates.
     #[serde(default)]
     pub runtime: Option<String>,
@@ -550,6 +556,8 @@ measurements. Returns measurements only, never a judgement about which is better
                     target_repo: args.target_repo,
                     target_ref: args.target_ref,
                     task: args.task,
+                    setup_command: args.setup_command,
+                    omp_command: args.omp_command,
                     validation_commands: args.validation_commands.unwrap_or_default(),
                     repetitions: args.repetitions,
                     timeout_seconds: args.timeout_seconds,

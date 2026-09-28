@@ -229,6 +229,97 @@ def page_path(route: str) -> Path:
         return ROOT / "index.html"
     return ROOT / f"{route.strip('/')}/index.html"
 
+# Error pages are rendered from the same shell as everything else, so a reader
+# who lands on a 404 sees the site rather than a server's default page. Each
+# entry says what happened and what to do next; none of them is a dead end.
+ERROR_PAGES: dict[int, dict[str, str]] = {
+    403: {
+        "title": "403 — Forbidden",
+        "headline": "You do not have access to this",
+        "body": """<p class="lede">This resource belongs to another tenant, or the key you
+presented is not scoped for it. AIec never reveals whether a resource exists
+to a caller who cannot see it.</p>""",
+        "actions": '<a class="btn btn--solid" href="/docs">Read the docs</a>'
+        '<a class="btn" href="/cloud/keys">Check your key scopes</a>',
+    },
+    404: {
+        "title": "404 — Not found",
+        "headline": "There is nothing at this address",
+        "body": """<p class="lede">The page moved, or the link that brought you here was
+typed by hand. The sections below are the ones people usually want.</p>""",
+        "actions": '<a class="btn btn--solid" href="/">Home</a>'
+        '<a class="btn" href="/docs">Docs</a>'
+        '<a class="btn" href="/mcp">MCP</a>',
+    },
+    429: {
+        "title": "429 — Too many requests",
+        "headline": "You are going faster than the cluster can go",
+        "body": """<p class="lede">The request was refused before it reached a sandbox.
+Public alpha meters per tenant, so a burst is rejected rather than queued
+indefinitely.</p>""",
+        "actions": '<a class="btn btn--solid" href="/docs">Read the docs</a>'
+        '<a class="btn" href="/status">Service status</a>',
+    },
+    500: {
+        "title": "500 — Internal error",
+        "headline": "Something broke on our side",
+        "body": """<p class="lede">This is a fault in AIec, not in your request. Sandboxes
+already running are unaffected: they are leased from the scheduler and their
+guests keep working while the control plane recovers.</p>""",
+        "actions": '<a class="btn btn--solid" href="/status">Service status</a>'
+        '<a class="btn" href="/">Home</a>',
+    },
+    503: {
+        "title": "503 — Unavailable",
+        "headline": "No local worker can take a sandbox right now",
+        "body": """<p class="lede">Every worker in the cluster is out of capacity or
+draining. AIec does not quietly move a workload to a cloud provider when the
+local cluster is full, so the request failed here instead.</p>""",
+        "actions": '<a class="btn btn--solid" href="/status">Service status</a>'
+        '<a class="btn" href="/docs">Read the docs</a>',
+    },
+}
+
+
+def render_error_page(status: int) -> str:
+    """Renders one error page in the site shell, with no rail and no nav state."""
+    spec = ERROR_PAGES[status]
+    body = f"""<h1>{html.escape(spec["title"])}</h1>
+<p class="lede" style="font-size:1.5rem;font-weight:650;letter-spacing:-0.02em">
+{html.escape(spec["headline"])}</p>
+<div class="rule" aria-hidden="true"></div>
+{spec["body"]}
+<div class="actions">{spec["actions"]}</div>
+<div class="grid-3" style="margin-top:44px">
+  <div class="block">
+    <h3><a href="/docs">Docs</a></h3>
+    <p>Quickstart, the API reference, SDK usage and self-hosting.</p>
+  </div>
+  <div class="block">
+    <h3><a href="/mcp">Local MCP</a></h3>
+    <p>Give an agent a disposable machine on a cluster you run yourself.</p>
+  </div>
+  <div class="block">
+    <h3><a href="/status">Status</a></h3>
+    <p>Whether the control plane and its workers are serving right now.</p>
+  </div>
+</div>"""
+    return SHELL.format(
+        title=html.escape(f"{status} {spec['title'].split('—')[0].strip()}"),
+        description=html.escape(spec["headline"]),
+        nav=render_nav(""),
+        footer_nav=render_footer_nav(),
+        rail="",
+        wide="",
+        body=body,
+    )
+
+
+def render_error_pages() -> int:
+    """Writes <status>.html for every error code, which the Worker serves."""
+    for status in ERROR_PAGES:
+        (ROOT / f"{status}.html").write_text(render_error_page(status), encoding="utf-8")
+    return len(ERROR_PAGES)
 
 def main() -> int:
     rendered = 0
@@ -257,7 +348,8 @@ def main() -> int:
             encoding="utf-8",
         )
         rendered += 1
-    print(f"rendered {rendered} pages into {ROOT}")
+    pages = render_error_pages()
+    print(f"rendered {rendered} pages and {pages} error pages into {ROOT}")
     return 0
 
 
