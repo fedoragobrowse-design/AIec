@@ -227,10 +227,19 @@ async fn execute(
         "placement".to_owned(),
         placement_started.elapsed().as_millis() as u64,
     );
-    run.placement = placement;
-    let _ = store
+    run.placement = placement.clone();
+    // Written on its own rather than smuggled into the results: placement is
+    // decided before any work runs, and a later write of results must not be
+    // able to rewrite where the run went.
+    if let Err(error) = store.set_run_placement(tenant, run.id, placement).await {
+        tracing::warn!(run_id = %run.id, error = %error, "could not record a run's placement");
+    }
+    if let Err(error) = store
         .record_run_results(tenant, run.id, results.clone(), run.state)
-        .await;
+        .await
+    {
+        tracing::warn!(run_id = %run.id, error = %error, "could not record a run's results");
+    }
 
     let sandbox_id = sandbox.id;
     let _ = store

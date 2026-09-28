@@ -5,8 +5,8 @@ use aiec_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
     Snapshot, UsageEvent, UsageSummary, new_id,
     run::{
-        RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox,
-        RunState, WorkloadSpec,
+        Placement, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
+        RunSandbox, RunState, WorkloadSpec,
     },
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
     storage::{
@@ -1205,6 +1205,25 @@ impl PostgresRepository {
         )
         .bind(failure_reason.as_deref())
         .bind(state.as_str())
+        .bind(tenant)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        run_from_row(&updated)
+    }
+
+    async fn set_run_placement(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        placement: Placement,
+    ) -> Result<Run, StoreError> {
+        let updated = sqlx::query(
+            "UPDATE runs SET placement = $1 WHERE tenant_id = $2 AND id = $3 RETURNING *",
+        )
+        .bind(serde_json::to_value(&placement).map_err(StoreError::Json)?)
         .bind(tenant)
         .bind(id)
         .fetch_optional(&self.pool)
@@ -3600,6 +3619,17 @@ impl MetadataStore for PostgresRepository {
         state: RunState,
     ) -> Result<Run, CoreError> {
         Self::set_run_failure(self, tenant, id, failure_reason, state)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn set_run_placement(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        placement: Placement,
+    ) -> Result<Run, CoreError> {
+        Self::set_run_placement(self, tenant, id, placement)
             .await
             .map_err(core_error)
     }

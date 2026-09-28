@@ -3,7 +3,7 @@
 use crate::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Snapshot,
     UsageEvent, UsageSummary,
-    run::{Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState},
+    run::{Placement, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState},
     runtime::RuntimeCapabilities,
 };
 use async_trait::async_trait;
@@ -748,6 +748,20 @@ pub trait MetadataStore: Send + Sync {
     /// Separate from `record_run_results` because the reason is its own column:
     /// a caller reading a failed run should not have to know that it also landed
     /// in the results document to find it.
+    /// Records where a run was placed and why.
+    ///
+    /// Kept out of `record_run_results` deliberately: placement is decided once,
+    /// before any work runs, and a results document written later should not be
+    /// able to rewrite where the run went.
+    async fn set_run_placement(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _placement: Placement,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+
     async fn set_run_failure(
         &self,
         _tenant: TenantId,
