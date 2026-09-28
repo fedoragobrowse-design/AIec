@@ -1,0 +1,46 @@
+[workspace]
+# Deliberately a separate workspace. This harness ships as a single binary that
+# is baked into guest images, so it is built and gated on its own, and must not
+# inherit another workspace's feature unification or build graph.
+members = ["."]
+
+[package]
+name = "aiec-harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A very small coding-agent runtime that boots inside a disposable AIec VM, works on a repository, and exits."
+license = "Apache-2.0"
+
+[[bin]]
+name = "aiec-agent"
+path = "src/main.rs"
+
+[lib]
+name = "aiec_harness"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+futures = "0.3"
+globset = "0.4"
+regex = "1"
+tempfile = "3"
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

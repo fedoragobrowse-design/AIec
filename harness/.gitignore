@@ -1,0 +1,3 @@
+# Build output. This crate is a guest-image artifact, so the release binary is
+# built when the image is built, never committed.
+/target/
