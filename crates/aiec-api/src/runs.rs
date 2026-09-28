@@ -99,8 +99,84 @@ pub async fn submit_and_execute(
         return Ok(run);
     }
 
-    execute(state, tenant, run, request).await
+    // A run has a deadline, not just a command timeout.
+    //
+    // Without this a run whose worker became unreachable - a restart, a drained
+    // node - never settles: it sits in `running` holding a sandbox that never
+    // started, and the tenant's capacity stays consumed until that sandbox's own
+    // TTL runs out. That is a cleanup failure, not a slow run, and it is
+    // precisely what three abandoned runs on a live cluster turned out to be.
+    let deadline = request
+        .workload
+        .timeout_seconds
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+        .saturating_add(PLACEMENT_GRACE_SECONDS);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(deadline),
+        execute(state, tenant, run.clone(), request),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            // Reclaim what the run was holding rather than leaving it to a
+            // sandbox TTL, and say plainly that it was reclaimed.
+            let mut timed_out = run;
+            let mut results = RunResults::default();
+            let mut phases = BTreeMap::new();
+            phases.insert("deadline_s".to_owned(), deadline);
+            release_held_sandboxes(state, tenant, &mut timed_out, &mut results).await;
+            fail(
+                state,
+                tenant,
+                &mut timed_out,
+                Some(format!(
+                    "the run exceeded its {deadline}s deadline and was reclaimed"
+                )),
+                &mut results,
+                &mut phases,
+            )
+            .await?;
+            state.repository().get_run(tenant, timed_out.id).await
+        }
+    }
 }
+
+/// Destroys every machine a run is still holding.
+///
+/// Used when a run is reclaimed rather than finishing, so a timed-out or
+/// cancelled run does not leave capacity behind.
+pub(crate) async fn release_held_sandboxes(
+    state: &AppState,
+    tenant: TenantId,
+    run: &mut Run,
+    results: &mut RunResults,
+) {
+    let Ok(links) = state.repository().list_run_sandboxes(tenant, run.id).await else {
+        return;
+    };
+    for link in links {
+        if let Err(error) = state
+            .repository()
+            .delete_sandbox(tenant, link.sandbox_id)
+            .await
+        {
+            tracing::warn!(
+                run_id = %run.id,
+                sandbox_id = %link.sandbox_id,
+                error = %error,
+                "could not release a sandbox held by a reclaimed run"
+            );
+            results.cleanup_failed = Some(CleanupReport {
+                sandbox_id: link.sandbox_id,
+                error: error.to_string(),
+            });
+        }
+    }
+}
+
+/// Grace on top of the command timeout for placement and teardown.
+const PLACEMENT_GRACE_SECONDS: u64 = 120;
 
 /// Persists the run before any work starts.
 async fn create_run(

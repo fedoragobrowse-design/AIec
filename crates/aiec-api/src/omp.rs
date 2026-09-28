@@ -95,8 +95,13 @@ pub fn to_run_request(spec: &OmpRunSpec) -> RunRequest {
                 "/bin/sh".to_owned(),
                 "-lc".to_owned(),
                 format!(
-                    "set -e; git clone --depth 1 --branch {r} {repo} /workspace/omp && \
-                 cd /workspace/omp && (bun install && bun run build || true)",
+                    // No `|| true` on the build. This tool exists to compare
+                    // revisions, and a revision that does not build is the most
+                    // important thing it can report; swallowing that turns
+                    // "this revision is broken" into a confusing failure much
+                    // later. A caller whose agent genuinely cannot be built
+                    // here overrides `setup_command` and says so.
+                    "set -e; git clone --depth 1 --branch {r} {repo} /workspace/omp && cd /workspace/omp && bun install && bun run build",
                     r = shell_quote(&spec.omp_ref),
                     repo = shell_quote(&spec.omp_repo),
                 ),
