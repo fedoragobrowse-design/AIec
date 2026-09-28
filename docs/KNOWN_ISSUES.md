@@ -83,3 +83,63 @@ update nodes
 
 The `sandbox_count = 0` guard matters: without it the update would hand
 capacity that a live sandbox is holding to the next placement.
+
+---
+
+## The `initialize` handshake never answers `2026-07-28`
+
+**Status:** SDK behaviour, not a defect. Recorded so nobody re-investigates it.
+
+A client that asks for `2026-07-28` on `initialize` is answered
+`2025-11-25`:
+
+```
+client asks 2026-07-28 -> server answers 2025-11-25
+client asks 2025-11-25 -> server answers 2025-11-25
+client asks 2025-06-18 -> server answers 2025-06-18
+```
+
+This is what rmcp 3.4.1 does on purpose. Its own comment on
+`negotiate_protocol_version` says that `2026-07-28` replaced the handshake with
+per-request metadata, so a client naming that revision "is answered with the
+server's newest legacy version instead". `ProtocolVersion::LATEST` in the SDK is
+still `2025-11-25`, and `2026-07-28` is a known version used on the modern path.
+
+So the transport is current — Streamable HTTP — and the SDK is the official Rust
+implementation, which is what the milestone asked for. Setting
+`ServerConfig.protocol_version` to `V_2026_07_28` was tried and changed nothing,
+because the fallback is computed from the newest *legacy* version the server
+supports. It was reverted rather than left in, because it would have made
+`serverInfo` advertise a version the handshake does not answer.
+
+A `2026-07-28` client talks to this server over per-request metadata instead of
+the legacy handshake; that path is the SDK's, not ours.
+
+---
+
+## A destroyed sandbox could be reported as destroyed when it was not
+
+**Status:** fixed. Found by auditing the acceptance matrix, kept here because
+the shape of the bug is worth remembering.
+
+A `aiec_run_repo_task` that ended in a failing command left its sandbox running:
+`aiec_list_sandboxes` still showed it after the tool returned, holding capacity
+the caller believed had been released.
+
+Two defects compounded:
+
+- **The cleanup failure was invisible.** `SandboxGuard::release` logged a
+  warning and dropped the error, so the tool returned a result that read as
+  "the machine is gone". A cleanup failure is now reported in the result as
+  `cleanup_failed`, with the sandbox id and the reason, and the run's
+  measurements are still returned.
+- **The destroy was racy.** Issued immediately after a failed task it could come
+  back `conflict: worker lease generation or status changed`, because the worker
+  was still resyncing its lease. The identical call a minute later succeeded
+  against the same sandbox with an `active` lease, which is what identified it as
+  transient rather than a state error. Destroy is now retried briefly on that
+  specific conflict.
+
+A related honesty fix: `destroy_sandbox` used to give up after a two-second poll
+and return `"destroyed"` whether or not it had seen the sandbox disappear. It now
+reports the state it actually observed and fails if the machine is still there.

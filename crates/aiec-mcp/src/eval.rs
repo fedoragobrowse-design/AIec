@@ -236,6 +236,10 @@ pub struct RunRepoTaskResult {
     pub changed_files: Vec<String>,
     /// The task succeeded and every validation passed.
     pub overall_success: bool,
+    /// Set when the sandbox outlived the run, so a caller is never left with a
+    /// live machine it believes was released.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_failed: Option<CleanupFailure>,
 }
 
 /// Clones a repository, runs a task in it, and reports what changed.
@@ -286,8 +290,9 @@ pub async fn run_repo_task(
 
     // The one exit point: the machine is released before the result is
     // propagated, so a `?` on the way out cannot skip the cleanup.
-    guard.release().await;
-    let result = outcome?;
+    let cleanup_failed = guard.release().await;
+    let mut result = outcome?;
+    result.cleanup_failed = cleanup_failed;
     Ok(result)
 }
 
@@ -363,6 +368,8 @@ async fn repo_task_workflow(
         git_diff: evidence.git_diff,
         changed_files: evidence.changed_files,
         overall_success,
+        // Replaced by the caller, which owns the guard and its outcome.
+        cleanup_failed: None,
     })
 }
 
@@ -663,6 +670,16 @@ impl SideSummary {
     }
 }
 
+/// A sandbox this server created and could not destroy.
+///
+/// Reported rather than swallowed: the run's measurements are still worth
+/// having, but the caller has to know a machine is still alive.
+#[derive(Debug, Clone, Serialize)]
+pub struct CleanupFailure {
+    pub sandbox_id: String,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CompareOmpResult {
     /// Correlates every sandbox and log line of this comparison.
@@ -822,17 +839,27 @@ impl<'a> SandboxGuard<'a> {
     /// A cleanup failure is logged, never propagated: the caller's result
     /// matters more than a machine that outlived its run, and the ownership
     /// record still lets shutdown collect it.
-    async fn release(self) {
+    async fn release(self) -> Option<CleanupFailure> {
         if self.keep {
-            return;
+            return None;
         }
         let sandbox_id = self.sandbox_id;
-        if let Err(error) = self.aiec.destroy_sandbox(sandbox_id).await {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %error,
-                "could not destroy the evaluation sandbox"
-            );
+        match self.aiec.destroy_sandbox(sandbox_id).await {
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %error,
+                    "could not destroy the evaluation sandbox"
+                );
+                // Surfaced in the tool result: a silent failure here leaves a
+                // running machine holding capacity that the caller believes was
+                // released.
+                Some(CleanupFailure {
+                    sandbox_id: sandbox_id.to_string(),
+                    error: error.message,
+                })
+            }
         }
     }
 }

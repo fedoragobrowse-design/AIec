@@ -293,18 +293,39 @@ impl LocalAiec {
     /// caller cleaning up after a failure should not have to distinguish the
     /// two cases.
     pub async fn destroy_sandbox(&self, id: Uuid) -> ToolResult<String> {
-        let outcome = self.client.delete_sandbox(id).await;
-        if let Err(error) = &outcome {
-            // A sandbox that is already gone is the outcome the caller wanted,
-            // so only a genuine failure is reported.
-            let not_found = error.to_string().contains("404");
-            if !not_found {
-                return Err(map_client_error(error).with_sandbox(id));
+        // A destroy issued immediately after a failed task can race the
+        // worker's lease resync and come back "worker lease generation or status
+        // changed". It is transient: the same call a moment later succeeds. So
+        // it is retried briefly before being reported, which is what makes
+        // cleanup reliable rather than merely attempted.
+        let mut last_error: Option<aiec_client::ClientError> = None;
+        for attempt in 0..4 {
+            match self.client.delete_sandbox(id).await {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    // Already gone is the outcome the caller wanted.
+                    if error.to_string().contains("404") {
+                        last_error = None;
+                        break;
+                    }
+                    let lease_race = error.to_string().contains("lease");
+                    last_error = Some(error);
+                    if !lease_race || attempt == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt + 1))).await;
+                }
             }
+        }
+        if let Some(error) = last_error {
+            return Err(map_client_error(&error).with_sandbox(id));
         }
 
         // Confirm cleanup rather than assuming the delete was synchronous.
-        for _ in 0..10 {
+        for _ in 0..25 {
             match self.client.get_sandbox(id).await {
                 Ok(sandbox) => {
                     if is_terminal(sandbox.state) {
@@ -321,8 +342,22 @@ impl LocalAiec {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        self.forget(id);
-        Ok("destroyed".to_owned())
+
+        // The machine is still there. Saying "destroyed" anyway is a lie the
+        // caller acts on - it stops watching the machine and assumes its capacity
+        // is free - so this is reported as a failure and the ownership record is
+        // kept so the sandbox can still be collected.
+        let state = self
+            .client
+            .get_sandbox(id)
+            .await
+            .map(|sandbox| sandbox.state.as_str().to_owned())
+            .unwrap_or_else(|_| "unknown".to_owned());
+        Err(McpError::new(
+            ErrorCode::AiecApiUnavailable,
+            format!("the sandbox is still `{state}` after destroy was requested"),
+        )
+        .with_sandbox(id))
     }
 
     /// Runs a command inside a sandbox.
