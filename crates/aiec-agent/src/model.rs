@@ -351,13 +351,13 @@ fn clip(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessError, ToolCall, parse_reply};
+    use super::*;
 
     #[test]
     fn a_tool_reply_is_parsed() {
         let text = r#"{"choices":[{"message":{"content":null,"tool_calls":[
-                {"id":"c1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}}],
-                "usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
+            {"id":"c1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}}],
+            "usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
         let reply = parse_reply(text).expect("parsed");
         assert_eq!(reply.tool_calls.len(), 1);
         assert_eq!(reply.tool_calls[0].name, "read");
@@ -402,61 +402,4 @@ mod tests {
         };
         assert_ne!(first.signature(), second.signature());
     }
-
-    /// Parses a model reply for tests that feed hostile input.
-    ///
-    /// Exposed rather than duplicated so the tests exercise the real parser rather
-    /// than a copy of it that can drift.
-    #[doc(hidden)]
-    pub fn parse_reply_for_test(text: &str) -> Result<Reply, HarnessError> {
-        parse_reply(text)
-    }
-
-    #[cfg(test)]
-
-    fn call(name: &str, arguments: &str) -> ToolCall {
-        ToolCall {
-            id: "1".to_owned(),
-            name: name.to_owned(),
-            arguments: arguments.to_owned(),
-        }
-    }
-
-    #[test]
-    fn a_tool_reply_is_parsed() {
-        let text = r#"{"choices":[{"message":{"content":null,"tool_calls":[
-            {"id":"c1","function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}}]}}],
-            "usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
-        let reply = parse_reply(text).expect("parsed");
-        assert_eq!(reply.tool_calls.len(), 1);
-        assert_eq!(reply.tool_calls[0].name, "read");
-        assert!(reply.tool_calls[0].arguments.contains("a.rs"));
-        assert_eq!(reply.usage.input_tokens, 10);
-    }
-
-    #[test]
-    fn a_text_reply_is_parsed() {
-        let text = r#"{"choices":[{"message":{"content":"done","tool_calls":[]}}]}"#;
-        let reply = parse_reply(text).expect("parsed");
-        assert_eq!(reply.text.as_deref(), Some("done"));
-        assert!(reply.tool_calls.is_empty());
-    }
-
-    #[test]
-    fn a_reply_with_no_choices_is_an_error_not_a_panic() {
-        let error = parse_reply(r#"{"choices":[]}"#).unwrap_err();
-        assert!(matches!(error, HarnessError::Model(_)));
-    }
-
-    #[test]
-    fn a_malformed_reply_is_an_error_not_a_panic() {
-        assert!(parse_reply("not json").is_err());
-        assert!(parse_reply("{}").is_err(), "no choices is not a reply");
-    }
-
-    #[test]
-    fn the_same_call_with_different_arguments_is_not_a_repeat() {
-        let first = call("read", "{\"path\":\"a\"}");
-        let second = call("read", "{\"path\":\"b\"}");
-        assert_ne!(first.signature(), second.signature());
-    }
+}
