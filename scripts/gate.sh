@@ -31,6 +31,11 @@ run_gate "cargo test --workspace" cargo test --workspace --all-targets --all-fea
 # site, the README and the SDK from drifting apart.
 run_gate "sdk import contract" python3 scripts/check-sdk-contract.py
 
+# The import contract only checks one line, so a suite that cannot even be
+# collected - a stale import, a syntax error - left the gate green. That is
+# exactly what happened once, so the suite itself is part of the gate now.
+run_gate "python sdk tests" bash -c 'cd sdk/python && python3 -m pytest -q'
+
 if [ "$status" -eq 0 ]; then
   echo "gate passed"
 else
