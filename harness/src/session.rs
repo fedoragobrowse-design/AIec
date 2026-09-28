@@ -79,8 +79,18 @@ impl SessionState {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| HarnessError::io(path.display().to_string(), e))?;
+        // Read bytes, not text. A file that is not valid UTF-8 is still just a
+        // file, and it still must not be able to fail the run; going through
+        // `read_to_string` turned a corrupt state file into an error, which is
+        // precisely what this function promises never to do.
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(HarnessError::io(path.display().to_string(), error)),
+        };
+        let Ok(raw) = String::from_utf8(bytes) else {
+            return Ok(None);
+        };
         match serde_json::from_str::<Self>(&raw) {
             Ok(state) if state.protocol != crate::PROTOCOL_VERSION => Ok(None),
             Ok(state) if state.completed => Ok(None),

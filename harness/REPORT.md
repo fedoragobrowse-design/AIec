@@ -107,7 +107,7 @@ outcome a collector can be handed.
 ```
 cargo fmt --check                                     clean
 cargo clippy --all-targets -- -D warnings             0 errors
-cargo test                                           104 passed, 0 failed
+cargo test                                           123 passed, 0 failed
 ```
 
 ## Bugs the tests found
@@ -132,6 +132,26 @@ Recorded because they are the argument for having written the tests.
 7. **A server's `Retry-After` was clipped by our own backoff ceiling**, so a
    throttled gateway telling the truth about its own state was guaranteed to
    fail. The two budgets now bound different things.
+8. **A session file that was not valid UTF-8 aborted a resumed run.** The
+   function's own contract says a corrupt state file means "nothing to resume",
+   but it went through `read_to_string`, so an `io::Error` escaped where the
+   promise said `Ok(None)`. Found by the hostile-input suite, not by a review.
+
+## Hostile input
+
+`tests/fuzz_hostile.rs` covers the four surfaces §68 names, with a deterministic
+generator so any failure reproduces exactly:
+
+| Surface | What is thrown at it |
+| --- | --- |
+| Task document | 300 random byte strings, invalid UTF-8, JSON nesting bombs to 2048 deep, a 64 MiB document |
+| Model reply | 400 random byte strings through both parsers, nesting bombs to 4096 deep, lone surrogates, control characters, a 4 MiB tool argument |
+| Paths | 5000 generated relative paths; a property assertion that every one either resolves inside the root or is refused, with no third outcome |
+| Repository | Filenames with newlines, tabs, quotes, emoji, a leading dash, 200 characters, and non-UTF-8 bytes; a 300-level directory tree |
+
+The path test is the one that matters most. It asserts a property rather than a
+list of cases: whatever the input, the outcome is one of exactly two, and a
+prefix check that let a third through would fail it.
 
 ## What is intentionally not here
 
