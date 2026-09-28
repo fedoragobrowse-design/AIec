@@ -18,8 +18,8 @@ use aiec_core::RuntimeKind;
 use aiec_core::network::NetworkPolicy;
 use aiec_core::run::{
     CapabilityRequirements, CleanupReport, CommandOutcome, Placement, RepoSpec,
-    ResourceRequirements, RetentionPolicy, Run, RunArtifactRef, RunEvent, RunResults, RunSandbox,
-    RunState, WorkloadSpec,
+    ResourceRequirements, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
+    RunSandbox, RunState, WorkloadSpec,
 };
 use aiec_core::runtime::{RuntimeCapabilities, RuntimeIsolation, SandboxRuntime};
 use aiec_core::{ExecRequest, Sandbox, TenantId, WorkspaceSpec, new_id};
@@ -65,6 +65,17 @@ pub struct RunRequest {
     /// Where a repository clone lands, and whether there is one.
     #[serde(default)]
     pub retained_seconds: Option<i64>,
+    /// How many fresh machines to try before giving up. One means no retry.
+    ///
+    /// A retry is a *fresh* machine, not a second run of the same one: the
+    /// evidence that an attempt failed is usually about that machine, and
+    /// re-running it would produce the same answer.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn default_max_attempts() -> u32 {
+    1
 }
 
 /// The run's own view of its progress, for a caller polling or streaming.
@@ -111,52 +122,100 @@ pub async fn submit_and_execute(
         .timeout_seconds
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
         .saturating_add(PLACEMENT_GRACE_SECONDS);
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(deadline),
-        execute(state, tenant, run.clone(), request),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => {
-            // Reclaim what the run was holding rather than leaving it to a
-            // sandbox TTL, and say plainly that it was reclaimed.
-            let mut timed_out = run;
-            let mut results = RunResults::default();
-            let mut phases = BTreeMap::new();
-            phases.insert("deadline_s".to_owned(), deadline);
-            // The same cleanup every other exit takes, so a timed-out run that
-            // asked to be kept is actually kept.
-            let held = state
-                .repository()
-                .list_run_sandboxes(tenant, timed_out.id)
-                .await
-                .map(|links| {
-                    links
-                        .into_iter()
-                        .map(|link| link.sandbox_id)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            cleanup(state, tenant, &mut timed_out, &held, &mut results).await;
-            fail(
-                state,
-                tenant,
-                &mut timed_out,
-                Some(format!(
-                    "the run exceeded its {deadline}s deadline and was reclaimed"
-                )),
-                &mut results,
-                &mut phases,
-            )
-            .await?;
-            state.repository().get_run(tenant, timed_out.id).await
+    // A retry gets a fresh machine, and every attempt is recorded rather than
+    // overwritten: "it failed twice then passed" and "it passed" are different
+    // facts, and collapsing them is how a flaky agent looks reliable.
+    let max_attempts = request.max_attempts.max(1);
+    let store = state.repository();
+    let mut last_error: Option<CoreError> = None;
+
+    for attempt in 1..=max_attempts {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(deadline),
+            execute(state, tenant, run.clone(), request.clone()),
+        )
+        .await;
+
+        let attempt_error = match outcome {
+            Ok(Ok(finished)) => {
+                let _ = store
+                    .record_run_attempt(RunAttempt {
+                        id: Uuid::now_v7(),
+                        run_id: run.id,
+                        attempt_number: attempt as i32,
+                        sandbox_id: finished.retained_sandbox_id,
+                        state: finished.state,
+                        failure_reason: finished.failure_reason.clone(),
+                        started_at: Utc::now(),
+                        completed_at: Some(Utc::now()),
+                    })
+                    .await;
+                return Ok(finished);
+            }
+            Ok(Err(error)) => error,
+            Err(_elapsed) => {
+                CoreError::Unavailable(format!("the run exceeded its {deadline}s deadline"))
+            }
+        };
+
+        let retryable = is_retryable(&attempt_error);
+        let _ = store
+            .record_run_attempt(RunAttempt {
+                id: Uuid::now_v7(),
+                run_id: run.id,
+                attempt_number: attempt as i32,
+                sandbox_id: None,
+                state: RunState::Failed,
+                failure_reason: Some(attempt_error.to_string()),
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+            })
+            .await;
+        last_error = Some(attempt_error);
+
+        if !retryable || attempt == max_attempts {
+            break;
         }
+        tracing::info!(
+            run_id = %run.id,
+            attempt,
+            max_attempts,
+            "retrying a run on a fresh machine"
+        );
     }
+
+    // Everything the attempts could not explain becomes the run's reason, and
+    // the run is settled through the same path as any other failure.
+    let mut run = run;
+    let mut results = RunResults::default();
+    let mut phases = BTreeMap::new();
+    phases.insert("attempts".to_owned(), max_attempts as u64);
+    fail(
+        state,
+        tenant,
+        &mut run,
+        last_error.map(|error| error.to_string()),
+        &mut results,
+        &mut phases,
+    )
+    .await?;
+    state.repository().get_run(tenant, run.id).await
 }
 
 /// Grace on top of the command timeout for placement and teardown.
 const PLACEMENT_GRACE_SECONDS: u64 = 120;
+
+/// Whether a failed attempt is worth repeating on a fresh machine.
+fn is_retryable(error: &CoreError) -> bool {
+    let message = error.to_string();
+    // A capacity refusal is the conflict worth retrying: the cluster was full a
+    // moment ago and another machine may have been freed. Distinguishing it by
+    // message is unglamorous, and it is the difference between retrying the
+    // useful case and retrying every state clash in the system.
+    let capacity_clash = matches!(error, CoreError::Conflict(_))
+        && (message.contains("capacity") || message.contains("schedulable"));
+    capacity_clash || matches!(error, CoreError::Unavailable(_) | CoreError::Backend(_))
+}
 
 /// Persists the run before any work starts.
 async fn create_run(
@@ -938,5 +997,35 @@ async fn cleanup(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_policy {
+    use super::is_retryable;
+    use aiec_core::CoreError;
+
+    #[test]
+    fn infrastructure_failures_are_worth_another_machine() {
+        assert!(is_retryable(&CoreError::Unavailable("worker gone".into())));
+        assert!(is_retryable(&CoreError::Backend("transport".into())));
+        assert!(is_retryable(&CoreError::Conflict(
+            "no schedulable worker has capacity".into()
+        )));
+    }
+
+    #[test]
+    fn a_refusal_or_a_bad_request_is_not() {
+        // These fail identically every time; retrying only delays the answer.
+        assert!(!is_retryable(&CoreError::Conflict(
+            "stale lease generation".into()
+        )));
+        assert!(!is_retryable(&CoreError::InvalidRequest(
+            "no command".into()
+        )));
+        assert!(!is_retryable(&CoreError::QuotaExceeded(
+            "too many sandboxes".into()
+        )));
+        assert!(!is_retryable(&CoreError::Unsupported("nope".into())));
     }
 }
