@@ -96,6 +96,15 @@ pub enum CoreError {
     QuotaExceeded(String),
     #[error("backend unavailable: {0}")]
     Unavailable(String),
+    /// A failure that will probably not recur if the same work is tried again.
+    ///
+    /// Distinct from `Unavailable` on purpose. Deciding what to retry by
+    /// matching the text of an error is how a retry set grows one leaked
+    /// machine at a time, because the next transient failure arrives with
+    /// wording nobody anticipated. This variant makes the set closed: the
+    /// producer says it was transient, and the consumer trusts it.
+    #[error("transient: {0}")]
+    Transient(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
     #[error("backend error: {0}")]

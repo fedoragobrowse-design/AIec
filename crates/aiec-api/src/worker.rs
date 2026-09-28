@@ -227,6 +227,9 @@ impl WorkerError {
             CoreError::LimitExceeded(message) => ("limit_exceeded", message),
             CoreError::QuotaExceeded(message) => ("quota_exceeded", message),
             CoreError::Unavailable(message) => ("runtime_unavailable", message),
+            // Distinct from "conflict": the caller did nothing wrong, and the
+            // same request may well succeed a moment later.
+            CoreError::Transient(message) => ("transient", message),
             CoreError::Unsupported(message) => ("unsupported", message),
             CoreError::Backend(message) => ("internal", message),
             CoreError::Io(error) => ("internal", error.to_string()),
@@ -1374,6 +1377,7 @@ fn error_message(error: &CoreError) -> String {
         | CoreError::Conflict(message)
         | CoreError::Forbidden(message)
         | CoreError::Unavailable(message)
+        | CoreError::Transient(message)
         | CoreError::Backend(message)
         | CoreError::InvalidRequest(message)
         | CoreError::LimitExceeded(message)

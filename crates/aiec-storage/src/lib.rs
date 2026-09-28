@@ -37,6 +37,11 @@ pub enum StoreError {
     Conflict(String),
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
+    /// A database failure that clears on its own: a deadlock, or a transaction
+    /// that lost a serialisation race. Classified here, from the SQLSTATE,
+    /// rather than by callers guessing from the message.
+    #[error("transient database failure: {0}")]
+    Transient(String),
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
     #[error("migration: {0}")]
@@ -70,6 +75,7 @@ pub(crate) fn core_error(error: StoreError) -> CoreError {
             }
         }
         StoreError::Migration(error) => CoreError::Backend(error.to_string()),
+        StoreError::Transient(message) => CoreError::Transient(message),
         StoreError::Io(error) => CoreError::Io(error),
         StoreError::Json(error) => CoreError::Backend(error.to_string()),
         StoreError::InvalidObjectKey(message) => CoreError::InvalidRequest(message),
@@ -87,6 +93,14 @@ pub(crate) fn database_error(error: sqlx::Error) -> StoreError {
         }
         if database.is_check_violation() {
             return StoreError::Conflict("record violates a storage invariant".into());
+        }
+        // SQLSTATE, not prose: 40P01 is a deadlock and 40001 is a
+        // serialisation failure. Both clear once the other transaction
+        // commits, which is exactly what "try again" means.
+        if let Some(code) = database.code()
+            && matches!(code.as_ref(), "40P01" | "40001")
+        {
+            return StoreError::Transient(error.to_string());
         }
     }
     StoreError::Database(error)

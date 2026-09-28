@@ -635,7 +635,7 @@ async fn update_state_with_generation_transaction(
     let mut tx = pool.begin().await.map_err(database_error)?;
     let row = lock_sandbox(&mut tx, tenant, id).await?;
     if active_lease_generation(&mut tx, tenant, id).await? != Some(generation) {
-        return Err(StoreError::Conflict(
+        return Err(StoreError::Transient(
             "stale sandbox lease generation".into(),
         ));
     }
@@ -999,7 +999,7 @@ impl PostgresScheduler {
             .await?
             // Every healthy, capacity-bearing worker can also be draining, so the old
             // "no healthy worker" wording sent operators looking for an outage.
-            .ok_or_else(|| StoreError::Conflict("no schedulable worker has capacity".into()))?;
+            .ok_or_else(|| StoreError::Transient("no schedulable worker has capacity".into()))?;
         let worker_endpoint: String = node.try_get("control_endpoint")?;
         let node_id: Uuid = node.try_get("id")?;
         debit_capacity(&mut tx, node_id, demand).await?;

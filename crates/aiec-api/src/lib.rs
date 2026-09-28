@@ -413,6 +413,9 @@ impl From<CoreError> for ApiFailure {
             CoreError::Unavailable(m) => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable", m)
             }
+            // Advertised as a distinct code so a client can retry on the type
+            // rather than reading the message for a word it recognises.
+            CoreError::Transient(m) => Self::new(StatusCode::CONFLICT, "transient", m),
             CoreError::Unsupported(m) => Self::new(StatusCode::NOT_IMPLEMENTED, "unsupported", m),
             CoreError::Backend(m) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, "backend", m),
             CoreError::Io(e) => {
@@ -3803,7 +3806,9 @@ mod tests {
                     .update_state(tenant, id, expected, next, None)
                     .await
                     .map(|_| ()),
-                Some(_) => Err(CoreError::Conflict("stale sandbox lease generation".into())),
+                Some(_) => Err(CoreError::Transient(
+                    "stale sandbox lease generation".into(),
+                )),
                 None => Err(CoreError::Conflict("sandbox has no active lease".into())),
             }
         }

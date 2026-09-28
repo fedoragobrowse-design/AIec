@@ -320,7 +320,11 @@ impl LocalAiec {
                         last_error = None;
                         break;
                     }
-                    let lease_race = error.to_string().contains("lease");
+                    // On the wire, transience is a code, so it is matched as one.
+                    let lease_race = matches!(
+                        &error,
+                        aiec_client::ClientError::Api { code, .. } if code == "transient"
+                    );
                     last_error = Some(error);
                     if !lease_race || attempt == 3 {
                         break;

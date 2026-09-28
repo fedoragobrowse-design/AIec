@@ -224,14 +224,15 @@ const PLACEMENT_GRACE_SECONDS: u64 = 120;
 
 /// Whether a failed attempt is worth repeating on a fresh machine.
 fn is_retryable(error: &CoreError) -> bool {
-    let message = error.to_string();
-    // A capacity refusal is the conflict worth retrying: the cluster was full a
-    // moment ago and another machine may have been freed. Distinguishing it by
-    // message is unglamorous, and it is the difference between retrying the
-    // useful case and retrying every state clash in the system.
-    let capacity_clash = matches!(error, CoreError::Conflict(_))
-        && (message.contains("capacity") || message.contains("schedulable"));
-    capacity_clash || matches!(error, CoreError::Unavailable(_) | CoreError::Backend(_))
+    // The producer decides. A capacity refusal, a lease race and a database
+    // deadlock all arrive as `Transient` because whoever raised them knows
+    // whether asking again could work. Reading the message instead meant each
+    // new transient failure was a new leak, discovered by a cluster running
+    // dry rather than by a test.
+    matches!(
+        error,
+        CoreError::Transient(_) | CoreError::Unavailable(_) | CoreError::Backend(_)
+    )
 }
 
 /// Persists the run before any work starts.
@@ -933,13 +934,8 @@ async fn collect_artifacts(
 /// layer can deadlock or fail to serialise, which clears as soon as the other
 /// transaction commits. Treating either as terminal is how a finished run ends
 /// up outliving the machine it was supposed to release.
-fn is_transient_destroy_error(message: &str) -> bool {
-    message.contains("lease")
-        || message.contains("deadlock")
-        || message.contains("could not serialize")
-        // SQLSTATEs, in case the driver ever stops spelling it out.
-        || message.contains("40001")
-        || message.contains("40P01")
+fn is_transient_destroy_error(error: &CoreError) -> bool {
+    matches!(error, CoreError::Transient(_))
 }
 
 /// Destroys a sandbox, retrying the lease race.
@@ -967,7 +963,7 @@ async fn destroy_with_retry(
                 // transactions that resolves when one commits - and treating it
                 // as terminal is exactly how a finished run ends up leaking the
                 // machine it was supposed to release.
-                let transient = is_transient_destroy_error(&message);
+                let transient = is_transient_destroy_error(&error);
                 last = message;
                 if !transient || attempt + 1 == ATTEMPTS {
                     return Err(last);
@@ -1051,33 +1047,43 @@ mod retry_policy {
     use aiec_core::CoreError;
 
     /// A finished run whose destroy hit a database deadlock kept its machine
+    /// A finished run whose destroy hit a database deadlock kept its machine
     /// alive, because the retry treated a deadlock as terminal. A deadlock is
     /// the textbook transient failure: it clears when the other transaction
     /// commits, so refusing to retry is what leaks.
     #[test]
     fn a_database_deadlock_is_worth_retrying() {
-        let deadlock = CoreError::Backend("error returned from database: deadlock detected".into());
+        let deadlock = CoreError::Transient("transient database failure: deadlock detected".into());
         // The run-level policy and the destroy path must agree that this is
         // transient, or a finished run outlives the machine it owned.
         assert!(is_retryable(&deadlock));
+        assert!(is_transient_destroy_error(&deadlock));
 
         for transient in [
-            "worker lease generation or status changed",
-            "error returned from database: deadlock detected",
-            "could not serialize access due to concurrent update",
+            CoreError::Transient("stale sandbox lease generation".into()),
+            CoreError::Transient("no schedulable worker has capacity".into()),
+            CoreError::Transient("transient database failure: serialization failure".into()),
         ] {
             assert!(
-                is_transient_destroy_error(transient),
+                is_transient_destroy_error(&transient),
                 "{transient} must be retried"
             );
         }
+    }
+
+    /// The set is closed. Anything not explicitly transient is fatal, so a new
+    /// kind of failure cannot be quietly added to the retry list by whoever
+    /// happens to be reading a log that day.
+    #[test]
+    fn everything_else_is_fatal_on_destroy() {
         for permanent in [
-            "record not found",
-            "sandbox is not running",
-            "quota exceeded",
+            CoreError::NotFound("no such sandbox".into()),
+            CoreError::Conflict("sandbox is not running".into()),
+            CoreError::QuotaExceeded("disk quota exceeded".into()),
+            CoreError::InvalidRequest("bad id".into()),
         ] {
             assert!(
-                !is_transient_destroy_error(permanent),
+                !is_transient_destroy_error(&permanent),
                 "{permanent} must not be retried"
             );
         }
@@ -1087,7 +1093,7 @@ mod retry_policy {
     fn infrastructure_failures_are_worth_another_machine() {
         assert!(is_retryable(&CoreError::Unavailable("worker gone".into())));
         assert!(is_retryable(&CoreError::Backend("transport".into())));
-        assert!(is_retryable(&CoreError::Conflict(
+        assert!(is_retryable(&CoreError::Transient(
             "no schedulable worker has capacity".into()
         )));
     }

@@ -167,6 +167,15 @@ impl Registry {
         let args: Value = serde_json::from_str(&call.arguments).map_err(|error| {
             HarnessError::Tool(format!("{}: arguments are not json: {error}", call.name))
         })?;
+        // A model that sends an array or a bare string has not sent arguments,
+        // and every tool here takes an object. Saying so is more useful than
+        // letting it reach a field lookup and fail as a missing field.
+        if !args.is_object() {
+            return Err(HarnessError::Tool(format!(
+                "{}: arguments must be a json object",
+                call.name
+            )));
+        }
         let _ = &self.root;
         match call.name.as_str() {
             "read" => read(root, &args),
