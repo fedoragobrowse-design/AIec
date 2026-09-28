@@ -926,6 +926,22 @@ async fn collect_artifacts(
 /// A cleanup that fails is reported rather than logged and dropped: the caller
 /// has to know a machine is still alive, or they will stop watching it and
 /// assume its capacity is free.
+/// Whether a failed destroy is worth another attempt.
+///
+/// Two things go wrong transiently here. A sandbox whose worker is resyncing
+/// its lease refuses the first destroy and accepts the second. And the storage
+/// layer can deadlock or fail to serialise, which clears as soon as the other
+/// transaction commits. Treating either as terminal is how a finished run ends
+/// up outliving the machine it was supposed to release.
+fn is_transient_destroy_error(message: &str) -> bool {
+    message.contains("lease")
+        || message.contains("deadlock")
+        || message.contains("could not serialize")
+        // SQLSTATEs, in case the driver ever stops spelling it out.
+        || message.contains("40001")
+        || message.contains("40P01")
+}
+
 /// Destroys a sandbox, retrying the lease race.
 ///
 /// A sandbox whose lease is being resynced by its worker comes back "worker
@@ -945,9 +961,13 @@ async fn destroy_with_retry(
             Ok(()) => return Ok(()),
             Err(error) => {
                 let message = error.to_string();
-                // Only a lease race is worth waiting on; anything else will fail
-                // the same way again.
-                let transient = message.contains("lease");
+                // Worth another try: a lease the worker is resyncing, and a
+                // database deadlock or serialization failure. A deadlock is the
+                // textbook transient error - it is a conflict between two
+                // transactions that resolves when one commits - and treating it
+                // as terminal is exactly how a finished run ends up leaking the
+                // machine it was supposed to release.
+                let transient = is_transient_destroy_error(&message);
                 last = message;
                 if !transient || attempt + 1 == ATTEMPTS {
                     return Err(last);
@@ -1027,8 +1047,41 @@ async fn cleanup(
 
 #[cfg(test)]
 mod retry_policy {
-    use super::is_retryable;
+    use super::{is_retryable, is_transient_destroy_error};
     use aiec_core::CoreError;
+
+    /// A finished run whose destroy hit a database deadlock kept its machine
+    /// alive, because the retry treated a deadlock as terminal. A deadlock is
+    /// the textbook transient failure: it clears when the other transaction
+    /// commits, so refusing to retry is what leaks.
+    #[test]
+    fn a_database_deadlock_is_worth_retrying() {
+        let deadlock = CoreError::Backend("error returned from database: deadlock detected".into());
+        // The run-level policy and the destroy path must agree that this is
+        // transient, or a finished run outlives the machine it owned.
+        assert!(is_retryable(&deadlock));
+
+        for transient in [
+            "worker lease generation or status changed",
+            "error returned from database: deadlock detected",
+            "could not serialize access due to concurrent update",
+        ] {
+            assert!(
+                is_transient_destroy_error(transient),
+                "{transient} must be retried"
+            );
+        }
+        for permanent in [
+            "record not found",
+            "sandbox is not running",
+            "quota exceeded",
+        ] {
+            assert!(
+                !is_transient_destroy_error(permanent),
+                "{permanent} must not be retried"
+            );
+        }
+    }
 
     #[test]
     fn infrastructure_failures_are_worth_another_machine() {
