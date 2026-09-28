@@ -289,7 +289,12 @@ async fn execute(
                     "setup".to_owned(),
                     phase_started.elapsed().as_millis() as u64,
                 );
+                let cleanup_started = Instant::now();
                 cleanup(state, tenant, &mut run, &sandbox, &mut results).await;
+                phases.insert(
+                    "cleanup".to_owned(),
+                    cleanup_started.elapsed().as_millis() as u64,
+                );
                 settle(state, tenant, &mut run, &mut results, &mut phases).await?;
                 return store.get_run(tenant, run.id).await;
             }
@@ -366,7 +371,12 @@ async fn execute(
 
     // -- outcome -------------------------------------------------------------
     let succeeded = task_ok && results.validations.iter().all(|v| v.ok);
+    let cleanup_started = Instant::now();
     cleanup(state, tenant, &mut run, &sandbox, &mut results).await;
+    phases.insert(
+        "cleanup".to_owned(),
+        cleanup_started.elapsed().as_millis() as u64,
+    );
     if succeeded {
         settle(state, tenant, &mut run, &mut results, &mut phases).await?;
     } else {
