@@ -774,6 +774,7 @@ fn protected_routes() -> Router<AppState> {
         .route("/runs", post(create_run).get(list_runs))
         .route("/runs/{id}", get(get_run))
         .route("/runs/{id}/events", get(list_run_events))
+        .route("/runs/{id}/attempts", get(list_run_attempts))
         .route("/runs/{id}/artifacts", get(list_run_artifacts))
         .route("/runs/{id}/artifacts/{name}", get(download_run_artifact))
         .route("/runs/{id}/cancel", post(cancel_run))
@@ -3156,6 +3157,31 @@ async fn list_run_events(
             .await
             .map_err(ApiFailure::from)?,
     ))
+}
+
+/// Every attempt a run made, in order.
+///
+/// Written on both outcomes, and readable here: attempts that cannot be read
+/// are just a number, and "it failed twice then passed" is the fact a caller
+/// evaluating an agent most needs.
+async fn list_run_attempts(
+    State(s): State<AppState>,
+    Extension(p): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Value> {
+    p.authorize(Scope::SandboxesRead)
+        .map_err(ApiFailure::from)?;
+    // Tenant-scoped first, so a foreign run is 404 rather than an empty list.
+    s.repository()
+        .get_run(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let attempts = s
+        .repository()
+        .list_run_attempts(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(json!(attempts)))
 }
 
 /// The artifacts a run collected, with a URL for each one's bytes.

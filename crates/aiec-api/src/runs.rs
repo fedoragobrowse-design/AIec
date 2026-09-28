@@ -129,12 +129,29 @@ pub async fn submit_and_execute(
     let store = state.repository();
     let mut last_error: Option<CoreError> = None;
 
+    // One budget for the whole run, sliced across attempts.
+    //
+    // A per-attempt deadline would multiply: five attempts of a ten-minute task
+    // is fifty minutes of wall time, and the run would stop being bounded -
+    // which is the one property the deadline exists to provide. A run that wants
+    // more wall time asks for a longer timeout, not more attempts.
+    let run_budget = std::time::Duration::from_secs(deadline);
+    let per_attempt = (run_budget / max_attempts).max(std::time::Duration::from_secs(30));
+    let started = std::time::Instant::now();
+
     for attempt in 1..=max_attempts {
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(deadline),
-            execute(state, tenant, run.clone(), request.clone()),
-        )
-        .await;
+        // Never hand an attempt more than the run has left.
+        let remaining = run_budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            last_error = Some(CoreError::Unavailable(format!(
+                "the run exhausted its {deadline}s budget"
+            )));
+            break;
+        }
+        let slice = per_attempt.min(remaining);
+
+        let outcome =
+            tokio::time::timeout(slice, execute(state, tenant, run.clone(), request.clone())).await;
 
         let attempt_error = match outcome {
             Ok(Ok(finished)) => {
