@@ -618,7 +618,11 @@ impl AiecMcp {
     }
 
     /// Runs a tool body, logging it and converting a failure into an MCP error.
-    async fn report<T, F>(&self, tool: &str, body: F) -> Result<CallToolResult, McpErrorData>
+    pub(crate) async fn report<T, F>(
+        &self,
+        tool: &str,
+        body: F,
+    ) -> Result<CallToolResult, McpErrorData>
     where
         T: Serialize,
         F: Future<Output = Result<T, McpError>>,
@@ -669,7 +673,7 @@ impl AiecMcp {
 }
 
 /// Renders a value as a structured tool result with JSON text.
-fn structured<T: Serialize>(value: &T) -> CallToolResult {
+pub(crate) fn structured<T: Serialize>(value: &T) -> CallToolResult {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned());
     CallToolResult::success(vec![ContentBlock::text(text)])
 }
@@ -678,7 +682,7 @@ fn structured<T: Serialize>(value: &T) -> CallToolResult {
 // Handler, resources and prompts
 // ---------------------------------------------------------------------------
 
-#[tool_handler]
+#[tool_handler(router = crate::server::router())]
 impl ServerHandler for AiecMcp {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(
@@ -802,9 +806,13 @@ fn to_error(error: McpError) -> McpErrorData {
     error.into()
 }
 
-/// Re-exported so the binary can build the router.
+/// Every tool this server serves, sandbox tools and run tools together.
+///
+/// The handler dispatches through this router rather than through the
+/// macro-generated one, so a tool defined in another module is reachable
+/// without a second `ServerHandler` impl.
 pub fn router() -> ToolRouter<AiecMcp> {
-    AiecMcp::tool_router()
+    AiecMcp::tool_router() + AiecMcp::run_tool_router()
 }
 
 /// A convenience view used by the health tool and tests.

@@ -121,6 +121,15 @@ impl LocalAiec {
         &self.endpoint
     }
 
+    /// The authenticated client behind this facade.
+    ///
+    /// Runs are not sandboxes: they are the control plane's own workflow, and
+    /// they go through this same client rather than opening a second
+    /// connection to the same local control plane.
+    pub fn client(&self) -> &AIecClient {
+        &self.client
+    }
+
     pub fn max_parallel(&self) -> usize {
         self.max_parallel
     }
@@ -661,7 +670,7 @@ fn decode_base64(text: &str) -> Option<String> {
 }
 
 /// Clips output to a bound, reporting whether it had to.
-fn clamp(text: &str, limit: usize) -> (String, bool) {
+pub(crate) fn clamp(text: &str, limit: usize) -> (String, bool) {
     if text.len() <= limit {
         return (text.to_owned(), false);
     }

@@ -2,7 +2,7 @@ import base64
 import json
 import unittest
 
-from aiec.client import AIec, Sandbox
+from agentforge import AIec, Sandbox
 
 
 class ClientContractTest(unittest.TestCase):

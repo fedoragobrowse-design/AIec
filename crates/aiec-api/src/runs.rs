@@ -125,7 +125,20 @@ pub async fn submit_and_execute(
             let mut results = RunResults::default();
             let mut phases = BTreeMap::new();
             phases.insert("deadline_s".to_owned(), deadline);
-            release_held_sandboxes(state, tenant, &mut timed_out, &mut results).await;
+            // The same cleanup every other exit takes, so a timed-out run that
+            // asked to be kept is actually kept.
+            let held = state
+                .repository()
+                .list_run_sandboxes(tenant, timed_out.id)
+                .await
+                .map(|links| {
+                    links
+                        .into_iter()
+                        .map(|link| link.sandbox_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            cleanup(state, tenant, &mut timed_out, &held, &mut results).await;
             fail(
                 state,
                 tenant,
@@ -138,39 +151,6 @@ pub async fn submit_and_execute(
             )
             .await?;
             state.repository().get_run(tenant, timed_out.id).await
-        }
-    }
-}
-
-/// Destroys every machine a run is still holding.
-///
-/// Used when a run is reclaimed rather than finishing, so a timed-out or
-/// cancelled run does not leave capacity behind.
-pub(crate) async fn release_held_sandboxes(
-    state: &AppState,
-    tenant: TenantId,
-    run: &mut Run,
-    results: &mut RunResults,
-) {
-    let Ok(links) = state.repository().list_run_sandboxes(tenant, run.id).await else {
-        return;
-    };
-    for link in links {
-        if let Err(error) = state
-            .repository()
-            .delete_sandbox(tenant, link.sandbox_id)
-            .await
-        {
-            tracing::warn!(
-                run_id = %run.id,
-                sandbox_id = %link.sandbox_id,
-                error = %error,
-                "could not release a sandbox held by a reclaimed run"
-            );
-            results.cleanup_failed = Some(CleanupReport {
-                sandbox_id: link.sandbox_id,
-                error: error.to_string(),
-            });
         }
     }
 }
@@ -366,7 +346,7 @@ async fn execute(
                     phase_started.elapsed().as_millis() as u64,
                 );
                 let cleanup_started = Instant::now();
-                cleanup(state, tenant, &mut run, &sandbox, &mut results).await;
+                cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
                 phases.insert(
                     "cleanup".to_owned(),
                     cleanup_started.elapsed().as_millis() as u64,
@@ -448,7 +428,7 @@ async fn execute(
     // -- outcome -------------------------------------------------------------
     let succeeded = task_ok && results.validations.iter().all(|v| v.ok);
     let cleanup_started = Instant::now();
-    cleanup(state, tenant, &mut run, &sandbox, &mut results).await;
+    cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
     phases.insert(
         "cleanup".to_owned(),
         cleanup_started.elapsed().as_millis() as u64,
@@ -862,17 +842,63 @@ async fn collect_artifacts(
 /// A cleanup that fails is reported rather than logged and dropped: the caller
 /// has to know a machine is still alive, or they will stop watching it and
 /// assume its capacity is free.
+/// Destroys a sandbox, retrying the lease race.
+///
+/// A sandbox whose lease is being resynced by its worker comes back "worker
+/// lease generation or status changed", and the identical call a moment later
+/// succeeds. Retrying is not a nicety here: this path is the watchdog's, and a
+/// watchdog whose destroy fails once without retrying is a watchdog that does
+/// not reclaim, which is the failure it exists to prevent.
+async fn destroy_with_retry(
+    state: &AppState,
+    tenant: TenantId,
+    sandbox_id: Uuid,
+) -> Result<(), String> {
+    const ATTEMPTS: usize = 4;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        match state.repository().delete_sandbox(tenant, sandbox_id).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                // Only a lease race is worth waiting on; anything else will fail
+                // the same way again.
+                let transient = message.contains("lease");
+                last = message;
+                if !transient || attempt + 1 == ATTEMPTS {
+                    return Err(last);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Reclaims every machine a run holds, on every exit path.
+///
+/// One function, deliberately. A cleanup path that only some exits take is how a
+/// machine survives its run: the timeout path once had its own, and it ignored
+/// retention, so a `keep_on_failure` run that timed out had its machine destroyed
+/// anyway.
+///
+/// Retention is honoured first, because a run that failed is exactly the one a
+/// caller asked to be able to open.
 async fn cleanup(
     state: &AppState,
     tenant: TenantId,
     run: &mut Run,
-    sandbox: &Sandbox,
+    sandbox_ids: &[Uuid],
     results: &mut RunResults,
 ) {
+    if sandbox_ids.is_empty() {
+        return;
+    }
     let succeeded = run.failure_reason.is_none();
     if run.retention.should_retain(succeeded) {
         let until = Utc::now() + Duration::seconds(DEFAULT_RETENTION_SECONDS);
-        run.retained_sandbox_id = Some(sandbox.id);
+        run.retained_sandbox_id = sandbox_ids.first().copied();
         run.retained_until = Some(until);
         let _ = state
             .repository()
@@ -882,30 +908,35 @@ async fn cleanup(
             state,
             run,
             "sandbox.retained",
-            serde_json::json!({ "sandbox_id": sandbox.id, "until": until }),
+            serde_json::json!({ "sandbox_ids": sandbox_ids, "until": until }),
         )
         .await;
         return;
     }
 
-    if let Err(error) = state.repository().delete_sandbox(tenant, sandbox.id).await {
-        tracing::warn!(
-            run_id = %run.id,
-            sandbox_id = %sandbox.id,
-            error = %error,
-            "could not destroy a run's sandbox"
-        );
-        results.cleanup_failed = Some(CleanupReport {
-            sandbox_id: sandbox.id,
-            error: error.to_string(),
-        });
-    } else {
-        event(
-            state,
-            run,
-            "sandbox.destroyed",
-            serde_json::json!({ "sandbox_id": sandbox.id }),
-        )
-        .await;
+    for sandbox_id in sandbox_ids {
+        match destroy_with_retry(state, tenant, *sandbox_id).await {
+            Ok(()) => {
+                event(
+                    state,
+                    run,
+                    "sandbox.destroyed",
+                    serde_json::json!({ "sandbox_id": sandbox_id }),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    sandbox_id = %sandbox_id,
+                    error = %error,
+                    "could not destroy a run's sandbox"
+                );
+                results.cleanup_failed = Some(CleanupReport {
+                    sandbox_id: *sandbox_id,
+                    error: error.to_string(),
+                });
+            }
+        }
     }
 }

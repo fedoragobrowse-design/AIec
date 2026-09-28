@@ -6,6 +6,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from .runs import Runs
+
 class AIecError(RuntimeError):
     """An error returned by the AIec API.
 
@@ -57,6 +59,7 @@ class AIec:
                 "control plane with `aiec key create`"
             )
         self.sandboxes = _Sandboxes(self)
+        self.runs = Runs(self)
 
     def _request(self, method: str, path: str, payload: dict | None = None) -> Any:
         data = None if payload is None else json.dumps(payload).encode()
