@@ -945,6 +945,33 @@ fn is_transient_destroy_error(error: &CoreError) -> bool {
 /// succeeds. Retrying is not a nicety here: this path is the watchdog's, and a
 /// watchdog whose destroy fails once without retrying is a watchdog that does
 /// not reclaim, which is the failure it exists to prevent.
+/// Stops the machine, hands the capacity back, and only then forgets it.
+///
+/// The order is the point, and it is why this is one function rather than a
+/// snippet copied into each caller. Deleting the row first is cheap and looks
+/// finished, but the container or microVM keeps executing while the control
+/// plane already reports the sandbox gone - which is exactly what happened. A
+/// run's cleanup marked its sandbox destroyed and left seventeen containers
+/// running on the worker, holding capacity that had already been credited back.
+pub(crate) async fn tear_down_sandbox(
+    state: &AppState,
+    tenant: TenantId,
+    sandbox_id: Uuid,
+    sandbox: &Sandbox,
+) -> Result<(), CoreError> {
+    state.runtime_for(sandbox)?.destroy(sandbox).await?;
+    // Hosted capacity is never leased from a worker, so there is no lease to
+    // release; asking the scheduler would fail for a lease that never existed.
+    if state.is_production() && sandbox.runtime != RuntimeKind::Hosted {
+        state.scheduler().release(tenant, sandbox_id).await?;
+    }
+    state
+        .repository()
+        .delete_sandbox(tenant, sandbox_id)
+        .await?;
+    Ok(())
+}
+
 async fn destroy_with_retry(
     state: &AppState,
     tenant: TenantId,
@@ -953,7 +980,16 @@ async fn destroy_with_retry(
     const ATTEMPTS: usize = 4;
     let mut last = String::new();
     for attempt in 0..ATTEMPTS {
-        match state.repository().delete_sandbox(tenant, sandbox_id).await {
+        // Through the shared teardown, not straight to the row. Calling the
+        // repository directly marked the sandbox destroyed while its container
+        // or microVM kept running on the worker.
+        let outcome = match state.repository().get_sandbox(tenant, sandbox_id).await {
+            Ok(sandbox) => tear_down_sandbox(state, tenant, sandbox_id, &sandbox).await,
+            // Already gone, which is the outcome the caller wanted.
+            Err(CoreError::NotFound(_)) => return Ok(()),
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let message = error.to_string();

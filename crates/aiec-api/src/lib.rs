@@ -2049,26 +2049,13 @@ async fn delete_sandbox(
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    s.runtime_for(&x)?
-        .destroy(&x)
-        .await
-        .map_err(ApiFailure::from)?;
-    // Hosted capacity is never leased from a worker, so there is no lease to
-    // release; asking the scheduler would fail for a lease that never existed.
-    if s.is_production() && x.runtime != RuntimeKind::Hosted {
-        s.scheduler()
-            .release(p.tenant_id, id)
-            .await
-            .map_err(|error| {
-                ApiFailure::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "scheduler_unavailable",
-                    error.to_string(),
-                )
-            })?;
-    }
-    s.repository()
-        .delete_sandbox(p.tenant_id, id)
+    // Same teardown the run path uses. Two callers, one order, one meaning of
+    // "destroyed": the machine is stopped before the row is forgotten.
+    // Mapped through `from`, not flattened to one code. A teardown that lost a
+    // lease race or hit a deadlock arrives as `transient` and the caller should
+    // be able to see that and try again; collapsing every failure into
+    // `scheduler_unavailable` would hide the one distinction a client needs.
+    crate::runs::tear_down_sandbox(&s, p.tenant_id, id, &x)
         .await
         .map_err(ApiFailure::from)?;
     s.secrets.lock().await.remove(&(p.tenant_id, id));
@@ -3348,11 +3335,20 @@ async fn release_run_sandboxes(state: &AppState, run: &Run) -> (Run, Vec<Uuid>) 
         .await
         .unwrap_or_default();
     for link in held {
-        match state
+        // The same teardown as a normal finish, so cancelling stops the machine
+        // rather than only forgetting it.
+        let outcome = match state
             .repository()
-            .delete_sandbox(run.tenant_id, link.sandbox_id)
+            .get_sandbox(run.tenant_id, link.sandbox_id)
             .await
         {
+            Ok(sandbox) => {
+                runs::tear_down_sandbox(state, run.tenant_id, link.sandbox_id, &sandbox).await
+            }
+            Err(CoreError::NotFound(_)) => continue,
+            Err(error) => Err(error),
+        };
+        match outcome {
             Ok(()) => released.push(link.sandbox_id),
             Err(error) => {
                 tracing::warn!(
@@ -3397,7 +3393,54 @@ fn run_response(status: StatusCode, run: &Run) -> Result<Response, ApiFailure> {
     response.headers_mut().insert(RUN_ID_HEADER, id);
     Ok(response)
 }
+/// Starts the periodic lease sweeper.
+///
+/// This exists because capacity was only ever reclaimed by an operator calling
+/// `POST /v1/reconcile`. A cluster that leaked a machine therefore stayed
+/// exhausted forever, with the only remedy a manual request - which is not a
+/// remedy, it is a page someone has to be on. Every leaked sandbox becomes a
+/// permanent reduction in capacity, and enough of them take the cluster down.
+///
+/// The pass is bounded, idempotent, and logged, and it runs in its own task so
+/// a slow database cannot delay serving requests.
+fn spawn_lease_sweeper(state: AppState) {
+    tokio::spawn(async move {
+        // Long enough to be uninteresting, short enough that a dead machine
+        // does not cost a lease's worth of capacity for long.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            let actions = match state
+                .repository()
+                .reconcile_expired_leases(RECONCILE_LIMIT)
+                .await
+            {
+                Ok(actions) => actions,
+                Err(error) => {
+                    tracing::warn!(error = %error, "the lease sweeper could not list expiries");
+                    continue;
+                }
+            };
+            if actions.is_empty() {
+                continue;
+            }
+            // Deliberately not calling `recover_expired_leases` here. That
+            // re-places the sandbox on a new worker and rebuilds its workspace,
+            // which is the right thing to do when an operator asks for it and
+            // exactly wrong on a timer: it would resurrect machines for sandboxes
+            // whose runs finished long ago, turning a reclaimed slot back into a
+            // running workload nobody asked for. Reclaiming is automatic;
+            // resurrecting stays a deliberate act.
+            tracing::info!(
+                expired = actions.len(),
+                "the lease sweeper returned capacity held by expired leases"
+            );
+        }
+    });
+}
+
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {
+    spawn_lease_sweeper(state.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app(state)).await
 }
@@ -3408,6 +3451,9 @@ pub async fn serve_tls(
     cert_path: impl AsRef<std::path::Path>,
     key_path: impl AsRef<std::path::Path>,
 ) -> Result<(), std::io::Error> {
+    // The sweeper is a property of the control plane, not of a listener, so it
+    // starts here as well as on the plain listener.
+    spawn_lease_sweeper(state.clone());
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
     axum_server::bind_rustls(addr, config)
         // Without ConnectInfo the limiter cannot see the peer address, so every
@@ -3420,6 +3466,7 @@ pub async fn serve_worker(
     service: WorkerService,
     addr: std::net::SocketAddr,
 ) -> Result<(), std::io::Error> {
+    // A worker holds no leases of its own, so it gets no sweeper.
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, service.router()).await
 }
