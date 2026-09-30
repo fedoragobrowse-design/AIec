@@ -3521,8 +3521,9 @@ async fn sweep_once(state: &AppState) {
         .release_orphaned_leases(ORPHANED_LEASE_LIMIT)
         .await
     {
-        Ok(released) if released > 0 => tracing::info!(
-            released,
+        Ok(outcome) if outcome.released > 0 || outcome.already_released > 0 => tracing::info!(
+            released = outcome.released,
+            already_released = outcome.already_released,
             "the lease sweeper released leases whose sandbox had already finished"
         ),
         Ok(_) => {}

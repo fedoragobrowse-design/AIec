@@ -359,6 +359,20 @@ pub struct SandboxOperation {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What one pass of the orphaned-lease reclaim did.
+///
+/// Two counts rather than one, because "released a lease" and "found a lease
+/// another path had already released" are both success and mean different things
+/// to whoever is reading the sweeper. Collapsing them would make a pass that did
+/// nothing look identical to one that reclaimed a hundred slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanedLeaseRelease {
+    /// Leases this pass released.
+    pub released: u32,
+    /// Leases another path had already credited back before we reached them.
+    pub already_released: u32,
+}
+
 /// Persists AIec domain metadata with tenant-scoped access semantics.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
@@ -686,7 +700,10 @@ pub trait MetadataStore: Send + Sync {
     /// how a parallel soak left two vCPUs debited and flat: the ledger was
     /// internally consistent and still wrong, because an active lease is only
     /// evidence of a live machine if the machine can still be terminal.
-    async fn release_orphaned_leases(&self, _limit: u32) -> Result<u32, CoreError> {
+    async fn release_orphaned_leases(
+        &self,
+        _limit: u32,
+    ) -> Result<OrphanedLeaseRelease, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Sandboxes stuck in a non-terminal state that no live lease and no

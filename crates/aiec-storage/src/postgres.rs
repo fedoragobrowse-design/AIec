@@ -3056,7 +3056,10 @@ impl PostgresRepository {
         Ok(value)
     }
 
-    async fn release_orphaned_leases(&self, limit: u32) -> Result<u32, StoreError> {
+    async fn release_orphaned_leases(
+        &self,
+        limit: u32,
+    ) -> Result<aiec_core::storage::OrphanedLeaseRelease, StoreError> {
         let limit = i64::from(limit.clamp(1, 10_000));
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         let rows = sqlx::query(
@@ -3069,24 +3072,38 @@ impl PostgresRepository {
         .await
         .map_err(database_error)?;
         let mut released = 0u32;
+        let mut already = 0u32;
         for row in &rows {
             let lease = lease_from_row(row)?;
-            // `release_capacity` is fenced on the lease still being active, so a
-            // lease released twice is skipped rather than double-credited.
-            if release_capacity(
+            match release_capacity(
                 &mut tx,
                 &lease,
                 "released",
                 "sandbox reached a terminal state",
             )
             .await
-            .is_ok()
             {
-                released += 1;
+                Ok(()) => released += 1,
+                // The fence, not the terminal-state check, is what makes this
+                // safe to run on a timer. `release_capacity` updates the lease
+                // only while it is still `active` with the same generation, so a
+                // lease that a concurrent `delete_sandbox` already credited back
+                // affects no rows and reports a conflict. Treating that as
+                // "already released" is correct; treating it as an error would
+                // make this pass look broken every time it did its job.
+                Err(StoreError::Conflict(_)) => already += 1,
+                // Anything else is a real failure and is raised rather than
+                // counted as a success. Swallowing it would understate what is
+                // still held while the sweeper reported the pass as healthy.
+                // This layer does not log; it returns, and the caller decides.
+                Err(error) => return Err(error),
             }
         }
         tx.commit().await.map_err(database_error)?;
-        Ok(released)
+        Ok(aiec_core::storage::OrphanedLeaseRelease {
+            released,
+            already_released: already,
+        })
     }
 
     async fn list_stranded_sandboxes(
@@ -3786,7 +3803,10 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn release_orphaned_leases(&self, limit: u32) -> Result<u32, CoreError> {
+    async fn release_orphaned_leases(
+        &self,
+        limit: u32,
+    ) -> Result<aiec_core::storage::OrphanedLeaseRelease, CoreError> {
         Self::release_orphaned_leases(self, limit)
             .await
             .map_err(core_error)
