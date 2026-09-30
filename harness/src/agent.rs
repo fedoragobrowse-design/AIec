@@ -40,6 +40,9 @@ pub struct Agent<'a> {
     own_artifacts: Vec<String>,
     /// Where steering notes arrive, checked once per turn.
     steer_path: PathBuf,
+    /// Bound in `run`, where the caller states it, so the terminal state can be
+    /// written at the same place the in-flight one is.
+    state_path: PathBuf,
     cpu_start_ms: u64,
     started: Instant,
 }
@@ -111,6 +114,7 @@ impl<'a> Agent<'a> {
             root,
             own_artifacts: Vec::new(),
             steer_path,
+            state_path: PathBuf::new(),
             cpu_start_ms,
             started: Instant::now(),
         })
@@ -139,6 +143,7 @@ impl<'a> Agent<'a> {
     }
 
     pub async fn run(mut self, state_path: &Path) -> RunResult {
+        self.state_path = state_path.to_path_buf();
         self.events.emit(Event::SessionStarted {
             task_id: &self.task.task_id,
             provider: self.provider.config().provider.as_str(),
@@ -454,8 +459,17 @@ impl<'a> Agent<'a> {
             Status::Success
         };
 
-        self.state.completed = true;
+        // "Completed" means the TASK finished, not that the process exited.
+        // A run stopped by its budget, by the no-progress detector, or by a
+        // model error has left work undone, and refusing to resume it would
+        // throw away a session that a second attempt could continue.
+        self.state.completed = matches!(stop, Stop::ModelFinished) && passed;
         self.state.state = self.context.state.clone();
+        // Written at exit as well as during the run. Without this a finished
+        // session keeps its last in-flight marker, and since `load` refuses to
+        // resume a completed one, a task that is already done still looks
+        // resumable and gets run again.
+        self.persist(&self.state_path);
 
         RunResult {
             task_id: self.task.task_id.clone(),

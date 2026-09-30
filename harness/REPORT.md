@@ -152,6 +152,8 @@ Four real coding tasks, all with the model choosing its own tools.
 | --- | --- | --- | --- | --- | --- | --- |
 | `split_bill` remainder lost | 2 failures | **OK** | 95.8 s | 12 | 19 | 41 ms |
 | Multi-file: two coupled defects | 3 failures | **OK** | 33.2 s | 9 | 16 | 45 ms |
+| Crash mid-run, then resumed | 1 failure | **OK** | 81.1 s | 7 (after resume) | 17 | — |
+| 12-module repo, 3,000-token window | syntax error | **OK** | 97.9 s | 27 | 49 | 123 ms |
 | Unknown failure, told only "fix the tests" | 1 failure | **OK** | 37.7 s | 9 | 14 | 46 ms |
 | Impossible task, 3-request budget | — | clean stop | 57.3 s | 3 | — | — |
 
@@ -173,6 +175,22 @@ narrowing it down, and fixed the parameter rather than the symptom.
 95,265 ms of model latency against 41 ms of harness CPU — 99.96% of the wall
 time was the model. This is the shape §66 asked for, measured rather than
 asserted.
+
+The crash-recovery row is worth its own line. The harness was killed with
+SIGKILL twenty seconds into a real session; no result document existed, because
+there was no chance to write one, but the session state survived with its turn
+count, tool-call count and token usage. A second invocation with `--resume`
+picked it up and finished the task, and a third correctly declined to resume
+the now-finished session.
+
+That run also found a defect: the terminal state was never written, so a
+finished session kept its last in-flight marker and still looked resumable.
+Since `load` refuses to resume only what is marked completed, a task that was
+already done got run again. The state is now written at exit, and
+`completed` means the TASK finished - model finished and validation passed -
+rather than the process having exited, so a run stopped by its budget or by the
+no-progress detector stays resumable, which is the case where resuming is
+actually worth doing.
 
 ### What a real model found that no test did
 

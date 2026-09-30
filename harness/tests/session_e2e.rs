@@ -782,3 +782,31 @@ async fn a_tool_result_follows_the_assistant_turn_that_asked_for_it_exactly_once
     }
     assert_eq!(tool_messages, 2, "both tool results should be present");
 }
+
+#[tokio::test]
+async fn a_finished_run_leaves_state_that_is_not_offered_for_resume() {
+    let dir = repo_with_bug();
+    let task = task_for(dir.path(), vec![vec!["true"]]);
+    let log = EventLog::open(None).expect("event log");
+    let state_path = dir.path().join(".aiec-agent/session.json");
+
+    let provider = Scripted::new(vec![Step::Done("done")]);
+    let agent = Agent::new(&task, &provider, &log, None).expect("agent");
+    agent.run(&state_path).await;
+
+    // The terminal state is written at exit, not only between turns. Without
+    // it a task that is already finished still looks resumable, because load
+    // refuses to resume only what is marked completed.
+    let saved = SessionState::load(&state_path).expect("load");
+    assert!(
+        saved.is_none(),
+        "a finished session was still offered for resume: {saved:?}"
+    );
+    // And the file itself records the truth, for a human reading it.
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read")).expect("json");
+    assert_eq!(
+        raw["completed"], true,
+        "the state file does not say it finished"
+    );
+}
