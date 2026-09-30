@@ -1501,29 +1501,75 @@ pub(crate) async fn provision_sandbox(
     if x.state != SandboxState::Creating {
         return Ok(x);
     }
-    // If the runtime cannot bring the machine up, the row must not be left
-    // behind as Creating: it would count against the tenant's quota, appear in a
-    // console as running, and never be cleaned up. A provider that refuses
-    // capacity is a normal outcome, not a crash, so it is recorded as failed.
-    if let Err(error) = s.runtime_for(&x)?.create(&x).await {
-        let _ = s
-            .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
-            .await;
-        return Err(ApiFailure::from(error));
+
+    // From here the sandbox holds capacity and a lease, so every exit has to
+    // give both back. Before this, only the environment-preparation failure did:
+    // a `create` that failed left a `Failed` row still holding its lease, and a
+    // `start` that failed left the row in `Starting` holding the lease and the
+    // node's capacity. Neither is reclaimable by anything - the sweeper leaves
+    // rows with a live lease alone - so each one permanently consumed a slot.
+    // A hundred-run soak made it visible: successes stalled after twenty runs
+    // and the tenant was refused on quota with seven sandboxes stuck in
+    // `creating` and `starting`.
+    let provision = async {
+        // If the runtime cannot bring the machine up, the row must not be left
+        // behind as Creating: it would count against the tenant's quota, appear
+        // in a console as running, and never be cleaned up. A provider that
+        // refuses capacity is a normal outcome, not a crash, so it is recorded
+        // as failed.
+        if let Err(error) = s.runtime_for(&x)?.create(&x).await {
+            let _ = s
+                .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
+                .await;
+            return Err(ApiFailure::from(error));
+        }
+        s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
+            .await
+            .map_err(ApiFailure::from)?;
+        x.state = SandboxState::Starting;
+        s.runtime_for(&x)?
+            .start(&x)
+            .await
+            .map_err(ApiFailure::from)?;
+        prepare_environment(s, &x, &x.environment).await?;
+        s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
+            .await
+            .map_err(ApiFailure::from)?;
+        x.state = SandboxState::Running;
+        Ok::<(), ApiFailure>(())
     }
-    s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
-        .await
-        .map_err(ApiFailure::from)?;
-    x.state = SandboxState::Starting;
-    s.runtime_for(&x)?
-        .start(&x)
-        .await
-        .map_err(ApiFailure::from)?;
-    if let Err(error) = prepare_environment(s, &x, &x.environment).await {
-        let _ = s.runtime_for(&x)?.destroy(&x).await;
-        let _ = s
-            .commit_state(&x, SandboxState::Starting, SandboxState::Failed)
-            .await;
+    .await;
+
+    if let Err(error) = provision {
+        // Best effort, and in this order: stop anything that started, mark the
+        // row so nothing treats it as live, then hand the lease back. A failure
+        // here is logged rather than propagated - the caller is already being
+        // told the provisioning failed, and replacing that with a cleanup
+        // error would hide the original cause.
+        match s.runtime_for(&x) {
+            Ok(runtime) => {
+                if let Err(destroy_error) = runtime.destroy(&x).await {
+                    tracing::warn!(
+                        sandbox_id = %x.id,
+                        error = %destroy_error,
+                        "could not stop a sandbox whose provisioning failed"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                sandbox_id = %x.id,
+                error = %error,
+                "could not reach the runtime to stop a sandbox whose provisioning failed"
+            ),
+        }
+        let from = if x.state == SandboxState::Running {
+            SandboxState::Running
+        } else if x.state == SandboxState::Starting {
+            SandboxState::Starting
+        } else {
+            SandboxState::Creating
+        };
+        let _ = s.commit_state(&x, from, SandboxState::Failed).await;
         // Hosted capacity is not leased from a worker, so there is nothing to
         // release; asking the scheduler would fail for a lease that never
         // existed.
@@ -1532,11 +1578,6 @@ pub(crate) async fn provision_sandbox(
         }
         return Err(error);
     }
-
-    s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
-        .await
-        .map_err(ApiFailure::from)?;
-    x.state = SandboxState::Running;
     // A hosted sandbox is charged one vCPU-second unit per allocated vCPU per
     // hour of requested lifetime. This is a stop-loss against a finite provider
     // allowance, not a bill: the durable usage ledger remains the record.
