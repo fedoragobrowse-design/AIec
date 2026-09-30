@@ -403,7 +403,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // a generous flag can never conjure capacity the machine does not have.
     let allocated_memory = u64::from(args.capacity) * GIB;
     let allocated_disk = u64::from(args.capacity) * 10 * GIB;
-    let (measured_memory, measured_disk) = host_capacity();
+    let (measured_memory, measured_disk) = host_capacity(&args.state_dir);
     let total_memory_bytes = measured_memory.map_or(allocated_memory, |measured| {
         if measured < allocated_memory {
             tracing::warn!(
@@ -780,12 +780,19 @@ const DISK_RESERVE_BYTES: u64 = 2 * GIB;
 
 /// What the host actually has, minus the reserve.
 ///
+/// Disk is measured on the filesystem backing `workspace` rather than on `/`.
+/// They are the same filesystem on an ordinary host and emphatically not the
+/// same in a container, where `/` is the image's overlay and the workspaces live
+/// on a mounted volume. Measuring `/` there would describe storage the
+/// workloads cannot use, and a node would keep accepting sandboxes while the
+/// volume they actually need was full.
+///
 /// Returns `None` for either measurement it cannot take, and the caller decides
 /// what to do about it. Guessing is the failure this replaces, so a missing
 /// measurement is reported as missing rather than silently replaced with
 /// arithmetic - the fallback exists and says so in the log.
-fn host_capacity() -> (Option<u64>, Option<u64>) {
-    (measure_available_memory(), measure_free_disk("/"))
+fn host_capacity(workspace: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    (measure_available_memory(), measure_free_disk(workspace))
 }
 
 /// Memory the kernel says is available, not `MemFree`.
@@ -805,11 +812,11 @@ fn measure_available_memory() -> Option<u64> {
 }
 
 /// Free bytes on the filesystem holding `path`, minus the reserve.
-fn measure_free_disk(path: &str) -> Option<u64> {
+fn measure_free_disk(path: &std::path::Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_path = CString::new(std::ffi::OsStr::new(path).as_bytes().to_vec()).ok()?;
+    let c_path = CString::new(path.as_os_str().as_bytes().to_vec()).ok()?;
     // SAFETY: `stat` is zeroed before the call and `c_path` is a valid,
     // NUL-terminated string that outlives it. `statvfs` only writes through the
     // pointer we hand it.
