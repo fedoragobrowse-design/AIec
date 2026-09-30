@@ -662,6 +662,23 @@ async fn settle(
 /// Requirements, not a provider: the caller says what it needs and the existing
 /// registry decides. The reason it decided is kept, because "the scheduler
 /// refused it" is otherwise unanswerable.
+/// Keeps a placement refusal distinguishable from a placement failure.
+///
+/// Everything used to arrive as `Unavailable`, which is the one kind the run
+/// loop retries. So a tenant over quota with `max_attempts: 5` made five
+/// placement attempts, each reserving and releasing scheduler state, for a
+/// refusal that cannot succeed on the sixth - and the run then reported an
+/// outage, when the cause was a limit the caller can act on.
+fn placement_error(failure: &crate::ApiFailure) -> CoreError {
+    match failure.code {
+        "quota_exceeded" => CoreError::QuotaExceeded(failure.message.clone()),
+        "invalid_request" | "unsupported" => CoreError::InvalidRequest(failure.message.clone()),
+        // A scheduler that cannot answer right now, or a lease lost to a
+        // resync, is worth another machine.
+        _ => CoreError::Unavailable(failure.message.clone()),
+    }
+}
+
 async fn acquire_sandbox(
     state: &AppState,
     tenant: TenantId,
@@ -750,7 +767,7 @@ async fn acquire_sandbox(
     // with "active sandbox lease not found".
     let placed = crate::provision_sandbox(state, tenant, run.id, sandbox)
         .await
-        .map_err(|failure| (CoreError::Unavailable(failure.message), reasons.clone()))?;
+        .map_err(|failure| (placement_error(&failure), reasons.clone()))?;
 
     // The reasons are kept on the run: a refused placement is otherwise the
     // hardest thing to answer without re-running the scheduler by hand.

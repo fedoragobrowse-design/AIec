@@ -364,10 +364,10 @@ impl AppState {
     }
 }
 #[derive(Debug)]
-struct ApiFailure {
+pub(crate) struct ApiFailure {
     status: StatusCode,
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
     request_id: Uuid,
 }
 impl ApiFailure {

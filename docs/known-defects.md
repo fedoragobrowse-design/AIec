@@ -21,6 +21,8 @@ Each entry says what is wrong, how it shows up, and what is not yet done.
 | The control plane logged nothing at all | `EnvFilter::from_default_env` with no `RUST_LOG` means no directives, so every `tracing::` line was discarded | `5b40d36` |
 | A retried idempotency key ran the workload twice | the guard asked whether the run was finished, not whether this call created it | `e4275c6` |
 | Every fully-budgeted run was dropped by the client | SDK timeout `stated + 60s` was shorter than the server's `stated + 120s` budget | `e4275c6` |
+| A quota refusal cost five placement attempts and read as an outage | `acquire_sandbox` mapped every placement failure to `Unavailable`, the one kind the run loop retries | "Stop calling a quota refusal an outage" |
+| Sandboxes could not resolve names, or could not resolve at all | the container spec set no resolvers and let the daemon pick a public one the network blocks | `e975003` |
 
 ## Open
 
@@ -46,14 +48,6 @@ Writing results in that state is rejected by the lifecycle, so `phase_ms` and
 both are warn-only. A database blip during settlement leaves a run permanently
 non-terminal while a `run.failed` event already exists - a terminal event for a
 run that never became terminal.
-
-### Placement failures are flattened
-
-`acquire_sandbox` maps every placement failure to `Unavailable`, discarding the
-distinction between a quota refusal and an exhausted cluster. A tenant over
-quota with `max_attempts: 5` makes five placement attempts for an error that
-cannot succeed on the sixth, and the run reports an outage when the cause was a
-refusal.
 
 ### A worker restarts machines for sandboxes whose runs finished
 
