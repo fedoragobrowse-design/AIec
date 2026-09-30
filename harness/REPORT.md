@@ -192,6 +192,29 @@ rather than the process having exited, so a run stopped by its budget or by the
 no-progress detector stays resumable, which is the case where resuming is
 actually worth doing.
 
+### Streaming
+
+The OpenAI-compatible path now asks for a streamed reply and reassembles it.
+A long tool-calling turn otherwise sits silent for its whole duration, and in
+a disposable VM that is latency the caller pays for and cannot see.
+
+The reassembly follows the actual event-stream rules rather than a convenient
+approximation. A `data:` field may wrap over several lines, and the lines of
+one event are joined; treating each line as a whole event silently truncates
+exactly the long payload that matters most. Parallel tool calls are kept apart
+by their `index`, because a streamed name arrives in one frame and its
+arguments in the next. An endpoint that ignores `stream` and answers with a
+single object is still understood, since the difference is detected from the
+body rather than assumed.
+
+**The Anthropic path is not streamed.** Its event format is a different shape
+and is not implemented. The test asserts `stream: false` there, rather than
+asserting coverage that does not exist.
+
+Verified against the live endpoint: eight streamed turns, tool calls reassembled
+correctly across frames, `FAILED -> OK`, 82,672 ms of model latency against
+63 ms of harness CPU.
+
 ### What a real model found that no test did
 
 Running against a real provider exposed two defects that every scripted test

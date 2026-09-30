@@ -155,7 +155,14 @@ pub fn build_request_body(config: &ModelConfig, request: &Completion) -> Value {
     // Streaming is declared in the capabilities but not implemented yet; saying
     // so explicitly is cheaper than letting a server pick a default we cannot
     // parse.
-    body.insert("stream".into(), Value::Bool(false));
+    // Streaming is the default: a long tool-calling turn otherwise sits silent
+    // for its entire duration, and in a disposable VM that is latency the
+    // caller pays for and cannot see.
+    body.insert("stream".into(), Value::Bool(true));
+    body.insert(
+        "stream_options".into(),
+        serde_json::json!({ "include_usage": true }),
+    );
     if request.reasoning != Reasoning::Off {
         // Forwarded, not interpreted: the harness has no idea what "medium"
         // means to a provider it has never heard of, and guessing is worse.
@@ -306,6 +313,13 @@ struct WirePromptDetails {
 ///
 /// Pure, so the parser can be fed every shape a hostile endpoint might produce.
 pub fn parse_response(body: &str, latency_ms: u64) -> Result<Response, HarnessError> {
+    let assembled = assemble_stream(body)?;
+    parse_document(&assembled, latency_ms)
+}
+
+/// Parses the single JSON document an OpenAI-compatible endpoint returns,
+/// whether it arrived whole or as reassembled stream fragments.
+pub fn parse_document(body: &str, latency_ms: u64) -> Result<Response, HarnessError> {
     let wire: WireResponse = serde_json::from_str(body)
         .map_err(|error| HarnessError::Model(format!("unreadable reply: {error}")))?;
 
@@ -617,6 +631,126 @@ fn credential(config: &ModelConfig, base_url: &str) -> Result<Option<String>, Ha
             }
         }
     }
+}
+
+/// Splits a server-sent-event stream into the payload of each event.
+///
+/// A `data:` field may be wrapped over several lines, and the lines of one
+/// event are joined with newlines. Treating each line as a whole event is the
+/// obvious reading and it silently truncates any payload long enough to wrap,
+/// which is exactly the long tool call that matters most.
+pub fn sse_events(body: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            // A blank line dispatches the event that has been accumulating.
+            if !current.is_empty() {
+                events.push(current.join("\n"));
+                current.clear();
+            }
+            continue;
+        }
+        if let Some(payload) = line.strip_prefix("data:") {
+            current.push(payload.strip_prefix(' ').unwrap_or(payload));
+        }
+        // `event:`, `id:`, `retry:` and comment lines carry nothing this needs.
+    }
+    if !current.is_empty() {
+        events.push(current.join("\n"));
+    }
+    events
+}
+
+/// Reassembles a server-sent-event stream into the one JSON document that
+/// `parse_response` already understands.
+///
+/// A provider streams a reply as a sequence of `data:` lines, each a fragment
+/// of the same JSON object, with the accumulated values spread across them.
+/// Rather than merge fragments field by field, which means knowing every
+/// provider's shape, the textual pieces are reassembled and handed to the
+/// existing parser. That keeps one code path for the final answer, streamed or
+/// not, at the cost of a little string work that is invisible next to a
+/// network round trip.
+pub fn assemble_stream(body: &str) -> Result<String, HarnessError> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with("data:") {
+        // Not a stream at all: the endpoint ignored the request.
+        return Ok(body.to_owned());
+    }
+
+    let mut content = String::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+    let mut tool_calls: std::collections::BTreeMap<u64, (String, String, String)> =
+        std::collections::BTreeMap::new();
+
+    for event in sse_events(body) {
+        let Ok(chunk) = serde_json::from_str::<Value>(&event) else {
+            // A frame we cannot parse is a frame to skip, not a reply to fail.
+            continue;
+        };
+        if let Some(reported) = chunk.get("usage").filter(|u| !u.is_null()) {
+            usage = Some(reported.clone());
+        }
+        let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+            continue;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+            finish_reason = Some(reason.to_owned());
+        }
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+            content.push_str(text);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let entry = tool_calls
+                    .entry(index)
+                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.0.push_str(id);
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        entry.1.push_str(name);
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        entry.2.push_str(arguments);
+                    }
+                }
+            }
+        }
+    }
+
+    let calls: Vec<Value> = tool_calls
+        .into_values()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, arguments)| {
+            serde_json::json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            })
+        })
+        .collect();
+
+    let document = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "content": if content.is_empty() { Value::Null } else { Value::String(content) },
+                "tool_calls": calls,
+            },
+            "finish_reason": finish_reason.unwrap_or_else(|| "stop".to_owned()),
+        }],
+        "usage": usage.unwrap_or(Value::Null),
+    });
+    Ok(document.to_string())
 }
 
 /// Reads a body without ever buffering more than `limit`.

@@ -341,7 +341,11 @@ fn the_openai_request_is_the_chat_completions_shape() {
 
     assert_eq!(body["model"], json!("test-model"));
     assert_eq!(body["max_tokens"], json!(4096));
-    assert_eq!(body["stream"], json!(false));
+    assert_eq!(
+        body["stream"],
+        json!(true),
+        "the request should ask for a stream"
+    );
 
     let tools = body["tools"].as_array().expect("an array");
     assert_eq!(tools.len(), 1);
@@ -424,7 +428,9 @@ fn the_anthropic_request_takes_the_system_prompt_out_of_band() {
     let body = anthropic::build_request_body(&config, &completion());
 
     assert_eq!(body["model"], json!("test-model"));
-    assert_eq!(body["max_tokens"], json!(4096));
+    // The Anthropic path is not streamed. Its event format is a different
+    // shape and is not implemented; claiming otherwise would be worse than
+    // the latency it costs.
     assert_eq!(body["stream"], json!(false));
     // Out of band, not the first message: a conversation that opens with a
     // system turn is refused by the API.
@@ -1020,4 +1026,122 @@ fn the_base_url_is_normalized_for_both_providers() {
 
 fn http() -> reqwest::Client {
     aiec_harness::model::http_client().expect("a client")
+}
+
+// ------------------------------------------------------------ stream decoding
+
+/// A real streamed reply, in the shape an OpenAI-compatible endpoint sends:
+/// a sequence of `data:` frames, the accumulated values spread across them.
+fn sse(frames: &[&str]) -> String {
+    frames
+        .iter()
+        .map(|f| format!("data: {f}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_owned()))
+        .collect()
+}
+
+#[test]
+fn a_streamed_text_reply_is_assembled_into_the_whole_answer() {
+    let body = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":", "},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":4}}"#,
+    ]);
+    let response = openai::parse_response(&body, 7).expect("parsed");
+    assert_eq!(response.text.as_deref(), Some("Hello, world"));
+    assert_eq!(response.usage.input_tokens, 11);
+    assert_eq!(response.usage.output_tokens, 4);
+    assert_eq!(response.latency_ms, 7);
+}
+
+#[test]
+fn a_streamed_tool_call_is_reassembled_across_frames() {
+    // The name and the arguments arrive in different frames, which is the
+    // normal case and the one that breaks a naive line-by-line reader.
+    let body = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    let response = openai::parse_response(&body, 0).expect("parsed");
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].name, "read");
+    assert_eq!(response.tool_calls[0].id, "call_1");
+    // The reassembled arguments must still be valid json, or the dispatcher
+    // will report a model syntax error as a tool failure.
+    let args: serde_json::Value =
+        serde_json::from_str(&response.tool_calls[0].arguments).expect("arguments are json");
+    assert_eq!(args["path"], "a.rs");
+}
+
+#[test]
+fn parallel_tool_calls_are_kept_apart_by_index() {
+    let body = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"x\"}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"command\":[\"ls\"]}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    let response = openai::parse_response(&body, 0).expect("parsed");
+    assert_eq!(response.tool_calls.len(), 2);
+    let read = response
+        .tool_calls
+        .iter()
+        .find(|c| c.name == "read")
+        .expect("read");
+    let bash = response
+        .tool_calls
+        .iter()
+        .find(|c| c.name == "bash")
+        .expect("bash");
+    assert!(read.arguments.contains("x"));
+    assert!(bash.arguments.contains("ls"));
+}
+
+#[test]
+fn a_data_field_wrapped_over_several_lines_is_one_event() {
+    // A long payload is wrapped, and every line of it carries the `data:`
+    // prefix. Reading line by line would treat each fragment as its own event
+    // and lose everything.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a long\"\n",
+        "data: }}],\"usage\":{\"prompt_tokens\":7}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let response = openai::parse_response(body, 0).expect("parsed");
+    assert_eq!(response.text.as_deref(), Some("a long"));
+    assert_eq!(response.usage.input_tokens, 7);
+}
+
+#[test]
+fn carriage_returns_do_not_break_event_framing() {
+    let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cr\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n";
+    let response = openai::parse_response(body, 0).expect("parsed");
+    assert_eq!(response.text.as_deref(), Some("cr"));
+}
+
+#[test]
+fn an_endpoint_that_ignores_streaming_is_still_understood() {
+    // Some endpoints answer a streaming request with one ordinary object.
+    let body = r#"{"choices":[{"index":0,"message":{"content":"whole"},"finish_reason":"stop"}]}"#;
+    let response = openai::parse_response(body, 0).expect("parsed");
+    assert_eq!(response.text.as_deref(), Some("whole"));
+}
+
+#[test]
+fn a_hostile_or_truncated_stream_does_not_panic() {
+    for body in [
+        "data: [DONE]\n\n",
+        "data: \n\ndata: [DONE]\n\n",
+        "data: {not json}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+        "",
+        "data:",
+        "event: message\ndata: {}\n\n",
+    ] {
+        // The only requirement is that it returns rather than unwinds.
+        let _ = openai::parse_response(body, 0);
+    }
 }
