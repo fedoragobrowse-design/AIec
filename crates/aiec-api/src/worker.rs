@@ -532,15 +532,14 @@ pub struct WorkerRegistration {
     pub last_heartbeat: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkerHeartbeat {
-    pub node_id: Uuid,
-    pub sandbox_count: u32,
-    pub healthy: bool,
-    pub version: u64,
-    pub metadata: Value,
-    pub last_error: Option<String>,
-}
+/// The heartbeat a worker posts.
+///
+/// Re-exported rather than redefined. There were two structurally identical
+/// types - this one and `aiec_core::storage::WorkerHeartbeat` - and they drifted
+/// once, which is how a change could be made "everywhere" and still not compile:
+/// the worker imports this copy, the API handler uses the other, and only one of
+/// them is what a reader of `WorkerHeartbeat` finds first.
+pub use aiec_core::storage::WorkerHeartbeat;
 
 #[derive(Clone)]
 pub struct WorkerRuntime {

@@ -184,21 +184,22 @@ pub struct WorkerRegistration {
     pub total_memory_bytes: u64,
     /// Total disk capacity in bytes.
     pub total_disk_bytes: u64,
-    /// vCPUs the worker believes it can currently allocate.
+    /// vCPUs the worker declares it can allocate.
     ///
-    /// Carried for compatibility and **not** persisted: `heartbeat_worker` writes
-    /// liveness and never touches `nodes.available_*`. Capacity there belongs to
-    /// the scheduler, which decrements it on placement and returns it on release.
+    /// Seeded into `nodes.available_*` on a *first* registration, and only then.
+    /// The re-registration path deliberately omits them: a worker that restarts
+    /// has no business restoring capacity the scheduler has already handed out,
+    /// and a node that did would resurrect the debits of sandboxes it is not
+    /// currently running.
     ///
-    /// A worker that "reported" capacity here would be reporting a second,
-    /// competing source of truth, and the last writer would win - which is the
-    /// failure mode the store avoids by ignoring these entirely. They are
-    /// populated so the field set is stable, and they are documented here so
-    /// nobody reads them as a capacity report that is happening.
+    /// This is the only place a worker writes capacity, and it is a declaration
+    /// rather than a report. A heartbeat carries none, because a periodic
+    /// second writer would race `debit_capacity` and `release_capacity` and
+    /// leave the ledger disagreeing with itself.
     pub available_vcpus: u32,
-    /// See [`WorkerHeartbeat::available_vcpus`]; not persisted.
+    /// See [`WorkerRegistration::available_vcpus`].
     pub available_memory_bytes: u64,
-    /// See [`WorkerHeartbeat::available_vcpus`]; not persisted.
+    /// See [`WorkerRegistration::available_vcpus`].
     pub available_disk_bytes: u64,
     /// Whether the worker is accepting work.
     pub healthy: bool,
