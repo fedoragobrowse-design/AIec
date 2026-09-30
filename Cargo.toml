@@ -9,6 +9,7 @@ members = [
   "crates/aiec-client",
   "crates/aiec-cli",
   "crates/aiec-mcp",
+  "crates/aiec-agent",
   "guest/aiec-guest",
 ]
 
@@ -59,3 +60,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.17", features = ["v4", "v7", "serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
+
+# The agent harness ships inside every disposable VM, so it is optimised for
+# size and cold start rather than for build speed. It gets its own profile
+# rather than changing `release`, because the servers and CLIs in this workspace
+# have different priorities and should not inherit this trade.
+[profile.harness]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

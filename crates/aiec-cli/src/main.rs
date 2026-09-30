@@ -381,8 +381,29 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // not outrank the stored version, so registration and heartbeat must never
     // derive their versions separately.
     let version_base = worker_version_base();
-    let total_memory_bytes = u64::from(args.capacity) * 1024 * 1024 * 1024;
-    let total_disk_bytes = u64::from(args.capacity) * 10 * 1024 * 1024 * 1024;
+    // Measured, not assumed.
+    //
+    // These used to be `capacity x 1 GiB` and `capacity x 10 GiB`: arithmetic
+    // from the same flag that sets the vCPU count, with nothing on the host
+    // asked whether it agreed. A node on a host with four spare gigabytes would
+    // advertise eight and hand out eight, and the failure would arrive at boot -
+    // after the tenant's quota and the node's capacity had already been charged
+    // for work that could never start.
+    let (measured_memory, measured_disk) = host_capacity();
+    if let (Some(memory), Some(disk)) = (measured_memory, measured_disk) {
+        tracing::info!(
+            memory_bytes = memory,
+            disk_bytes = disk,
+            "declaring capacity measured from the host"
+        );
+    } else {
+        tracing::warn!(
+            "could not measure the host; falling back to the configured capacity, \
+             which may overstate what this node can actually run"
+        );
+    }
+    let total_memory_bytes = measured_memory.unwrap_or_else(|| u64::from(args.capacity) * GIB);
+    let total_disk_bytes = measured_disk.unwrap_or_else(|| u64::from(args.capacity) * 10 * GIB);
     let registration = WorkerRegistration {
         node_id,
         name: args.name,
@@ -719,6 +740,66 @@ async fn renew_leases(
 /// Derived from the process start time so a restarted worker always outranks
 /// the version it last reported, which the control plane requires before it
 /// will accept the re-registration.
+/// Bytes in a gibibyte.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Held back from every node so the host itself is never scheduled to zero.
+///
+/// Memory: the operating system, page cache, and this worker's own processes.
+/// Disk: room for logs, images, and the workspace archives a snapshot writes.
+/// Scheduling a node to its last byte is how a host starts refusing I/O in the
+/// middle of running somebody's job.
+const MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+const DISK_RESERVE_BYTES: u64 = 2 * GIB;
+
+/// What the host actually has, minus the reserve.
+///
+/// Returns `None` for either measurement it cannot take, and the caller decides
+/// what to do about it. Guessing is the failure this replaces, so a missing
+/// measurement is reported as missing rather than silently replaced with
+/// arithmetic - the fallback exists and says so in the log.
+fn host_capacity() -> (Option<u64>, Option<u64>) {
+    (measure_available_memory(), measure_free_disk("/"))
+}
+
+/// Memory the kernel says is available, not `MemFree`.
+///
+/// `MemFree` is memory nothing happens to be using, which on a healthy host is
+/// near zero precisely because the page cache is doing its job. `MemAvailable`
+/// is the estimate of what a new allocation can actually get.
+fn measure_available_memory() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let available_kb: u64 = meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        rest.split_whitespace().next()?.parse().ok()
+    })?;
+    available_kb
+        .checked_mul(1024)?
+        .checked_sub(MEMORY_RESERVE_BYTES)
+}
+
+/// Free bytes on the filesystem holding `path`, minus the reserve.
+fn measure_free_disk(path: &str) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(std::ffi::OsStr::new(path).as_bytes().to_vec()).ok()?;
+    // SAFETY: `stat` is zeroed before the call and `c_path` is a valid,
+    // NUL-terminated string that outlives it. `statvfs` only writes through the
+    // pointer we hand it.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        // `f_bavail` rather than `f_bfree`: blocks reserved for root are not
+        // available to a workload.
+        let block = stat.f_frsize;
+        let free = stat.f_bavail.checked_mul(block)?;
+        free.checked_sub(DISK_RESERVE_BYTES)
+    }
+}
+
 fn worker_version_base() -> u64 {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
