@@ -151,6 +151,39 @@ A host negotiates on `protocol` before starting a run.
 - **Bounded retries.** 429 and 5xx are retried with backoff and jitter; a 401 or
   a malformed request is not, because retrying it only wastes the budget.
 
+## Baking into a guest image
+
+The brief is explicit that guest *creation* must not run `cargo build`: a task
+that compiles in the guest pays for a toolchain, a registry and a build cache
+on every boot, in a machine that may live five minutes. The binary is built
+once, at image time, and the guest gets a file.
+
+```sh
+# after the rootfs is built, before the image is published
+harness/scripts/bake-into-guest.sh <rootfs-dir> <guest-capabilities.json>
+```
+
+That installs the release binary at `/usr/local/bin/aiec-agent`, checks it runs
+against the guest's own libraries rather than the build machine's, and records
+in the capabilities manifest:
+
+```json
+"aiec_agent": {
+  "version": "0.1.0",
+  "commit": "2e49f479...",
+  "sha256": "ae61f485...",
+  "protocol": 1,
+  "path": "/usr/local/bin/aiec-agent"
+}
+```
+
+plus `aiec-agent` and `coding-agent` in the `capabilities` list, so a host can
+decide on the same field it already uses for `git` and `python3`.
+
+A build from a dirty tree is recorded as `<commit>-dirty` and flagged with
+`built_from_dirty_tree`. A guest that cannot say which code it is running is a
+guest nobody can reproduce a result from.
+
 ## Development
 
 ```sh
