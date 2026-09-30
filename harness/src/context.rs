@@ -144,6 +144,36 @@ pub struct ToolResult {
     pub ok: bool,
 }
 
+/// Splits a reversed message stream into reversed turn units.
+///
+/// A unit is an assistant message and the tool results that follow it. The
+/// system prompt and the progress block are their own units: neither is
+/// anybody's tool result. Taking whole units backwards and then reversing the
+/// result preserves the original order.
+fn turn_units<'a>(messages: impl Iterator<Item = &'a Message>) -> Vec<Vec<&'a Message>> {
+    let mut units: Vec<Vec<&Message>> = Vec::new();
+    let mut pending: Vec<&Message> = Vec::new();
+    for message in messages {
+        match message {
+            Message::Tool { .. } => pending.push(message),
+            Message::Assistant { .. } => {
+                let mut unit = vec![message];
+                unit.append(&mut pending);
+                pending.clear();
+                units.push(unit);
+            }
+            // A system prompt or a user turn stands alone.
+            _ => units.push(vec![message]),
+        }
+    }
+    // Tool results with no assistant ahead of them in a reversed stream would
+    // otherwise be dropped silently; give them their own unit.
+    if !pending.is_empty() {
+        units.push(pending);
+    }
+    units
+}
+
 /// Roughly 4 characters per token. Deliberately an estimate: the only thing that
 /// matters is that it is monotonic and never wildly optimistic, and a real
 /// tokenizer would cost more than it saves here.
@@ -340,42 +370,39 @@ impl Context {
             rebuilt.push(progress.clone());
         }
 
-        // Walk backwards and keep what fits, rather than keeping a fixed
-        // NUMBER of messages. A count is the wrong unit: six small messages
-        // are nothing, and six large ones are a window overflow. The budget is
-        // the unit that matters.
+        // Walk backwards and keep what FITS, rather than keeping a fixed
+        // number of messages: a count is the wrong unit, since six small
+        // messages are nothing and six large ones are an overflow.
+        //
+        // The unit kept is a TURN, not a message: an assistant message together
+        // with the tool results answering it. Keeping one without the other
+        // produces a `tool` message with no call to answer, which no provider
+        // accepts, and which a scripted fixture happily waves through.
         let target = self
             .budget
             .available()
             .saturating_sub(self.tokens_of(&rebuilt));
         let mut used = 0u64;
-        for message in self.messages.iter().rev() {
-            if matches!(message, Message::System { .. }) {
-                continue;
-            }
-            let cost = message_tokens(message);
+        for unit in turn_units(self.messages.iter().rev()).into_iter().rev() {
+            let cost: u64 = unit.iter().map(|m| message_tokens(m)).sum();
             if used + cost > target {
                 break;
             }
             used += cost;
-            rebuilt.push(message.clone());
+            rebuilt.extend(unit.into_iter().cloned());
         }
-        rebuilt.reverse();
 
-        // If nothing at all fit, the last exchange still has to be bounded or
-        // the next request is unsendable. Squeezing it keeps the most recent
-        // thing the model saw, which is the thing it is most likely to need.
+        // If not even one turn fits, the newest one still has to be bounded or
+        // the next request is unsendable. Squeezing it keeps what the model most
+        // recently saw, which is what it is most likely to need.
         if used == 0
-            && let Some(last) = self
-                .messages
-                .iter()
-                .rev()
-                .find(|m| !matches!(m, Message::System { .. }))
+            && let Some(unit) = turn_units(self.messages.iter().rev()).into_iter().next()
         {
-            rebuilt.push(squeeze_message(
-                last,
-                (MIN_LAST_MESSAGE_TOKENS * 4) as usize,
-            ));
+            let keep = target.max(MIN_LAST_MESSAGE_TOKENS);
+            rebuilt.extend(
+                unit.into_iter()
+                    .map(|m| squeeze_message(m, (keep * 4) as usize)),
+            );
         }
 
         // The wrapper text around the progress block, and the system prompt

@@ -423,3 +423,50 @@ fn task_for(id: &str, instruction: &str) -> Task {
     ))
     .expect("task parses")
 }
+
+#[test]
+fn compaction_never_orphans_a_tool_result_from_its_assistant_turn() {
+    use aiec_harness::model::Message;
+
+    // A window this small forces compaction on the very first turn, which is
+    // where the orphaning happened.
+    let mut ctx = Context::new("objective", ContextBudget::new(3_000, 3_000));
+    let big = "y".repeat(6_000);
+
+    for _ in 0..6 {
+        let response = aiec_harness::model::Response {
+            text: Some("working".to_owned()),
+            tool_calls: vec![aiec_harness::model::ToolCall {
+                id: "c1".to_owned(),
+                name: "bash".to_owned(),
+                arguments: "{}".to_owned(),
+            }],
+            usage: Default::default(),
+            stop: aiec_harness::model::Stop::ModelFinished,
+            latency_ms: 0,
+        };
+        ctx.push_turn(&response, &[result(&big, false)]);
+    }
+
+    // Every tool message must be preceded by the assistant turn that made the
+    // call it answers. A `tool` message with no call is a conversation no
+    // provider accepts.
+    let mut seen_assistant = false;
+    for message in &ctx.messages {
+        match message {
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                seen_assistant = true
+            }
+            Message::Tool { .. } => {
+                assert!(
+                    seen_assistant,
+                    "compaction left an orphaned tool message: {:#?}",
+                    ctx.messages
+                );
+            }
+            _ => {}
+        }
+    }
+    // And the window is still respected.
+    assert!(ctx.tokens() <= 3_000, "context is {} tokens", ctx.tokens());
+}
