@@ -184,11 +184,21 @@ pub struct WorkerRegistration {
     pub total_memory_bytes: u64,
     /// Total disk capacity in bytes.
     pub total_disk_bytes: u64,
-    /// Currently allocatable vCPUs.
+    /// vCPUs the worker believes it can currently allocate.
+    ///
+    /// Carried for compatibility and **not** persisted: `heartbeat_worker` writes
+    /// liveness and never touches `nodes.available_*`. Capacity there belongs to
+    /// the scheduler, which decrements it on placement and returns it on release.
+    ///
+    /// A worker that "reported" capacity here would be reporting a second,
+    /// competing source of truth, and the last writer would win - which is the
+    /// failure mode the store avoids by ignoring these entirely. They are
+    /// populated so the field set is stable, and they are documented here so
+    /// nobody reads them as a capacity report that is happening.
     pub available_vcpus: u32,
-    /// Currently allocatable memory in bytes.
+    /// See [`WorkerHeartbeat::available_vcpus`]; not persisted.
     pub available_memory_bytes: u64,
-    /// Currently allocatable disk in bytes.
+    /// See [`WorkerHeartbeat::available_vcpus`]; not persisted.
     pub available_disk_bytes: u64,
     /// Whether the worker is accepting work.
     pub healthy: bool,
