@@ -89,7 +89,15 @@ const MAX_RUN_TIMEOUT_SECONDS: u64 = 86_400;
 /// The API drives a run to a terminal state before it answers, so the wait for
 /// `POST /v1/runs` *is* the run. A 60-second client timeout would abandon a
 /// perfectly healthy ten-minute workload and report it as a transport failure.
-const RUN_RESPONSE_SLACK_SECONDS: u64 = 60;
+///
+/// It must also be *longer* than the server's own budget, by enough that the
+/// server always gives up first. The control plane adds a grace period on top of
+/// the stated timeout for placement and teardown; a client that waits less than
+/// that drops the connection while the server is still working, which cancels
+/// the run's future mid-flight, leaves the row non-terminal with no terminal
+/// event, and leaks the machine. Those are the runs that hold a machine longest,
+/// so the slack is what the failure costs most.
+const RUN_RESPONSE_SLACK_SECONDS: u64 = 300;
 
 /// How long a cancel may take: it transitions the run, then waits for each
 /// machine it was holding to be destroyed.
@@ -506,6 +514,32 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The client's patience must exceed the server's budget.
+    ///
+    /// A client that gives up first does not merely fail: it drops the
+    /// connection, the server's `execute` future is cancelled mid-flight, and
+    /// the run is left non-terminal holding a machine. Because that happens
+    /// exactly when a run uses its whole budget, it takes down the runs that
+    /// hold compute longest - the opposite of what a shorter timeout buys.
+    #[test]
+    fn the_client_outlasts_the_servers_own_budget() {
+        // Mirrors the control plane's PLACEMENT_GRACE_SECONDS. Duplicated on
+        // purpose rather than imported: if the server ever changes its grace,
+        // this assertion should fail loudly here instead of both sides moving
+        // together and nobody noticing the relationship.
+        const SERVER_PLACEMENT_GRACE_SECONDS: u64 = 120;
+        const _: () = assert!(
+            RUN_RESPONSE_SLACK_SECONDS > SERVER_PLACEMENT_GRACE_SECONDS,
+            "the client gives up before the server does: a client that drops the \
+             connection mid-run cancels the server's future and leaks the machine"
+        );
+        let workload = WorkloadSpec {
+            timeout_seconds: Some(600),
+            ..WorkloadSpec::default()
+        };
+        assert_eq!(run_response_timeout(&workload).as_secs(), 900);
+    }
+
     use super::*;
 
     use std::sync::Arc;

@@ -102,11 +102,18 @@ pub async fn submit_and_execute(
         .validate()
         .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
 
-    let run = create_run(state, tenant, &request).await?;
+    let (run, is_new) = create_run(state, tenant, &request).await?;
 
     // An idempotent hit is an existing run, not an error, and definitely not a
     // second execution.
-    if run.state.is_terminal() {
+    //
+    // Keyed on whether this call created the row rather than on the run being
+    // finished. A client retrying while the first request is still in flight
+    // gets that in-flight row back, and a terminal check waves it through: the
+    // workload runs again on a second machine, both placements are billed, and
+    // the two executions then fight over one row - the loser's terminal write
+    // is rejected and its final `fail` overwrites the winner's outcome.
+    if !is_new {
         return Ok(run);
     }
 
@@ -236,11 +243,19 @@ fn is_retryable(error: &CoreError) -> bool {
 }
 
 /// Persists the run before any work starts.
+/// Returns the run, and whether this call is the one that created it.
+///
+/// The second value is what makes an idempotency key mean anything. The store
+/// resolves a duplicate key to the existing row, so "the run is not terminal"
+/// does not imply "nobody is working on it" - a client retrying while the
+/// first request is still in flight gets that row back, and treating it as
+/// permission to start again runs the workload twice on two machines and bills
+/// for both.
 async fn create_run(
     state: &AppState,
     tenant: TenantId,
     request: &RunRequest,
-) -> Result<Run, CoreError> {
+) -> Result<(Run, bool), CoreError> {
     let now = Utc::now();
     let run = Run {
         id: new_id(),
@@ -266,7 +281,8 @@ async fn create_run(
     let store = state.repository();
     let created = store.create_run(run.clone()).await?;
 
-    if created.id == run.id {
+    let is_new = created.id == run.id;
+    if is_new {
         event(
             state,
             &created,
@@ -280,7 +296,7 @@ async fn create_run(
         )
         .await;
     }
-    Ok(created)
+    Ok((created, is_new))
 }
 
 /// Records a run event. Detail is shapes and names; a value that could be a

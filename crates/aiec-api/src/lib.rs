@@ -3559,6 +3559,7 @@ mod tests {
     use super::*;
     use aiec_core::run::{
         RetentionPolicy, Run, RunArtifactRef, RunEvent, RunResults, RunSandbox, RunState,
+        WorkloadSpec,
     };
     use aiec_core::storage::{
         AuditEvent, MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot,
@@ -4778,6 +4779,10 @@ mod tests {
     /// control plane reported them gone. Assertions about rows and capacity all
     /// passed while that was happening; the observable that would have caught
     /// it is the one the old code never produced.
+    /// Blocks inside `exec` until released, so a test can hold a run in flight
+    /// for as long as it needs. `RunRuntime` returns immediately, which makes
+    /// "submit twice" race rather than reproduce: the first request is usually
+    /// already settled when the second arrives, and a broken guard passes.
     #[derive(Clone, Default)]
     struct RunRuntime {
         recorder: Option<DestroyRecorder>,
@@ -5022,6 +5027,76 @@ mod tests {
         assert_eq!(stopped, vec![linked[0].sandbox_id]);
     }
 
+    /// The same idempotency key must not run the workload twice.
+    ///
+    /// The old guard asked whether the run was finished. A client retrying
+    /// while the first request is still in flight gets that in-flight row back,
+    /// it is not finished, and the workload runs again on a second machine with
+    /// a second charge - then the two executions fight over one row and the
+    /// loser's terminal write overwrites the winner's outcome.
+    /// A key that already names a run must not start that workload again.
+    ///
+    /// The guard used to ask whether the run was finished. A run that is still
+    /// in flight is not finished, so a client retrying while the first request
+    /// is running got the in-flight row, passed the check, and executed the
+    /// whole workload again on a second machine and a second charge - after
+    /// which two executions fight over one row and the loser's final write
+    /// overwrites the winner's outcome.
+    ///
+    /// The run here is deliberately `running`, not finished: that is the state
+    /// the old check waved through, so this test fails against it rather than
+    /// passing on a state both versions agree about.
+    #[tokio::test]
+    async fn a_retried_key_does_not_restart_an_unfinished_run() {
+        let runtime = Arc::new(RunRuntime::default());
+        let fixture = RunFixture::with_runtime(runtime);
+        let request = crate::runs::RunRequest {
+            workload: WorkloadSpec {
+                image: Some("python:3.13".into()),
+                command: vec!["/bin/sh".into(), "-lc".into(), "true".into()],
+                ..WorkloadSpec::default()
+            },
+            requested_runtime: Some("docker".into()),
+            retention: RetentionPolicy::Destroy,
+            idempotency_key: Some("already-going".into()),
+            ..crate::runs::RunRequest::default()
+        };
+
+        // A previous submit for this key is still running.
+        let mut existing = settled_run(fixture.tenant, RunState::Running);
+        existing.idempotency_key = Some("already-going".into());
+        fixture
+            .store
+            .create_run(existing.clone())
+            .await
+            .expect("seed the in-flight run");
+
+        let run = crate::runs::submit_and_execute(&fixture.state, fixture.tenant, request.clone())
+            .await
+            .expect("submit");
+        let _ = std::fs::remove_dir_all(&fixture.root);
+
+        assert_eq!(
+            run.id, existing.id,
+            "a retried key must return the run that already exists"
+        );
+        assert_eq!(
+            run.state,
+            RunState::Running,
+            "a retried key must not have executed anything"
+        );
+        let machines = fixture
+            .store
+            .list_run_sandboxes(fixture.tenant, existing.id)
+            .await
+            .expect("run sandboxes");
+        assert!(
+            machines.is_empty(),
+            "a retried key placed {} machines for a run already in flight",
+            machines.len()
+        );
+    }
+
     struct RunFixture {
         state: AppState,
         store: Arc<LeasedRepository>,
@@ -5033,13 +5108,19 @@ mod tests {
 
     impl RunFixture {
         fn new() -> Self {
+            Self::with_runtime(Arc::new(RunRuntime::default()))
+        }
+
+        /// The same fixture with a different runtime, so a test that needs a
+        /// runtime which blocks or counts has not hand-rolled a second platform
+        /// setup that can quietly stop placing sandboxes.
+        fn with_runtime(runtime: Arc<dyn SandboxRuntime>) -> Self {
             let store = LeasedRepository::new();
             let tenant = new_id();
             let key = run_api_key();
             let root = std::env::temp_dir().join(format!("af-runs-{}", new_id()));
             let objects: Arc<dyn ArtifactStore> =
                 Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
-            let runtime = Arc::new(RunRuntime::default());
             let metadata: Arc<dyn MetadataStore> = store.clone();
             let platform = Platform::builder()
                 .runtime(runtime.clone())
