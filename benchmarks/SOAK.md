@@ -68,11 +68,45 @@ Neither leaks. Both are worth understanding before the system is given more load
 than eight slots, and neither is a correctness failure: a caller that sees either
 can resubmit and will not be charged for work that did not happen.
 
-## Not done
+## Parallel soak
 
-- **Parallel soak** (5 x 20 batches) not run. The cluster has eight docker slots
-  and a shared host, and a parallel soak while a sequential one is already
-  finding leaks would not separate the two effects.
+Five batches of eight concurrent runs, forty in total, sampling live state after
+each batch:
+
+```
+baseline: containers=0 vcpus=18 nonterminal=0
+  batch 1: submitted= 8 succeeded= 6 containers=0 vcpus=17 nonterminal=0
+  batch 2: submitted=16 succeeded=13 containers=0 vcpus=16 nonterminal=1
+  batch 3: submitted=24 succeeded=19 containers=0 vcpus=16 nonterminal=1
+  batch 4: submitted=32 succeeded=25 containers=0 vcpus=16 nonterminal=1
+  batch 5: submitted=40 succeeded=31 containers=0 vcpus=16 nonterminal=1
+FINAL: containers=0 vcpus=16 nonterminal=1
+```
+
+**The property that matters held under concurrency**: no running containers at
+any sample, and non-terminal sandboxes flat at one from batch two onward rather
+than climbing. The sequential soak's failure mode was accumulation, and eight
+simultaneous placements did not produce it - which is the evidence that the
+provisioning fix is about the leak and not about load level.
+
+**Two things did not return to baseline**, and saying otherwise would be the
+easy lie:
+
+- vCPUs settled at 16 of 18, not 18.
+- One non-terminal sandbox remained.
+
+Both stopped moving after batch two and held flat for the remaining three
+batches, so this is a steady-state residue rather than a leak - but it is a
+residue, and 2 vCPUs and one sandbox are still held by something. The sequential
+soak returned to exactly zero, so whatever holds these is specific to concurrent
+placement and has not been identified. It is worth two vCPUs of a small cluster
+now and considerably more on a real one.
+
+Nine of forty failed. The failure classes are the same two as the sequential
+soak - placement lease races and transient capacity refusals - and neither
+accumulates.
+
+## Not done
 - **The remaining audit findings** are in `docs/known-defects.md`. The three
   fixed in this pass - the sweeper's unbounded reclaim loop, the uncapped retry
   loop, and the unguarded terminal-state write - are listed there with their
