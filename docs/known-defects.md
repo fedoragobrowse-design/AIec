@@ -64,3 +64,23 @@ worker that re-registers after being reprovisioned smaller trips the
 `nodes_capacity_within_total` check, which surfaces as a conflict; a worker that
 cannot register cannot heartbeat, and one that cannot heartbeat is never
 recovered.
+
+
+## Verification notes
+
+Two things about this cluster that cost time and will again.
+
+**A sandbox with no network cannot resolve anything.** `NetworkPolicy::Disabled`
+maps to Docker's `network_mode: none`, so a run that does not ask for network
+gets no interface, no resolver, and fails every lookup with "could not resolve
+host" - which reads like a broken image. A workload that clones a repository or
+installs anything needs `"resources": {"network": {"enabled": true}}`, and the
+failure otherwise surfaces as a bare `exit 128` from the setup step.
+
+**The resolvers a sandbox can use come from the worker, not the host.** The
+runtime reads `/etc/resolv.conf` as seen by the worker process. On this host
+that file lists only `127.0.0.53`, systemd-resolved's loopback stub, which is
+filtered because a container cannot use it; the nameservers a sandbox actually
+receives (`169.254.1.1`, `192.168.1.1`) come from the worker's own container
+configuration. That is why the change is a no-op when read from the host and a
+fix when read from the worker.
