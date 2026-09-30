@@ -128,6 +128,12 @@ def bench_control_plane(client: Client, samples: int) -> list[dict]:
 def bench_run(client: Client, image: str, runtime: str, samples: int) -> dict:
     """End-to-end run cost, plus the per-phase breakdown it already records.
 
+    A run that does not succeed is excluded from the timing and counted
+    separately. Beware what a "failed" bench says on a cluster that has been
+    used: stranded sandboxes count against the tenant's active-sandbox quota
+    even when nothing is running on them, so enough leftovers make every
+    submission fail on quota and the benchmark quietly measures nothing.
+
     The phase timings matter more than the total: a run that takes 30 seconds is
     not actionable, but "24 of them were placement" is.
     """
@@ -137,22 +143,48 @@ def bench_run(client: Client, image: str, runtime: str, samples: int) -> dict:
         "resources": {"cpu": 1, "memory_mb": 512, "disk_mb": 2048},
     }
     totals: list[float] = []
+    # Per-run, so the residual can be computed for each run rather than
+    # subtracted from two independently-aggregated medians. A median of
+    # differences is not the difference of medians, and that mistake is what
+    # produced a confident "32% unaccounted" that nothing could reproduce.
     phases: dict[str, list[float]] = {}
+    residuals: list[float] = []
     failures = 0
+    excluded = 0
 
     for _ in range(samples):
         seconds, status, value = client.timed("POST", "/v1/runs", body, timeout=600)
         if status >= 400 or not isinstance(value, dict):
             failures += 1
             continue
-        if value.get("state") == "succeeded":
-            totals.append(seconds)
+        if value.get("state") != "succeeded":
+            # Excluded from the timing, and counted. A run that did not succeed
+            # has phases that describe a different population from the total,
+            # so including them would make the two columns disagree about what
+            # they are averages of.
+            excluded += 1
+            continue
+        totals.append(seconds)
+        measured = 0.0
         for phase, millis in (value.get("results") or {}).get("phase_ms", {}).items():
-            phases.setdefault(phase, []).append(millis / 1000.0)
+            seconds_in_phase = millis / 1000.0
+            phases.setdefault(phase, []).append(seconds_in_phase)
+            measured += seconds_in_phase
+        # What the client waited for that no phase claims: creating the run row,
+        # the state transitions, the HTTP round trip. Clamped at zero because a
+        # phase can straddle the request boundary by a few milliseconds, and a
+        # negative residual is measurement noise, not time saved.
+        residuals.append(max(0.0, seconds - measured))
 
-    report = {"completed": len(totals), "failed": failures}
+    report = {
+        "completed": len(totals),
+        "failed": failures,
+        "excluded_not_succeeded": excluded,
+    }
     if totals:
         report["run_total"] = summarise("run_total", totals)
+    if residuals:
+        report["residual_unattributed"] = summarise("residual_unattributed", residuals)
     for phase, values in sorted(phases.items()):
         report[f"phase_{phase}"] = summarise(f"phase_{phase}", values)
     return report
