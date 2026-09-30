@@ -4308,9 +4308,6 @@ mod tests {
             .unwrap();
         let heartbeat = WorkerHeartbeat {
             node_id,
-            available_vcpus: 2,
-            available_memory_bytes: 128 * 1_048_576,
-            available_disk_bytes: 1024 * 1_048_576,
             sandbox_count: 7,
             healthy: true,
             version: 1,
@@ -5256,9 +5253,6 @@ mod tests {
         let beat = repository
             .heartbeat_worker(WorkerHeartbeat {
                 node_id,
-                available_vcpus: 4,
-                available_memory_bytes: 256 * 1_048_576,
-                available_disk_bytes: 4_096 * 1_048_576,
                 sandbox_count: 0,
                 healthy: true,
                 version: 2,

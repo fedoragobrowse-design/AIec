@@ -910,9 +910,10 @@ async fn heartbeat_worker(
         .repository()
         .heartbeat_worker(aiec_core::storage::WorkerHeartbeat {
             node_id: heartbeat.node_id,
-            available_vcpus: heartbeat.available_vcpus,
-            available_memory_bytes: heartbeat.available_memory_bytes,
-            available_disk_bytes: heartbeat.available_disk_bytes,
+            // Capacity is not copied through. The wire type still accepts it so
+            // an older worker keeps working, and this is where the disconnect
+            // happens: the store never wrote these, and now the API does not
+            // carry them either.
             sandbox_count: heartbeat.sandbox_count,
             healthy: heartbeat.healthy,
             version: heartbeat.version,

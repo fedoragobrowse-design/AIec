@@ -484,7 +484,6 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     let liveness_client = client.clone();
     let liveness_url = control.clone();
     let liveness_health_url = format!("{}/health", advertise_url);
-    let liveness_capacity = args.capacity;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -501,12 +500,8 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 continue;
             };
             let active = status.sandbox_count as u32;
-            let available = args_capacity(liveness_capacity, active);
             let heartbeat = WorkerHeartbeat {
                 node_id: liveness_node,
-                available_vcpus: available,
-                available_memory_bytes: u64::from(available) * 1024 * 1024 * 1024,
-                available_disk_bytes: u64::from(available) * 10 * 1024 * 1024 * 1024,
                 sandbox_count: active,
                 healthy: status.healthy,
                 version: liveness_version.fetch_add(1, Ordering::Relaxed) + 1,
@@ -719,9 +714,6 @@ async fn renew_leases(
     outcome
 }
 
-fn args_capacity(capacity: u32, in_flight: u32) -> u32 {
-    capacity.saturating_sub(in_flight)
-}
 /// Base value for this process's node version.
 ///
 /// Derived from the process start time so a restarted worker always outranks

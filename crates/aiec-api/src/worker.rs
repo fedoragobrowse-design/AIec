@@ -535,9 +535,6 @@ pub struct WorkerRegistration {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerHeartbeat {
     pub node_id: Uuid,
-    pub available_vcpus: u32,
-    pub available_memory_bytes: u64,
-    pub available_disk_bytes: u64,
     pub sandbox_count: u32,
     pub healthy: bool,
     pub version: u64,

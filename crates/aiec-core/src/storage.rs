@@ -217,12 +217,6 @@ pub struct WorkerRegistration {
 pub struct WorkerHeartbeat {
     /// Worker identifier.
     pub node_id: WorkerId,
-    /// Currently allocatable vCPUs.
-    pub available_vcpus: u32,
-    /// Currently allocatable memory in bytes.
-    pub available_memory_bytes: u64,
-    /// Currently allocatable disk in bytes.
-    pub available_disk_bytes: u64,
     /// Number of assigned sandboxes.
     pub sandbox_count: u32,
     /// Whether the worker remains healthy.
