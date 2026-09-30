@@ -136,6 +136,69 @@ to the operator's host and not something this repository should do to itself.
 So the honest position: the harness is proven inside a real AIec sandbox, and
 the Firecracker path is unproven and blocked on host privileges.
 
+## Real model: `space-bunny-free`
+
+The endpoint is the one OMP itself uses, from its own model cache:
+`https://opencode.ai/zen/v1`, `api: openai-completions`, model
+`space-bunny-free`, 1,048,576-token context. It needs no credential, which
+required a small change: an OpenAI-compatible endpoint on a custom base URL may
+legitimately need no key at all — Ollama, vLLM, a gateway fronting a
+subscription — and the correct behaviour is to send no `Authorization` header
+rather than an empty bearer. The provider's own default URL still requires one.
+
+Four real coding tasks, all with the model choosing its own tools.
+
+| Task | Before | After | Wall | Requests | Tools | Harness CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| `split_bill` remainder lost | 2 failures | **OK** | 95.8 s | 12 | 19 | 41 ms |
+| Multi-file: two coupled defects | 3 failures | **OK** | 33.2 s | 9 | 16 | 45 ms |
+| Unknown failure, told only "fix the tests" | 1 failure | **OK** | 37.7 s | 9 | 14 | 46 ms |
+| Impossible task, 3-request budget | — | clean stop | 57.3 s | 3 | — | — |
+
+The `split_bill` fix, written by the model:
+
+```python
+cents = int(round(total * 100))
+each, leftover = divmod(cents, shares)
+parts = [each + 1] * leftover + [each] * (shares - leftover)
+return [part / 100 for part in parts]
+```
+
+The unknown-failure task was given no more than "fix the tests". The defect was
+a module constant used where a function parameter belonged, which no test name
+points at. The model read the module, ran the suite five times while
+narrowing it down, and fixed the parameter rather than the symptom.
+
+**The profile is the one the design was aiming at.** On the first task,
+95,265 ms of model latency against 41 ms of harness CPU — 99.96% of the wall
+time was the model. This is the shape §66 asked for, measured rather than
+asserted.
+
+### What a real model found that no test did
+
+Running against a real provider exposed two defects that every scripted test
+had accepted:
+
+1. **Every tool result was sent twice**, once as a `tool` message and again as
+   a plain `user` message.
+2. **Tool messages were emitted before the assistant turn that issued the
+   calls.**
+
+Space Bunny answered the first request in 1,643 ms with two tool calls, both of
+which executed correctly, then rejected request two with a 400. The scripted
+fixture accepted the malformed transcript without complaint for an entire
+session. That is precisely what a test double written to agree with the
+implementation is blind to, and it is the strongest argument in this report for
+having used the real thing.
+
+### What a real model found about the harness itself
+
+The failure case showed the retry loop spending 107.8 seconds in backoff inside
+a 120-second session, to obtain a result the VM would be destroyed before
+anyone read. `ModelConfig` now carries a deadline the caller sets from the
+task's wall budget, and the loop stops when it is reached. The same task now
+finishes in 57.3 seconds with the truthful `request_budget_exhausted`.
+
 ## Failure case
 
 A task that cannot succeed, with a validation of `false` and a two-request
@@ -203,9 +266,7 @@ prefix check that let a third through would fail it.
 
 ## What is intentionally not here
 
-- **A real model run.** No LLM has driven this. The loop is proven against a
-  scripted endpoint; tool selection, recovery from a confused model, and token
-  behaviour under a real reasoning model are unmeasured.
+- **A Firecracker guest run**, blocked on host privileges (see above).
 - **A Firecracker guest.** The binary is portable and statically shaped, but it
   has not been baked into an image or run inside a VM. That is the single
   largest gap.
