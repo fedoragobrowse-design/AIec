@@ -21,14 +21,31 @@ resources, and anything that trades safety for speed.
 
 ### High
 
-**Worker capacity is advertised from CLI flags, not measured.** `aiec-cli` sends
-`available_memory_bytes = slots x 1 GiB` and `available_disk_bytes = slots x
-10 GiB`, every five seconds. Two consequences: the per-placement memory debit is
-*erased* by the next heartbeat, so the scheduler's memory predicate degenerates
-into "are there free slots" - a node told 8 GiB is free accepts eight 8 GiB
-sandboxes and the host is asked for 64 GiB. And no disk pressure is measured
-anywhere: there is no `statvfs` in the workspace, so a host at 99% full keeps
-advertising disk and fails at boot, after quota and capacity have been charged.
+**Nothing measures the host.** The one high finding here is narrower than the
+audit first reported, and the correction matters more than the original claim.
+
+The audit said a worker advertising `slots x 1 GiB` of memory every five seconds
+erases the per-placement debit, so the scheduler's memory predicate degenerates
+into "are there free slots". **That is wrong**, and it was checked rather than
+assumed. `heartbeat_worker` updates `healthy`, `version`, `metadata`,
+`last_error`, `observed_sandbox_count` and `last_heartbeat` - it never touches
+`available_*`, and the only two writers of those columns in the whole repository
+are `debit_capacity` and `release_capacity`. Registration omits them for the same
+reason. Confirmed on the cluster: `available_vcpus` and `available_memory_bytes`
+were byte-identical across four consecutive heartbeats.
+
+What is actually true is the smaller thing underneath it. `available_*` is
+maintained purely by arithmetic over *requested* sandbox sizes, and nothing
+anywhere measures the machine. There is no `statvfs` in the workspace. So a node
+is scheduled to exactly the sum of what callers asked for, with no reserve for
+the operating system, the worker's own processes, or page cache, and with no
+disk-pressure signal at all - a host at 99% full still looks to the scheduler
+like a node with ten gigabytes per free slot, and the failure arrives at boot,
+after quota and capacity have already been charged.
+
+The worker still computes and sends those numbers, and the store discards them.
+Dead data on the wire, and misleading to anyone reading `aiec-cli`: it looks like
+capacity is being reported when it is not.
 
 **No control-plane concurrency limit on in-flight runs.** No semaphore, no
 `ConcurrencyLimitLayer`. Each `POST /v1/runs` holds a connection and a future for
@@ -169,9 +186,11 @@ assertion.
 
 Blockers, in the order they would matter:
 
-1. **Resource accounting is not measured, it is declared.** A worker says how much
-   memory it has based on a flag, and the heartbeat overwrites the debit the
-   scheduler just made. Every capacity number in the system is a claim.
+1. **No host is ever measured.** Capacity is arithmetic over what callers
+   requested, with no reserve for the host itself and no disk-pressure signal.
+   The debits are correct - an earlier draft of this file claimed a heartbeat
+   erased them, which is false, and the disproof is recorded above - but correct
+   arithmetic about a number nobody measures is still not a measurement.
 2. **A parallel soak leaves a steady-state residue** - two vCPUs and one sandbox,
    flat across three batches, not returned and not identified. The sequential
    soak returns to exactly zero; this does not.
