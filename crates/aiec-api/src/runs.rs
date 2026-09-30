@@ -74,21 +74,14 @@ pub struct RunRequest {
     pub max_attempts: u32,
 }
 
-/// Two, not one.
-///
-/// The run loop treats a lease resync and an exhausted cluster as retryable,
-/// which is only meaningful if a retry actually happens - and one attempt means
-/// it never does. The cost of the second attempt is nothing when the first
-/// succeeded, because it is never reached; the cost of not having it is that a
-/// run fails for a reason that had nothing to do with the workload, which is
-/// what a soak of a hundred runs showed: transient placement races surfacing
-/// as `failed` to callers who never asked for a retry.
-///
-/// This is about *placement*, which is why it is safe. A task that ran and
-/// returned a non-zero exit is not retried; only a failure that happened before
-/// any work did.
+/// One. A second attempt is not free: the run's wall-clock budget is sliced
+/// across attempts, so asking for two halves the time a workload legitimately
+/// has, and a task that needed its full stated timeout would time out, retry on
+/// a second machine, time out again, and fail having paid for both. Placement
+/// races get their own retry instead, because nothing has run yet when they
+/// happen.
 fn default_max_attempts() -> u32 {
-    2
+    1
 }
 
 /// The run's own view of its progress, for a caller polling or streaming.
@@ -164,8 +157,19 @@ pub async fn submit_and_execute(
     // which is the one property the deadline exists to provide. A run that wants
     // more wall time asks for a longer timeout, not more attempts.
     let run_budget = std::time::Duration::from_secs(deadline);
-    let per_attempt = (run_budget / max_attempts).max(std::time::Duration::from_secs(30));
+    // The whole budget is available to an attempt. Dividing it by `max_attempts`
+    // is what made "ask for two attempts" a trap: each attempt got half the time
+    // regardless of whether the first had actually used any, so a workload that
+    // needed its stated timeout would be cut short and then repeated. Attempts
+    // are for when a machine is at fault; the caller who wants more wall time
+    // asks for a longer timeout.
+    let per_attempt = run_budget;
     let started = std::time::Instant::now();
+    // Placement attempts that never reached a machine. A lease resync or an
+    // exhausted cluster is decided in milliseconds and costs no compute, so
+    // these are retried inside the run's existing budget rather than by
+    // splitting it - a second full attempt would be the expensive kind.
+    let mut placement_retries = PLACEMENT_RETRIES;
 
     for attempt in 1..=max_attempts {
         // Never hand an attempt more than the run has left.
@@ -218,6 +222,28 @@ pub async fn submit_and_execute(
             .await;
         last_error = Some(attempt_error);
 
+        // Free retry: the attempt placed nothing, so there is no work to repeat
+        // and no bill to pay twice. Only for the case where the run never got a
+        // machine - checked against what the run actually holds, not inferred
+        // from the error type.
+        let placed_nothing = store
+            .list_run_sandboxes(tenant, run.id)
+            .await
+            .map(|linked| linked.is_empty())
+            .unwrap_or(false);
+        if retryable && placed_nothing && placement_retries > 0 {
+            placement_retries -= 1;
+            tracing::info!(
+                run_id = %run.id,
+                attempt,
+                remaining = placement_retries,
+                "retrying placement; no work has run yet"
+            );
+            let pause = std::time::Duration::from_millis(150 * (attempt as u64 + 1)).min(remaining);
+            tokio::time::sleep(pause).await;
+            continue;
+        }
+
         if !retryable || attempt == max_attempts {
             break;
         }
@@ -259,6 +285,13 @@ pub async fn submit_and_execute(
 
 /// Ceiling on a single run's attempts, whatever the caller asks for.
 const MAX_RUN_ATTEMPTS: u32 = 10;
+
+/// How many times a run may retry *placement* when it never reached a machine.
+///
+/// Separate from `max_attempts` because it costs nothing: no sandbox is created,
+/// no command runs, and the run's wall-clock budget is untouched. What it is
+/// not is a second full attempt.
+const PLACEMENT_RETRIES: u32 = 2;
 
 /// Grace on top of the command timeout for placement and teardown.
 const PLACEMENT_GRACE_SECONDS: u64 = 120;
