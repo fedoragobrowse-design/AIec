@@ -43,6 +43,53 @@ fn workspace_path(raw: &str) -> Result<String, aiec_core::CoreError> {
 
 const MAX_LIST_ENTRIES: usize = 10_000;
 
+/// Whether a nameserver is one a container can actually reach.
+///
+/// Loopback is the trap. A host running systemd-resolved lists only
+/// `127.0.0.53`, which is a stub listening on the *host's* loopback; hand that
+/// to a container and it asks its own loopback, where nothing is listening, so
+/// every lookup fails immediately instead of merely being slow. Docker's
+/// embedded resolver, `127.0.0.11`, is the same idea and is reachable only
+/// inside a container the daemon set up itself.
+///
+/// Passing such an address through would trade "no resolver configured" for
+/// "total, silent DNS failure", which is strictly worse than leaving the
+/// daemon's default in place.
+fn is_reachable_nameserver(address: &str) -> bool {
+    let address = address.trim();
+    if address.eq_ignore_ascii_case("::1") {
+        return false;
+    }
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => !v4.is_loopback(),
+        // An IPv6 address that is not loopback is as reachable as its v4 peer.
+        Ok(std::net::IpAddr::V6(v6)) => !v6.is_loopback(),
+        // Not an address we can judge; let it through rather than silently
+        // dropping a resolver the operator configured on purpose.
+        Err(_) => !address.is_empty(),
+    }
+}
+
+/// The nameservers a container can use, or nothing to leave the daemon's own
+/// default alone.
+///
+/// A sandbox that is never told where to ask fails every lookup with "could
+/// not resolve host", which reads like a broken image rather than a container
+/// that was misconfigured. Inheriting the host's resolvers fixes that on any
+/// host with a reachable one; `is_reachable_nameserver` is what keeps it from
+/// breaking the hosts that only have a loopback stub.
+fn host_resolvers() -> Option<Vec<String>> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let servers: Vec<String> = contents
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .map(str::trim)
+        .filter(|address| is_reachable_nameserver(address))
+        .map(str::to_owned)
+        .collect();
+    (!servers.is_empty()).then_some(servers)
+}
+
 fn container_network_mode(network: &NetworkPolicy) -> Result<&'static str, aiec_core::CoreError> {
     match network {
         NetworkPolicy::Disabled => Ok("none"),
@@ -527,6 +574,7 @@ impl SandboxRuntime for DockerRuntime {
             working_dir: Some("/workspace".into()),
             host_config: Some(HostConfig {
                 network_mode: Some(network.into()),
+                dns: host_resolvers(),
                 cap_drop: Some(vec!["ALL".into()]),
                 pids_limit: Some(128),
                 memory: Some(i64::from(sandbox.memory_mb) * 1024 * 1024),
@@ -1506,5 +1554,35 @@ mod tests {
             b"durable state"
         );
         let _ = std::fs::remove_dir_all(second);
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::is_reachable_nameserver;
+
+    /// A container handed a loopback resolver resolves against its own
+    /// loopback, where nothing listens. Every lookup fails, instantly, with an
+    /// error that looks like the workload's fault.
+    #[test]
+    fn loopback_resolvers_are_never_handed_to_a_container() {
+        for stub in [
+            "127.0.0.53", // systemd-resolved
+            "127.0.0.11", // Docker's embedded resolver
+            "127.0.0.1",
+            "::1",
+        ] {
+            assert!(
+                !is_reachable_nameserver(stub),
+                "{stub} is reachable only from the host's own loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn real_resolvers_are_kept() {
+        for good in ["1.1.1.1", "8.8.8.8", "192.168.1.1", "2606:4700:4700::1111"] {
+            assert!(is_reachable_nameserver(good), "{good} should be kept");
+        }
     }
 }
