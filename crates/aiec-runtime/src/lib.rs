@@ -768,7 +768,12 @@ impl FirecrackerConfig {
         let cache =
             VERIFIED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let key = match artifact_identity(&self.rootfs, &self.kernel) {
+        let key = match artifact_identity(
+            &self.rootfs,
+            &self.kernel,
+            self.guest_artifact.as_ref(),
+            self.require_coding_guest,
+        ) {
             Ok(key) => key,
             // If the artifacts cannot be stat'd there is nothing to key on, and
             // the honest response is to verify rather than to guess.
@@ -928,7 +933,12 @@ pub struct LocalReconciliationReport {
 /// process-wide result is not enough at all. Size and mtime together catch the
 /// replacement that matters: an image swapped for a different one is a
 /// different length, and an image rewritten in place moves its mtime.
-fn artifact_identity(rootfs: &Path, kernel: &Path) -> std::io::Result<String> {
+fn artifact_identity(
+    rootfs: &Path,
+    kernel: &Path,
+    artifact: Option<&guest_artifact::GuestArtifact>,
+    require_coding_guest: bool,
+) -> std::io::Result<String> {
     let describe = |path: &Path| -> std::io::Result<String> {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)?;
@@ -939,7 +949,20 @@ fn artifact_identity(rootfs: &Path, kernel: &Path) -> std::io::Result<String> {
             meta.mtime()
         ))
     };
-    Ok(format!("{}|{}", describe(rootfs)?, describe(kernel)?))
+    // The whole artifact metadata, serialised, plus the flag derived from it.
+    //
+    // Listing fields by hand is how the previous version was wrong: a key built
+    // from the ones I thought of looked complete and was not, because the check
+    // also consults `require_coding_guest`, and a lax configuration's success
+    // would satisfy a strict one. Serialising the input means a field added to
+    // the check later is in the key the day it is added, rather than on the day
+    // somebody remembers.
+    let identity = serde_json::to_string(&artifact).unwrap_or_else(|_| "unserialisable".into());
+    Ok(format!(
+        "{}|{}|coding={require_coding_guest}|{identity}",
+        describe(rootfs)?,
+        describe(kernel)?,
+    ))
 }
 
 impl FirecrackerRuntime {
@@ -2704,6 +2727,7 @@ mod tests {
 #[cfg(test)]
 mod artifact_cache_tests {
     use super::artifact_identity;
+    use super::guest_artifact;
     use std::io::Write;
 
     /// Two different files must not share a verification verdict.
@@ -2726,12 +2750,12 @@ mod artifact_cache_tests {
             file.write_all(b"contents").expect("write");
         }
 
-        let a = artifact_identity(&first, &kernel).expect("identity a");
-        let b = artifact_identity(&second, &kernel).expect("identity b");
+        let a = artifact_identity(&first, &kernel, None, false).expect("identity a");
+        let b = artifact_identity(&second, &kernel, None, false).expect("identity b");
         assert_ne!(a, b, "two different rootfs must not share a verdict");
         assert_eq!(
             a,
-            artifact_identity(&first, &kernel).expect("identity again"),
+            artifact_identity(&first, &kernel, None, false).expect("identity again"),
             "the same unchanged artifact must still hit the cache"
         );
 
@@ -2741,9 +2765,54 @@ mod artifact_cache_tests {
         let longer = dir.join("rootfs-longer.img");
         std::fs::write(&longer, b"a considerably longer set of contents").expect("write");
         assert_ne!(
-            artifact_identity(&first, &kernel).expect("identity a"),
-            artifact_identity(&longer, &kernel).expect("identity longer"),
+            artifact_identity(&first, &kernel, None, false).expect("identity a"),
+            artifact_identity(&longer, &kernel, None, false).expect("identity longer"),
             "a different file at a different path must not reuse a verdict"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The coding-guest requirement is part of the check, so it is part of the key.
+    ///
+    /// `check_guest_artifact` finishes with `check_guest_capabilities`, which
+    /// reads `require_coding_guest`. Two configurations differing only in that
+    /// flag share every path and every byte, so a key built from the files alone
+    /// would let a lax configuration's success satisfy a strict one - and the
+    /// strict one is the one that was supposed to refuse to run an image that
+    /// cannot clone.
+    #[test]
+    fn the_coding_guest_requirement_is_part_of_the_key() {
+        let dir = std::env::temp_dir().join(format!("af-coding-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.img");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&rootfs, b"same bytes").expect("write rootfs");
+        std::fs::write(&kernel, b"same kernel").expect("write kernel");
+
+        let lax = artifact_identity(&rootfs, &kernel, None, false).expect("lax");
+        let strict = artifact_identity(&rootfs, &kernel, None, true).expect("strict");
+        assert_ne!(
+            lax, strict,
+            "a lax verification must not satisfy a configuration that demands a coding guest"
+        );
+
+        // Different metadata is a different verdict too, even at identical paths.
+        let artifact = guest_artifact::GuestArtifact {
+            artifact_version: "1".into(),
+            base: "debian".into(),
+            profile: "coding".into(),
+            capabilities: vec!["git".into()],
+            git_version: Some("2.39.0".into()),
+            guest_agent_version: "1".into(),
+            rootfs_sha256: "abc123".into(),
+            kernel_sha256: Some("def456".into()),
+        };
+        let with_artifact =
+            artifact_identity(&rootfs, &kernel, Some(&artifact), true).expect("with artifact");
+        assert_ne!(
+            strict, with_artifact,
+            "different artifact metadata is a different artifact"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2754,7 +2823,7 @@ mod artifact_cache_tests {
     fn an_unstatable_artifact_has_no_key() {
         let missing = std::env::temp_dir().join("af-definitely-not-here-9f2c.img");
         assert!(
-            artifact_identity(&missing, &missing).is_err(),
+            artifact_identity(&missing, &missing, None, false).is_err(),
             "a missing file must not yield a cache key"
         );
     }
