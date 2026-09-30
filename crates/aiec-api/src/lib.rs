@@ -3452,6 +3452,9 @@ const STRANDED_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 /// Upper bound on abandoned sandboxes released in one pass.
 const STRANDED_LIMIT: u32 = 50;
 
+/// Upper bound on leases released in one pass because their sandbox is done.
+const ORPHANED_LEASE_LIMIT: u32 = 200;
+
 /// Upper bound on pages of abandoned sandboxes examined in one pass.
 ///
 /// A pass that reclaims nothing stops on its own; this is the backstop for the
@@ -3506,6 +3509,27 @@ async fn sweep_once(state: &AppState) {
     // machines for sandboxes whose runs finished long ago, turning a reclaimed
     // slot back into a workload nobody asked for. Reclaiming is automatic;
     // resurrecting stays a deliberate act.
+
+    // Leases that are still valid but belong to a sandbox already destroyed or
+    // failed. Neither of the two reclaim paths below can see these: the lease is
+    // alive, so the expiry pass skips it, and the sandbox is terminal, so the
+    // stranded pass never selects it. A parallel soak left two vCPUs debited
+    // because of exactly this, flat across three batches - the ledger was
+    // internally consistent and still wrong.
+    match state
+        .repository()
+        .release_orphaned_leases(ORPHANED_LEASE_LIMIT)
+        .await
+    {
+        Ok(released) if released > 0 => tracing::info!(
+            released,
+            "the lease sweeper released leases whose sandbox had already finished"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "could not release leases orphaned by finished sandboxes");
+        }
+    }
 
     // Sandboxes in a non-terminal state that nothing accounts for. Expiring a
     // lease returns the capacity, but the row stayed counted against the

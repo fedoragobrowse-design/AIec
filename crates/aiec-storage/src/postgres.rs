@@ -3056,6 +3056,39 @@ impl PostgresRepository {
         Ok(value)
     }
 
+    async fn release_orphaned_leases(&self, limit: u32) -> Result<u32, StoreError> {
+        let limit = i64::from(limit.clamp(1, 10_000));
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let rows = sqlx::query(
+            "SELECT l.* FROM sandbox_leases l JOIN sandboxes s ON s.id = l.sandbox_id \
+             WHERE l.status = 'active' AND s.state IN ('destroyed', 'failed') \
+             ORDER BY l.expires_at LIMIT $1 FOR UPDATE OF l SKIP LOCKED",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let mut released = 0u32;
+        for row in &rows {
+            let lease = lease_from_row(row)?;
+            // `release_capacity` is fenced on the lease still being active, so a
+            // lease released twice is skipped rather than double-credited.
+            if release_capacity(
+                &mut tx,
+                &lease,
+                "released",
+                "sandbox reached a terminal state",
+            )
+            .await
+            .is_ok()
+            {
+                released += 1;
+            }
+        }
+        tx.commit().await.map_err(database_error)?;
+        Ok(released)
+    }
+
     async fn list_stranded_sandboxes(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
@@ -3750,6 +3783,11 @@ impl MetadataStore for PostgresRepository {
         state: RunState,
     ) -> Result<Run, CoreError> {
         Self::record_run_results(self, tenant, id, results, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn release_orphaned_leases(&self, limit: u32) -> Result<u32, CoreError> {
+        Self::release_orphaned_leases(self, limit)
             .await
             .map_err(core_error)
     }

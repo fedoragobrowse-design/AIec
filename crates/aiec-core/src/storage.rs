@@ -676,6 +676,19 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Releases leases whose sandbox has already reached a terminal state.
+    ///
+    /// The gap between the two sweepers. One reclaims capacity from leases that
+    /// have expired; the other releases sandboxes that nothing holds. Neither
+    /// sees a lease that is still valid but belongs to a sandbox already
+    /// `destroyed` or `failed` - the lease is alive, so the first skips it, and
+    /// the sandbox is terminal, so the second never selects it. That is exactly
+    /// how a parallel soak left two vCPUs debited and flat: the ledger was
+    /// internally consistent and still wrong, because an active lease is only
+    /// evidence of a live machine if the machine can still be terminal.
+    async fn release_orphaned_leases(&self, _limit: u32) -> Result<u32, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Sandboxes stuck in a non-terminal state that no live lease and no
     /// unfinished run accounts for.
     ///
