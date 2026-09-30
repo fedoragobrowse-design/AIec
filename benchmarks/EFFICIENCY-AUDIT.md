@@ -63,8 +63,14 @@ checked it once" - is exactly what this does.
   Safe (`stop_if_token` checks the token) but it is an unowned task.
 - **`truncated` hardcoded false**, while bwrap truncates and Docker fails the
   whole run. A clipped output is recorded as complete.
-- **The `max_attempts` divide** was also *why* the placement retry was needed at
-  all; both are now addressed but the interaction is worth re-testing under load.
+- **`per_attempt` and `max_attempts` were over-argued.** Two commits here
+  reasoned that dividing the run budget by the attempt count would halve a
+  workload's time. Measured properly - a run declaring `timeout_seconds: 60`
+  that sleeps 130s is killed at 60.8s - it is the *runtime* enforcing the
+  workload's own timeout, which it has always done. The slice is a secondary
+  bound over placement, teardown and retries together. Both defaults are now
+  correct, and the change was worth making for reasons that were not the ones
+  first given.
 - **Image resolution re-streams the whole multi-GB rootfs through SHA-256 on
   every sandbox create** (`SignedImageResolver::rootfs_digest`), with no cache.
   `health()` also does a live daemon round trip on every runtime selection.
