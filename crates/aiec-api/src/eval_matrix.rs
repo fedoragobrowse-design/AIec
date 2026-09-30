@@ -22,7 +22,7 @@ use aiec_core::TenantId;
 use aiec_core::run::RepoSpec;
 use aiec_core::run::{BatchOptions, Run, RunState, WorkloadSpec};
 use chrono::{DateTime, Utc};
-use futures::future::join_all;
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -105,18 +105,27 @@ pub async fn run_batch(
     }
     let limit = options.max_parallel.min(requests.len()).max(1);
 
-    let mut collected = Vec::with_capacity(requests.len());
-    for chunk in requests.chunks(limit) {
-        let handles: Vec<_> = chunk
-            .iter()
-            .map(|request| submit_and_execute(state, tenant, request.clone()))
-            .collect();
-        // A batch reports the runs it managed to start. One cell failing to
-        // schedule must not abandon the others: the point of a batch is that
-        // fifty tasks do not need fifty separate submissions.
-        collected.extend(join_all(handles).await.into_iter().flatten());
-    }
-    Ok(collected)
+    // A sliding window rather than fixed chunks.
+    //
+    // Chunks bound the concurrency correctly but stall: a chunk finishes only
+    // when its slowest cell does, so one cell that takes three minutes holds
+    // the rest of its chunk idle even when slots have been free for two of
+    // them. On a matrix of variable workloads that is most of the wall time
+    // spent waiting on the slowest member of whichever group it landed in.
+    //
+    // `buffer_unordered` keeps the same bound and fills each freed slot
+    // immediately, which is the property that matters when the point of the
+    // bound is to match the cluster's real capacity rather than merely not
+    // exceed it.
+    let outcomes = futures::stream::iter(requests)
+        .map(|request| submit_and_execute(state, tenant, request))
+        .buffer_unordered(limit)
+        .collect::<Vec<_>>()
+        .await;
+    // A batch reports the runs it managed to start. One cell failing to
+    // schedule must not abandon the others: the point of a batch is that
+    // fifty tasks do not need fifty separate submissions.
+    Ok(outcomes.into_iter().flatten().collect())
 }
 
 /// Runs the same workload several times.
