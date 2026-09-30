@@ -410,7 +410,15 @@ fn a_hostile_observation_never_grows_the_state_without_bound() {
             stop: aiec_harness::model::Stop::ModelFinished,
             latency_ms: 0,
         };
-        ctx.push_turn(&response, &[(blob, rng.below(2) == 0)]);
+        ctx.push_turn(
+            &response,
+            &[aiec_harness::context::ToolResult {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                content: blob,
+                ok: rng.below(2) == 0,
+            }],
+        );
     }
     // The context is bounded by construction, whatever it was fed.
     assert!(

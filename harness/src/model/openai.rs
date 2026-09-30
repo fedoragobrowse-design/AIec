@@ -453,7 +453,7 @@ impl ModelProvider for OpenAiProvider {
 
     fn complete<'a>(&'a self, request: &'a Completion) -> BoxFuture<'a, Response> {
         Box::pin(async move {
-            let key = credential(&self.config)?;
+            let key = credential(&self.config, &self.base_url)?;
             let body = build_request_body(&self.config, request);
             let payload = serde_json::to_vec(&body)
                 .map_err(|error| HarnessError::Model(format!("unserialisable request: {error}")))?;
@@ -465,7 +465,7 @@ impl ModelProvider for OpenAiProvider {
 
             for attempt in 1..=attempts {
                 let started = Instant::now();
-                match self.send(&url, &payload, &key).await {
+                match self.send(&url, &payload, key.as_deref()).await {
                     Ok(text) => {
                         return parse_response(&text, elapsed_ms(started));
                     }
@@ -514,7 +514,7 @@ impl ModelProvider for OpenAiProvider {
 impl OpenAiProvider {
     /// One attempt: no retry logic, so the retry loop above is the only place
     /// that decides whether a failure was worth repeating.
-    async fn send(&self, url: &str, payload: &[u8], key: &str) -> Result<String, Failure> {
+    async fn send(&self, url: &str, payload: &[u8], key: Option<&str>) -> Result<String, Failure> {
         // Rebuilt per attempt: a request that cannot be cloned is cheaper to
         // re-assemble than to keep, and the payload is the only part with any
         // size to it.
@@ -522,7 +522,12 @@ impl OpenAiProvider {
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+            // Absent rather than empty: an endpoint that needs no credential
+            // should not see a bearer token at all.
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", key.unwrap_or_default()),
+            )
             .body(payload.to_vec());
         if self.config.provider == crate::model::Provider::OpenRouter {
             // OpenRouter uses these for attribution. Not secrets, and harmless
@@ -570,13 +575,31 @@ impl OpenAiProvider {
 /// Reading it per request is deliberate: a key held in a struct is a key that
 /// can reach a `Debug` line, a serialized config, or a crash report. Held only
 /// in this frame, it cannot.
-fn credential(config: &ModelConfig) -> Result<String, HarnessError> {
+/// Reads the credential, if the endpoint wants one.
+///
+/// A custom base URL is allowed to need no key at all, because a real and
+/// increasingly common case is an endpoint that serves a local or already
+/// authenticated model: Ollama, vLLM, LM Studio, or a gateway that fronts a
+/// subscription. Demanding `OPENAI_API_KEY` for those is wrong, and the fix is
+/// not "send an empty bearer" but "send no Authorization header at all".
+///
+/// On the provider's own default URL the key is still required, because
+/// omitting it there produces a confusing 401 instead of a clear message.
+fn credential(config: &ModelConfig, base_url: &str) -> Result<Option<String>, HarnessError> {
     let name = config.provider.credential_env();
     match std::env::var(name) {
         // Trimmed because a key pasted with a trailing newline is a very common
         // way to spend an afternoon on a 401.
-        Ok(value) if !value.trim().is_empty() => Ok(value.trim().to_owned()),
-        _ => Err(HarnessError::MissingCredential(name.to_owned())),
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
+        _ => {
+            let on_default_endpoint =
+                base_url.trim_end_matches('/') == config.provider.default_base_url();
+            if on_default_endpoint {
+                Err(HarnessError::MissingCredential(name.to_owned()))
+            } else {
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -584,7 +607,7 @@ fn credential(config: &ModelConfig) -> Result<String, HarnessError> {
 async fn read_capped(
     response: reqwest::Response,
     limit: usize,
-    key: &str,
+    key: Option<&str>,
 ) -> Result<String, String> {
     let mut buffer: Vec<u8> = Vec::with_capacity(limit.min(16 * 1024));
     let mut stream = response.bytes_stream();
@@ -609,11 +632,13 @@ async fn read_capped(
 ///
 /// A gateway that echoes the key back inside its own error message is a real
 /// thing that happens, and that text ends up in the result file.
-fn scrub(text: &str, key: &str) -> String {
-    if key.is_empty() {
-        return text.to_owned();
+fn scrub(text: &str, key: Option<&str>) -> String {
+    // No key means no key to leak, and `replace` with an empty pattern would
+    // otherwise insert the marker between every character.
+    match key {
+        Some(key) if !key.is_empty() => text.replace(key, "[redacted]"),
+        _ => text.to_owned(),
     }
-    text.replace(key, "[redacted]")
 }
 
 fn quote(text: &str) -> String {

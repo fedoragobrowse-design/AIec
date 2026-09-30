@@ -8,9 +8,20 @@
 
 use std::time::{Duration, Instant};
 
+use crate::context::ToolResult;
 use crate::context::{Budget as ContextBudget, Context, compress_output};
 use crate::model::{Completion, Message};
 use crate::tools::registry;
+
+/// A stand-in tool result, for driving the context engine without a registry.
+fn tool_result(content: String, ok: bool) -> ToolResult {
+    ToolResult {
+        call_id: "bench".to_owned(),
+        name: "bench".to_owned(),
+        content,
+        ok,
+    }
+}
 
 /// The median of a set of samples, which is the number to quote: a first run
 /// pays page faults and lazy binding that later runs do not.
@@ -129,7 +140,7 @@ pub fn run(iterations: usize) -> Report {
                 stop: crate::model::Stop::ModelFinished,
                 latency_ms: 0,
             },
-            &[("observation ".repeat(20), true)],
+            &[tool_result("observation ".repeat(20), true)],
         );
     }
     let mut samples = Vec::with_capacity(n);
@@ -157,7 +168,7 @@ pub fn run(iterations: usize) -> Report {
                     stop: crate::model::Stop::ModelFinished,
                     latency_ms: 0,
                 },
-                &[("x".repeat(3_000), false)],
+                &[tool_result("x".repeat(3_000), false)],
             );
         }
         let start = Instant::now();

@@ -15,6 +15,16 @@ use aiec_harness::session::SessionState;
 use aiec_harness::task::Task;
 use aiec_harness::tools::resolve;
 
+/// A tool result for driving the context engine directly.
+fn result(content: &str, ok: bool) -> aiec_harness::context::ToolResult {
+    aiec_harness::context::ToolResult {
+        call_id: "c1".to_owned(),
+        name: "read".to_owned(),
+        content: content.to_owned(),
+        ok,
+    }
+}
+
 fn tool_call(name: &str, args: &str) -> ToolCall {
     ToolCall {
         id: "1".to_owned(),
@@ -54,7 +64,10 @@ fn a_context_that_outgrows_its_window_compacts_and_keeps_the_objective() {
     let mut ctx = Context::new("make the failing test pass", ContextBudget::new(600, 100));
     for _ in 0..40 {
         let big = "x".repeat(4_000);
-        ctx.push_turn(&reply(None, vec![tool_call("read", "{}")]), &[(big, false)]);
+        ctx.push_turn(
+            &reply(None, vec![tool_call("read", "{}")]),
+            &[result(&big, false)],
+        );
     }
     assert!(ctx.compactions() > 0, "the context should have compacted");
 
@@ -75,13 +88,13 @@ fn compaction_keeps_the_most_recent_exchange_verbatim() {
     for _ in 0..30 {
         ctx.push_turn(
             &reply(None, vec![tool_call("read", "{}")]),
-            &[("old noise".repeat(50), false)],
+            &[result(&"old noise".repeat(50), false)],
         );
     }
     // The final observation must be findable without a model summary.
     ctx.push_turn(
         &reply(None, vec![tool_call("read", "{}")]),
-        &[("THE FINAL OBSERVATION".to_owned(), true)],
+        &[result("THE FINAL OBSERVATION", true)],
     );
     let rendered: String = ctx.messages.iter().map(|m| format!("{m:?}")).collect();
     assert!(

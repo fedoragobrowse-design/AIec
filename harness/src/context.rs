@@ -134,6 +134,16 @@ fn squeeze_message(message: &Message, limit: usize) -> Message {
     }
 }
 
+/// What one tool produced, carried with the identity needed to answer the call
+/// that asked for it.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub name: String,
+    pub content: String,
+    pub ok: bool,
+}
+
 /// Roughly 4 characters per token. Deliberately an estimate: the only thing that
 /// matters is that it is monotonic and never wildly optimistic, and a real
 /// tokenizer would cost more than it saves here.
@@ -262,26 +272,30 @@ impl Context {
     /// Records what happened, then compacts if the next request would not fit.
     ///
     /// Returns true when a compaction happened, so the caller can log it.
-    pub fn push_turn(&mut self, response: &Response, observations: &[(String, bool)]) -> bool {
-        self.state.observe(response, observations);
+    /// Records a whole turn: the assistant's reply, then the tool results that
+    /// answer it.
+    ///
+    /// The order matters and is the reason this lives in one place. A `tool`
+    /// message is a reply to a specific tool call and has to follow the
+    /// assistant turn that made it; emitting them in any other order produces a
+    /// conversation that a real provider rejects with a 400 and a fixture
+    /// happily accepts.
+    pub fn push_turn(&mut self, response: &Response, results: &[ToolResult]) -> bool {
+        let observations: Vec<(String, bool)> =
+            results.iter().map(|r| (r.content.clone(), r.ok)).collect();
+        self.state.observe(response, &observations);
 
-        if let Some(text) = &response.text
-            && !text.is_empty()
-        {
+        if response.text.is_some() || !response.tool_calls.is_empty() {
             self.messages.push(Message::Assistant {
-                text: Some(text.clone()),
-                tool_calls: response.tool_calls.clone(),
-            });
-        } else if !response.tool_calls.is_empty() {
-            self.messages.push(Message::Assistant {
-                text: None,
+                text: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
             });
         }
-
-        for (summary, _ok) in observations {
-            self.messages.push(Message::User {
-                content: summary.clone(),
+        for result in results {
+            self.messages.push(Message::Tool {
+                call_id: result.call_id.clone(),
+                name: result.name.clone(),
+                content: result.content.clone(),
             });
         }
 

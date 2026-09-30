@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::budget::{Budget, cpu_time_ms, peak_rss_bytes};
-use crate::context::{Budget as ContextBudget, Context};
+use crate::context::{Budget as ContextBudget, Context, ToolResult};
 use crate::events::{Event, EventLog};
 use crate::loop_guard::{LoopGuard, Progress, classify};
 use crate::model::{Completion, Message, ModelProvider, Response, Stop, Usage};
@@ -235,7 +235,11 @@ impl<'a> Agent<'a> {
 
             let observations = self.run_calls(&response, &tools, turn).await;
 
-            let progress: Vec<Progress> = classify(&response, &observations);
+            let pairs: Vec<(String, bool)> = observations
+                .iter()
+                .map(|r| (r.content.clone(), r.ok))
+                .collect();
+            let progress: Vec<Progress> = classify(&response, &pairs);
             guard.record_progress(&progress);
             for p in &progress {
                 match p {
@@ -249,7 +253,7 @@ impl<'a> Agent<'a> {
                 }
             }
 
-            if guard.observe_turn(&response, &observations) {
+            if guard.observe_turn(&response, &pairs) {
                 break Stop::NoProgress;
             }
 
@@ -327,13 +331,13 @@ impl<'a> Agent<'a> {
         response: &Response,
         tools: &crate::tools::Registry,
         turn: u32,
-    ) -> Vec<(String, bool)> {
+    ) -> Vec<ToolResult> {
         let ctx = ToolContext {
             root: self.root.clone(),
             limits: self.task.limits,
             phase: Phase::Working,
         };
-        let mut observations = Vec::new();
+        let mut observations: Vec<ToolResult> = Vec::new();
 
         for call in &response.tool_calls {
             self.events.emit(Event::ToolStarted {
@@ -369,8 +373,6 @@ impl<'a> Agent<'a> {
 
             self.context.note_tool_output(text.len() as u64);
             self.metrics.bytes_written += text.len() as u64;
-            observations.push((text.clone(), ok));
-
             self.events.emit(Event::ToolFinished {
                 turn,
                 name: &call.name,
@@ -378,11 +380,11 @@ impl<'a> Agent<'a> {
                 bytes: text.len() as u64,
                 detail: if ok { None } else { Some(&text) },
             });
-
-            self.context.messages.push(Message::Tool {
+            observations.push(ToolResult {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 content: text,
+                ok,
             });
         }
         observations

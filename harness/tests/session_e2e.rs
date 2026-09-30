@@ -710,3 +710,64 @@ async fn a_relative_artifact_path_is_still_treated_as_the_harness_own() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_tool_result_follows_the_assistant_turn_that_asked_for_it_exactly_once() {
+    use aiec_harness::model::Message;
+
+    let dir = repo_with_bug();
+    let task = task_for(dir.path(), vec![]);
+    let log = EventLog::open(None).expect("event log");
+
+    // Two calls in one turn, so both the pairing and the ordering are exercised.
+    let provider = Scripted::new(vec![Step::Calls(vec![
+        ("read", r#"{"path":"calc.py"}"#.to_owned()),
+        ("git_status", "{}".to_owned()),
+    ])]);
+    let agent = Agent::new(&task, &provider, &log, None).expect("agent");
+    agent.run(&dir.path().join("state.json")).await;
+
+    // Rebuild what the loop would have sent by reading the recorded turns back
+    // out of the model, which saw every request.
+    let request = provider.seen.lock().expect("lock").last().cloned();
+    let Some(request) = request else {
+        panic!("the model was never asked");
+    };
+
+    let mut seen_assistant = false;
+    let mut tool_messages = 0;
+    for message in &request.messages {
+        match message {
+            Message::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                assert!(
+                    !seen_assistant,
+                    "two assistant turns with tool calls in a row: a tool result \
+                     was lost between them"
+                );
+                seen_assistant = true;
+            }
+            Message::Tool { content, .. } => {
+                assert!(
+                    seen_assistant,
+                    "a tool result appeared before the assistant turn that \
+                     requested it, which providers reject"
+                );
+                tool_messages += 1;
+                // Exactly one message per observation, not the same text sent
+                // again as a plain user turn. This duplication is what a real
+                // provider rejected with a 400 and a fixture accepted happily.
+                let echoes = request
+                    .messages
+                    .iter()
+                    .filter(|m| matches!(m, Message::User { content: c } if c == content))
+                    .count();
+                assert_eq!(
+                    echoes, 0,
+                    "a tool observation was duplicated as a user message"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(tool_messages, 2, "both tool results should be present");
+}
