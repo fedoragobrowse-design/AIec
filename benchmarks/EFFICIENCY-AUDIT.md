@@ -115,3 +115,67 @@ subsystem: something is counted, and the count is not kept honest. The
 sequential soak now returns to baseline, which is the one measurement that says
 the system does not degrade under load - but it was reached by fixing a
 correctness bug, not by optimising anything.
+
+---
+
+## Report
+
+Environment: one host, 192.168.1.250. `docker` runtime, 8 vCPU / 8 GiB on the
+docker node, plus Firecracker and bubblewrap nodes. PostgreSQL on the same host.
+Firecracker is registered but not exercised here.
+
+### Changes implemented, with what was measured
+
+| Change | Before | After | Evidence |
+|---|---|---|---|
+| Provisioning releases its lease on failure | 24/80 runs succeeded; 7 sandboxes stranded; 11/18 vCPUs | 38/45 succeeded; 0 stranded; 18/18 vCPUs | `SOAK.md` |
+| Placement retried without splitting the budget | transient lease races reached the caller as `failed` | retried free, no machine charged | `bcac7e6`, `899195b` |
+| Batch uses a sliding window | *not measured* | *not measured* | `80fcc39` |
+| Lease sweeper cannot spin | unbounded loop, no exit | bounded by pages and by progress | `e909669` |
+| Retry loop capped and backed off | thousands of transactions per request | ≤10 attempts, exponential | `e909669` |
+| Terminal run states protected | cancelled runs reported `failed` | verdict protected | `e909669` |
+| Batch bound pinned structurally | untested | arithmetic, no cluster | `72ca055` |
+
+Only the first row is a before/after in the strict sense. The rest are
+correctness or robustness changes whose effect on throughput I did not measure,
+and the specification is explicit that only observed measurements may be
+reported, so none is given a number.
+
+### Not implemented
+
+- **Worker capacity from measured host state.** `aiec-cli` advertises
+  `slots x 1 GiB` memory every five seconds, which erases the per-placement
+  debit and means no disk or memory pressure is ever observed. The highest-value
+  open item, and a design change rather than a patch.
+- **Image verification cache keyed on something.** A `OnceLock` with no key is
+  correct only because there is one image path.
+- **Firecracker rootfs materialisation.** A full copy per sandbox, `e2fsck -f` on
+  the copy, and the whole disk image read into RAM to hash it on snapshot.
+- **Artifact streaming.** Artifacts are stored as base64 text and their size is
+  recorded as the base64 length.
+- **No in-flight concurrency limit on the control plane.**
+- **The SDK's `run_cells` chunking stall** - converting it breaks the `#[tool]`
+  macro and needs the boundary reshaped.
+
+### Security regression gate
+
+Isolation, fencing, tenant boundaries, durability and cleanup guarantees were
+not traded for any of the above. The workspace gate is clean: `fmt`, clippy with
+`-D warnings`, 348 Rust tests and 15 Python tests. The changes are all on failure
+paths, and the two that touch cleanup were verified by the soak rather than by
+assertion.
+
+### AIEC EFFICIENCY: INCOMPLETE
+
+Blockers, in the order they would matter:
+
+1. **Resource accounting is not measured, it is declared.** A worker says how much
+   memory it has based on a flag, and the heartbeat overwrites the debit the
+   scheduler just made. Every capacity number in the system is a claim.
+2. **A parallel soak leaves a steady-state residue** - two vCPUs and one sandbox,
+   flat across three batches, not returned and not identified. The sequential
+   soak returns to exactly zero; this does not.
+3. **Placement races and capacity refusals are still ~20% of runs** under load.
+   They no longer leak, but a caller still sees `failed` for work that never ran.
+4. **The Firecracker path is unmeasured.** Everything above is the docker runtime;
+   the microVM path has not been soaked or profiled once.
