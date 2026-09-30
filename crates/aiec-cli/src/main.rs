@@ -389,21 +389,47 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // advertise eight and hand out eight, and the failure would arrive at boot -
     // after the tenant's quota and the node's capacity had already been charged
     // for work that could never start.
+    // The measurement is a ceiling, not a claim.
+    //
+    // Reading the host and declaring what it found is only correct if one node
+    // owns the machine. Four workers on one host each read the same figures and
+    // each declared them, so the cluster came to believe 35 GiB of memory existed
+    // where the host had 26 - overcommitted by a third, which is the failure this
+    // was meant to remove, not an improvement on it.
+    //
+    // The flag is the operator's allocation to *this* node. The host is reality.
+    // The safe declaration is the smaller of the two: measurement can only ever
+    // tighten what a node claims, so a host filling up stops offering work, and
+    // a generous flag can never conjure capacity the machine does not have.
+    let allocated_memory = u64::from(args.capacity) * GIB;
+    let allocated_disk = u64::from(args.capacity) * 10 * GIB;
     let (measured_memory, measured_disk) = host_capacity();
-    if let (Some(memory), Some(disk)) = (measured_memory, measured_disk) {
-        tracing::info!(
-            memory_bytes = memory,
-            disk_bytes = disk,
-            "declaring capacity measured from the host"
-        );
-    } else {
-        tracing::warn!(
-            "could not measure the host; falling back to the configured capacity, \
-             which may overstate what this node can actually run"
-        );
-    }
-    let total_memory_bytes = measured_memory.unwrap_or_else(|| u64::from(args.capacity) * GIB);
-    let total_disk_bytes = measured_disk.unwrap_or_else(|| u64::from(args.capacity) * 10 * GIB);
+    let total_memory_bytes = measured_memory.map_or(allocated_memory, |measured| {
+        if measured < allocated_memory {
+            tracing::warn!(
+                allocated_bytes = allocated_memory,
+                measured_bytes = measured,
+                "the host has less available than this node was allocated; \
+                 declaring the measurement"
+            );
+            measured
+        } else {
+            allocated_memory
+        }
+    });
+    let total_disk_bytes = measured_disk.map_or(allocated_disk, |measured| {
+        if measured < allocated_disk {
+            tracing::warn!(
+                allocated_bytes = allocated_disk,
+                measured_bytes = measured,
+                "the host has less free disk than this node was allocated; \
+                 declaring the measurement"
+            );
+            measured
+        } else {
+            allocated_disk
+        }
+    });
     let registration = WorkerRegistration {
         node_id,
         name: args.name,
