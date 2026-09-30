@@ -3,7 +3,7 @@ use aiec_core::run::{
     RunState, WorkloadSpec,
 };
 use aiec_core::*;
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::time::Duration;
@@ -440,30 +440,53 @@ impl AIecClient {
         }
         let limit = limit.min(requests.len());
         let mut cells = Vec::with_capacity(requests.len());
-        for (offset, chunk) in requests.chunks(limit).enumerate() {
-            let base = offset * limit;
-            let in_flight: Vec<_> = chunk
-                .iter()
-                .enumerate()
-                .map(|(position, request)| async move {
-                    let index = base + position;
-                    match self.create_run(request).await {
-                        Ok(run) => RunCell {
-                            index,
-                            run: Some(run),
-                            error: None,
-                        },
-                        Err(error) => RunCell {
-                            index,
-                            run: None,
-                            error: Some(error.to_string()),
-                        },
-                    }
-                })
-                .collect();
-            cells.extend(join_all(in_flight).await);
+        let mut queued = requests.iter().enumerate();
+
+        // A sliding window, built from concrete futures rather than a stream.
+        //
+        // Chunks bound the concurrency correctly and then waste most of it: a
+        // chunk ends only when its slowest member does, so one cell that takes
+        // a minute holds the rest of its group idle while slots sit free. On a
+        // heterogeneous batch that is most of the wall time spent waiting on
+        // whichever slow cell a slot happened to be grouped with.
+        //
+        // `FuturesUnordered` over an explicit refill keeps the same bound and
+        // starts the next cell the moment one finishes. It is written this way
+        // rather than as `buffer_unordered` because a closure there infers a
+        // higher-ranked future the MCP `#[tool]` wrapper will not accept - the
+        // same change written this way compiles for both.
+        let mut in_flight = FuturesUnordered::new();
+        for _ in 0..limit {
+            if let Some((index, request)) = queued.next() {
+                in_flight.push(self.run_one_cell(index, request));
+            }
         }
+        while let Some(cell) = in_flight.next().await {
+            cells.push(cell);
+            if let Some((index, request)) = queued.next() {
+                in_flight.push(self.run_one_cell(index, request));
+            }
+        }
+        // The window completes out of order; callers identify a failed cell by
+        // its position in what they submitted, so it is restored here.
+        cells.sort_by_key(|cell| cell.index);
         Ok(cells)
+    }
+
+    /// One cell of a batch, reduced to the shape every cell has.
+    async fn run_one_cell(&self, index: usize, request: &CreateRunRequest) -> RunCell {
+        match self.create_run(request).await {
+            Ok(run) => RunCell {
+                index,
+                run: Some(run),
+                error: None,
+            },
+            Err(error) => RunCell {
+                index,
+                run: None,
+                error: Some(error.to_string()),
+            },
+        }
     }
 
     /// Runs several workloads with bounded concurrency.
