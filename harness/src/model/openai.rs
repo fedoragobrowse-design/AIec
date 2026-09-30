@@ -463,7 +463,15 @@ impl ModelProvider for OpenAiProvider {
             let mut spent = Duration::ZERO;
             let mut last: Option<HarnessError> = None;
 
-            for attempt in 1..=attempts {
+            // One deadline for the whole call, not per attempt: the point is
+            // that the call as a whole respects the session's budget.
+            let deadline = self
+                .config
+                .deadline_ms
+                .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
+            let mut attempt = 0;
+            while attempt < attempts {
+                attempt += 1;
                 let started = Instant::now();
                 match self.send(&url, &payload, key.as_deref()).await {
                     Ok(text) => {
@@ -496,7 +504,15 @@ impl ModelProvider for OpenAiProvider {
                             }
                         };
                         spent += delay;
-                        tokio::time::sleep(delay).await;
+                        if let Some(deadline) = deadline {
+                            tokio::time::sleep_until(std::cmp::min(
+                                deadline,
+                                tokio::time::Instant::now() + delay,
+                            ))
+                            .await;
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                     Err(failure) => return Err(failure.error),
                 }

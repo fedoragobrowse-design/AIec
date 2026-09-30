@@ -113,6 +113,7 @@ fn openai_config(base: &str) -> ModelConfig {
         base_url: Some(base.to_owned()),
         reasoning: Reasoning::Off,
         context_window: 0,
+        deadline_ms: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn anthropic_config(base: &str) -> ModelConfig {
         base_url: Some(base.to_owned()),
         reasoning: Reasoning::Off,
         context_window: 0,
+        deadline_ms: None,
     }
 }
 

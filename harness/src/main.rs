@@ -181,7 +181,7 @@ async fn run_async(args: RunArgs, started: Instant) -> ExitCode {
         }
     };
 
-    let config = match model_config(&args) {
+    let config = match model_config(&args, task.limits.wall_seconds) {
         Ok(c) => c,
         Err(e) => {
             let provenance = fallback_provenance();
@@ -260,7 +260,10 @@ async fn run_async(args: RunArgs, started: Instant) -> ExitCode {
 ///
 /// There is deliberately no config file: a repository is untrusted, and a file
 /// inside the workspace must never be able to decide where credentials go.
-fn model_config(args: &RunArgs) -> std::result::Result<ModelConfig, HarnessError> {
+fn model_config(
+    args: &RunArgs,
+    wall_seconds: u64,
+) -> std::result::Result<ModelConfig, HarnessError> {
     let provider_name = args
         .provider
         .as_deref()
@@ -302,6 +305,10 @@ fn model_config(args: &RunArgs) -> std::result::Result<ModelConfig, HarnessError
             .or_else(|| Some(provider.default_base_url().to_owned())),
         reasoning,
         context_window,
+        // A single request may not outlive the session that asked for it. From
+        // the task, not the environment: the task is what the caller actually
+        // bounded, and the provider is downstream of that decision.
+        deadline_ms: Some(wall_seconds.saturating_mul(1000)),
     })
 }
 

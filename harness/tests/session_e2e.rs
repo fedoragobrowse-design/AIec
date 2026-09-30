@@ -46,6 +46,7 @@ impl Scripted {
                 base_url: None,
                 reasoning: Reasoning::Off,
                 context_window: 200_000,
+                deadline_ms: None,
             },
             steps: Mutex::new(steps),
             seen: Mutex::new(Vec::new()),
@@ -312,16 +313,26 @@ async fn a_model_asking_for_an_unknown_tool_does_not_end_the_session() {
 #[tokio::test]
 async fn a_turn_that_repeats_identically_is_stopped_as_no_progress() {
     let dir = repo_with_bug();
-    let task = task_for(dir.path(), vec![]);
+    let body = serde_json::json!({
+        "task_id": "loop",
+        "instruction": "do the thing",
+        "workspace": dir.path().to_string_lossy(),
+        "limits": { "max_model_requests": 60, "wall_seconds": 120 }
+    });
+    let task = Task::parse(&body.to_string()).expect("parses");
     let log = EventLog::open(None).expect("event log");
 
     // The same call, the same result, forever: the definition of a stuck model.
+    //
+    // `read`, not `bash`. The detector compares observations byte for byte, and
+    // a shell result carries its own duration, so a bash fixture is a coin
+    // flip between 0.00s and 0.01s and the test decides on timing rather than
+    // on behaviour. A file read is byte-stable, which is what this is about.
     let provider = Scripted::new(
         (0..50)
-            .map(|_| Step::Calls(vec![("bash", r#"{"command":["sleep","0"]}"#.to_owned())]))
+            .map(|_| Step::Calls(vec![("read", r#"{"path":"calc.py"}"#.to_owned())]))
             .collect(),
     );
-
     let agent = Agent::new(&task, &provider, &log, None).expect("agent");
     let document = agent.run(&dir.path().join("state.json")).await;
 

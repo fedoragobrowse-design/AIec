@@ -96,6 +96,14 @@ pub struct ModelConfig {
     pub reasoning: Reasoning,
     #[serde(default)]
     pub context_window: u32,
+    /// Wall-clock ceiling for one `complete`, set by the caller from the task's
+    /// own budget.
+    ///
+    /// A disposable VM does not reward patience. Without this a single request
+    /// can spend two minutes in retry backoff in a session whose whole budget
+    /// is two, and the retries buy a result nobody will ever read.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
