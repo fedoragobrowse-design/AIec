@@ -157,13 +157,20 @@ pub async fn submit_and_execute(
     // which is the one property the deadline exists to provide. A run that wants
     // more wall time asks for a longer timeout, not more attempts.
     let run_budget = std::time::Duration::from_secs(deadline);
-    // The whole budget is available to an attempt. Dividing it by `max_attempts`
-    // is what made "ask for two attempts" a trap: each attempt got half the time
-    // regardless of whether the first had actually used any, so a workload that
-    // needed its stated timeout would be cut short and then repeated. Attempts
-    // are for when a machine is at fault; the caller who wants more wall time
-    // asks for a longer timeout.
-    let per_attempt = run_budget;
+    // A caller who asks for one attempt - the default - gets the whole budget:
+    // dividing it by one is dividing by one, and the point is that a *retry*
+    // must not silently halve the time the workload legitimately has.
+    //
+    // A caller who explicitly asks for several is asking for several attempts,
+    // and the budget is still shared between them. That is the property the
+    // deadline exists to provide: three attempts of a ten-minute task is not
+    // thirty minutes of wall time, or the run stops being bounded. The floor
+    // keeps a very short run from slicing itself into nothing.
+    let per_attempt = if max_attempts <= 1 {
+        run_budget
+    } else {
+        (run_budget / max_attempts).max(std::time::Duration::from_secs(30))
+    };
     let started = std::time::Instant::now();
     // Placement attempts that never reached a machine. A lease resync or an
     // exhausted cluster is decided in milliseconds and costs no compute, so
