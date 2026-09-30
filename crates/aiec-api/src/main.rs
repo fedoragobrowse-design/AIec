@@ -71,8 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
+    // Defaults to `info` for this crate rather than trusting the environment to
+    // be set. `from_default_env` with no RUST_LOG means no directives at all, so
+    // every structured log line the control plane emits - placement decisions,
+    // lease sweeps, teardown failures - is silently discarded and the service
+    // looks like a black box that only ever prints its listening line. A
+    // background task that dies is then invisible, which is the worst possible
+    // failure mode for the one whose job is preventing leaks.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        "info,aiec_api=info,aiec_core=info,aiec_storage=info,sqlx=warn".to_owned()
+    });
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();
     let bind = std::env::var("AIEC_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let bind: std::net::SocketAddr = bind.parse()?;

@@ -395,51 +395,113 @@ async fn execute(
     )
     .await;
 
-    let runtime = state.runtime_for(&sandbox)?;
+    // From here on the run owns a machine, so every exit releases it. Doing the
+    // work in one place and cleaning up in another is what let eight `?` exits
+    // after placement return without destroying anything, each leaking a machine
+    // and each error being retryable - so a failed run burned one machine per
+    // attempt and reported only that it failed.
+    let attempt = post_placement(
+        state,
+        tenant,
+        &mut run,
+        &request,
+        &sandbox,
+        &mut results,
+        &mut phases,
+    )
+    .await;
+    if let Err(error) = &attempt {
+        // Decided before cleanup, because retention is judged on it. A caller
+        // that asked to keep a failed machine should not have it destroyed
+        // because the failure arrived as an error rather than a non-zero exit.
+        run.failure_reason = Some(error.to_string());
+    }
+    let cleanup_started = Instant::now();
+    cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
+    phases.insert(
+        "cleanup".to_owned(),
+        cleanup_started.elapsed().as_millis() as u64,
+    );
+
+    let succeeded = results.task.as_ref().is_some_and(|task| task.ok)
+        && results.validations.iter().all(|validation| validation.ok);
+    let reason = (!succeeded).then(|| {
+        results
+            .task
+            .as_ref()
+            .filter(|task| !task.ok)
+            .map(|_| "the task did not succeed".to_owned())
+            .unwrap_or_else(|| "a validation failed".to_owned())
+    });
+
+    match attempt {
+        Ok(()) => {
+            if succeeded {
+                settle(state, tenant, &mut run, &mut results, &mut phases).await?;
+            } else {
+                fail(state, tenant, &mut run, reason, &mut results, &mut phases).await?;
+            }
+        }
+        Err(error) => {
+            // The machine is already released above; this records why the run
+            // stopped, and re-raises so the attempt loop can decide about a
+            // retry with the caller's budget.
+            fail(
+                state,
+                tenant,
+                &mut run,
+                Some(error.to_string()),
+                &mut results,
+                &mut phases,
+            )
+            .await?;
+            return Err(error);
+        }
+    }
+
+    store.get_run(tenant, run.id).await
+}
+
+/// Everything a run does once it holds a machine.
+///
+/// Split out so `execute` can own the teardown. Returning an error from here
+/// used to skip cleanup entirely, because the cleanup call sat at the bottom of
+/// the same function and every `?` above it returned past it.
+#[allow(clippy::too_many_arguments)]
+async fn post_placement(
+    state: &AppState,
+    tenant: TenantId,
+    run: &mut Run,
+    request: &RunRequest,
+    sandbox: &Sandbox,
+    results: &mut RunResults,
+    phases: &mut BTreeMap<String, u64>,
+) -> Result<(), CoreError> {
+    let runtime = state.runtime_for(sandbox)?;
 
     // -- setup ---------------------------------------------------------------
     if !request.workload.setup.is_empty() {
-        advance(state, &mut run, RunState::Running).await?;
+        advance(state, run, RunState::Running).await?;
         let phase_started = Instant::now();
         for command in &request.workload.setup {
-            let outcome = run_command(state, tenant, &run, &sandbox, command, None).await?;
+            let outcome = run_command(state, tenant, run, sandbox, command, None).await?;
             let ok = outcome.ok;
             results.setup.push(outcome);
             if !ok {
                 // An environment that never built makes every later measurement
                 // meaningless, so stop here rather than report a task result
                 // from a machine that is not the one asked for.
-                fail(
-                    state,
-                    tenant,
-                    &mut run,
-                    Some("a setup command failed".to_owned()),
-                    &mut results,
-                    &mut phases,
-                )
-                .await?;
                 phases.insert(
                     "setup".to_owned(),
                     phase_started.elapsed().as_millis() as u64,
                 );
-                let cleanup_started = Instant::now();
-                cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
-                phases.insert(
-                    "cleanup".to_owned(),
-                    cleanup_started.elapsed().as_millis() as u64,
-                );
-                settle(state, tenant, &mut run, &mut results, &mut phases).await?;
-                return store.get_run(tenant, run.id).await;
+                return Err(CoreError::Backend("a setup command failed".into()));
             }
         }
-        phases.insert(
-            "setup".to_owned(),
-            phase_started.elapsed().as_millis() as u64,
-        );
     }
 
     if run.started_at.is_none() {
-        advance(state, &mut run, RunState::Running).await?;
+        advance(state, run, RunState::Running).await?;
     }
 
     // -- the task ------------------------------------------------------------
@@ -447,8 +509,8 @@ async fn execute(
     let task = run_command(
         state,
         tenant,
-        &run,
-        &sandbox,
+        run,
+        sandbox,
         &request.workload.command,
         request.workload.timeout_seconds,
     )
@@ -456,7 +518,7 @@ async fn execute(
     phases.insert("task".to_owned(), task_started.elapsed().as_millis() as u64);
     event(
         state,
-        &run,
+        run,
         "task.finished",
         serde_json::json!({
             "exit_code": task.exit_code,
@@ -465,17 +527,16 @@ async fn execute(
         }),
     )
     .await;
-    let task_ok = task.ok;
     results.task = Some(task);
 
     // -- validation ----------------------------------------------------------
     if !request.workload.validations.is_empty() {
-        advance(state, &mut run, RunState::Validating).await?;
+        advance(state, run, RunState::Validating).await?;
         let validate_started = Instant::now();
         for command in &request.workload.validations {
             // Every validation runs even after one fails, so a caller can tell a
             // loud failure from a silent one.
-            let outcome = run_command(state, tenant, &run, &sandbox, command, None).await?;
+            let outcome = run_command(state, tenant, run, sandbox, command, None).await?;
             results.validations.push(outcome);
         }
         phases.insert(
@@ -485,52 +546,24 @@ async fn execute(
     }
 
     // -- collection ----------------------------------------------------------
-    advance(state, &mut run, RunState::Collecting).await?;
+    advance(state, run, RunState::Collecting).await?;
     let collect_started = Instant::now();
     if request.workload.git_evidence {
         let evidence =
-            git_evidence(runtime.as_ref(), &sandbox, request.workload.repo.as_ref()).await;
+            git_evidence(runtime.as_ref(), sandbox, request.workload.repo.as_ref()).await;
         results.commit = evidence.head;
         results.git_status = evidence.status;
         results.git_diff = evidence.diff;
         results.changed_files = evidence.changed_files;
     }
-    let artifacts = collect_artifacts(state, tenant, &run, &sandbox, &request.workload).await;
+    let artifacts = collect_artifacts(state, tenant, run, sandbox, &request.workload).await;
     results.artifacts = artifacts;
     phases.insert(
         "collection".to_owned(),
         collect_started.elapsed().as_millis() as u64,
     );
 
-    // -- outcome -------------------------------------------------------------
-    // The outcome is decided *before* anything is cleaned up, because retention
-    // is judged on it. Cleaning up first meant a failed run still looked
-    // successful to `should_retain`, so a `keep_on_failure` run had its machine
-    // destroyed - the one case the caller asked to be able to open.
-    let succeeded = task_ok && results.validations.iter().all(|v| v.ok);
-    let reason = (!succeeded).then(|| {
-        results
-            .task
-            .as_ref()
-            .filter(|task| !task.ok)
-            .map(|_| "the task did not succeed".to_owned())
-            .unwrap_or_else(|| "a validation failed".to_owned())
-    });
-    run.failure_reason = reason.clone();
-
-    let cleanup_started = Instant::now();
-    cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
-    phases.insert(
-        "cleanup".to_owned(),
-        cleanup_started.elapsed().as_millis() as u64,
-    );
-    if succeeded {
-        settle(state, tenant, &mut run, &mut results, &mut phases).await?;
-    } else {
-        fail(state, tenant, &mut run, reason, &mut results, &mut phases).await?;
-    }
-
-    store.get_run(tenant, run.id).await
+    Ok(())
 }
 
 /// Marks a run failed and records why.
@@ -964,6 +997,40 @@ pub(crate) async fn tear_down_sandbox(
     // release; asking the scheduler would fail for a lease that never existed.
     if state.is_production() && sandbox.runtime != RuntimeKind::Hosted {
         state.scheduler().release(tenant, sandbox_id).await?;
+    }
+    state
+        .repository()
+        .delete_sandbox(tenant, sandbox_id)
+        .await?;
+    Ok(())
+}
+
+/// Gives up on a sandbox nothing is holding any more.
+///
+/// Different from `tear_down_sandbox` on purpose. A worker that has lost the
+/// lease also refuses to stop the machine and reports "not found", but by the
+/// time this is called the lease is gone by definition, so the worker has
+/// already forgotten the machine and there is nothing left on that host to stop.
+/// Tolerant on destroy, and deliberately does not ask the scheduler to release
+/// anything - the capacity was returned when the lease expired, and asking
+/// again is the error this function exists to survive.
+///
+/// A normal teardown is not tolerant, because tolerating a lost lease there
+/// would flip the row to `destroyed` while a machine kept running, which is the
+/// exact failure this whole path was rewritten to prevent.
+pub(crate) async fn abandon_sandbox(
+    state: &AppState,
+    tenant: TenantId,
+    sandbox_id: Uuid,
+    sandbox: &Sandbox,
+) -> Result<(), CoreError> {
+    let stop = match state.runtime_for(sandbox) {
+        Ok(runtime) => runtime.destroy(sandbox).await,
+        Err(error) => Err(error),
+    };
+    match stop {
+        Ok(()) | Err(CoreError::NotFound(_)) => {}
+        Err(error) => return Err(error),
     }
     state
         .repository()

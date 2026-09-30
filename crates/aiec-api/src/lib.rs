@@ -3403,40 +3403,107 @@ fn run_response(status: StatusCode, run: &Run) -> Result<Response, ApiFailure> {
 ///
 /// The pass is bounded, idempotent, and logged, and it runs in its own task so
 /// a slow database cannot delay serving requests.
+/// How long a sandbox may sit in a non-terminal state before it is considered
+/// abandoned. Long enough that placement, image pull and start all comfortably
+/// fit inside it.
+const STRANDED_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Upper bound on abandoned sandboxes released in one pass.
+const STRANDED_LIMIT: u32 = 50;
+
 fn spawn_lease_sweeper(state: AppState) {
+    // Announced at startup and on every pass. A background task that panics is
+    // silent - tokio drops it and nothing is ever reclaimed again - so its
+    // presence has to be visible from outside or "the sweeper is not running"
+    // is indistinguishable from "the sweeper is running and has nothing to do".
+    tracing::info!("the lease sweeper is starting");
     tokio::spawn(async move {
-        // Long enough to be uninteresting, short enough that a dead machine
-        // does not cost a lease's worth of capacity for long.
+        // Short enough that a dead machine does not hold capacity for long,
+        // long enough to be uninteresting.
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             ticker.tick().await;
-            let actions = match state
-                .repository()
-                .reconcile_expired_leases(RECONCILE_LIMIT)
-                .await
-            {
-                Ok(actions) => actions,
-                Err(error) => {
-                    tracing::warn!(error = %error, "the lease sweeper could not list expiries");
-                    continue;
-                }
-            };
-            if actions.is_empty() {
-                continue;
-            }
-            // Deliberately not calling `recover_expired_leases` here. That
-            // re-places the sandbox on a new worker and rebuilds its workspace,
-            // which is the right thing to do when an operator asks for it and
-            // exactly wrong on a timer: it would resurrect machines for sandboxes
-            // whose runs finished long ago, turning a reclaimed slot back into a
-            // running workload nobody asked for. Reclaiming is automatic;
-            // resurrecting stays a deliberate act.
-            tracing::info!(
-                expired = actions.len(),
-                "the lease sweeper returned capacity held by expired leases"
-            );
+            sweep_once(&state).await;
         }
     });
+}
+
+/// One pass: return capacity held by dead leases, then release sandboxes that
+/// no lease and no unfinished run accounts for.
+async fn sweep_once(state: &AppState) {
+    let expired = match state
+        .repository()
+        .reconcile_expired_leases(RECONCILE_LIMIT)
+        .await
+    {
+        Ok(actions) => {
+            let count = actions.len();
+            if count > 0 {
+                tracing::info!(
+                    expired = count,
+                    "the lease sweeper returned capacity held by expired leases"
+                );
+            }
+            count
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "the lease sweeper could not list expiries");
+            return;
+        }
+    };
+    let mut seen = 0usize;
+    // Deliberately not calling `recover_expired_leases`. That re-places the
+    // sandbox on a new worker and rebuilds its workspace, which is right when an
+    // operator asks for it and exactly wrong on a timer: it would resurrect
+    // machines for sandboxes whose runs finished long ago, turning a reclaimed
+    // slot back into a workload nobody asked for. Reclaiming is automatic;
+    // resurrecting stays a deliberate act.
+
+    // Sandboxes in a non-terminal state that nothing accounts for. Expiring a
+    // lease returns the capacity, but the row stayed counted against the
+    // tenant's active-sandbox quota forever - and quota is checked before
+    // placement, so enough of them and a tenant cannot submit any work at all
+    // while nodes report free capacity. That is how this host came to refuse
+    // every run.
+    let mut reclaimed = 0usize;
+    loop {
+        let stranded = match state
+            .repository()
+            .list_stranded_sandboxes(Utc::now() - STRANDED_GRACE, STRANDED_LIMIT)
+            .await
+        {
+            Ok(stranded) => stranded,
+            Err(error) => {
+                tracing::warn!(error = %error, "could not look for stranded sandboxes");
+                return;
+            }
+        };
+        if stranded.is_empty() {
+            break;
+        }
+        seen += stranded.len();
+        for sandbox in &stranded {
+            match runs::abandon_sandbox(state, sandbox.tenant_id, sandbox.id, sandbox).await {
+                Ok(()) => reclaimed += 1,
+                Err(error) => tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    error = %error,
+                    "could not reclaim a stranded sandbox"
+                ),
+            }
+        }
+        // Bounded per pass so a large backlog cannot hold the task indefinitely.
+        if stranded.len() < STRANDED_LIMIT as usize {
+            break;
+        }
+    }
+    tracing::debug!(expired, stranded = seen, reclaimed, "lease sweep complete");
+    if reclaimed > 0 {
+        tracing::info!(
+            reclaimed,
+            "the lease sweeper released sandboxes no run or lease accounted for"
+        );
+    }
 }
 
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {

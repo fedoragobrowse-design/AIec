@@ -676,6 +676,21 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Sandboxes stuck in a non-terminal state that no live lease and no
+    /// unfinished run accounts for.
+    ///
+    /// A sandbox whose lease expired is not this: that is the reconciler's job,
+    /// and the sandbox may be recoverable. These are the ones nothing can reach
+    /// - the run that owned them finished or vanished, and the lease is gone -
+    /// so nothing will ever select them again and they keep counting against
+    /// the tenant's active-sandbox quota for as long as the database exists.
+    async fn list_stranded_sandboxes(
+        &self,
+        _older_than: chrono::DateTime<chrono::Utc>,
+        _limit: u32,
+    ) -> Result<Vec<Sandbox>, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Persists which machine a run kept, and until when.
     ///
     /// Separate from `record_run_results` because it is the only thing that

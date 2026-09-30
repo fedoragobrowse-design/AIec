@@ -3041,6 +3041,42 @@ impl PostgresRepository {
         Ok(value)
     }
 
+    async fn list_stranded_sandboxes(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+        limit: u32,
+    ) -> Result<Vec<Sandbox>, StoreError> {
+        // Two conditions, both necessary.
+        //
+        // No live lease: something still holding a sandbox on a worker renews
+        // its lease, so its absence means nobody is driving it.
+        //
+        // And no unfinished run: a sandbox being set up right now has a run in
+        // `preparing` and briefly no lease, and tearing that down would kill
+        // work in flight. Terminal or absent run means nobody is waiting for
+        // this machine.
+        let rows = sqlx::query(
+            "SELECT s.* FROM sandboxes s \
+             WHERE s.state NOT IN ('destroyed', 'failed') \
+               AND s.updated_at < $1 \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM sandbox_leases l \
+                 WHERE l.sandbox_id = s.id AND l.status = 'active' \
+                   AND l.expires_at > now()) \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM run_sandboxes rs JOIN runs r ON r.id = rs.run_id \
+                 WHERE rs.sandbox_id = s.id \
+                   AND r.state NOT IN ('succeeded', 'failed', 'cancelled')) \
+             ORDER BY s.updated_at ASC LIMIT $2",
+        )
+        .bind(older_than)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(sandbox_from_row).collect()
+    }
+
     async fn retain_run_sandbox(
         &self,
         tenant: Uuid,
@@ -3699,6 +3735,15 @@ impl MetadataStore for PostgresRepository {
         state: RunState,
     ) -> Result<Run, CoreError> {
         Self::record_run_results(self, tenant, id, results, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_stranded_sandboxes(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+        limit: u32,
+    ) -> Result<Vec<Sandbox>, CoreError> {
+        Self::list_stranded_sandboxes(self, older_than, limit)
             .await
             .map_err(core_error)
     }
