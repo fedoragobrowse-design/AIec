@@ -88,6 +88,19 @@ impl MatrixResult {
     }
 }
 
+/// How many cells a batch may run at once.
+///
+/// Extracted so the bound can be tested without a cluster. The bound is the
+/// point of a batch - asking for fifty runs must not be a way to take the
+/// cluster - and a test that needs a live scheduler to observe a `min` is a
+/// test that will not be run.
+fn effective_parallelism(options: &BatchOptions, requested: usize) -> usize {
+    if requested == 0 {
+        return 1;
+    }
+    options.max_parallel.clamp(1, requested)
+}
+
 /// Runs a list of workloads with bounded concurrency.
 ///
 /// The tasks are chunked rather than all fired at once: a slow task must not
@@ -103,7 +116,7 @@ pub async fn run_batch(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    let limit = options.max_parallel.min(requests.len()).max(1);
+    let limit = effective_parallelism(options, requests.len());
 
     // A sliding window rather than fixed chunks.
     //
@@ -291,5 +304,33 @@ impl Suite {
                 max_parallel: parallelism.max(1),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod parallelism_tests {
+    use super::effective_parallelism;
+    use aiec_core::run::BatchOptions;
+
+    /// The batch bound, stated as arithmetic rather than as a live run.
+    ///
+    /// Both halves matter and they fail differently: without the `min` a
+    /// two-cell batch would still open `max_parallel` futures, and without the
+    /// floor a caller asking for zero would silently run nothing.
+    #[test]
+    fn the_batch_never_exceeds_what_was_asked_or_what_exists() {
+        let at = |parallel: usize, requested: usize| {
+            effective_parallelism(
+                &BatchOptions {
+                    max_parallel: parallel,
+                },
+                requested,
+            )
+        };
+        assert_eq!(at(3, 10), 3, "never more than was asked for");
+        assert_eq!(at(10, 3), 3, "never more futures than there are cells");
+        assert_eq!(at(64, 100), 64, "a large batch is still bounded");
+        assert_eq!(at(0, 5), 1, "a caller asking for zero gets one, not none");
+        assert_eq!(at(8, 0), 1, "an empty batch is not a division by zero");
     }
 }
