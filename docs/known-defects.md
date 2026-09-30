@@ -16,48 +16,22 @@ Each entry says what is wrong, how it shows up, and what is not yet done.
 | A finished run could outlive its machine on a database deadlock | destroy gave up because the retry matched prose, not SQLSTATE | `a5737da`, `d0a52d6` |
 | Guaranteed deadlock destroying a sandbox | `delete_sandbox` locked sandbox-then-lease while every other path locked lease-then-sandbox | `8a9cc7a` |
 | A failed run's machine was destroyed anyway | `cleanup` ran before the outcome was decided, so retention saw a failure as success | `8614e40` |
+| Machines leaked on eight exit paths after placement | `execute` reached cleanup on two paths; the rest returned past it with `?` | `5b40d36` |
+| Stranded sandboxes exhausted a tenant's quota forever | nothing selected a non-terminal sandbox with no live lease and no unfinished run | `5b40d36` |
+| The control plane logged nothing at all | `EnvFilter::from_default_env` with no `RUST_LOG` means no directives, so every `tracing::` line was discarded | `5b40d36` |
+| A retried idempotency key ran the workload twice | the guard asked whether the run was finished, not whether this call created it | `e4275c6` |
+| Every fully-budgeted run was dropped by the client | SDK timeout `stated + 60s` was shorter than the server's `stated + 120s` budget | `e4275c6` |
 
 ## Open
 
-### Sandboxes in a non-terminal state are never reclaimed
+### `set_run_failure` has no compare-and-set
 
-A sandbox left in `running`, `starting` or `creating` whose lease is gone is
-never selected by anything. The sweeper expires leases; it does not notice a
-sandbox whose owner has vanished.
-
-Observed consequence: eight such sandboxes held a tenant's entire
-`max_active_sandboxes` quota with nothing running on them, and every subsequent
-run failed with `tenant resource quota exceeded` while nodes still reported free
-capacity. Enough of these and a tenant cannot submit work at all.
-
-The reconciler's recovery path exists for this and is not wired to anything that
-would run it: `reassign_expired_lease` returns `Ok(None)` when it cannot place a
-sandbox, the caller drops that action, and the lease is no longer `active` so it
-is never selected again.
-
-### Eight exit paths after placement skip cleanup
-
-`execute` reaches `cleanup` on two paths. Every other exit after a sandbox is
-acquired propagates with `?` and destroys nothing - `runtime_for`, each
-`advance`, and the setup, task and validation `run_command` calls. Those errors
-are retryable, so each attempt leaks one machine and the caller is only told the
-run failed.
-
-### The client gives up before the server does
-
-The SDK's run timeout is `timeout + 60s`; the server's budget is
-`timeout + 120s`. A run that uses its full budget is dropped by the client while
-the server is still executing it, which leaves the run non-terminal with no
-terminal event and the machine unreleased. It fires on exactly the runs that
-hold a machine longest.
-
-### Idempotency only guards terminal runs
-
-A client retrying `POST /v1/runs` with the same `Idempotency-Key` while the first
-request is still in flight gets the in-flight row, passes the `is_terminal()`
-guard, and executes the workload again on a second machine, billing twice. The
-loser's terminal write is then rejected, and the final `fail()` overwrites the
-winner's state because `set_run_failure` has no compare-and-set.
+`set_run_failure` writes `state` and `failure_reason` unconditionally. A
+cancelled run whose synchronous `execute` then fails is rewritten from
+`cancelled` to `failed`, so a caller that was told `200 OK / cancelled` reads a
+run that says `failed`. `advance` also adopts a terminal state and returns `Ok`,
+which lets `execute` keep running commands on a machine `cancel_run` already
+destroyed.
 
 ### `record_run_results` loses results on the final failure
 
