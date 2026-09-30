@@ -1,3 +1,8 @@
 # Build output. This crate is a guest-image artifact, so the release binary is
 # built when the image is built, never committed.
 /target/
+
+# The harness's own runtime state, written when it is run in-tree (bench, a
+# smoke test, a hand run). It is per-run bookkeeping, not source, and a stale
+# session file in a repository is misleading about what has been run.
+/.aiec-agent/
