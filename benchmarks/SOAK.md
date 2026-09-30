@@ -10,9 +10,13 @@ measured, not estimated.
 
 ## Before and after
 
+Both soaks were stopped before their nominal length once their shape was clear -
+soak 1 because it was already answering the question, soak 2 to keep the run
+short - so the counts are what was actually executed, not what was planned.
+
 | | Soak 1 | Soak 2 |
 |---|---:|---:|
-| runs | 80 | 45 |
+| runs executed | 80 | 45 |
 | succeeded | 24 | 38 |
 | success rate | 30% | 84% |
 | sandboxes still held at the end | 7 | **0** |
@@ -90,17 +94,26 @@ simultaneous placements did not produce it - which is the evidence that the
 provisioning fix is about the leak and not about load level.
 
 **Two things did not return to baseline**, and saying otherwise would be the
-easy lie:
+easy lie: vCPUs settled at 16 of 18, and one non-terminal sandbox remained.
+Both stopped moving after batch two and held flat for three more batches, so it
+looked like a steady-state residue rather than a leak.
 
-- vCPUs settled at 16 of 18, not 18.
-- One non-terminal sandbox remained.
+**It was a leak, and it has been attributed and fixed.** The second vCPU came
+from a lease that was still `active` and not yet expired, belonging to a sandbox
+already in state `failed`. Neither reclaim path could see it: the lease sweeper
+only looks at leases that have *expired*, and the stranded-sandbox sweep only
+selects sandboxes with *no* live lease. A lease that is alive and a sandbox that
+is finished sit precisely in the gap between the two.
 
-Both stopped moving after batch two and held flat for the remaining three
-batches, so this is a steady-state residue rather than a leak - but it is a
-residue, and 2 vCPUs and one sandbox are still held by something. The sequential
-soak returned to exactly zero, so whatever holds these is specific to concurrent
-placement and has not been identified. It is worth two vCPUs of a small cluster
-now and considerably more on a real one.
+A third pass releases exactly that case. Verified on the cluster with no
+intervention beyond deploying: active leases 2 to 1, orphaned leases 1 to 0,
+`docker-host` 6/8 to 7/8, total free vCPUs 16 to 17. The remaining lease belongs
+to a sandbox genuinely `running`, which is the correct answer rather than a
+smaller number.
+
+One non-terminal sandbox remains from an earlier experiment, not from the soak;
+it is a live machine with a live lease, which is what a non-terminal sandbox
+should look like.
 
 Nine of forty failed. The failure classes are the same two as the sequential
 soak - placement lease races and transient capacity refusals - and neither
