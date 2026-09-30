@@ -199,6 +199,40 @@ anyone read. `ModelConfig` now carries a deadline the caller sets from the
 task's wall budget, and the loop stops when it is reached. The same task now
 finishes in 57.3 seconds with the truthful `request_budget_exhausted`.
 
+## Comparison with OMP
+
+Both harnesses, the same repository with the same committed defect, the same
+instruction, the same model (`space-bunny-free`), each in a fresh git repo.
+Three runs of `aiec-agent`, two of OMP.
+
+| | aiec-agent | OMP 18.3.5 |
+| --- | --- | --- |
+| Task solved | yes, 3/3 runs | yes, 2/2 runs |
+| Peak RSS | **16.1–16.3 MiB** | **483.6 MiB** |
+| Wall clock | 38.7 s, 48.8 s, 85.3 s | 20.9 s, 21.0 s |
+| Harness CPU per session | 40–123 ms | not separately reported |
+| Model requests | 8, every run | not reported in print mode |
+| Input tokens | 40,774 / 48,818 / 113,000 | **not reported** |
+| Output tokens | 1,262 / 3,356 | not reported |
+| Cache reads | 2,788 / 25,860 | not reported |
+
+**On memory the difference is decisive: 31×.** OMP is a general-purpose harness
+that loads an agent registry, an LSP layer, an MCP client, a session database
+and a plugin system before it starts working. A disposable VM pays all of that
+on every task.
+
+**On wall clock OMP was faster, roughly 21 s against a 39–85 s spread, and the
+honest reading is that this measures the model rather than either harness.**
+The free tier rate-limits long generations: the same harness on the same task
+varied by a factor of two across three runs, and `harness_cpu_ms` never exceeded
+123 ms of it. The spread is upstream.
+
+**What cannot be compared is the most interesting axis.** OMP does not report
+token usage in `-p` print mode, so input tokens, cache reads and request counts
+are unavailable for it, and this report will not guess at them from wall clock.
+A fair token comparison needs OMP's usage surface, which is a follow-up, not
+something to be inferred here.
+
 ## Failure case
 
 A task that cannot succeed, with a validation of `false` and a two-request
