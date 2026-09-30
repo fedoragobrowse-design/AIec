@@ -74,8 +74,21 @@ pub struct RunRequest {
     pub max_attempts: u32,
 }
 
+/// Two, not one.
+///
+/// The run loop treats a lease resync and an exhausted cluster as retryable,
+/// which is only meaningful if a retry actually happens - and one attempt means
+/// it never does. The cost of the second attempt is nothing when the first
+/// succeeded, because it is never reached; the cost of not having it is that a
+/// run fails for a reason that had nothing to do with the workload, which is
+/// what a soak of a hundred runs showed: transient placement races surfacing
+/// as `failed` to callers who never asked for a retry.
+///
+/// This is about *placement*, which is why it is safe. A task that ran and
+/// returned a non-zero exit is not retried; only a failure that happened before
+/// any work did.
 fn default_max_attempts() -> u32 {
-    1
+    2
 }
 
 /// The run's own view of its progress, for a caller polling or streaming.
