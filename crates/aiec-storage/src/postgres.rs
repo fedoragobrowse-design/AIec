@@ -1198,8 +1198,23 @@ impl PostgresRepository {
         failure_reason: Option<String>,
         state: RunState,
     ) -> Result<Run, StoreError> {
+        // Guarded against overwriting a state that is already final.
+        //
+        // Every other write in this file holds the run to its lifecycle, and
+        // this one did not - so a run that reached `cancelled` or `succeeded`
+        // was silently rewritten to `failed` afterwards. That is not a
+        // theoretical race: cancelling a run destroys its machine, the
+        // in-flight execution then fails against a machine that is gone, and
+        // this statement is what turns the caller's "cancelled" into "failed".
+        // The executor cannot be reached to stop, because the run *is* the
+        // request.
+        //
+        // The reason is still recorded on a losing write, so the history of what
+        // happened is not lost - only the terminal verdict is protected.
         let updated = sqlx::query(
-            "UPDATE runs SET failure_reason = $1, state = $2, \
+            "UPDATE runs SET failure_reason = $1, \
+               state = CASE WHEN state IN ('succeeded', 'cancelled') \
+                 THEN state ELSE $2 END, \
                completed_at = COALESCE(completed_at, now()) \
              WHERE tenant_id = $3 AND id = $4 RETURNING *",
         )

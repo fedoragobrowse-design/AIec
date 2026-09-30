@@ -3411,6 +3411,13 @@ const STRANDED_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 /// Upper bound on abandoned sandboxes released in one pass.
 const STRANDED_LIMIT: u32 = 50;
 
+/// Upper bound on pages of abandoned sandboxes examined in one pass.
+///
+/// A pass that reclaims nothing stops on its own; this is the backstop for the
+/// case where every page makes a little progress and the backlog is larger than
+/// any single tick should spend.
+const STRANDED_MAX_PAGES: u32 = 4;
+
 fn spawn_lease_sweeper(state: AppState) {
     // Announced at startup and on every pass. A background task that panics is
     // silent - tokio drops it and nothing is ever reclaimed again - so its
@@ -3466,7 +3473,18 @@ async fn sweep_once(state: &AppState) {
     // while nodes report free capacity. That is how this host came to refuse
     // every run.
     let mut reclaimed = 0usize;
-    loop {
+    // Paging is bounded by both a page count and evidence of progress.
+    //
+    // The page count alone is not enough, and the comment that used to claim
+    // otherwise was wrong. A sandbox whose teardown keeps failing - an
+    // unreachable worker, a fenced lease, a database error - is left untouched,
+    // so it still matches the query and comes back on the next page. A loop that
+    // only exits on a short page therefore never exits: it re-selects the same
+    // fifty rows forever, with no sleep, and the sweeper never reaches its
+    // ticker again. Stopping when a page reclaims nothing fixes that directly,
+    // because a page that made no progress will not make progress on the next
+    // one either, and the next tick can try again after the cause clears.
+    for _ in 0..STRANDED_MAX_PAGES {
         let stranded = match state
             .repository()
             .list_stranded_sandboxes(Utc::now() - STRANDED_GRACE, STRANDED_LIMIT)
@@ -3482,9 +3500,13 @@ async fn sweep_once(state: &AppState) {
             break;
         }
         seen += stranded.len();
+        let mut reclaimed_this_page = 0usize;
         for sandbox in &stranded {
             match runs::abandon_sandbox(state, sandbox.tenant_id, sandbox.id, sandbox).await {
-                Ok(()) => reclaimed += 1,
+                Ok(()) => {
+                    reclaimed += 1;
+                    reclaimed_this_page += 1;
+                }
                 Err(error) => tracing::warn!(
                     sandbox_id = %sandbox.id,
                     error = %error,
@@ -3492,8 +3514,13 @@ async fn sweep_once(state: &AppState) {
                 ),
             }
         }
-        // Bounded per pass so a large backlog cannot hold the task indefinitely.
-        if stranded.len() < STRANDED_LIMIT as usize {
+        if stranded.len() < STRANDED_LIMIT as usize || reclaimed_this_page == 0 {
+            if reclaimed_this_page == 0 && !stranded.is_empty() {
+                tracing::warn!(
+                    stranded = stranded.len(),
+                    "stranded sandboxes could not be reclaimed; leaving them for a later pass"
+                );
+            }
             break;
         }
     }

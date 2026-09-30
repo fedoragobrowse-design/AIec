@@ -132,7 +132,15 @@ pub async fn submit_and_execute(
     // A retry gets a fresh machine, and every attempt is recorded rather than
     // overwritten: "it failed twice then passed" and "it passed" are different
     // facts, and collapsing them is how a flaky agent looks reliable.
-    let max_attempts = request.max_attempts.max(1);
+    // Capped, and not for politeness. A placement refusal returns in
+    // milliseconds, so the per-attempt deadline never fires and an unbounded
+    // `max_attempts` becomes a tight loop: every iteration is a scheduling
+    // transaction that takes the tenant quota row `FOR UPDATE`, scans nodes,
+    // inserts a row and rolls back, and every iteration writes an attempt row.
+    // One request could drive thousands of those for the whole run budget.
+    // Repeating a task is a legitimate ask; doing it thousands of times per
+    // second is not, and the caller does not get to decide the difference.
+    let max_attempts = request.max_attempts.clamp(1, MAX_RUN_ATTEMPTS);
     let store = state.repository();
     let mut last_error: Option<CoreError> = None;
 
@@ -206,6 +214,16 @@ pub async fn submit_and_execute(
             max_attempts,
             "retrying a run on a fresh machine"
         );
+        // Backing off matters most for exactly the case that retries fastest.
+        // A placement refusal is immediate, so without a pause the loop spins
+        // at the speed of the database while the cluster is full - hammering
+        // the same locks it is waiting on to be released. Bounded by the
+        // remaining budget so the backoff can never extend a run past its
+        // deadline.
+        let backoff =
+            std::time::Duration::from_millis((100u64 * 2u64.pow(attempt.min(6) - 1)).min(5_000))
+                .min(remaining);
+        tokio::time::sleep(backoff).await;
     }
 
     // Everything the attempts could not explain becomes the run's reason, and
@@ -225,6 +243,9 @@ pub async fn submit_and_execute(
     .await?;
     state.repository().get_run(tenant, run.id).await
 }
+
+/// Ceiling on a single run's attempts, whatever the caller asks for.
+const MAX_RUN_ATTEMPTS: u32 = 10;
 
 /// Grace on top of the command timeout for placement and teardown.
 const PLACEMENT_GRACE_SECONDS: u64 = 120;
