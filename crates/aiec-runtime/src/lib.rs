@@ -746,12 +746,56 @@ impl FirecrackerConfig {
     /// the same image is used for every sandbox on the node and the digest of a
     /// multi-gigabyte rootfs is not cheap to recompute per create.
     pub fn verify_guest_image(&self) -> Result<(), RuntimeError> {
-        static VERIFIED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-        let outcome =
-            VERIFIED.get_or_init(|| self.check_guest_artifact().map_err(|e| e.to_string()));
+        // Keyed on the artifact's identity, not on the process.
+        //
+        // This was a bare `OnceLock`: one result for the whole process,
+        // whatever was being verified. It happens to be correct today because
+        // there is exactly one configured guest image, and it would be silently,
+        // dangerously wrong the moment there were two - a worker pointed at a
+        // second, unverified image would inherit the first one's verdict, which
+        // is precisely the failure the specification names when it says never to
+        // skip integrity verification because you checked once "sometime
+        // earlier".
+        //
+        // The key is path, size and mtime for each file that takes part, which
+        // is the specification's own example. Replacing a rootfs in place, or
+        // pointing the runtime at a different one, misses the cache and is
+        // verified again. Nothing is trusted because it was trusted before; it
+        // is trusted because *these bytes at these paths* were.
+        static VERIFIED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+        > = std::sync::OnceLock::new();
+        let cache =
+            VERIFIED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let key = match artifact_identity(&self.rootfs, &self.kernel) {
+            Ok(key) => key,
+            // If the artifacts cannot be stat'd there is nothing to key on, and
+            // the honest response is to verify rather than to guess.
+            Err(_error) => {
+                return self
+                    .check_guest_artifact()
+                    .map_err(|error| RuntimeError::Unavailable(error.to_string()));
+            }
+        };
+
+        if let Ok(entries) = cache.lock()
+            && let Some(outcome) = entries.get(&key)
+        {
+            return match outcome {
+                Ok(()) => Ok(()),
+                Err(error) => Err(RuntimeError::Unavailable(error.clone())),
+            };
+        }
+        let outcome = self
+            .check_guest_artifact()
+            .map_err(|error| error.to_string());
+        if let Ok(mut entries) = cache.lock() {
+            entries.insert(key, outcome.clone());
+        }
         match outcome {
             Ok(()) => Ok(()),
-            Err(error) => Err(RuntimeError::Unavailable(error.clone())),
+            Err(error) => Err(RuntimeError::Unavailable(error)),
         }
     }
 
@@ -876,6 +920,26 @@ pub struct LocalReconciliationReport {
     pub owned: usize,
     /// Owned directories with no live API socket; reported, never killed.
     pub orphan_candidates: Vec<Uuid>,
+}
+
+/// Identity of the artifacts a verification result is valid for.
+///
+/// Path alone is not enough - a rootfs can be replaced at the same path - and a
+/// process-wide result is not enough at all. Size and mtime together catch the
+/// replacement that matters: an image swapped for a different one is a
+/// different length, and an image rewritten in place moves its mtime.
+fn artifact_identity(rootfs: &Path, kernel: &Path) -> std::io::Result<String> {
+    let describe = |path: &Path| -> std::io::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path)?;
+        Ok(format!(
+            "{}:{}:{}",
+            path.display(),
+            meta.size(),
+            meta.mtime()
+        ))
+    };
+    Ok(format!("{}|{}", describe(rootfs)?, describe(kernel)?))
 }
 
 impl FirecrackerRuntime {
@@ -2634,5 +2698,64 @@ mod tests {
         .check_guest_artifact()
         .expect("a coding guest with git and CA certificates satisfies the requirement");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod artifact_cache_tests {
+    use super::artifact_identity;
+    use std::io::Write;
+
+    /// Two different files must not share a verification verdict.
+    ///
+    /// The cache this replaced was a process-wide `OnceLock`: one result for
+    /// everything, correct only while there was exactly one configured image. A
+    /// worker pointed at a second, unverified rootfs inherited the first one's
+    /// verdict, which is the failure the specification names when it says never
+    /// to skip integrity verification because you checked once "sometime
+    /// earlier".
+    #[test]
+    fn a_different_artifact_gets_a_different_key() {
+        let dir = std::env::temp_dir().join(format!("af-cache-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let first = dir.join("rootfs-a.img");
+        let second = dir.join("rootfs-b.img");
+        let kernel = dir.join("vmlinux");
+        for path in [&first, &second, &kernel] {
+            let mut file = std::fs::File::create(path).expect("create");
+            file.write_all(b"contents").expect("write");
+        }
+
+        let a = artifact_identity(&first, &kernel).expect("identity a");
+        let b = artifact_identity(&second, &kernel).expect("identity b");
+        assert_ne!(a, b, "two different rootfs must not share a verdict");
+        assert_eq!(
+            a,
+            artifact_identity(&first, &kernel).expect("identity again"),
+            "the same unchanged artifact must still hit the cache"
+        );
+
+        // Replacing a file in place must miss: the same path with different
+        // bytes is a different artifact, and trusting the old verdict for it is
+        // exactly the bug.
+        let longer = dir.join("rootfs-longer.img");
+        std::fs::write(&longer, b"a considerably longer set of contents").expect("write");
+        assert_ne!(
+            artifact_identity(&first, &kernel).expect("identity a"),
+            artifact_identity(&longer, &kernel).expect("identity longer"),
+            "a different file at a different path must not reuse a verdict"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unreadable artifact produces no key rather than a shared one.
+    #[test]
+    fn an_unstatable_artifact_has_no_key() {
+        let missing = std::env::temp_dir().join("af-definitely-not-here-9f2c.img");
+        assert!(
+            artifact_identity(&missing, &missing).is_err(),
+            "a missing file must not yield a cache key"
+        );
     }
 }
