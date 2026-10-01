@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::model::Message;
+use crate::model::{Message, ToolCall};
 use crate::task::{Event, EventKind, Task};
 
 /// Rough token count for a string.
@@ -36,8 +36,13 @@ pub struct Context {
     /// point of the run, and losing them to a summary would be absurd.
     pinned: Vec<String>,
     /// Token counts by what produced them, so a caller can see where the
-    /// context actually went.
+    /// context actually went. This is an accounting record of the whole run:
+    /// it does not shrink when the conversation does.
     ledger: BTreeMap<&'static str, u32>,
+    /// What the conversation currently costs. The ceiling is measured against
+    /// this and not against the ledger, because a ledger that forgets to shrink
+    /// turns the ceiling into a number that only ever grows.
+    live: u32,
     max_tokens: u32,
     turns: u32,
 }
@@ -56,12 +61,13 @@ impl Context {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        let ledger = BTreeMap::from([("system", estimate_tokens(&system))]);
+        let system_tokens = estimate_tokens(&system);
         Self {
             system,
             messages: Vec::new(),
             pinned: task.context_notes.clone(),
-            ledger,
+            ledger: BTreeMap::from([("system", system_tokens)]),
+            live: system_tokens,
             // A deliberate fraction of a typical window. Compacting at 70% keeps
             // room for a large tool result to arrive without overflowing.
             max_tokens: 96_000,
@@ -88,14 +94,19 @@ impl Context {
         }
     }
 
-    /// Records a tool result, compressed to a bound first.
-    pub fn push_tool_result(&mut self, tool: &str, content: &str) {
+    /// Records a tool result, compressed to a bound first, and tied to the call
+    /// it answers.
+    ///
+    /// The id travels with the result because that is the only thing that says
+    /// which question this is the answer to. A result with an empty id is not a
+    /// shorter message, it is a message about nothing.
+    pub fn push_tool_result(&mut self, call: &ToolCall, content: &str) {
         let compressed = crate::DEFAULT_TOOL_OUTPUT_BYTES.min(4096);
         let rendered = crate::tools::compress(content, compressed);
         self.add("tool", estimate_tokens(&rendered));
         self.messages.push(Message::Tool {
-            tool_call_id: String::new(),
-            name: tool.to_owned(),
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
             content: rendered,
         });
     }
@@ -109,10 +120,18 @@ impl Context {
 
     fn add(&mut self, bucket: &'static str, tokens: u32) {
         *self.ledger.entry(bucket).or_insert(0) += tokens;
+        self.live = self.live.saturating_add(tokens);
     }
 
-    /// Approximate tokens currently held.
+    /// Approximate tokens the conversation currently costs.
     pub fn tokens(&self) -> u32 {
+        self.live
+    }
+
+    /// Tokens the whole run produced, by source, whether or not they are still
+    /// in the window. The result document reports this; the ceiling uses
+    /// [`Context::tokens`].
+    pub fn total_produced(&self) -> u32 {
         self.ledger.values().sum()
     }
 
@@ -150,6 +169,18 @@ impl Context {
         let digest_tokens = estimate_tokens(&digest);
         self.messages.insert(0, Message::User { content: digest });
         self.ledger.insert("compacted", digest_tokens);
+        // Rebase what the conversation costs. Without this the ceiling keeps
+        // measuring every message the run ever produced, so the first
+        // compaction does not lower anything and every later turn compacts
+        // again over a window that never grew smaller.
+        self.live = estimate_tokens(&self.system)
+            + digest_tokens
+            + self
+                .messages
+                .iter()
+                .skip(1)
+                .map(|message| message_to_value(message).to_string().len() as u32 / 4)
+                .sum::<u32>();
         (before as u32, self.messages.len() as u32)
     }
 
@@ -235,19 +266,11 @@ fn describe(message: &Message) -> Option<String> {
         Message::User { content } => content.clone(),
         Message::Tool { name, content, .. } => {
             let first = content.lines().next().unwrap_or_default();
-            format!("{name}: {}", clip(first, 100))
+            format!("{name}: {}", crate::clip(first, 100))
         }
         Message::System { .. } => return None,
     };
-    Some(clip(text.trim(), 160))
-}
-
-fn clip(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(limit).collect();
-    format!("{kept}…")
+    Some(crate::clip(text.trim(), 160))
 }
 
 /// Events describing what the context engine did, for the result document.
@@ -284,6 +307,14 @@ pub fn context_events(
 mod tests {
     use super::*;
 
+    fn call(name: &str) -> crate::model::ToolCall {
+        crate::model::ToolCall {
+            id: format!("call_{name}"),
+            name: name.to_owned(),
+            arguments: "{}".to_owned(),
+        }
+    }
+
     fn task() -> Task {
         Task {
             instruction: "fix the parser".to_owned(),
@@ -313,11 +344,78 @@ mod tests {
         );
     }
 
+    /// A tool result has to be attached to the call it answers, or the
+    /// conversation the model sees on the next request is not a conversation.
+    ///
+    /// The wire format pairs each tool message with the assistant message that
+    /// requested it by id. An assistant turn whose `tool_calls` were dropped,
+    /// followed by a tool message with an empty id, is a transcript no
+    /// conforming endpoint will accept and no model can read: the result
+    /// arrives with nothing saying which question it is the answer to.
+    #[test]
+    fn a_tool_result_is_paired_with_the_call_that_asked_for_it() {
+        let mut context = Context::new(&task());
+        let call = ToolCall {
+            id: "call_abc123".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"src/lib.rs"}"#.to_owned(),
+        };
+        context.push_assistant(Some("looking".to_owned()));
+        context.push_tool_calls(vec![call.clone()]);
+        context.push_tool_result(&call, "the file");
+        let wire = context.as_wire();
+        let assistant = wire
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("an assistant turn");
+        assert_eq!(
+            assistant["tool_calls"][0]["id"], "call_abc123",
+            "the model's own call must survive into the next request: {assistant}"
+        );
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "read");
+        let tool = wire.iter().find(|m| m["role"] == "tool").expect("a result");
+        assert_eq!(
+            tool["tool_call_id"], "call_abc123",
+            "the result must name the call it answers: {tool}"
+        );
+        assert_eq!(tool["name"], "read");
+    }
+
+    /// Every call in a batch gets its own answer, and no answer is invented for
+    /// a call the model did not make.
+    #[test]
+    fn every_call_in_a_batch_is_answered_exactly_once() {
+        let mut context = Context::new(&task());
+        let calls: Vec<ToolCall> = ["read", "grep", "bash"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ToolCall {
+                id: format!("call_{index}"),
+                name: (*name).to_owned(),
+                arguments: "{}".to_owned(),
+            })
+            .collect();
+        context.push_assistant(Some("three things".to_owned()));
+        context.push_tool_calls(calls.clone());
+        for call in &calls {
+            context.push_tool_result(call, "done");
+        }
+        let wire = context.as_wire();
+        let answers: Vec<&Value> = wire.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(answers.len(), calls.len());
+        for call in &calls {
+            let matched = answers
+                .iter()
+                .filter(|m| m["tool_call_id"] == call.id.as_str())
+                .count();
+            assert_eq!(matched, 1, "{} is answered {matched} times", call.id);
+        }
+    }
     #[test]
     fn the_system_message_is_first_and_stable() {
         let mut context = Context::new(&task());
         let first = context.as_wire()[0].clone();
-        context.push_tool_result("read", "contents");
+        context.push_tool_result(&call("read"), "contents");
         context.push_note("done".to_owned());
         let again = context.as_wire()[0].clone();
         // A stable prefix is what lets a provider cache it.
@@ -329,7 +427,7 @@ mod tests {
         let mut context = Context::new(&task());
         for index in 0..40 {
             context.push_assistant(Some(format!("assistant turn {index}")));
-            context.push_tool_result("read", "output");
+            context.push_tool_result(&call("read"), "output");
         }
         let before = context.as_wire().len();
         let (from, to) = context.compact();
@@ -352,10 +450,46 @@ mod tests {
         assert!(system.contains("fix the parser"));
     }
 
+    /// Compaction has to lower what the conversation costs, or the ceiling it
+    /// is compared against never moves.
+    ///
+    /// The ledger is a record of the whole run and deliberately does not shrink,
+    /// so it cannot also be the number the ceiling reads: a context that had
+    /// compacted every turn would still report itself over the limit and
+    /// compact again, forever, over a window no bigger than before.
+    #[test]
+    fn compaction_lowers_what_the_conversation_costs() {
+        let mut context = Context::new(&task());
+        for index in 0..400 {
+            context.push_assistant(Some(format!("turn {index}")));
+            context.push_tool_result(&call("read"), &"x".repeat(2000));
+        }
+        let produced = context.total_produced();
+        let before = context.tokens();
+        assert!(before > 96_000, "the fixture has to exceed the ceiling");
+        let (_, after_messages) = context.compact();
+        let after = context.tokens();
+        assert!(
+            after < before / 2,
+            "compaction took {before} to {after}; the ceiling did not move"
+        );
+        assert!(after_messages <= 8, "{after_messages} messages kept");
+        // What the run produced is still reported, and compaction's own digest
+        // is part of it: that is work the run did, not work it undid.
+        let total = context.total_produced();
+        assert!(
+            total > produced && total - produced < 20_000,
+            "the run produced {produced} and compaction added {}",
+            total - produced
+        );
+        assert!(context.ledger().contains_key("compacted"));
+        assert!(!context.should_compact(), "a compacted context is under it");
+    }
+
     #[test]
     fn the_ledger_attributes_tokens_by_source() {
         let mut context = Context::new(&task());
-        context.push_tool_result("read", "x".repeat(4000).as_str());
+        context.push_tool_result(&call("read"), "x".repeat(4000).as_str());
         assert!(context.ledger().contains_key("tool"));
         assert!(context.tokens() > 1000);
     }

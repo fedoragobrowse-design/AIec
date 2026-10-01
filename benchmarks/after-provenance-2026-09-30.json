@@ -1,0 +1,18 @@
+{
+  "deployed_api_sha256": "94554bfcf8e7c92c921fc6c32dcc95995c5c3fabe7bbf7bcfcf2b2ce28d243f6",
+  "deployed_worker_cli_sha256": "2867702cd1f561e12eed3c8237d20d9405b138b93802305c60141e3eb9e3a24d",
+  "baseline_sha256_preserved": "29fdbcb4fe4a123d8bfd4f5f97a80d9de905919d161acf41d7be2a4c6686cfb1",
+  "baseline_conditions_fingerprint": "602f511b90348c50",
+  "service_started_at": {"api": "2026-10-01T03:51:44Z", "firecracker_worker": "2026-10-01T03:51:44Z", "docker_worker": "2026-10-01T03:51:50Z"},
+  "service_pids": {"api": 1928873, "firecracker_worker": 1928880, "docker_worker": 1929019},
+  "target": "https://127.0.0.1:18443",
+  "ca": "/home/gobrowse/aiec/tls/ca.crt",
+  "api_key_file": "/tmp/bench-key.txt",
+  "api_key_file_mode": "0600",
+  "workload_gate": "flock /tmp/aiec-acceptance.lock",
+  "runtime_requested_matched_benchmark": null,
+  "source_changes": false,
+  "service_changes": false,
+  "manual_reclamation": false,
+  "observation_caveat": "Initial after-host benchmark observer SQL accidentally queried the unrelated local testdb. Its database and peak queue fields are invalid production evidence. Correct production Neon observation begins in after-production-observer-2026-09-30.json. Sequential, explicit-batch parallel, Firecracker and lifecycle proofs use the corrected production bridge from their baselines onward. Linux task count is OS threads, not Tokio task count."
+}

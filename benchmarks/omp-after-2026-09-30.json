@@ -1,0 +1,481 @@
+{
+  "harness": "aiec-omp-proof (throwaway)",
+  "phase": "after",
+  "nonce": "final-20261001T0635Z",
+  "started_at": "2026-10-01T06:31:45.499506+00:00",
+  "conditions": {
+    "omp_repo": "https://github.com/can1357/oh-my-pi",
+    "omp_sides": {
+      "baseline": {
+        "ref": "v9.7.0",
+        "commit": "b04a94024515afe1c23123f88cb7bd554644210d",
+        "needs_natives": true
+      },
+      "candidate": {
+        "ref": "v9.8.0",
+        "commit": "a37b5f4b988cd44ec6262b37cd9c5be50327739a",
+        "needs_natives": true
+      }
+    },
+    "target_repo": "https://github.com/octocat/Hello-World",
+    "target_commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+    "task": "Create a file named PROOF.md in the repository root containing exactly one line, and nothing else: 6 times 7 is 42",
+    "expected_line": "6 times 7 is 42",
+    "image": "python:3.13",
+    "runtime": "docker",
+    "resources": {
+      "cpu": 2,
+      "memory_mb": 2048,
+      "disk_mb": 4096,
+      "network": {
+        "enabled": true
+      }
+    },
+    "repetitions": 1,
+    "max_parallel": 2,
+    "workload_timeout_seconds": 1800,
+    "max_attempts": 2,
+    "retention": "destroy",
+    "credential_transport": "PUT /v1/sandboxes/{id}/files after polling the run's attempt row; never in the Run request, argv, environment or a requested artifact",
+    "credential_config_sha256_prefix": "47c3df4d2b160908",
+    "agent_output_transport": "Run artifact /workspace/omp-events.jsonl (--mode json), not parsed stdout",
+    "measurement_pin": "4bef4d22aaba",
+    "harness_sha256": "ddc458fefadbba0865a24a5c6cc915e8496b64560f37d5c3f2ab745d2b545c5f",
+    "model": "opencode-zen/space-bunny-free",
+    "artifacts_requested": true
+  },
+  "prerequisites": {
+    "provider_probe": {
+      "checked": true,
+      "status": 200,
+      "model_echo": "space-bunny-free",
+      "auth": "ok"
+    },
+    "target_pin": {
+      "repo": "https://github.com/octocat/Hello-World",
+      "pinned": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+      "remote_head": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+      "verified": true
+    },
+    "artifact_storage": {
+      "configured": true,
+      "reachable": true,
+      "status": 403,
+      "endpoint": "http://127.0.0.1:9000/"
+    },
+    "host_before": {
+      "nproc": 12,
+      "mem_total": "32554972 kB",
+      "loadavg": [
+        1.76806640625,
+        1.9658203125,
+        1.83203125
+      ],
+      "container_tool": "podman",
+      "containers_running": [
+        "aiec-testdb"
+      ],
+      "images_present": [
+        "docker.io/library/python:3.13",
+        "docker.io/library/python:3.13-slim",
+        "docker.io/library/postgres:16",
+        "docker.io/library/alpine:3.21",
+        "registry.fedoraproject.org/fedora:latest",
+        "docker.io/library/ubuntu:24.04",
+        "docker.io/library/ubuntu:26.04"
+      ],
+      "omp_service_present": true
+    },
+    "api_health": {
+      "status": "ok",
+      "version": "0.1.0"
+    },
+    "sandboxes_before": {
+      "live_count": 0,
+      "live_states": [],
+      "live_ids": [],
+      "historical_rows_total": 1025,
+      "note": "live_count is the cleanup-comparable number; historical_rows_total is context only"
+    },
+    "sandboxes_after": {
+      "live_count": 0,
+      "live_states": [],
+      "live_ids": [],
+      "historical_rows_total": 1027,
+      "note": "live_count is the cleanup-comparable number; historical_rows_total is context only"
+    },
+    "host_after": {
+      "nproc": 12,
+      "mem_total": "32554972 kB",
+      "loadavg": [
+        1.75634765625,
+        1.93798828125,
+        1.83056640625
+      ],
+      "container_tool": "podman",
+      "containers_running": [
+        "aiec-testdb"
+      ],
+      "images_present": [
+        "docker.io/library/python:3.13",
+        "docker.io/library/python:3.13-slim",
+        "docker.io/library/postgres:16",
+        "docker.io/library/alpine:3.21",
+        "registry.fedoraproject.org/fedora:latest",
+        "docker.io/library/ubuntu:24.04",
+        "docker.io/library/ubuntu:26.04"
+      ],
+      "omp_service_present": true
+    }
+  },
+  "discovered_run_ids": {
+    "omp-proof-final-20261001T0635Z-after-candidate-4bef4d22aaba-1": "01a0f629-78f8-726d-a46c-845a7d0b9cb0",
+    "omp-proof-final-20261001T0635Z-after-baseline-4bef4d22aaba-1": "01a0f629-78f8-726d-a46c-8459f5fed4f0"
+  },
+  "provisioning": {
+    "mode": "api-file-write",
+    "path": "/workspace/.omp/agent/models.yml",
+    "delivered": [
+      {
+        "run_id": "01a0f629-78f8-726d-a46c-8459f5fed4f0",
+        "sandbox_id": "01a0f629-8394-77dc-94bc-b2e605b75159"
+      },
+      {
+        "run_id": "01a0f629-78f8-726d-a46c-845a7d0b9cb0",
+        "sandbox_id": "01a0f629-8738-769e-8274-0736c1855abe"
+      }
+    ],
+    "missing": []
+  },
+  "submission_seconds": 60.871,
+  "run_ids": {
+    "baseline": [
+      "01a0f629-78f8-726d-a46c-8459f5fed4f0"
+    ],
+    "candidate": [
+      "01a0f629-78f8-726d-a46c-845a7d0b9cb0"
+    ]
+  },
+  "sides": {
+    "baseline": [
+      {
+        "side": "baseline",
+        "run_id": "01a0f629-78f8-726d-a46c-8459f5fed4f0",
+        "state": "succeeded",
+        "failure_reason": null,
+        "runtime": "docker",
+        "node": null,
+        "retained_sandbox_id": null,
+        "cleanup_failed": null,
+        "requested_at": "2026-10-01T06:31:48.216403Z",
+        "completed_at": "2026-10-01T06:32:32.951215Z",
+        "phase_ms": {
+          "cleanup": 2960,
+          "collection": 4364,
+          "placement": 5978,
+          "placement.allocation": 498,
+          "placement.boot": 537,
+          "placement.scheduler": 1980,
+          "placement.workspace": 1271,
+          "setup": 12943,
+          "task": 11230,
+          "validation": 2186
+        },
+        "omp_ref_requested": "v9.7.0",
+        "omp_commit_recorded": "b04a94024515afe1c23123f88cb7bd554644210d",
+        "setup_steps": [
+          {
+            "exit_code": 0,
+            "stdout": "CREDENTIAL_PRESENT"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "FETCHER=curl\nINSTALLER_EXIT=1\n        at moduleEvaluation (native:1:11)\n        at moduleEvaluation (native:1:11)\n        at loadAndEvaluateModule (native:2)\ntotal 109280\ndrwxr-xr-x. 1 root root         6 Oct  1 06:32 .\ndrwxrwxrwx. 1 root root        42 Oct  1 06:32 ..\n-rwxr-xr-x. 1 root root 111899797 Oct  1 06:32 omp"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "NATIVE_ASSET=pi_natives.linux-x64.node\n-rw-r--r--. 1 root root 6052440 Oct  1 06:32 /workspace/omp-bin/pi_natives.linux-x64.node"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "OMP_VERSION_EXIT=0\nOMP_VERSION_REPORTED=9.7.0\nOMP_VERSION_OK=9.7.0"
+          }
+        ],
+        "task_exit_code": 0,
+        "task_duration_ms": 10582,
+        "task_stdout_preview": "AGENT_EXIT=0\nEVENTS_BYTES=192918\nAGENT_TAIL\nr checker compares raw bytes without stripping the newline, say so and I'll drop it.\"}],\"api\":\"openai-completions\",\"provider\":\"opencode-zen\",\"model\":\"space-bunny-free\",\"usage\":{\"input\":345,\"output\":99,\"cacheRead\":10746,\"cacheWrite\":0,\"totalTokens\":11190,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":1790836340159,\"duration\":1862,\"ttft\":984}]}\n\nAGENT_STDERR_TAIL\n\nRESULT_FILE\n6 times 7 is 42",
+        "task_stderr_preview": "",
+        "validations": [
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          },
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          },
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          }
+        ],
+        "validation_passed": 3,
+        "validation_total": 3,
+        "target_commit_actual": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "git_status": "?? PROOF.md",
+        "git_diff_bytes": 0,
+        "git_diff_preview": "",
+        "changed_files": [
+          "PROOF.md"
+        ],
+        "artifacts": [
+          {
+            "name": "/workspace/omp-events.jsonl",
+            "size_bytes": 192918,
+            "sha256": "ef8389d80fdaa8f5f53fc558255440180f165f67375b4c8ae4beb5d1425d21fc"
+          },
+          {
+            "name": "/workspace/omp-stderr.txt",
+            "size_bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      }
+    ],
+    "candidate": [
+      {
+        "side": "candidate",
+        "run_id": "01a0f629-78f8-726d-a46c-845a7d0b9cb0",
+        "state": "succeeded",
+        "failure_reason": null,
+        "runtime": "docker",
+        "node": null,
+        "retained_sandbox_id": null,
+        "cleanup_failed": null,
+        "requested_at": "2026-10-01T06:31:48.216463Z",
+        "completed_at": "2026-10-01T06:32:42.114907Z",
+        "phase_ms": {
+          "cleanup": 3129,
+          "collection": 4178,
+          "placement": 6748,
+          "placement.allocation": 477,
+          "placement.boot": 664,
+          "placement.scheduler": 2592,
+          "placement.workspace": 1223,
+          "setup": 12860,
+          "task": 18897,
+          "validation": 2104
+        },
+        "omp_ref_requested": "v9.8.0",
+        "omp_commit_recorded": "a37b5f4b988cd44ec6262b37cd9c5be50327739a",
+        "setup_steps": [
+          {
+            "exit_code": 0,
+            "stdout": "CREDENTIAL_PRESENT"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "FETCHER=curl\nINSTALLER_EXIT=0\n\n\u2713 Installed omp to /workspace/omp-bin/omp\nAdd /workspace/omp-bin to your PATH, then run 'omp'\ntotal 119244\ndrwxr-xr-x. 1 root root         6 Oct  1 06:32 .\ndrwxrwxrwx. 1 root root        42 Oct  1 06:32 ..\n-rwxr-xr-x. 1 root root 122103186 Oct  1 06:32 omp"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "NATIVE_ASSET=pi_natives.linux-x64.node\n-rw-r--r--. 1 root root 10230856 Oct  1 06:32 /workspace/omp-bin/pi_natives.linux-x64.node"
+          },
+          {
+            "exit_code": 0,
+            "stdout": "OMP_VERSION_EXIT=0\nOMP_VERSION_REPORTED=9.8.0\nOMP_VERSION_OK=9.8.0"
+          }
+        ],
+        "task_exit_code": 0,
+        "task_duration_ms": 18212,
+        "task_stdout_preview": "AGENT_EXIT=0\nEVENTS_BYTES=328673\nAGENT_TAIL\n -l` counts0 \u2014 the terminator is what makes the line count agree across tooling.\"}],\"api\":\"openai-completions\",\"provider\":\"opencode-zen\",\"model\":\"space-bunny-free\",\"usage\":{\"input\":433,\"output\":149,\"cacheRead\":10872,\"cacheWrite\":0,\"totalTokens\":11454,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":1790836348566,\"duration\":2727,\"ttft\":1653}]}\n\nAGENT_STDERR_TAIL\n\nRESULT_FILE\n6 times 7 is 42",
+        "task_stderr_preview": "",
+        "validations": [
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          },
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          },
+          {
+            "exit_code": 0,
+            "ok": true,
+            "stderr": ""
+          }
+        ],
+        "validation_passed": 3,
+        "validation_total": 3,
+        "target_commit_actual": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "git_status": "?? PROOF.md",
+        "git_diff_bytes": 0,
+        "git_diff_preview": "",
+        "changed_files": [
+          "PROOF.md"
+        ],
+        "artifacts": [
+          {
+            "name": "/workspace/omp-events.jsonl",
+            "size_bytes": 328673,
+            "sha256": "bdb11351103d3f44f09059fac6fcde80372ae43519d6c71760b71095a107cf56"
+          },
+          {
+            "name": "/workspace/omp-stderr.txt",
+            "size_bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      }
+    ]
+  },
+  "agent_transcripts": {
+    "01a0f629-78f8-726d-a46c-8459f5fed4f0": {
+      "path": "/tmp/aiec-omp-proof/after-final-20261001T0635Z-01a0f629-78f8-726d-a46c-8459f5fed4f0-events.jsonl",
+      "bytes_downloaded": 192918,
+      "bytes_saved": 192918,
+      "transcript_scrubbed": true,
+      "lines": 151,
+      "sha256_of_download": "ef8389d80fdaa8f5"
+    },
+    "01a0f629-78f8-726d-a46c-845a7d0b9cb0": {
+      "path": "/tmp/aiec-omp-proof/after-final-20261001T0635Z-01a0f629-78f8-726d-a46c-845a7d0b9cb0-events.jsonl",
+      "bytes_downloaded": 328673,
+      "bytes_saved": 328673,
+      "transcript_scrubbed": true,
+      "lines": 205,
+      "sha256_of_download": "bdb11351103d3f44"
+    }
+  },
+  "judgement": {
+    "passed": true,
+    "checks": [
+      {
+        "check": "both_revision_runs_present",
+        "passed": true,
+        "detail": "a settled baseline and candidate run must both be measured"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_ran_on_docker",
+        "passed": true,
+        "detail": "placement.runtime=docker"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_agent_really_ran",
+        "passed": true,
+        "detail": "task exit=0, stdout present=True"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_credential_was_delivered",
+        "passed": true,
+        "detail": "setup reported the credential file present"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_target_validation_passed",
+        "passed": true,
+        "detail": "3/3 validations passed"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_git_evidence_present",
+        "passed": true,
+        "detail": "changed_files=['PROOF.md']"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_agent_output_collected",
+        "passed": true,
+        "detail": "omp-events.jsonl collected as a Run artifact"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-8459f5fed4f0_cleaned_up",
+        "passed": true,
+        "detail": "retained=None, cleanup_failed=None"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_ran_on_docker",
+        "passed": true,
+        "detail": "placement.runtime=docker"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_agent_really_ran",
+        "passed": true,
+        "detail": "task exit=0, stdout present=True"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_credential_was_delivered",
+        "passed": true,
+        "detail": "setup reported the credential file present"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_target_validation_passed",
+        "passed": true,
+        "detail": "3/3 validations passed"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_git_evidence_present",
+        "passed": true,
+        "detail": "changed_files=['PROOF.md']"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_agent_output_collected",
+        "passed": true,
+        "detail": "omp-events.jsonl collected as a Run artifact"
+      },
+      {
+        "check": "01a0f629-78f8-726d-a46c-845a7d0b9cb0_cleaned_up",
+        "passed": true,
+        "detail": "retained=None, cleanup_failed=None"
+      }
+    ],
+    "verdict": "measurements only: which revision is better is the caller's judgement, and one repetition per side is an anecdote, not a distribution"
+  },
+  "timing": {
+    "baseline": [
+      {
+        "run_id": "01a0f629-78f8-726d-a46c-8459f5fed4f0",
+        "phase_ms": {
+          "cleanup": 2960,
+          "collection": 4364,
+          "placement": 5978,
+          "placement.allocation": 498,
+          "placement.boot": 537,
+          "placement.scheduler": 1980,
+          "placement.workspace": 1271,
+          "setup": 12943,
+          "task": 11230,
+          "validation": 2186
+        },
+        "task_ms": 11230,
+        "placement_ms": 5978,
+        "cleanup_ms": 2960,
+        "collection_ms": 4364
+      }
+    ],
+    "candidate": [
+      {
+        "run_id": "01a0f629-78f8-726d-a46c-845a7d0b9cb0",
+        "phase_ms": {
+          "cleanup": 3129,
+          "collection": 4178,
+          "placement": 6748,
+          "placement.allocation": 477,
+          "placement.boot": 664,
+          "placement.scheduler": 2592,
+          "placement.workspace": 1223,
+          "setup": 12860,
+          "task": 18897,
+          "validation": 2104
+        },
+        "task_ms": 18897,
+        "placement_ms": 6748,
+        "cleanup_ms": 3129,
+        "collection_ms": 4178
+      }
+    ]
+  },
+  "finished_at": "2026-10-01T06:32:50.980591+00:00"
+}

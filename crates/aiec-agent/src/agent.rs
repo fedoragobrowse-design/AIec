@@ -41,6 +41,15 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
 
         budget.next_turn();
         events.turn(budget.turns());
+        if context.should_compact() {
+            let (from, to) = context.compact();
+            events.compacted(from, to);
+        }
+        // Before the request, not after it: a request that is already over the
+        // window is the failure this exists to prevent. The ceiling used to be
+        // a constant nothing read, so a long run grew one request at a time
+        // until the provider refused it and the whole task failed with an
+        // error that named nothing the operator could act on.
 
         let reply = match model
             .complete(&context, &registry.schemas(), budget.reserve_output())
@@ -55,6 +64,11 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
             Err(HarnessError::Budget(_)) => break StopReason::RequestBudget,
             Err(error) => return Err(error),
         };
+        // The model's own calls go into the conversation before any of them
+        // runs. They are the questions the results below answer, and a
+        // transcript that keeps the answers and drops the questions is one the
+        // model cannot read on its next request.
+        context.push_tool_calls(reply.tool_calls.clone());
 
         if reply.tool_calls.is_empty() {
             context.push_note(format!(
@@ -66,6 +80,13 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
 
         for call in reply.tool_calls {
             guard.observe(&call);
+            // The guard's second signal needs to know whether the call changed
+            // anything. Only an edit does: a model that reads and searches for
+            // forty turns has learned nothing about the repository and is
+            // spending a VM's budget on it. Without this call the no-progress
+            // half of the guard was never reached from the loop at all, so it
+            // was a rule that existed only in its own tests.
+            guard.observe_effect(matches!(call.name.as_str(), "write" | "edit"));
             events.tool_call(&call.name);
             let outcome_for_call = registry.execute(&call, &repo).await;
             let rendered = match outcome_for_call {
@@ -81,7 +102,7 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
                     format!("error: {error}")
                 }
             };
-            context.push_tool_result(&call.name, &rendered);
+            context.push_tool_result(&call, &rendered);
         }
     };
 

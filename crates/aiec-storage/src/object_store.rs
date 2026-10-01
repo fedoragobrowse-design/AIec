@@ -1,26 +1,208 @@
 use crate::{StoreError, core_error};
 use aiec_core::{
     CoreError,
-    storage::{ArtifactStore, GetObjectOptions, ObjectMetadata},
+    storage::{ArtifactDownload, ArtifactSource, ArtifactStore, GetObjectOptions, ObjectMetadata},
 };
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::{Method, Url, header};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const TRANSFER_CHUNK_BYTES: usize = aiec_core::runtime::FILE_CHUNK_BYTES;
+const LEGACY_DOWNLOAD_LIMIT: u64 = aiec_core::snapshots::MAX_WORKSPACE_ARCHIVE_BYTES as u64;
+
+struct BytesSource(Bytes);
+
+#[async_trait]
+impl ArtifactSource for BytesSource {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, CoreError> {
+        if self.0.is_empty() {
+            return Ok(None);
+        }
+        let length = self.0.len().min(TRANSFER_CHUNK_BYTES);
+        Ok(Some(self.0.split_to(length)))
+    }
+}
+
+// Anonymous files have no directory entry, so cancellation, errors and dropped
+// downloads reclaim their disk space simply by closing the owned descriptor.
+async fn anonymous_spool() -> Result<tokio::fs::File, StoreError> {
+    let file = tokio::task::spawn_blocking(|| {
+        let path = std::env::temp_dir().join(format!(".aiec-spool.{}.tmp", Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&path)?;
+        std::fs::remove_file(&path)?;
+        Ok::<_, std::io::Error>(file)
+    })
+    .await
+    .map_err(|error| StoreError::ObjectStore(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+struct SpoolSource {
+    file: tokio::fs::File,
+    remaining: u64,
+}
+
+#[async_trait]
+impl ArtifactSource for SpoolSource {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, CoreError> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let length = self.remaining.min(TRANSFER_CHUNK_BYTES as u64) as usize;
+        let mut bytes = BytesMut::with_capacity(length);
+        while bytes.len() < length {
+            let remaining = length - bytes.len();
+            let count = (&mut self.file)
+                .take(remaining as u64)
+                .read_buf(&mut bytes)
+                .await
+                .map_err(|error| core_error(error.into()))?;
+            if count == 0 {
+                return Err(CoreError::Backend(
+                    "verified artifact spool was truncated".into(),
+                ));
+            }
+        }
+        self.remaining -= length as u64;
+        Ok(Some(bytes.freeze()))
+    }
+}
+
+struct UploadOwner {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Drop for UploadOwner {
+    fn drop(&mut self) {
+        // Synchronous unlink is deliberate: no spawned cleanup can outlive a
+        // cancelled upload or race a subsequent GC pass after lock release.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn upload_owner(path: PathBuf) -> Result<UploadOwner, StoreError> {
+    tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(&path)?;
+        let owner = UploadOwner { path, file };
+        lock_temporary_file(&owner.file)?;
+        Ok::<_, std::io::Error>(owner)
+    })
+    .await
+    .map_err(|error| StoreError::ObjectStore(error.to_string()))?
+    .map_err(Into::into)
+}
+
+fn check_size(size: u64, max_bytes: u64) -> Result<(), StoreError> {
+    if size > max_bytes {
+        return Err(CoreError::LimitExceeded("artifact body exceeds byte limit".into()).into());
+    }
+    Ok(())
+}
+
+async fn write_source(
+    source: &mut dyn ArtifactSource,
+    file: &mut tokio::fs::File,
+    max_bytes: u64,
+) -> Result<(u64, [u8; 32]), StoreError> {
+    let mut size = 0u64;
+    let mut digest = Sha256::new();
+    while let Some(bytes) = source.next_chunk().await? {
+        if bytes.is_empty() || bytes.len() > TRANSFER_CHUNK_BYTES {
+            return Err(CoreError::InvalidRequest(
+                "artifact source must yield 1..=65536 bytes".into(),
+            )
+            .into());
+        }
+        size = size
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| CoreError::LimitExceeded("artifact body size overflow".into()))?;
+        check_size(size, max_bytes)?;
+        digest.update(&bytes);
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok((size, digest.finalize().into()))
+}
+
+async fn hash_reader(
+    reader: &mut (impl AsyncRead + Unpin),
+    mut spool: Option<&mut tokio::fs::File>,
+    max_bytes: u64,
+) -> Result<(u64, String), StoreError> {
+    let mut size = 0u64;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; TRANSFER_CHUNK_BYTES];
+    loop {
+        // At the limit read only one sentinel byte, never another full chunk.
+        let length = (max_bytes.saturating_sub(size).saturating_add(1))
+            .min(TRANSFER_CHUNK_BYTES as u64) as usize;
+        let count = reader.read(&mut buffer[..length]).await?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| CoreError::LimitExceeded("artifact body size overflow".into()))?;
+        check_size(size, max_bytes)?;
+        digest.update(&buffer[..count]);
+        if let Some(file) = spool.as_mut() {
+            file.write_all(&buffer[..count]).await?;
+        }
+    }
+    if let Some(file) = spool {
+        file.flush().await?;
+        file.rewind().await?;
+    }
+    Ok((size, hex::encode(digest.finalize())))
+}
+
+fn verify_digest(actual: &str, options: &GetObjectOptions) -> Result<(), StoreError> {
+    if let Some(expected) = &options.expected_checksum_sha256 {
+        validate_checksum(expected)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(StoreError::ObjectStore(
+                "stored object checksum mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn collect_download(mut download: ArtifactDownload) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = Vec::with_capacity(download.metadata.size_bytes as usize);
+    while let Some(chunk) = download.body.next_chunk().await? {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn validate_object_key(key: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_object_key(key: &str) -> Result<(), StoreError> {
     if key.is_empty() || key.len() > 1024 {
         return Err(StoreError::InvalidObjectKey(
             "key must contain 1 to 1024 bytes".into(),
@@ -46,10 +228,6 @@ fn validate_object_key(key: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn checksum(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 fn is_within(root: &Path, path: &Path) -> bool {
     path == root || path.starts_with(root)
 }
@@ -58,6 +236,7 @@ fn is_within(root: &Path, path: &Path) -> bool {
 pub struct FilesystemObjectStore {
     pub root: PathBuf,
     mutation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    temporary_scan: std::sync::Arc<tokio::sync::Mutex<Vec<tokio::fs::ReadDir>>>,
 }
 
 impl FilesystemObjectStore {
@@ -65,6 +244,7 @@ impl FilesystemObjectStore {
         Self {
             root: root.into(),
             mutation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            temporary_scan: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -228,11 +408,11 @@ impl FilesystemObjectStore {
                     .map_err(|_| StoreError::InvalidObjectKey("object path escaped root".into()))?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let bytes = tokio::fs::read(&path).await?;
-                let digest = checksum(&bytes);
+                let mut file = tokio::fs::File::open(&path).await?;
+                let (size_bytes, digest) = hash_reader(&mut file, None, u64::MAX).await?;
                 objects.push(ObjectMetadata {
                     key,
-                    size_bytes: bytes.len() as u64,
+                    size_bytes,
                     checksum_sha256: digest.clone(),
                     etag: Some(digest),
                 });
@@ -241,36 +421,37 @@ impl FilesystemObjectStore {
         objects.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(objects)
     }
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectMetadata, StoreError> {
+        let limit = bytes.len() as u64;
+        self.put_stream(key, &mut BytesSource(bytes), limit).await
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        source: &mut dyn ArtifactSource,
+        max_bytes: u64,
+    ) -> Result<ObjectMetadata, StoreError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let path = self.safe_path(key, true).await?;
         let parent = path
             .parent()
             .ok_or_else(|| StoreError::InvalidObjectKey("missing object parent".into()))?;
-        let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-        let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .await?;
-            tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
-            file.sync_all().await?;
-            drop(file);
-            tokio::fs::rename(&temporary, &path).await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-        }
-        result?;
-        let content_checksum = checksum(bytes);
+        let owner =
+            upload_owner(parent.join(format!(".aiec-upload.{}.tmp", Uuid::new_v4()))).await?;
+        let mut file = tokio::fs::File::from_std(owner.file.try_clone()?);
+        let (size_bytes, digest) = write_source(source, &mut file, max_bytes).await?;
+        let digest = hex::encode(digest);
+        file.sync_all().await?;
+        drop(file);
+        // No await between publication and owner drop: cancellation cannot
+        // leave a background rename racing cleanup of the staging file.
+        std::fs::rename(&owner.path, &path)?;
         Ok(ObjectMetadata {
             key: key.to_owned(),
-            size_bytes: bytes.len() as u64,
-            checksum_sha256: content_checksum.clone(),
-            etag: Some(content_checksum),
+            size_bytes,
+            checksum_sha256: digest.clone(),
+            etag: Some(digest),
         })
     }
 
@@ -283,26 +464,56 @@ impl FilesystemObjectStore {
         key: &str,
         options: &GetObjectOptions,
     ) -> Result<Vec<u8>, StoreError> {
+        collect_download(
+            self.get_verified(key, options, LEGACY_DOWNLOAD_LIMIT)
+                .await?,
+        )
+        .await
+    }
+
+    async fn get_verified(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+        max_bytes: u64,
+    ) -> Result<ArtifactDownload, StoreError> {
         if let Some(expected) = &options.expected_checksum_sha256 {
             validate_checksum(expected)?;
         }
+        if let Some(expected) = &options.if_match {
+            validate_checksum(expected.trim_matches('"'))?;
+        }
         let path = self.safe_path(key, false).await?;
-        let bytes = tokio::fs::read(path).await?;
-        if let Some(expected) = &options.expected_checksum_sha256
-            && !actual_checksum(&bytes, expected)?
-        {
+        let mut file = tokio::fs::File::open(path).await?;
+        let declared_size = file.metadata().await?.len();
+        check_size(declared_size, max_bytes)?;
+        let mut spool = anonymous_spool().await?;
+        let (size_bytes, digest) = hash_reader(&mut file, Some(&mut spool), max_bytes).await?;
+        if declared_size != size_bytes {
             return Err(StoreError::ObjectStore(
-                "stored object checksum mismatch".into(),
+                "filesystem object size changed during read".into(),
             ));
         }
+        verify_digest(&digest, options)?;
         if let Some(expected) = &options.if_match
-            && !actual_checksum(&bytes, expected.trim_matches('"'))?
+            && !digest.eq_ignore_ascii_case(expected.trim_matches('"'))
         {
             return Err(StoreError::ObjectStore(
                 "filesystem ETag precondition failed".into(),
             ));
         }
-        Ok(bytes)
+        Ok(ArtifactDownload {
+            metadata: ObjectMetadata {
+                key: key.to_owned(),
+                size_bytes,
+                checksum_sha256: digest.clone(),
+                etag: Some(digest),
+            },
+            body: Box::new(SpoolSource {
+                file: spool,
+                remaining: size_bytes,
+            }),
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
@@ -312,12 +523,12 @@ impl FilesystemObjectStore {
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StoreError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         let path = self.existing_path(key).await?;
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let actual = checksum(&bytes);
+        let (_, actual) = hash_reader(&mut file, None, u64::MAX).await?;
         if actual.eq_ignore_ascii_case(etag.trim_matches('"')) {
             match tokio::fs::remove_file(path).await {
                 Ok(()) => Ok(()),
@@ -332,10 +543,139 @@ impl FilesystemObjectStore {
     }
 }
 
+fn lock_temporary_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // Advisory ownership survives process crashes and spans all store instances.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "local artifact upload ownership requires Unix file locks",
+        ))
+    }
+}
+
+impl FilesystemObjectStore {
+    async fn cleanup_temporary_uploads(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u32, StoreError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "invalid temporary upload scan bound".into(),
+            ));
+        }
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let mut scan = self.temporary_scan.lock().await;
+        if scan.is_empty() {
+            scan.push(tokio::fs::read_dir(self.root().await?).await?);
+        }
+        let mut deleted = 0;
+        // Retain directory iterators across ticks, rather than repeatedly scanning
+        // the same prefix or materializing an unbounded list of object paths.
+        for _ in 0..limit {
+            let Some(directory) = scan.last_mut() else {
+                break;
+            };
+            let entry = match directory.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    scan.pop();
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    scan.pop();
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let file_type = entry.file_type().await?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                scan.push(tokio::fs::read_dir(entry.path()).await?);
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(id) = name
+                .strip_prefix(".aiec-upload.")
+                .and_then(|name| name.strip_suffix(".tmp"))
+            else {
+                continue;
+            };
+            if Uuid::parse_str(id).is_err() || !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let removed = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true).write(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW);
+                let owner = match options.open(&path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                match lock_temporary_file(&owner) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+                let modified: DateTime<Utc> = owner.metadata()?.modified()?.into();
+                if modified >= older_than {
+                    return Ok(false);
+                }
+                match std::fs::remove_file(path) {
+                    Ok(()) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .map_err(|error| StoreError::ObjectStore(error.to_string()))??;
+            deleted += u32::from(removed);
+        }
+        Ok(deleted)
+    }
+}
+
 #[async_trait]
 impl ArtifactStore for FilesystemObjectStore {
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectMetadata, CoreError> {
         Self::put(self, key, bytes).await.map_err(core_error)
+    }
+    async fn put_stream(
+        &self,
+        key: &str,
+        source: &mut dyn ArtifactSource,
+        max_bytes: u64,
+    ) -> Result<ObjectMetadata, CoreError> {
+        Self::put_stream(self, key, source, max_bytes)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_verified(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+        max_bytes: u64,
+    ) -> Result<ArtifactDownload, CoreError> {
+        Self::get_verified(self, key, options, max_bytes)
+            .await
+            .map_err(core_error)
     }
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError> {
         Self::list(self, prefix).await.map_err(core_error)
@@ -364,6 +704,16 @@ impl ArtifactStore for FilesystemObjectStore {
             .await
             .map_err(core_error)
     }
+
+    async fn cleanup_temporary_uploads(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u32, CoreError> {
+        Self::cleanup_temporary_uploads(self, older_than, limit)
+            .await
+            .map_err(core_error)
+    }
 }
 
 fn validate_checksum(expected: &str) -> Result<(), StoreError> {
@@ -373,11 +723,6 @@ fn validate_checksum(expected: &str) -> Result<(), StoreError> {
         ));
     }
     Ok(())
-}
-
-fn actual_checksum(bytes: &[u8], expected: &str) -> Result<bool, StoreError> {
-    validate_checksum(expected)?;
-    Ok(checksum(bytes).eq_ignore_ascii_case(expected))
 }
 
 #[derive(Clone)]
@@ -461,7 +806,7 @@ impl S3ObjectStore {
     pub fn new(config: S3Config) -> Result<Self, StoreError> {
         config.validate()?;
         let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .timeout(config.request_timeout.min(Duration::from_secs(300)))
             .build()
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
         Ok(Self { client, config })
@@ -580,9 +925,10 @@ impl S3ObjectStore {
 }
 
 impl S3ObjectStore {
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, StoreError> {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectMetadata, StoreError> {
         let full_key = self.full_key(key)?;
-        let digest = Sha256::digest(bytes);
+        let size_bytes = bytes.len() as u64;
+        let digest = Sha256::digest(&bytes);
         let body_hash = hex::encode(digest);
         let checksum = BASE64.encode(digest);
         let signed = self.signed(
@@ -599,7 +945,7 @@ impl S3ObjectStore {
             .client
             .request(Method::PUT, signed.url)
             .headers(signed.headers)
-            .body(Bytes::copy_from_slice(bytes))
+            .body(bytes)
             .send()
             .await
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
@@ -611,7 +957,50 @@ impl S3ObjectStore {
             .map(str::to_owned);
         Ok(ObjectMetadata {
             key: key.to_owned(),
-            size_bytes: bytes.len() as u64,
+            size_bytes,
+            checksum_sha256: body_hash,
+            etag,
+        })
+    }
+
+    async fn put_stream(
+        &self,
+        key: &str,
+        source: &mut dyn ArtifactSource,
+        max_bytes: u64,
+    ) -> Result<ObjectMetadata, StoreError> {
+        let full_key = self.full_key(key)?;
+        let mut spool = anonymous_spool().await?;
+        let (size_bytes, digest) = write_source(source, &mut spool, max_bytes).await?;
+        spool.rewind().await?;
+        let body_hash = hex::encode(digest);
+        let signed = self.signed(
+            Method::PUT,
+            &full_key,
+            &body_hash,
+            &[
+                ("content-type", "application/octet-stream".into()),
+                ("content-length", size_bytes.to_string()),
+                ("if-none-match", "*".into()),
+                ("x-amz-checksum-sha256", BASE64.encode(digest)),
+            ],
+        )?;
+        let response = self
+            .client
+            .request(Method::PUT, signed.url)
+            .headers(signed.headers)
+            .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                spool,
+                TRANSFER_CHUNK_BYTES,
+            )))
+            .send()
+            .await
+            .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
+        let response = require_success(response).await?;
+        let etag = response_header(&response, header::ETAG.as_str())?;
+        Ok(ObjectMetadata {
+            key: key.to_owned(),
+            size_bytes,
             checksum_sha256: body_hash,
             etag,
         })
@@ -626,15 +1015,28 @@ impl S3ObjectStore {
         key: &str,
         options: &GetObjectOptions,
     ) -> Result<Vec<u8>, StoreError> {
-        let key = self.full_key(key)?;
+        collect_download(
+            self.get_verified(key, options, LEGACY_DOWNLOAD_LIMIT)
+                .await?,
+        )
+        .await
+    }
+
+    async fn get_verified(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+        max_bytes: u64,
+    ) -> Result<ArtifactDownload, StoreError> {
+        let full_key = self.full_key(key)?;
         if let Some(expected) = &options.expected_checksum_sha256 {
             validate_checksum(expected)?;
         }
-        let mut signed_headers = Vec::new();
+        let mut signed_headers = vec![("x-amz-checksum-mode", "ENABLED".into())];
         if let Some(etag) = &options.if_match {
             signed_headers.push(("if-match", etag.clone()));
         }
-        let signed = self.signed(Method::GET, &key, EMPTY_SHA256, &signed_headers)?;
+        let signed = self.signed(Method::GET, &full_key, EMPTY_SHA256, &signed_headers)?;
         let response = self
             .client
             .request(Method::GET, signed.url)
@@ -642,40 +1044,13 @@ impl S3ObjectStore {
             .send()
             .await
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
-        let remote_checksum = response
-            .headers()
-            .get("x-amz-checksum-sha256")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let bytes = require_success(response)
-            .await?
-            .bytes()
-            .await
-            .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
-        let actual = checksum(&bytes);
-        if let Some(remote) = remote_checksum {
-            let remote = remote.trim_matches('"');
-            let digest = BASE64.decode(remote).map_err(|error| {
-                StoreError::ObjectStore(format!("invalid S3 response checksum: {error}"))
-            })?;
-            if hex::encode(digest) != actual {
-                return Err(StoreError::ObjectStore(
-                    "S3 response checksum mismatch".into(),
-                ));
-            }
+        let response = require_success(response).await?;
+        let declared_size = response.content_length();
+        if let Some(size) = declared_size {
+            check_size(size, max_bytes)?;
         }
-        if let Some(expected) = &options.expected_checksum_sha256
-            && !actual_checksum(&bytes, expected)?
-        {
-            return Err(StoreError::ObjectStore(
-                "S3 object checksum mismatch".into(),
-            ));
-        }
+        let remote_checksum = response_header(&response, "x-amz-checksum-sha256")?;
+        let etag = response_header(&response, header::ETAG.as_str())?;
         if options.if_match.is_some()
             && etag.as_deref().map(|value| value.trim_matches('"'))
                 != options
@@ -687,7 +1062,35 @@ impl S3ObjectStore {
                 "S3 ETag precondition failed".into(),
             ));
         }
-        Ok(bytes.to_vec())
+        let mut reader = StreamReader::new(response.bytes_stream().map_err(std::io::Error::other));
+        let mut spool = anonymous_spool().await?;
+        let (size_bytes, actual) = hash_reader(&mut reader, Some(&mut spool), max_bytes).await?;
+        if declared_size.is_some_and(|size| size != size_bytes) {
+            return Err(StoreError::ObjectStore("S3 object size mismatch".into()));
+        }
+        if let Some(remote) = remote_checksum {
+            let digest = BASE64.decode(remote.trim_matches('"')).map_err(|error| {
+                StoreError::ObjectStore(format!("invalid S3 response checksum: {error}"))
+            })?;
+            if hex::encode(digest) != actual {
+                return Err(StoreError::ObjectStore(
+                    "S3 response checksum mismatch".into(),
+                ));
+            }
+        }
+        verify_digest(&actual, options)?;
+        Ok(ArtifactDownload {
+            metadata: ObjectMetadata {
+                key: key.to_owned(),
+                size_bytes,
+                checksum_sha256: actual,
+                etag,
+            },
+            body: Box::new(SpoolSource {
+                file: spool,
+                remaining: size_bytes,
+            }),
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
@@ -700,6 +1103,9 @@ impl S3ObjectStore {
             .send()
             .await
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         require_success(response).await?;
         Ok(())
     }
@@ -719,6 +1125,9 @@ impl S3ObjectStore {
             .send()
             .await
             .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         require_success(response).await?;
         Ok(())
     }
@@ -726,8 +1135,28 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ArtifactStore for S3ObjectStore {
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError> {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectMetadata, CoreError> {
         Self::put(self, key, bytes).await.map_err(core_error)
+    }
+    async fn put_stream(
+        &self,
+        key: &str,
+        source: &mut dyn ArtifactSource,
+        max_bytes: u64,
+    ) -> Result<ObjectMetadata, CoreError> {
+        Self::put_stream(self, key, source, max_bytes)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_verified(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+        max_bytes: u64,
+    ) -> Result<ArtifactDownload, CoreError> {
+        Self::get_verified(self, key, options, max_bytes)
+            .await
+            .map_err(core_error)
     }
     async fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError> {
         Err(CoreError::Unsupported(
@@ -804,24 +1233,374 @@ fn host_header(url: &Url) -> Result<String, StoreError> {
     Ok(host)
 }
 
-async fn require_success(response: reqwest::Response) -> Result<reqwest::Response, StoreError> {
+fn response_header(response: &reqwest::Response, name: &str) -> Result<Option<String>, StoreError> {
+    response
+        .headers()
+        .get(name)
+        .map(|value| {
+            value.to_str().map(str::to_owned).map_err(|error| {
+                StoreError::ObjectStore(format!("invalid S3 response header: {error}"))
+            })
+        })
+        .transpose()
+}
+
+async fn require_success(mut response: reqwest::Response) -> Result<reqwest::Response, StoreError> {
     if response.status().is_success() {
         return Ok(response);
     }
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| StoreError::ObjectStore(error.to_string()))?;
-    let body: String = body.chars().take(1024).collect();
+    let mut body = Vec::with_capacity(1024);
+    while body.len() < 1024 {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| StoreError::ObjectStore(error.to_string()))?
+        else {
+            break;
+        };
+        let length = chunk.len().min(1024 - body.len());
+        body.extend_from_slice(&chunk[..length]);
+    }
     Err(StoreError::ObjectStore(format!(
-        "S3 request returned {status}: {body}"
+        "S3 request returned {status}: {}",
+        String::from_utf8_lossy(&body)
     )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn filesystem_verified_download_is_bounded_and_refuses_corruption() {
+        let root = std::env::temp_dir().join(format!("aiec-verified-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+        let payload = Bytes::from(vec![0x5a; TRANSFER_CHUNK_BYTES + 17]);
+        let metadata = store
+            .put_stream(
+                "object",
+                &mut BytesSource(payload.clone()),
+                payload.len() as u64,
+            )
+            .await
+            .unwrap();
+        let options = GetObjectOptions {
+            if_match: metadata.etag.clone(),
+            expected_checksum_sha256: Some(metadata.checksum_sha256.clone()),
+        };
+        assert!(matches!(
+            store
+                .get_verified("object", &options, payload.len() as u64 - 1)
+                .await,
+            Err(StoreError::Core(CoreError::LimitExceeded(_)))
+        ));
+        let mut download = store
+            .get_verified("object", &options, payload.len() as u64)
+            .await
+            .unwrap();
+        // The verified body is isolated from subsequent mutations of the object.
+        tokio::fs::write(root.join("object"), b"corrupt")
+            .await
+            .unwrap();
+        assert_eq!(
+            download.body.next_chunk().await.unwrap().unwrap(),
+            payload.slice(..TRANSFER_CHUNK_BYTES)
+        );
+        assert_eq!(
+            download.body.next_chunk().await.unwrap().unwrap(),
+            payload.slice(TRANSFER_CHUNK_BYTES..)
+        );
+        assert!(download.body.next_chunk().await.unwrap().is_none());
+        assert!(
+            store
+                .get_verified("object", &options, payload.len() as u64)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_verified(
+                    "object",
+                    &GetObjectOptions {
+                        if_match: metadata.etag,
+                        expected_checksum_sha256: None,
+                    },
+                    payload.len() as u64
+                )
+                .await
+                .is_err()
+        );
+        drop(download);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    struct PausedSource {
+        first: bool,
+        paused: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl ArtifactSource for PausedSource {
+        async fn next_chunk(&mut self) -> Result<Option<Bytes>, CoreError> {
+            if self.first {
+                self.first = false;
+                return Ok(Some(Bytes::from_static(b"incomplete")));
+            }
+            if let Some(paused) = self.paused.take() {
+                let _ = paused.send(());
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn filesystem_cancelled_upload_cleans_staging_and_releases_ownership() {
+        let root = std::env::temp_dir().join(format!("aiec-aborted-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+        let (paused, wait) = tokio::sync::oneshot::channel();
+        let uploader = store.clone();
+        let task = tokio::spawn(async move {
+            uploader
+                .put_stream(
+                    "object",
+                    &mut PausedSource {
+                        first: true,
+                        paused: Some(paused),
+                    },
+                    1024,
+                )
+                .await
+        });
+        wait.await.unwrap();
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let temporary = entries.next_entry().await.unwrap().unwrap().path();
+        assert!(
+            temporary
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".aiec-upload.")
+        );
+        let janitor = FilesystemObjectStore::new(&root);
+        assert_eq!(
+            janitor
+                .cleanup_temporary_uploads(Utc::now() + chrono::Duration::hours(1), 100)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(temporary.exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!temporary.exists());
+        assert!(!root.join("object").exists());
+        let metadata = store
+            .put_stream(
+                "object",
+                &mut BytesSource(Bytes::from_static(b"complete")),
+                8,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata.checksum_sha256,
+            hex::encode(Sha256::digest(b"complete"))
+        );
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        assert_eq!(
+            entries.next_entry().await.unwrap().unwrap().file_name(),
+            "object"
+        );
+        assert!(entries.next_entry().await.unwrap().is_none());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filesystem_rejected_stream_never_replaces_committed_object() {
+        let root = std::env::temp_dir().join(format!("aiec-overflow-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+        store
+            .put("object", Bytes::from_static(b"original"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .put_stream(
+                    "object",
+                    &mut BytesSource(Bytes::from_static(b"too large")),
+                    8
+                )
+                .await,
+            Err(StoreError::Core(CoreError::LimitExceeded(_)))
+        ));
+        assert_eq!(store.get("object").await.unwrap(), b"original");
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        assert_eq!(
+            entries.next_entry().await.unwrap().unwrap().file_name(),
+            "object"
+        );
+        assert!(entries.next_entry().await.unwrap().is_none());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    async fn s3_response(response: Vec<u8>) -> (S3ObjectStore, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            // Oversized declared bodies may be refused before the server finishes.
+            let _ = socket.write_all(&response).await;
+        });
+        let store = S3ObjectStore::new(S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "examplebucket".into(),
+            access_key_id: "test".into(),
+            secret_access_key: "test".into(),
+            prefix: String::new(),
+            request_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        (store, server)
+    }
+
+    #[tokio::test]
+    async fn s3_verified_download_rejects_declared_and_actual_oversize() {
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n123456789".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n9\r\n123456789\r\n0\r\n\r\n".to_vec(),
+        ] {
+            let (store, server) = s3_response(response).await;
+            assert!(matches!(
+                store.get_verified("object", &GetObjectOptions::default(), 8).await,
+                Err(StoreError::Core(CoreError::LimitExceeded(_)))
+            ));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_verified_download_checks_checksum_version_and_truncation_before_return() {
+        let digest = hex::encode(Sha256::digest(b"payload"));
+        let options = GetObjectOptions {
+            if_match: Some("\"version\"".into()),
+            expected_checksum_sha256: Some(digest),
+        };
+        for headers in [
+            "Content-Length: 7\r\nETag: \"other\"\r\n",
+            "Content-Length: 7\r\nETag: \"version\"\r\nx-amz-checksum-sha256: aW52YWxpZA==\r\n",
+            "Content-Length: 8\r\nETag: \"version\"\r\n",
+        ] {
+            let (store, server) = s3_response(
+                format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\npayload")
+                    .into_bytes(),
+            )
+            .await;
+            assert!(store.get_verified("object", &options, 8).await.is_err());
+            server.await.unwrap();
+        }
+        let (store, server) = s3_response(format!(
+            "HTTP/1.1 200 OK\r\nETag: \"version\"\r\nx-amz-checksum-sha256: {}\r\nConnection: close\r\n\r\npayload",
+            BASE64.encode(Sha256::digest(b"payload"))
+        ).into_bytes()).await;
+        let download = store.get_verified("object", &options, 7).await.unwrap();
+        assert_eq!(collect_download(download).await.unwrap(), b"payload");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn untrusted_download_reads_only_one_sentinel_byte_past_limit() {
+        let payload = [0x5a; TRANSFER_CHUNK_BYTES * 2];
+        let mut reader = payload.as_slice();
+        let mut spool = anonymous_spool().await.unwrap();
+        assert!(matches!(
+            hash_reader(&mut reader, Some(&mut spool), 8).await,
+            Err(StoreError::Core(CoreError::LimitExceeded(_)))
+        ));
+        assert_eq!(reader.len(), payload.len() - 9);
+        // An oversized first read is rejected before any bytes reach the spool.
+        assert_eq!(spool.metadata().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_s3_verification_closes_unfinished_backend_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n")
+                .await
+                .unwrap();
+            sent.send(()).unwrap();
+            let count = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "cancelled download kept the backend response alive"
+            );
+        });
+        let store = S3ObjectStore::new(S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "examplebucket".into(),
+            access_key_id: "test".into(),
+            secret_access_key: "test".into(),
+            prefix: String::new(),
+            request_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let task = tokio::spawn(async move {
+            store
+                .get_verified("object", &GetObjectOptions::default(), 8)
+                .await
+                .map(|_| ())
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_spool_is_unlinked_before_any_body_is_written() {
+        use std::os::unix::fs::MetadataExt;
+        let mut spool = anonymous_spool().await.unwrap();
+        assert_eq!(spool.metadata().await.unwrap().nlink(), 0);
+        spool.write_all(b"private verified body").await.unwrap();
+        spool.rewind().await.unwrap();
+        let mut body = SpoolSource {
+            file: spool,
+            remaining: 21,
+        };
+        assert_eq!(
+            body.next_chunk().await.unwrap().unwrap(),
+            b"private verified body".as_slice()
+        );
+        drop(body);
+    }
 
     fn store() -> S3ObjectStore {
         S3ObjectStore::new(S3Config {
@@ -860,13 +1639,30 @@ mod tests {
         let payload = b"aiec live S3 artifact";
         let operation = async {
             let metadata = store
-                .put(&key, payload)
+                .put_stream(
+                    &key,
+                    &mut BytesSource(Bytes::from_static(payload)),
+                    payload.len() as u64,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             if metadata.size_bytes != payload.len() as u64 {
                 return Err(format!("unexpected object size: {}", metadata.size_bytes));
             }
-            let downloaded = store.get(&key).await.map_err(|error| error.to_string())?;
+            let download = store
+                .get_verified(
+                    &key,
+                    &GetObjectOptions {
+                        if_match: metadata.etag,
+                        expected_checksum_sha256: Some(metadata.checksum_sha256),
+                    },
+                    payload.len() as u64,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let downloaded = collect_download(download)
+                .await
+                .map_err(|error| error.to_string())?;
             if downloaded != payload {
                 return Err("downloaded object bytes differ".into());
             }
@@ -900,7 +1696,10 @@ mod tests {
     async fn filesystem_list_omits_in_progress_temp_files() {
         let root = std::env::temp_dir().join(format!("aiec-list-{}", Uuid::new_v4()));
         let store = FilesystemObjectStore::new(&root);
-        store.put("prefix/committed", b"payload").await.unwrap();
+        store
+            .put("prefix/committed", Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
         tokio::fs::create_dir_all(root.join("prefix"))
             .await
             .unwrap();
@@ -911,6 +1710,61 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].key, "prefix/committed");
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temporary_gc_bounds_scanning_and_preserves_fresh_owned_and_nonupload_files() {
+        let root = std::env::temp_dir().join(format!("aiec-temp-gc-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        let staging = |name: &str| {
+            let path = root.join("nested").join(name);
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            (path, file)
+        };
+        let (abandoned, abandoned_owner) = staging(&format!(".aiec-upload.{}.tmp", Uuid::new_v4()));
+        drop(abandoned_owner);
+        let (owned, owner) = staging(&format!(".aiec-upload.{}.tmp", Uuid::new_v4()));
+        lock_temporary_file(&owner).unwrap();
+        let (nonupload, file) = staging("committed-object");
+        drop(file);
+        let fresh = root
+            .join("nested")
+            .join(format!(".aiec-upload.{}.tmp", Uuid::new_v4()));
+        tokio::fs::write(&fresh, b"in-progress").await.unwrap();
+        // A separately created store tests the cross-instance OS lock, not just
+        // the per-instance mutex used by normal uploads.
+        let janitor = FilesystemObjectStore::new(&root);
+        let cutoff = Utc::now() - chrono::Duration::hours(1);
+        let mut removed = 0;
+        for _ in 0..20 {
+            let count = janitor.cleanup_temporary_uploads(cutoff, 1).await.unwrap();
+            assert!(count <= 1);
+            removed += count;
+        }
+        assert_eq!(removed, 1);
+        assert!(!abandoned.exists());
+        assert!(owned.exists());
+        assert!(nonupload.exists());
+        assert!(fresh.exists());
+        drop(owner);
+        for _ in 0..20 {
+            removed += janitor.cleanup_temporary_uploads(cutoff, 1).await.unwrap();
+        }
+        assert_eq!(removed, 2);
+        assert!(!owned.exists());
+        assert!(nonupload.exists());
+        assert!(fresh.exists());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[tokio::test]
@@ -949,14 +1803,20 @@ mod tests {
         let store = FilesystemObjectStore::new(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let metadata = store.put("nested/object", b"payload").await.unwrap();
+            let metadata = store
+                .put("nested/object", Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
             let etag = metadata.etag.unwrap();
             assert!(store.delete("nested/object").await.is_ok());
             assert!(store.delete("nested/object").await.is_ok());
             assert!(store.delete("missing/nested/object").await.is_ok());
             assert!(!root.join("missing").exists());
 
-            let metadata = store.put("conditional/object", b"payload").await.unwrap();
+            let metadata = store
+                .put("conditional/object", Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
             assert!(
                 store
                     .delete_if_match("conditional/object", "wrong-etag")

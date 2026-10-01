@@ -1,12 +1,11 @@
+mod artifact_gc;
 mod images;
+mod matrix;
+mod memory_artifact_gc;
 mod object_store;
 mod postgres;
+mod run_queue;
 mod snapshots;
-
-pub use images::{SignedImageResolver, StandardImageResolver};
-pub use object_store::{FilesystemObjectStore, S3Config, S3ObjectStore};
-pub use postgres::PostgresScheduler;
-pub use snapshots::{snapshot_capabilities, snapshot_kind, snapshot_metadata};
 
 use aiec_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
@@ -19,8 +18,15 @@ use aiec_core::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+pub use images::{SignedImageResolver, StandardImageResolver};
+pub use object_store::{FilesystemObjectStore, S3Config, S3ObjectStore};
+pub use postgres::PostgresScheduler;
+pub use snapshots::{snapshot_capabilities, snapshot_kind, snapshot_metadata};
 use sqlx::PgPool;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -115,6 +121,8 @@ struct MemoryData {
     stored_snapshots: HashMap<Uuid, StoredSnapshot>,
     nodes: HashMap<Uuid, Node>,
     tenants: HashMap<Uuid, TenantRecord>,
+    artifact_objects: BTreeMap<String, memory_artifact_gc::MemoryArtifact>,
+    artifact_scan: Option<String>,
 }
 
 #[derive(Default)]
@@ -249,9 +257,12 @@ impl MemoryRepository {
 
     async fn put_snapshot(&self, value: Snapshot) -> Result<(), StoreError> {
         let mut data = self.data.write().await;
-        if data.snapshots.contains_key(&value.id) {
+        // PostgreSQL keeps one `snapshots` row per snapshot: a basic insert and
+        // a stored insert are the same primary key, not two records.
+        if data.snapshots.contains_key(&value.id) || data.stored_snapshots.contains_key(&value.id) {
             return Err(StoreError::Conflict("snapshot exists".into()));
         }
+        memory_artifact_gc::link_keys(&mut data, value.tenant_id, &[Some(&value.object_key)])?;
         data.snapshots.insert(value.id, value);
         Ok(())
     }
@@ -285,13 +296,35 @@ impl MemoryRepository {
 
     async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
         let mut data = self.data.write().await;
-        if data
-            .snapshots
-            .remove(&id)
-            .filter(|value| value.tenant_id == tenant)
-            .is_none()
-        {
+        // The stored and basic views are written together and share one owning
+        // tenant, so either authorises the delete and a foreign tenant sees
+        // nothing to delete.
+        let owned = data
+            .stored_snapshots
+            .get(&id)
+            .is_some_and(|value| value.tenant_id == tenant)
+            || data
+                .snapshots
+                .get(&id)
+                .is_some_and(|value| value.tenant_id == tenant);
+        if !owned {
             return Err(StoreError::NotFound);
+        }
+        let basic_key = data
+            .snapshots
+            .get(&id)
+            .map(|value| value.object_key.clone());
+        data.snapshots.remove(&id);
+        // One stored row carries every object role, so its keys are unlinked
+        // once each; a basic-only snapshot references its primary key alone.
+        match data.stored_snapshots.remove(&id) {
+            Some(stored) => {
+                memory_artifact_gc::unlink_keys(
+                    &mut data,
+                    &memory_artifact_gc::stored_keys(&stored),
+                );
+            }
+            None => memory_artifact_gc::unlink_keys(&mut data, &[basic_key.as_deref()]),
         }
         Ok(())
     }
@@ -356,11 +389,31 @@ impl MemoryRepository {
             .cloned()
             .collect())
     }
+    /// PostgreSQL records a stored snapshot as that same `snapshots` row, so the
+    /// basic view is written with it under one lock: a stored-only insert is
+    /// listable, gettable and deletable, and each object key is referenced once.
     async fn put_stored_snapshot(&self, value: StoredSnapshot) -> Result<(), StoreError> {
         let mut data = self.data.write().await;
-        if data.stored_snapshots.contains_key(&value.id) {
+        if data.snapshots.contains_key(&value.id) || data.stored_snapshots.contains_key(&value.id) {
             return Err(StoreError::Conflict("snapshot exists".into()));
         }
+        memory_artifact_gc::link_keys(
+            &mut data,
+            value.tenant_id,
+            &memory_artifact_gc::stored_keys(&value),
+        )?;
+        data.snapshots.insert(
+            value.id,
+            Snapshot {
+                id: value.id,
+                tenant_id: value.tenant_id,
+                sandbox_id: value.sandbox_id,
+                object_key: value.object_key.clone(),
+                size_bytes: value.size_bytes,
+                image_id: value.image_id.clone(),
+                created_at: value.created_at,
+            },
+        );
         data.stored_snapshots.insert(value.id, value);
         Ok(())
     }
@@ -426,12 +479,13 @@ impl MetadataStore for MemoryRepository {
             .map_err(core_error)
     }
 
-    async fn update_state_with_generation(
+    async fn update_state_with_lease(
         &self,
         _tenant: Uuid,
         _id: Uuid,
         _expected: SandboxState,
         _next: SandboxState,
+        _lease_id: Uuid,
         _generation: i64,
     ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("memory metadata store".into()))
@@ -720,6 +774,50 @@ impl MetadataStore for MemoryRepository {
         _limit: u32,
     ) -> Result<Vec<AuditEvent>, CoreError> {
         Err(CoreError::Unsupported("memory metadata store".into()))
+    }
+
+    async fn reserve_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        Self::reserve_artifact_upload(self, tenant, run, key).await
+    }
+    async fn complete_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        Self::complete_artifact_upload(self, tenant, run, key).await
+    }
+    async fn claim_artifact_deletions(
+        &self,
+        now: chrono::DateTime<Utc>,
+        retention_seconds: i64,
+        pending_grace_seconds: i64,
+        limit: u32,
+        lease_seconds: i64,
+    ) -> Result<Vec<aiec_core::storage::ArtifactDeletion>, CoreError> {
+        Self::claim_artifact_deletions(
+            self,
+            now,
+            retention_seconds,
+            pending_grace_seconds,
+            limit,
+            lease_seconds,
+        )
+        .await
+    }
+    async fn finish_artifact_deletion(
+        &self,
+        key: &str,
+        claim: Uuid,
+        deleted: bool,
+        retry_at: chrono::DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        Self::finish_artifact_deletion(self, key, claim, deleted, retry_at).await
     }
 }
 

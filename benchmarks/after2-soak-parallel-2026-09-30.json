@@ -1,0 +1,5790 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "run",
+  "generated_at": "2026-10-01T06:22:04+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 408,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "soak"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 80,
+      "parallelism": 4,
+      "checkpoint_every": 20
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 10
+  },
+  "conditions_fingerprint": "85b132f9f645ba84",
+  "scenarios": {
+    "soak": {
+      "succeeded": 77,
+      "not_succeeded": 3,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 77,
+        "failed": 3
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 13.366,
+        "max_s": 23.9289,
+        "mean_s": 15.9846,
+        "median_s": 15.592,
+        "p50_s": 15.592,
+        "p95_s": 20.0437,
+        "p99_s": 23.9289
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 5.2988,
+        "max_s": 10.6317,
+        "mean_s": 6.5578,
+        "median_s": 6.3623,
+        "p50_s": 6.3623,
+        "p95_s": 8.3809,
+        "p99_s": 10.6317
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 7.1033,
+        "max_s": 14.0674,
+        "mean_s": 8.3879,
+        "median_s": 7.9152,
+        "p50_s": 7.9152,
+        "p95_s": 11.2884,
+        "p99_s": 14.0674
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 7.1033,
+        "max_s": 14.0674,
+        "mean_s": 8.3879,
+        "median_s": 7.9152,
+        "p50_s": 7.9152,
+        "p95_s": 11.2884,
+        "p99_s": 14.0674
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 12.0441,
+        "max_s": 21.0802,
+        "mean_s": 13.9405,
+        "median_s": 13.3186,
+        "p50_s": 13.3186,
+        "p95_s": 17.3037,
+        "p99_s": 21.0802
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 2.871,
+        "max_s": 10.404,
+        "mean_s": 3.6115,
+        "median_s": 3.203,
+        "p50_s": 3.203,
+        "p95_s": 6.093,
+        "p99_s": 10.404
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 4.244,
+        "max_s": 7.811,
+        "mean_s": 5.1001,
+        "median_s": 4.813,
+        "p50_s": 4.813,
+        "p95_s": 7.28,
+        "p99_s": 7.811
+      },
+      "phase_placement.allocation": {
+        "metric": "phase_placement.allocation",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.462,
+        "max_s": 0.686,
+        "mean_s": 0.5184,
+        "median_s": 0.515,
+        "p50_s": 0.515,
+        "p95_s": 0.57,
+        "p99_s": 0.686
+      },
+      "phase_placement.boot": {
+        "metric": "phase_placement.boot",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.484,
+        "max_s": 0.873,
+        "mean_s": 0.5359,
+        "median_s": 0.529,
+        "p50_s": 0.529,
+        "p95_s": 0.609,
+        "p99_s": 0.873
+      },
+      "phase_placement.scheduler": {
+        "metric": "phase_placement.scheduler",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 1.648,
+        "max_s": 5.003,
+        "mean_s": 2.2526,
+        "median_s": 1.986,
+        "p50_s": 1.986,
+        "p95_s": 4.16,
+        "p99_s": 5.003
+      },
+      "phase_placement.workspace": {
+        "metric": "phase_placement.workspace",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 77,
+        "min_s": 0.639,
+        "max_s": 0.857,
+        "mean_s": 0.7152,
+        "median_s": 0.709,
+        "p50_s": 0.709,
+        "p95_s": 0.82,
+        "p99_s": 0.857
+      },
+      "failure_reasons": {
+        "backend unavailable: transient: no schedulable worker has capacity": 3
+      },
+      "shape": {
+        "iterations_requested": 80,
+        "iterations_executed": 80,
+        "parallelism": 4,
+        "mode": "bounded parallel",
+        "wall_clock_s": 369.296,
+        "stopped_early": "no: every requested iteration was executed",
+        "checkpoint_every": 20
+      },
+      "throughput": {
+        "available": true,
+        "runs_per_minute": 12.51,
+        "note": "successful runs per minute of wall clock, including the time spent waiting for machines; a queue that refuses work lowers this without making the control plane slower"
+      },
+      "checkpoints": [
+        {
+          "at": "2026-10-01T06:16:10+00:00",
+          "iterations": 1,
+          "wall_clock_s": 17.404,
+          "succeeded": 1,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 1
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 17.4019,
+            "max_s": 17.4019,
+            "mean_s": 17.4019,
+            "median_s": 17.4019,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:13+00:00",
+          "iterations": 2,
+          "wall_clock_s": 20.245,
+          "succeeded": 2,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 2
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 2,
+            "min_s": 17.4019,
+            "max_s": 20.0437,
+            "mean_s": 18.7228,
+            "median_s": 18.7228,
+            "percentiles_withheld": "2 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:15+00:00",
+          "iterations": 3,
+          "wall_clock_s": 21.876,
+          "succeeded": 3,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 3,
+            "min_s": 17.4019,
+            "max_s": 21.1411,
+            "mean_s": 19.5289,
+            "median_s": 20.0437,
+            "percentiles_withheld": "3 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:17+00:00",
+          "iterations": 4,
+          "wall_clock_s": 23.752,
+          "succeeded": 4,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 4
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 4,
+            "min_s": 17.4019,
+            "max_s": 22.1447,
+            "mean_s": 20.1828,
+            "median_s": 20.5924,
+            "percentiles_withheld": "4 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:29+00:00",
+          "iterations": 5,
+          "wall_clock_s": 36.119,
+          "succeeded": 5,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 5
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 5,
+            "min_s": 16.9348,
+            "max_s": 22.1447,
+            "mean_s": 19.5332,
+            "median_s": 20.0437,
+            "percentiles_withheld": "5 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:32+00:00",
+          "iterations": 6,
+          "wall_clock_s": 39.54,
+          "succeeded": 6,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 6
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 6,
+            "min_s": 16.9348,
+            "max_s": 22.1447,
+            "mean_s": 19.1883,
+            "median_s": 18.7538,
+            "percentiles_withheld": "6 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:34+00:00",
+          "iterations": 7,
+          "wall_clock_s": 41.498,
+          "succeeded": 7,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 7
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 7,
+            "min_s": 16.9348,
+            "max_s": 22.1447,
+            "mean_s": 18.9459,
+            "median_s": 17.4913,
+            "percentiles_withheld": "7 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:36+00:00",
+          "iterations": 8,
+          "wall_clock_s": 43.312,
+          "succeeded": 8,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 8
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 8,
+            "min_s": 16.9348,
+            "max_s": 22.1447,
+            "mean_s": 18.7596,
+            "median_s": 17.4776,
+            "percentiles_withheld": "8 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:47+00:00",
+          "iterations": 9,
+          "wall_clock_s": 54.116,
+          "succeeded": 9,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 9
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 9,
+            "min_s": 16.3322,
+            "max_s": 22.1447,
+            "mean_s": 18.4899,
+            "median_s": 17.4638,
+            "percentiles_withheld": "9 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:50+00:00",
+          "iterations": 10,
+          "wall_clock_s": 57.419,
+          "succeeded": 10,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 10
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 10,
+            "min_s": 15.7202,
+            "max_s": 22.1447,
+            "mean_s": 18.2129,
+            "median_s": 17.4597,
+            "percentiles_withheld": "10 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:55+00:00",
+          "iterations": 11,
+          "wall_clock_s": 62.271,
+          "succeeded": 11,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 11
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 11,
+            "min_s": 15.7202,
+            "max_s": 22.1447,
+            "mean_s": 18.2626,
+            "median_s": 17.4638,
+            "percentiles_withheld": "11 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:16:57+00:00",
+          "iterations": 12,
+          "wall_clock_s": 63.833,
+          "succeeded": 12,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 12
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 12,
+            "min_s": 15.7202,
+            "max_s": 22.1447,
+            "mean_s": 18.2093,
+            "median_s": 17.4776,
+            "percentiles_withheld": "12 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:05+00:00",
+          "iterations": 13,
+          "wall_clock_s": 72.223,
+          "succeeded": 13,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 13
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 13,
+            "min_s": 15.7202,
+            "max_s": 22.1447,
+            "mean_s": 18.0499,
+            "median_s": 17.4638,
+            "percentiles_withheld": "13 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:07+00:00",
+          "iterations": 14,
+          "wall_clock_s": 74.625,
+          "succeeded": 14,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 14
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 14,
+            "min_s": 15.5819,
+            "max_s": 22.1447,
+            "mean_s": 17.8736,
+            "median_s": 17.4597,
+            "percentiles_withheld": "14 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:09+00:00",
+          "iterations": 15,
+          "wall_clock_s": 76.157,
+          "succeeded": 14,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 14,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 14,
+            "min_s": 15.5819,
+            "max_s": 22.1447,
+            "mean_s": 17.8736,
+            "median_s": 17.4597,
+            "percentiles_withheld": "14 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:13+00:00",
+          "iterations": 16,
+          "wall_clock_s": 79.721,
+          "succeeded": 15,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 15,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 15,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.6368,
+            "median_s": 17.4556,
+            "percentiles_withheld": "15 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:22+00:00",
+          "iterations": 17,
+          "wall_clock_s": 89.473,
+          "succeeded": 16,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 16,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 16,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.5217,
+            "median_s": 17.4287,
+            "percentiles_withheld": "16 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:24+00:00",
+          "iterations": 18,
+          "wall_clock_s": 91.046,
+          "succeeded": 17,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 17,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 17,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.344,
+            "median_s": 17.4019,
+            "percentiles_withheld": "17 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:26+00:00",
+          "iterations": 19,
+          "wall_clock_s": 92.904,
+          "succeeded": 18,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 18,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 18,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.2331,
+            "median_s": 17.1684,
+            "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:27+00:00",
+          "iterations": 20,
+          "wall_clock_s": 94.439,
+          "succeeded": 18,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 18,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 18,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.2331,
+            "median_s": 17.1684,
+            "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:39+00:00",
+          "iterations": 21,
+          "wall_clock_s": 106.656,
+          "succeeded": 19,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 19,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 19,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.1371,
+            "median_s": 16.9348,
+            "percentiles_withheld": "19 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:44+00:00",
+          "iterations": 22,
+          "wall_clock_s": 110.975,
+          "succeeded": 20,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 20,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 20,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.1982,
+            "median_s": 17.1684,
+            "p50_s": 16.9348,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:45+00:00",
+          "iterations": 23,
+          "wall_clock_s": 112.483,
+          "succeeded": 21,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 21,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 21,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.1276,
+            "median_s": 16.9348,
+            "p50_s": 16.9348,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:47+00:00",
+          "iterations": 24,
+          "wall_clock_s": 114.072,
+          "succeeded": 22,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 22,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 22,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.0872,
+            "median_s": 16.6335,
+            "p50_s": 16.3322,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:17:57+00:00",
+          "iterations": 25,
+          "wall_clock_s": 123.723,
+          "succeeded": 23,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 23,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 23,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.0199,
+            "median_s": 16.3322,
+            "p50_s": 16.3322,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:03+00:00",
+          "iterations": 26,
+          "wall_clock_s": 130.507,
+          "succeeded": 24,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 24,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 24,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.0535,
+            "median_s": 16.6335,
+            "p50_s": 16.3322,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:05+00:00",
+          "iterations": 27,
+          "wall_clock_s": 132.018,
+          "succeeded": 25,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 25,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.0377,
+            "median_s": 16.6593,
+            "p50_s": 16.6593,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:06+00:00",
+          "iterations": 28,
+          "wall_clock_s": 133.491,
+          "succeeded": 26,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 26,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 26,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 17.0201,
+            "median_s": 16.6199,
+            "p50_s": 16.5805,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:14+00:00",
+          "iterations": 29,
+          "wall_clock_s": 140.8,
+          "succeeded": 27,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 27,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 27,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 16.9653,
+            "median_s": 16.5805,
+            "p50_s": 16.5805,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:21+00:00",
+          "iterations": 30,
+          "wall_clock_s": 148.33,
+          "succeeded": 28,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 28,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 28,
+            "min_s": 14.3216,
+            "max_s": 22.1447,
+            "mean_s": 16.9348,
+            "median_s": 16.4564,
+            "p50_s": 16.3322,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:23+00:00",
+          "iterations": 31,
+          "wall_clock_s": 149.832,
+          "succeeded": 29,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 29,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 29,
+            "min_s": 14.2409,
+            "max_s": 22.1447,
+            "mean_s": 16.8419,
+            "median_s": 16.3322,
+            "p50_s": 16.3322,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:24+00:00",
+          "iterations": 32,
+          "wall_clock_s": 151.26,
+          "succeeded": 30,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 30,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 30,
+            "min_s": 13.9455,
+            "max_s": 22.1447,
+            "mean_s": 16.7453,
+            "median_s": 16.2858,
+            "p50_s": 16.2395,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:29+00:00",
+          "iterations": 33,
+          "wall_clock_s": 155.845,
+          "succeeded": 31,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 31,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 31,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.6363,
+            "median_s": 16.2395,
+            "p50_s": 16.2395,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:30+00:00",
+          "iterations": 34,
+          "wall_clock_s": 157.26,
+          "succeeded": 31,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 31,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 31,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.6363,
+            "median_s": 16.2395,
+            "p50_s": 16.2395,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:39+00:00",
+          "iterations": 35,
+          "wall_clock_s": 166.356,
+          "succeeded": 32,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 32,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 32,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.5819,
+            "median_s": 16.1881,
+            "p50_s": 16.1367,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:42+00:00",
+          "iterations": 36,
+          "wall_clock_s": 169.366,
+          "succeeded": 33,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 33,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 33,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.5814,
+            "median_s": 16.2395,
+            "p50_s": 16.2395,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:44+00:00",
+          "iterations": 37,
+          "wall_clock_s": 171.539,
+          "succeeded": 34,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 34,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 34,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.5078,
+            "median_s": 16.1881,
+            "p50_s": 16.1367,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:47+00:00",
+          "iterations": 38,
+          "wall_clock_s": 174.096,
+          "succeeded": 35,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 35,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 35,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.4728,
+            "median_s": 16.1367,
+            "p50_s": 16.1367,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:57+00:00",
+          "iterations": 39,
+          "wall_clock_s": 184.104,
+          "succeeded": 36,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 36,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 36,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.4695,
+            "median_s": 16.1881,
+            "p50_s": 16.1367,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:18:59+00:00",
+          "iterations": 40,
+          "wall_clock_s": 186.228,
+          "succeeded": 37,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 37,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 37,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.4432,
+            "median_s": 16.1367,
+            "p50_s": 16.1367,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:02+00:00",
+          "iterations": 41,
+          "wall_clock_s": 188.821,
+          "succeeded": 38,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 38,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 38,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.4219,
+            "median_s": 16.1242,
+            "p50_s": 16.1117,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:03+00:00",
+          "iterations": 42,
+          "wall_clock_s": 190.313,
+          "succeeded": 39,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 39,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 39,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.3539,
+            "median_s": 16.1117,
+            "p50_s": 16.1117,
+            "p95_s": 21.1411,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:13+00:00",
+          "iterations": 43,
+          "wall_clock_s": 200.03,
+          "succeeded": 40,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 40,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 40,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.3058,
+            "median_s": 15.9531,
+            "p50_s": 15.7945,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:16+00:00",
+          "iterations": 44,
+          "wall_clock_s": 202.995,
+          "succeeded": 41,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 41,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 41,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.2799,
+            "median_s": 15.7945,
+            "p50_s": 15.7945,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:18+00:00",
+          "iterations": 45,
+          "wall_clock_s": 204.961,
+          "succeeded": 42,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 42,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 42,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.2363,
+            "median_s": 15.7574,
+            "p50_s": 15.7202,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:21+00:00",
+          "iterations": 46,
+          "wall_clock_s": 207.823,
+          "succeeded": 43,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 43,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 43,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.2327,
+            "median_s": 15.7945,
+            "p50_s": 15.7945,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:31+00:00",
+          "iterations": 47,
+          "wall_clock_s": 217.794,
+          "succeeded": 44,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 44,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 44,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.2321,
+            "median_s": 15.9388,
+            "p50_s": 15.7945,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:32+00:00",
+          "iterations": 48,
+          "wall_clock_s": 219.301,
+          "succeeded": 45,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 45,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 45,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.1908,
+            "median_s": 15.7945,
+            "p50_s": 15.7945,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:35+00:00",
+          "iterations": 49,
+          "wall_clock_s": 222.111,
+          "succeeded": 46,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 46,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 46,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.1766,
+            "median_s": 15.7574,
+            "p50_s": 15.7202,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:36+00:00",
+          "iterations": 50,
+          "wall_clock_s": 223.586,
+          "succeeded": 47,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 47,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 47,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.1365,
+            "median_s": 15.7202,
+            "p50_s": 15.7202,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:47+00:00",
+          "iterations": 51,
+          "wall_clock_s": 233.72,
+          "succeeded": 48,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 48,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 48,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.0965,
+            "median_s": 15.7179,
+            "p50_s": 15.7156,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:49+00:00",
+          "iterations": 52,
+          "wall_clock_s": 235.865,
+          "succeeded": 49,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 49,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 49,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.0692,
+            "median_s": 15.7156,
+            "p50_s": 15.7156,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:51+00:00",
+          "iterations": 53,
+          "wall_clock_s": 237.9,
+          "succeeded": 50,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 50,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 50,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.0342,
+            "median_s": 15.6736,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:19:53+00:00",
+          "iterations": 54,
+          "wall_clock_s": 240.489,
+          "succeeded": 51,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 51,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 51,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 16.0191,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:03+00:00",
+          "iterations": 55,
+          "wall_clock_s": 249.975,
+          "succeeded": 52,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 52,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 10.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 52,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 15.9785,
+            "median_s": 15.6067,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:06+00:00",
+          "iterations": 56,
+          "wall_clock_s": 253.643,
+          "succeeded": 53,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 53,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 53,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 15.9813,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:08+00:00",
+          "iterations": 57,
+          "wall_clock_s": 255.244,
+          "succeeded": 54,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 54,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 54,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 15.9691,
+            "median_s": 15.6067,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:10+00:00",
+          "iterations": 58,
+          "wall_clock_s": 256.669,
+          "succeeded": 55,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 55,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 55,
+            "min_s": 13.366,
+            "max_s": 22.1447,
+            "mean_s": 15.9385,
+            "median_s": 15.5819,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 22.1447
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:28+00:00",
+          "iterations": 59,
+          "wall_clock_s": 275.445,
+          "succeeded": 56,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 56,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 56,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0812,
+            "median_s": 15.6067,
+            "p50_s": 15.5819,
+            "p95_s": 21.1411,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:30+00:00",
+          "iterations": 60,
+          "wall_clock_s": 277.011,
+          "succeeded": 57,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 57,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 57,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.1117,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 21.1411,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:32+00:00",
+          "iterations": 61,
+          "wall_clock_s": 278.68,
+          "succeeded": 58,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 58,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 58,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.1025,
+            "median_s": 15.6067,
+            "p50_s": 15.5819,
+            "p95_s": 21.1411,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:33+00:00",
+          "iterations": 62,
+          "wall_clock_s": 280.092,
+          "succeeded": 59,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 59,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 59,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.1187,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 21.1411,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:44+00:00",
+          "iterations": 63,
+          "wall_clock_s": 291.423,
+          "succeeded": 60,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 60,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 2,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 60,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0869,
+            "median_s": 15.6067,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:46+00:00",
+          "iterations": 64,
+          "wall_clock_s": 293.335,
+          "succeeded": 61,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 61,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 61,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0601,
+            "median_s": 15.5819,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:49+00:00",
+          "iterations": 65,
+          "wall_clock_s": 295.884,
+          "succeeded": 62,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 62,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 62,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0526,
+            "median_s": 15.5869,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:20:50+00:00",
+          "iterations": 66,
+          "wall_clock_s": 297.417,
+          "succeeded": 63,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 63,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 1,
+          "available_vcpus": 11.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 63,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0276,
+            "median_s": 15.5819,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:04+00:00",
+          "iterations": 67,
+          "wall_clock_s": 311.2,
+          "succeeded": 64,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 64,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 64,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0631,
+            "median_s": 15.5869,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:06+00:00",
+          "iterations": 68,
+          "wall_clock_s": 312.724,
+          "succeeded": 65,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 65,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 65,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0667,
+            "median_s": 15.592,
+            "p50_s": 15.592,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:07+00:00",
+          "iterations": 69,
+          "wall_clock_s": 314.157,
+          "succeeded": 66,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 66,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 66,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0417,
+            "median_s": 15.5869,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:09+00:00",
+          "iterations": 70,
+          "wall_clock_s": 315.688,
+          "succeeded": 67,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 67,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 67,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0262,
+            "median_s": 15.5819,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:24+00:00",
+          "iterations": 71,
+          "wall_clock_s": 330.691,
+          "succeeded": 68,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 68,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 68,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0518,
+            "median_s": 15.5869,
+            "p50_s": 15.5819,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:25+00:00",
+          "iterations": 72,
+          "wall_clock_s": 332.14,
+          "succeeded": 69,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 69,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 69,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0523,
+            "median_s": 15.592,
+            "p50_s": 15.592,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:26+00:00",
+          "iterations": 73,
+          "wall_clock_s": 333.639,
+          "succeeded": 70,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 70,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 70,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0588,
+            "median_s": 15.6117,
+            "p50_s": 15.592,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:28+00:00",
+          "iterations": 74,
+          "wall_clock_s": 335.229,
+          "succeeded": 71,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 71,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 71,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0622,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:41+00:00",
+          "iterations": 75,
+          "wall_clock_s": 348.58,
+          "succeeded": 72,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 72,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 72,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0647,
+            "median_s": 15.6736,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:43+00:00",
+          "iterations": 76,
+          "wall_clock_s": 350.089,
+          "succeeded": 73,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 73,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 73,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0386,
+            "median_s": 15.6315,
+            "p50_s": 15.6315,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:44+00:00",
+          "iterations": 77,
+          "wall_clock_s": 351.575,
+          "succeeded": 74,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 74,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 74,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 16.0158,
+            "median_s": 15.6117,
+            "p50_s": 15.592,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        },
+        {
+          "at": "2026-10-01T06:21:59+00:00",
+          "iterations": 80,
+          "wall_clock_s": 366.233,
+          "succeeded": 77,
+          "not_succeeded": 3,
+          "run_states": {
+            "succeeded": 77,
+            "failed": 3
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 77,
+            "min_s": 13.366,
+            "max_s": 23.9289,
+            "mean_s": 15.9846,
+            "median_s": 15.592,
+            "p50_s": 15.592,
+            "p95_s": 20.0437,
+            "p99_s": 23.9289
+          }
+        }
+      ],
+      "census_at_end": {
+        "sandboxes": {
+          "available": true,
+          "at": "2026-10-01T06:22:01+00:00",
+          "total": 998,
+          "by_state": {
+            "destroyed": 970,
+            "failed": 28
+          },
+          "nonterminal_count": 0,
+          "nonterminal_sandbox_ids": [],
+          "nonterminal_truncated": false
+        },
+        "node_capacity": {
+          "available": true,
+          "at": "2026-10-01T06:22:01+00:00",
+          "scope": "reserved by the scheduler, not measured on the host",
+          "available_vcpus": 12.0,
+          "available_memory_bytes": 12884901888.0,
+          "api_requests_total": 4388.0
+        },
+        "containers": {
+          "available": true,
+          "at": "2026-10-01T06:22:02+00:00",
+          "scope": "the podman daemon on the harness host",
+          "running": 1,
+          "names": [
+            "aiec-testdb"
+          ],
+          "names_truncated": false
+        },
+        "postgres": {
+          "metric": "postgres",
+          "available": false,
+          "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+        }
+      },
+      "rate_limit_429s": 0,
+      "sandbox_histogram": {
+        "succeeded": 77,
+        "failed": 3
+      }
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-10-01T06:15:49+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:15:49+00:00",
+        "total": 921,
+        "by_state": {
+          "destroyed": 893,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:15:50+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3043.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:15:50+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:15:50+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:15:50+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.67,
+          1.61,
+          1.71
+        ],
+        "memory_available_bytes": 27153473536,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:15:50+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:15:50+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:15:52+00:00",
+        "total": 921,
+        "by_state": {
+          "destroyed": 893,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:15:52+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3049.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:15:52+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:15:53+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:15:53+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.86,
+          1.65,
+          1.72
+        ],
+        "memory_available_bytes": 27143856128,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:15:53+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:10+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:11+00:00",
+        "total": 925,
+        "by_state": {
+          "destroyed": 896,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61a-feb9-723a-9ac5-b653b3915b51"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:11+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3104.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:12+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:12+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-1",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:13+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:14+00:00",
+        "total": 925,
+        "by_state": {
+          "destroyed": 897,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:14+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3109.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:14+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:15+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-2",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:15+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:16+00:00",
+        "total": 925,
+        "by_state": {
+          "destroyed": 897,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:16+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3118.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:16+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:17+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-3",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:17+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:17+00:00",
+        "total": 925,
+        "by_state": {
+          "destroyed": 897,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:17+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3125.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:18+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:18+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-4",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:29+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:30+00:00",
+        "total": 929,
+        "by_state": {
+          "destroyed": 899,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-5452-729e-821c-9072f78d15bd",
+          "01a0f61b-4fb9-703b-bc06-3fdae0757540"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:30+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3169.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:30+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:31+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-5",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:32+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:33+00:00",
+        "total": 929,
+        "by_state": {
+          "destroyed": 900,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-5452-729e-821c-9072f78d15bd"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:34+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3178.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:34+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:34+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-6",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:34+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:35+00:00",
+        "total": 929,
+        "by_state": {
+          "destroyed": 901,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:35+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3188.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:36+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:36+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-7",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:36+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:37+00:00",
+        "total": 930,
+        "by_state": {
+          "destroyed": 901,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-8310-75b1-ad13-c81879fad681"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:37+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3198.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:37+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:38+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-8",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:47+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:48+00:00",
+        "total": 933,
+        "by_state": {
+          "destroyed": 903,
+          "failed": 28,
+          "running": 1,
+          "starting": 1
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-a158-7042-9fef-026b47d866d5",
+          "01a0f61b-9c8b-708e-8ffb-161131651b6d"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:48+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3233.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:49+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:49+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-9",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:50+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:51+00:00",
+        "total": 933,
+        "by_state": {
+          "destroyed": 903,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-a158-7042-9fef-026b47d866d5",
+          "01a0f61b-9c8b-708e-8ffb-161131651b6d"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:51+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3246.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:51+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:52+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-10",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:55+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:56+00:00",
+        "total": 934,
+        "by_state": {
+          "destroyed": 905,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-cccb-7486-8696-f4a6e2fdd6fe"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:56+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3261.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:56+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:57+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-11",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:16:57+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:16:57+00:00",
+        "total": 934,
+        "by_state": {
+          "destroyed": 905,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-cccb-7486-8696-f4a6e2fdd6fe"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:16:58+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3268.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:16:58+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:16:58+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-12",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:05+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:06+00:00",
+        "total": 936,
+        "by_state": {
+          "destroyed": 907,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-ef48-77bd-8ea7-00eb1a5f5494"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:06+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3296.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:06+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:07+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-13",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:07+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:08+00:00",
+        "total": 936,
+        "by_state": {
+          "destroyed": 907,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-ef48-77bd-8ea7-00eb1a5f5494"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:08+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3306.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:09+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:09+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-14",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:09+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:10+00:00",
+        "total": 936,
+        "by_state": {
+          "destroyed": 907,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61b-ef48-77bd-8ea7-00eb1a5f5494"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:10+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3313.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:10+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:10+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-15",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:13+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:13+00:00",
+        "total": 937,
+        "by_state": {
+          "destroyed": 908,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-1031-715e-b122-94c8904dc0f0"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:13+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3324.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:14+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:14+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-16",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:22+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:23+00:00",
+        "total": 939,
+        "by_state": {
+          "destroyed": 910,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-1e89-718d-9539-ca1510be5943"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:23+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3358.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:24+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:24+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-17",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:24+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:25+00:00",
+        "total": 939,
+        "by_state": {
+          "destroyed": 911,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:25+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3364.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:25+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:25+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-18",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:26+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:26+00:00",
+        "total": 939,
+        "by_state": {
+          "destroyed": 911,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:27+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3374.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:27+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:27+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-19",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:27+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:28+00:00",
+        "total": 939,
+        "by_state": {
+          "destroyed": 911,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:28+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3379.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:28+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:29+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-20",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:39+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:40+00:00",
+        "total": 943,
+        "by_state": {
+          "destroyed": 913,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-66f4-706a-8cf7-974dc2aacb0a",
+          "01a0f61c-58b1-7298-9f92-a81e8c2b9975"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:40+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3429.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:41+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:41+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-21",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:44+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:44+00:00",
+        "total": 943,
+        "by_state": {
+          "destroyed": 915,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:45+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3435.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:45+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:45+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-22",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:45+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:46+00:00",
+        "total": 944,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 915,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-9657-7306-b42e-cf4cf56bd476"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:46+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3445.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:47+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:47+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-23",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:47+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:48+00:00",
+        "total": 944,
+        "by_state": {
+          "destroyed": 915,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-9657-7306-b42e-cf4cf56bd476"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:48+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3455.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:48+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:48+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-24",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:17:57+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:17:57+00:00",
+        "total": 947,
+        "by_state": {
+          "destroyed": 916,
+          "failed": 28,
+          "running": 2,
+          "starting": 1
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-b417-750b-ae8b-e3f0b448026e",
+          "01a0f61c-af42-7749-865f-ebdd8043e4d1",
+          "01a0f61c-a736-7409-82dc-b1c02ec9eea7"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:17:57+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3488.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:17:58+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:17:58+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-25",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:03+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:04+00:00",
+        "total": 948,
+        "by_state": {
+          "destroyed": 919,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-d878-77e3-95c7-925a399964ce"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:04+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3512.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:05+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:05+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-26",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:05+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:05+00:00",
+        "total": 948,
+        "by_state": {
+          "destroyed": 919,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-d878-77e3-95c7-925a399964ce"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:06+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3521.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:06+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:06+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-27",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:06+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:07+00:00",
+        "total": 948,
+        "by_state": {
+          "destroyed": 919,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61c-d878-77e3-95c7-925a399964ce"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:07+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3530.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:08+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:08+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-28",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:14+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:15+00:00",
+        "total": 951,
+        "by_state": {
+          "destroyed": 920,
+          "failed": 28,
+          "running": 2,
+          "starting": 1
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-01e2-71ed-98ee-e13e19dc552d",
+          "01a0f61c-f9ec-700a-ae70-223b77ab07e6",
+          "01a0f61c-f51e-7649-bcec-5e7ec8c71691"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:15+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3555.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:15+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:15+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-29",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:21+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:22+00:00",
+        "total": 952,
+        "by_state": {
+          "destroyed": 923,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-1b34-702a-bc27-4b56aede0deb"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:22+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3580.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:22+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:23+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-30",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:23+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:23+00:00",
+        "total": 952,
+        "by_state": {
+          "destroyed": 923,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-1b34-702a-bc27-4b56aede0deb"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:23+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3586.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:24+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:24+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-31",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:24+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:25+00:00",
+        "total": 952,
+        "by_state": {
+          "destroyed": 923,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-1b34-702a-bc27-4b56aede0deb"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:25+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3594.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:25+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:26+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-32",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:29+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:29+00:00",
+        "total": 953,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 924,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-3dad-7235-89f2-5fb1661f1f1e"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:29+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3604.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:30+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:30+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-33",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:30+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:31+00:00",
+        "total": 954,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 924,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-44e0-7009-8c84-6d11ddc91619",
+          "01a0f61d-3dad-7235-89f2-5fb1661f1f1e"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:31+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3617.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:31+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:32+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-34",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:39+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:40+00:00",
+        "total": 956,
+        "by_state": {
+          "destroyed": 925,
+          "failed": 28,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-5d32-74d9-8c8f-a1209dd5fbd5",
+          "01a0f61d-5598-732e-a16f-28f1ddc917bf",
+          "01a0f61d-44e0-7009-8c84-6d11ddc91619"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:40+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3653.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:40+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:41+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-35",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:42+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:43+00:00",
+        "total": 956,
+        "by_state": {
+          "destroyed": 927,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-5d32-74d9-8c8f-a1209dd5fbd5"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:43+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3662.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:43+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:44+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-36",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:44+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:45+00:00",
+        "total": 956,
+        "by_state": {
+          "destroyed": 928,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:45+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3671.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:46+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:46+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-37",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:47+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:48+00:00",
+        "total": 957,
+        "by_state": {
+          "destroyed": 928,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-8061-7230-9ad4-a75b7ee58393"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:48+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3684.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:48+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:48+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-38",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:57+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:18:58+00:00",
+        "total": 960,
+        "by_state": {
+          "destroyed": 930,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-9caf-73bb-afa6-8aab588250ca",
+          "01a0f61d-94fc-779f-a1f2-ec4f07217c57"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:18:58+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3724.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:18:58+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:18:58+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-39",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:18:59+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:00+00:00",
+        "total": 960,
+        "by_state": {
+          "destroyed": 931,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-9caf-73bb-afa6-8aab588250ca"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:00+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3733.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:00+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:01+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-40",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:02+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:02+00:00",
+        "total": 960,
+        "by_state": {
+          "destroyed": 932,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:02+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3740.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:03+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:03+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-41",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:03+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:04+00:00",
+        "total": 961,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 932,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-c4f0-7709-84f3-14d2aea5c9ef"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:04+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3747.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:04+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:05+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-42",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:13+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:14+00:00",
+        "total": 964,
+        "by_state": {
+          "destroyed": 934,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-dca0-7520-b01e-f9b4854af4a5",
+          "01a0f61d-d767-77d9-b120-748b0e4b6367"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:14+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3788.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:14+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:14+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-43",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:16+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:17+00:00",
+        "total": 964,
+        "by_state": {
+          "destroyed": 935,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61d-dca0-7520-b01e-f9b4854af4a5"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:17+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3799.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:17+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:17+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-44",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:18+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:18+00:00",
+        "total": 964,
+        "by_state": {
+          "destroyed": 936,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:19+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3806.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:19+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:19+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-45",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:21+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:21+00:00",
+        "total": 965,
+        "by_state": {
+          "destroyed": 936,
+          "failed": 28,
+          "starting": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-043f-7255-8b5e-d63ad642cd20"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:21+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3819.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:22+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:22+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-46",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:31+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:31+00:00",
+        "total": 968,
+        "by_state": {
+          "destroyed": 938,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-21dc-7757-82c5-0ef241feccbc",
+          "01a0f61e-16a7-716f-962a-a996296eecf2"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:31+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3854.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:32+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:32+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-47",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:32+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:33+00:00",
+        "total": 968,
+        "by_state": {
+          "destroyed": 939,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-21dc-7757-82c5-0ef241feccbc"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:33+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3861.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:33+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:34+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-48",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:35+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:36+00:00",
+        "total": 968,
+        "by_state": {
+          "destroyed": 940,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:36+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3870.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:36+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:36+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-49",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:36+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:37+00:00",
+        "total": 969,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 940,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-494d-753d-9857-2257dd77f602"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:37+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3877.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:38+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:38+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-50",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:47+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:47+00:00",
+        "total": 972,
+        "by_state": {
+          "destroyed": 942,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-5e84-760a-84e1-d208b0480a2c",
+          "01a0f61e-59a3-73f3-9f21-5b256093fc65"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:48+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3916.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:48+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:49+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-51",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:49+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:49+00:00",
+        "total": 972,
+        "by_state": {
+          "destroyed": 943,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-5e84-760a-84e1-d208b0480a2c"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:50+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3925.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:50+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:50+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-52",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:51+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:52+00:00",
+        "total": 972,
+        "by_state": {
+          "destroyed": 944,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:52+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3932.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:52+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:53+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-53",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:19:53+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:19:54+00:00",
+        "total": 973,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 944,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-893d-74bc-b097-3be6ab75dc49"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:19:54+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 3939.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:19:55+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:19:55+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-54",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:03+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:03+00:00",
+        "total": 976,
+        "by_state": {
+          "destroyed": 946,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-9fb5-77b4-b687-faf7bd5418cb",
+          "01a0f61e-9b1a-7621-aaac-0438865f41f6"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:04+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 3979.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:04+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:04+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-55",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:06+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:07+00:00",
+        "total": 976,
+        "by_state": {
+          "destroyed": 948,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:07+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3993.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:08+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:08+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-56",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:08+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:09+00:00",
+        "total": 976,
+        "by_state": {
+          "destroyed": 948,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:09+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3998.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:09+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:10+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-57",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:10+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:10+00:00",
+        "total": 977,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 948,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61e-c7fb-76c5-a4b7-12e3c198c345"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:11+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 4009.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:11+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:11+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-58",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:28+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:29+00:00",
+        "total": 980,
+        "by_state": {
+          "destroyed": 952,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:29+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4063.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:30+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:30+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-59",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:30+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:31+00:00",
+        "total": 980,
+        "by_state": {
+          "destroyed": 952,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:31+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4072.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:31+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:32+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-60",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:32+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:32+00:00",
+        "total": 980,
+        "by_state": {
+          "destroyed": 952,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:32+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4077.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:33+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:33+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-61",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:33+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:34+00:00",
+        "total": 980,
+        "by_state": {
+          "destroyed": 952,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:34+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4082.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:34+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:34+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-62",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:44+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:45+00:00",
+        "total": 984,
+        "by_state": {
+          "destroyed": 954,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f61f-3b06-728f-a055-176b6a0681de",
+          "01a0f61f-363d-7739-a71f-120c9b3848bf"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:45+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 4126.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:45+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:46+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-63",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:46+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:47+00:00",
+        "total": 984,
+        "by_state": {
+          "destroyed": 955,
+          "failed": 28,
+          "running": 1
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61f-3b06-728f-a055-176b6a0681de"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:47+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4136.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:47+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:48+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-64",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:49+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:49+00:00",
+        "total": 984,
+        "by_state": {
+          "destroyed": 956,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:50+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4143.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:50+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:50+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-65",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:20:50+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:20:51+00:00",
+        "total": 985,
+        "by_state": {
+          "creating": 1,
+          "destroyed": 956,
+          "failed": 28
+        },
+        "nonterminal_count": 1,
+        "nonterminal_sandbox_ids": [
+          "01a0f61f-6845-76a9-984b-a9bf4fe58e93"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:20:51+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 11.0,
+        "available_memory_bytes": 12348030976.0,
+        "api_requests_total": 4152.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:20:51+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:20:52+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-66",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:04+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:05+00:00",
+        "total": 988,
+        "by_state": {
+          "destroyed": 960,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:05+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4199.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:05+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:06+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-67",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:06+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:06+00:00",
+        "total": 988,
+        "by_state": {
+          "destroyed": 960,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:06+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4208.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:07+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:07+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-68",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:07+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:08+00:00",
+        "total": 988,
+        "by_state": {
+          "destroyed": 960,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:08+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4215.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:08+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:09+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-69",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:09+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:09+00:00",
+        "total": 988,
+        "by_state": {
+          "destroyed": 960,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:09+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4220.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:10+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:10+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-70",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:24+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:24+00:00",
+        "total": 992,
+        "by_state": {
+          "destroyed": 964,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:24+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4273.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:25+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:25+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-71",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:25+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:26+00:00",
+        "total": 992,
+        "by_state": {
+          "destroyed": 964,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:26+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4282.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:26+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:26+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-72",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:26+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:27+00:00",
+        "total": 992,
+        "by_state": {
+          "destroyed": 964,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:27+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4290.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:28+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:28+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-73",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:28+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:29+00:00",
+        "total": 992,
+        "by_state": {
+          "destroyed": 964,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:29+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4295.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:29+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:30+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-74",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:41+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:42+00:00",
+        "total": 996,
+        "by_state": {
+          "destroyed": 968,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:42+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4340.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:43+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:43+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-75",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:43+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:44+00:00",
+        "total": 996,
+        "by_state": {
+          "destroyed": 968,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:44+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4345.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:44+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:44+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-76",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:44+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:21:45+00:00",
+        "total": 996,
+        "by_state": {
+          "destroyed": 968,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:21:45+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4353.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:21:46+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:21:46+00:00",
+        "page_limit": 100,
+        "at_least": 1,
+        "may_be_truncated": false,
+        "by_state": {
+          "queued": 1
+        }
+      },
+      "label": "soak-checkpoint-77",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:21:59+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:22:00+00:00",
+        "total": 998,
+        "by_state": {
+          "destroyed": 970,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:22:00+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4382.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:22:00+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:22:00+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-80",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:22:00+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:22:01+00:00",
+        "total": 998,
+        "by_state": {
+          "destroyed": 970,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:22:01+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4388.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:22:02+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:22:02+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:22:02+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.4,
+          1.59,
+          1.69
+        ],
+        "memory_available_bytes": 27121987584,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:22:02+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-final",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:22:02+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:22:03+00:00",
+        "total": 998,
+        "by_state": {
+          "destroyed": 970,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:22:03+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4392.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:22:03+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:22:04+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:22:04+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.4,
+          1.59,
+          1.69
+        ],
+        "memory_available_bytes": 27126558720,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:22:04+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 0,
+      "nonterminal_at_end": 0,
+      "new_nonterminal_sandbox_ids": [],
+      "by_state_at_end": {
+        "destroyed": 970,
+        "failed": 28
+      },
+      "available_vcpus_before": 12.0,
+      "available_vcpus_after": 12.0,
+      "vcpus_returned_to_baseline": true
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  }
+}

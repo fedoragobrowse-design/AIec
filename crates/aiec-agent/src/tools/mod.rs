@@ -241,7 +241,7 @@ fn read(root: &Path, args: &Value) -> Result<String, HarnessError> {
         out.push_str(&format!("{}\t{}\n", index + 1, line));
     }
     if out.len() > crate::DEFAULT_READ_BYTES {
-        out.truncate(crate::DEFAULT_READ_BYTES);
+        out.truncate(crate::head_bytes(&out, crate::DEFAULT_READ_BYTES).len());
         out.push_str("… truncated\n");
     }
     Ok(out)
@@ -278,7 +278,7 @@ fn edit(root: &Path, args: &Value) -> Result<String, HarnessError> {
     if occurrences == 0 {
         return Err(HarnessError::Tool(format!(
             "`{}` does not appear in {}; read the file and copy the text exactly",
-            clip(&old, 60),
+            crate::clip(&old, 60),
             path.display()
         )));
     }
@@ -286,7 +286,7 @@ fn edit(root: &Path, args: &Value) -> Result<String, HarnessError> {
         // Guessing which occurrence was meant is how an agent corrupts a file.
         return Err(HarnessError::Tool(format!(
             "`{}` appears {occurrences} times in {}; include more context or pass replace_all",
-            clip(&old, 60),
+            crate::clip(&old, 60),
             path.display()
         )));
     }
@@ -338,7 +338,7 @@ fn grep(root: &Path, args: &Value) -> Result<String, HarnessError> {
         Ok(result) => {
             return Err(HarnessError::Tool(format!(
                 "git grep failed: {}",
-                clip(&String::from_utf8_lossy(&result.stderr), 200)
+                crate::clip(&String::from_utf8_lossy(&result.stderr), 200)
             )));
         }
         Err(_) => return Err(HarnessError::Tool("git is not available".to_owned())),
@@ -355,38 +355,119 @@ fn grep(root: &Path, args: &Value) -> Result<String, HarnessError> {
     Ok(kept.join("\n"))
 }
 
+/// Runs a shell command, keeping its output bounded and leaving nothing behind.
+///
+/// Three properties this has to have, each of which was missing:
+///
+/// * The output is read incrementally and capped. Collecting the whole stream
+///   and clipping it afterwards bounds what the *model* sees and nothing else,
+///   so a command printing without end takes the sandbox down with it.
+/// * The command runs in its own process group and a timeout kills the group.
+///   Killing the shell leaves a backgrounded grandchild running for the rest of
+///   the run, holding CPU and any pipe the next command is waiting on.
+/// * What was dropped is counted. A model handed a silently clipped result
+///   assumes the output ended there and concludes from a partial answer.
 async fn bash(root: &Path, args: &Value) -> Result<String, HarnessError> {
+    const STDOUT_CAP: usize = 8000;
+    const STDERR_CAP: usize = 4000;
     let command = arg_str(args, "command")?;
     let timeout = arg_usize(args, "timeout_seconds", 120).clamp(1, 3600);
-    let child = tokio::process::Command::new("/bin/sh")
+    let mut child = tokio::process::Command::new("/bin/sh")
         .arg("-c")
         .arg(&command)
         .current_dir(root)
-        .kill_on_drop(true)
+        // Explicit, because the default is to inherit: an inherited pipe means
+        // the command's output goes to the harness's own stdout instead of to
+        // the model, which is both invisible and unbounded.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own group, so the timeout below reaches everything it started.
+        .process_group(0)
         .spawn()
         .map_err(|error| HarnessError::Tool(format!("spawning: {error}")))?;
-    let waited = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout as u64),
-        child.wait_with_output(),
-    )
-    .await;
-    let output = match waited {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return Err(HarnessError::Tool(format!("{error}"))),
-        Err(_) => {
-            // The child is killed by kill_on_drop; the model is told it timed
-            // out rather than left waiting.
-            return Ok("timed out".to_owned());
+    let group = child.id().map(|pid| pid as i32);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| HarnessError::Tool("stdout unavailable".to_owned()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| HarnessError::Tool("stderr unavailable".to_owned()))?;
+    let out_task = tokio::spawn(drain(stdout, STDOUT_CAP));
+    let err_task = tokio::spawn(drain(stderr, STDERR_CAP));
+
+    let status =
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout as u64), child.wait())
+            .await
+        {
+            Ok(Ok(status)) => Some(status),
+            Ok(Err(error)) => return Err(HarnessError::Tool(format!("{error}"))),
+            Err(_) => {
+                if let Some(group) = group {
+                    // Negative pid: the signal goes to the process group, so a
+                    // backgrounded job dies with the shell that started it.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                None
+            }
+        };
+    // The pipes close when the group is gone, so these finish promptly even on
+    // the timeout path. Awaiting them is what makes the bound hold: a detached
+    // reader would still be accumulating after the tool call returned.
+    let (stdout, stdout_total) = out_task.await.unwrap_or_default();
+    let (stderr, stderr_total) = err_task.await.unwrap_or_default();
+    let mut rendered = String::new();
+    match status {
+        Some(status) => rendered.push_str(&format!("exit={}\n", status.code().unwrap_or(-1))),
+        None => rendered.push_str("timed out\n"),
+    }
+    rendered.push_str("--- stdout\n");
+    push_stream(&mut rendered, &stdout, stdout_total, STDOUT_CAP);
+    rendered.push_str("--- stderr\n");
+    push_stream(&mut rendered, &stderr, stderr_total, STDERR_CAP);
+    Ok(rendered)
+}
+
+/// Reads a pipe to end of file, keeping at most `cap` bytes and counting the
+/// rest. The pipe is always drained: a reader that stops early leaves the
+/// writer blocked on a full pipe forever.
+async fn drain<R>(mut reader: R, cap: usize) -> (Vec<u8>, u64)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut kept = Vec::with_capacity(cap.min(8192));
+    let mut total: u64 = 0;
+    let mut buffer = [0; 8192];
+    loop {
+        match tokio::io::AsyncReadExt::read(&mut reader, &mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                total += count as u64;
+                if kept.len() < cap {
+                    let take = count.min(cap - kept.len());
+                    kept.extend_from_slice(&buffer[..take]);
+                }
+            }
         }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(format!(
-        "exit={}\n--- stdout\n{}\n--- stderr\n{}",
-        output.status.code().unwrap_or(-1),
-        clip(&stdout, 8000),
-        clip(&stderr, 4000)
-    ))
+    }
+    (kept, total)
+}
+
+/// Appends one stream, saying how much of it was not shown.
+fn push_stream(out: &mut String, kept: &[u8], total: u64, cap: usize) {
+    out.push_str(&String::from_utf8_lossy(kept));
+    if total > cap as u64 {
+        out.push_str(&format!(
+            "\n… [{} more bytes not shown; rerun with a narrower command] …\n",
+            total - cap as u64
+        ));
+    } else {
+        out.push('\n');
+    }
 }
 
 /// Shrinks a large tool result so it is cheap to send again.
@@ -398,8 +479,8 @@ pub fn compress(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
     }
-    let head = limit * 3 / 4;
-    let tail = limit - head;
+    let head = crate::head_bytes(text, limit * 3 / 4).len();
+    let tail = crate::tail_bytes(text, limit - limit * 3 / 4).len();
     let mut kept = String::with_capacity(limit);
     kept.push_str(&text[..head]);
     kept.push_str(&format!(
@@ -496,13 +577,6 @@ fn walk(root: &Path, pattern: &str, limit: usize) -> Result<Vec<String>, Harness
     Ok(out)
 }
 
-fn clip(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    format!("{}…", &text[..limit])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,6 +606,60 @@ mod tests {
         assert!(squeezed.len() < text.len());
         assert!(squeezed.contains("TAIL"), "the end must survive");
         assert!(squeezed.contains("elided"), "the drop must be visible");
+    }
+
+    /// A string of `n` ASCII bytes, then a three-byte character, then a tail, so
+    /// that a byte limit of `n + 1` lands inside that character.
+    fn straddling(n: usize) -> String {
+        let mut text = String::new();
+        while text.len() < n {
+            text.push('a');
+        }
+        text.push('€');
+        text.push_str("tail");
+        text
+    }
+
+    #[test]
+    fn clipping_a_limit_inside_a_character_does_not_panic() {
+        // The limit is a byte count and the text is UTF-8, so a limit that lands
+        // mid-character is the normal case for any non-ASCII output, not an
+        // edge case. Slicing there used to abort the whole harness, losing the
+        // run's result document with it.
+        let text = straddling(8000);
+        let clipped = crate::clip(&text, 8001);
+        assert!(clipped.ends_with('…'));
+        assert!(!clipped.is_empty());
+    }
+
+    #[test]
+    fn compression_survives_a_boundary_inside_a_character() {
+        let limit = 8000;
+        let head = limit * 3 / 4;
+        // Long enough past the limit to be compressed at all, with the
+        // character straddling the byte the head is cut at.
+        let text = format!("{}{}", straddling(head - 1), "b".repeat(limit));
+        let squeezed = compress(&text, limit);
+        assert!(squeezed.contains("elided"), "the drop must be visible");
+        assert!(squeezed.ends_with('b'), "the end must survive");
+    }
+
+    #[test]
+    fn a_read_truncated_mid_character_does_not_panic() {
+        let root = scratch("read-utf8");
+        // `read` prefixes every line with its number and a tab, so the file's
+        // first byte lands two bytes into the rendered output. The character
+        // goes where the truncation actually cuts.
+        let mut content = String::new();
+        while content.len() < crate::DEFAULT_READ_BYTES - 3 {
+            content.push('a');
+        }
+        content.push('€');
+        content.push_str("tail\n");
+        std::fs::write(root.join("big.txt"), &content).unwrap();
+        let out = read(&root, &serde_json::json!({"path": "big.txt"})).unwrap();
+        assert!(out.contains("truncated"), "the cut must be visible");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -583,6 +711,79 @@ mod tests {
         .unwrap();
         assert!(tail.contains("2\ttwo"));
         assert!(!tail.contains("three"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn the_model_actually_sees_what_the_command_printed() {
+        let root = scratch("bash-visible");
+        // A tool that returns an exit code and no output is not a shell. This
+        // pins the property itself rather than the clipping: whatever else the
+        // bounds become, what a command printed has to reach the model.
+        let out = bash(
+            &root,
+            &serde_json::json!({"command": "echo to-stdout; echo to-stderr >&2; exit 3"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("exit=3"), "the exit code: {out}");
+        assert!(out.contains("to-stdout"), "stdout must be visible: {out}");
+        assert!(out.contains("to-stderr"), "stderr must be visible: {out}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_command_printing_without_end_is_bounded_and_says_so() {
+        let root = scratch("bash-bound");
+        // Twenty megabytes on a pipe. Collecting the whole thing first and
+        // clipping afterwards is what this test exists to prevent: the model
+        // gets a bounded string either way, but the harness's own memory does
+        // not, and the elided count is what tells the model to narrow the
+        // command rather than assume the output ended.
+        let args = serde_json::json!({
+            "command": "head -c 20000000 /dev/zero | tr '\\0' 'a'",
+            "timeout_seconds": 60,
+        });
+        let out = bash(&root, &args).await.unwrap();
+        assert!(
+            out.len() < 20_000,
+            "the result must be bounded: {}",
+            out.len()
+        );
+        assert!(out.contains("not shown"), "the drop must be counted: {out}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_leaves_nothing_running() {
+        let root = scratch("bash-orphan");
+        let pid_file = root.join("grandchild.pid");
+        // The shell backgrounds a long sleep and then waits. Timing out kills
+        // the shell; without killing the process group the sleep keeps running
+        // in the sandbox for the rest of the run, holding CPU and, if the
+        // command had opened one, a pipe the next command is waiting on.
+        let args = serde_json::json!({
+            "command": format!("sleep 120 & echo $! > {} ; sleep 120", pid_file.display()),
+            "timeout_seconds": 1,
+        });
+        let out = bash(&root, &args).await.unwrap();
+        assert!(out.contains("timed out"), "{out}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the shell should have recorded its child")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // The kill lands asynchronously relative to the shell's exit, so this
+        // polls briefly rather than asserting on the first look.
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "process {pid} outlived the tool call");
         let _ = std::fs::remove_dir_all(root);
     }
 }

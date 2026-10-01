@@ -1,0 +1,704 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "run",
+  "generated_at": "2026-10-01T06:31:19+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 213,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "control-plane",
+      "empty-exec"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 20,
+      "parallelism": 1,
+      "checkpoint_every": 5
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 25
+  },
+  "conditions_fingerprint": "602f511b90348c50",
+  "scenarios": {
+    "control-plane": {
+      "endpoints": [
+        {
+          "endpoint": "health",
+          "path": "/health",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "health",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.002,
+            "max_s": 0.003,
+            "mean_s": 0.0025,
+            "median_s": 0.0024,
+            "p50_s": 0.0024,
+            "p95_s": 0.0028,
+            "p99_s": 0.003
+          }
+        },
+        {
+          "endpoint": "ready",
+          "path": "/ready",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "ready",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.1362,
+            "max_s": 0.176,
+            "mean_s": 0.1568,
+            "median_s": 0.1625,
+            "p50_s": 0.1625,
+            "p95_s": 0.1704,
+            "p99_s": 0.176
+          }
+        },
+        {
+          "endpoint": "list_sandboxes",
+          "path": "/v1/sandboxes",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_sandboxes",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.5636,
+            "max_s": 1.032,
+            "mean_s": 0.6579,
+            "median_s": 0.6518,
+            "p50_s": 0.6518,
+            "p95_s": 0.8211,
+            "p99_s": 1.032
+          }
+        },
+        {
+          "endpoint": "list_runs",
+          "path": "/v1/runs?limit=20",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_runs",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.3823,
+            "max_s": 0.5625,
+            "mean_s": 0.4803,
+            "median_s": 0.4864,
+            "p50_s": 0.4864,
+            "p95_s": 0.557,
+            "p99_s": 0.5625
+          }
+        },
+        {
+          "endpoint": "list_queued_runs",
+          "path": "/v1/runs?state=queued&limit=100",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_queued_runs",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2981,
+            "max_s": 0.3789,
+            "mean_s": 0.3259,
+            "median_s": 0.322,
+            "p50_s": 0.322,
+            "p95_s": 0.3604,
+            "p99_s": 0.3789
+          }
+        },
+        {
+          "endpoint": "current_account",
+          "path": "/v1/account",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "current_account",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2807,
+            "max_s": 0.4198,
+            "mean_s": 0.3662,
+            "median_s": 0.3718,
+            "p50_s": 0.3718,
+            "p95_s": 0.4131,
+            "p99_s": 0.4198
+          }
+        },
+        {
+          "endpoint": "usage",
+          "path": "/v1/usage",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "usage",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2788,
+            "max_s": 0.4519,
+            "mean_s": 0.3248,
+            "median_s": 0.325,
+            "p50_s": 0.325,
+            "p95_s": 0.3777,
+            "p99_s": 0.4519
+          }
+        }
+      ]
+    },
+    "empty-exec": {
+      "succeeded": 25,
+      "not_succeeded": 0,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 25
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 13.6528,
+        "max_s": 17.9718,
+        "mean_s": 14.9127,
+        "median_s": 14.5631,
+        "p50_s": 14.5631,
+        "p95_s": 16.1231,
+        "p99_s": 17.9718
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 5.2188,
+        "max_s": 7.4466,
+        "mean_s": 6.1979,
+        "median_s": 5.9574,
+        "p50_s": 5.9574,
+        "p95_s": 7.3758,
+        "p99_s": 7.4466
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.3992,
+        "max_s": 9.3598,
+        "mean_s": 7.7867,
+        "median_s": 7.6293,
+        "p50_s": 7.6293,
+        "p95_s": 8.209,
+        "p99_s": 9.3598
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.3992,
+        "max_s": 9.3598,
+        "mean_s": 7.7867,
+        "median_s": 7.6293,
+        "p50_s": 7.6293,
+        "p95_s": 8.209,
+        "p99_s": 9.3598
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 12.233,
+        "max_s": 15.6914,
+        "mean_s": 12.9539,
+        "median_s": 12.7115,
+        "p50_s": 12.7115,
+        "p95_s": 14.6001,
+        "p99_s": 15.6914
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 2.9,
+        "max_s": 4.605,
+        "mean_s": 3.2806,
+        "median_s": 3.133,
+        "p50_s": 3.133,
+        "p95_s": 4.539,
+        "p99_s": 4.605
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 4.427,
+        "max_s": 6.027,
+        "mean_s": 4.7321,
+        "median_s": 4.701,
+        "p50_s": 4.701,
+        "p95_s": 4.847,
+        "p99_s": 6.027
+      },
+      "phase_placement.allocation": {
+        "metric": "phase_placement.allocation",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.479,
+        "max_s": 0.557,
+        "mean_s": 0.5148,
+        "median_s": 0.515,
+        "p50_s": 0.515,
+        "p95_s": 0.555,
+        "p99_s": 0.557
+      },
+      "phase_placement.boot": {
+        "metric": "phase_placement.boot",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.507,
+        "max_s": 0.645,
+        "mean_s": 0.5384,
+        "median_s": 0.534,
+        "p50_s": 0.534,
+        "p95_s": 0.557,
+        "p99_s": 0.645
+      },
+      "phase_placement.scheduler": {
+        "metric": "phase_placement.scheduler",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 1.638,
+        "max_s": 3.325,
+        "mean_s": 1.9464,
+        "median_s": 1.946,
+        "p50_s": 1.946,
+        "p95_s": 2.007,
+        "p99_s": 3.325
+      },
+      "phase_placement.workspace": {
+        "metric": "phase_placement.workspace",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.644,
+        "max_s": 0.755,
+        "mean_s": 0.702,
+        "median_s": 0.703,
+        "p50_s": 0.703,
+        "p95_s": 0.752,
+        "p99_s": 0.755
+      },
+      "workload": {
+        "image": "python:3.13",
+        "command": [
+          "true"
+        ],
+        "runtime_requested": null,
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048
+        },
+        "repo": null,
+        "validations": [],
+        "artifacts": [],
+        "retention": "destroy"
+      },
+      "first_sample": {
+        "state": "succeeded",
+        "seconds": 15.6195
+      },
+      "api_request_accounting": {
+        "available": true,
+        "definition": "aiec_api_requests_total delta, which counts HTTP requests, not database queries",
+        "before": 4820.0,
+        "after": 5359.0,
+        "delta": 539.0,
+        "per_run": 21.56
+      },
+      "run_events": {
+        "available": true,
+        "runs_sampled": 3,
+        "first_event_after_request": {
+          "metric": "first_event_after_request",
+          "available": true,
+          "unit": "s",
+          "samples": 3,
+          "min_s": 0.6609,
+          "max_s": 0.8213,
+          "mean_s": 0.7439,
+          "median_s": 0.7494,
+          "percentiles_withheld": "3 samples is below the 20 needed for a p50/p95/p99"
+        },
+        "timelines": [
+          {
+            "run_id": "01a0f623-4cbb-72ab-867c-aa4cfa08669a",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.7494
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 7.0915
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 7.6256
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 8.3277
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 11.7265
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 13.0001
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f623-89a7-74a0-b2ed-a38ab4213310",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.8213
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 7.7695
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 8.2589
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 8.9035
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 12.1982
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 13.4576
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f623-c266-7330-9a42-dfd7e020f3a8",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.6609
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 7.0046
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 7.4527
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 8.1527
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 11.4045
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 12.6647
+              }
+            ]
+          }
+        ]
+      },
+      "rate_limit_429s": 0
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-10-01T06:23:56+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:23:58+00:00",
+        "total": 1000,
+        "by_state": {
+          "destroyed": 972,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:23:58+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 4590.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:23:58+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:23:59+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:23:59+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.9,
+          1.7,
+          1.71
+        ],
+        "memory_available_bytes": 27119091712,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624025600,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:23:59+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:31:18+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:31:18+00:00",
+        "total": 1025,
+        "by_state": {
+          "destroyed": 997,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:31:19+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 5365.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:31:19+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:31:19+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:31:19+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.98,
+          2.02,
+          1.85
+        ],
+        "memory_available_bytes": 27151953920,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624025600,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:31:19+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 0,
+      "nonterminal_at_end": 0,
+      "new_nonterminal_sandbox_ids": [],
+      "by_state_at_end": {
+        "destroyed": 997,
+        "failed": 28
+      },
+      "available_vcpus_before": 12.0,
+      "available_vcpus_after": 12.0,
+      "vcpus_returned_to_baseline": true
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  }
+}

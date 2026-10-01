@@ -52,3 +52,39 @@ pub const DEFAULT_READ_BYTES: usize = 256 * 1024;
 
 /// How much of a tool result survives into context before compression.
 pub const DEFAULT_TOOL_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// The first `limit` bytes of `text`, cut on a character boundary.
+///
+/// A byte limit that lands inside a multi-byte character is not an edge case:
+/// it happens for any non-ASCII output, and slicing there is a panic rather
+/// than a shorter string. Every bound in this harness is a byte count, so
+/// every one of them goes through here.
+pub fn head_bytes(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The last `limit` bytes of `text`, cut on a character boundary.
+pub fn tail_bytes(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// Trims `text` to at most `limit` characters, marking the cut.
+///
+/// One implementation on purpose. Four copies of this helper existed, three of
+/// them character-safe and one not, which is how a bound that aborts the whole
+/// harness survived in the one place that clips command output.
+pub fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}…")
+}

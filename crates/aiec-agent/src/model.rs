@@ -240,7 +240,7 @@ impl Client {
             // problem, and a harness that swallows it cannot be diagnosed.
             return Err(HarnessError::Model(format!(
                 "provider returned {status}: {}",
-                clip(&text, 300)
+                crate::clip(&text, 300)
             )));
         }
         parse_reply(&text)
@@ -339,14 +339,6 @@ fn first_env(names: &[&str]) -> Option<String> {
         .iter()
         .find_map(|name| std::env::var(name).ok())
         .filter(|value| !value.trim().is_empty())
-}
-
-fn clip(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(limit).collect();
-    format!("{kept}…")
 }
 
 #[cfg(test)]

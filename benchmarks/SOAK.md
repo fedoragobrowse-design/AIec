@@ -127,3 +127,41 @@ accumulates.
 - **Before/after for the individual optimisations** is not reported, because no
   performance optimisation was applied. What is measured here is a correctness
   fix whose effect on throughput is a side effect of not leaking.
+
+## Reproducing this
+
+Both soaks above were run by hand and the numbers are left as they were
+recorded. The loop itself is now a scenario, so the same measurement can be
+repeated instead of remembered:
+
+```
+# sequential, as above
+python3 benchmarks/bench.py soak --iterations 80 --max-parallel 1 \
+    --checkpoint-every 15
+
+# bounded concurrency, as above
+python3 benchmarks/bench.py soak --iterations 40 --max-parallel 8 \
+    --checkpoint-every 8
+```
+
+It takes the same checkpoints this document quotes - success and failure counts,
+non-terminal sandboxes, free vCPUs, running containers - and adds the sandbox
+census by state, the tenant's usage counters, and the queue state, at the start
+and at the end of the loop.
+
+Three properties are enforced rather than remembered, because each of them is a
+way a soak can quietly measure nothing:
+
+- **The final observation happens before any cleanup.** A soak that tidies up
+  as it goes cannot see what the platform leaked.
+- **Only sandboxes the harness itself created are destroyed.** Machines that
+  outlived their run are listed by id and left alone; `--reclaim-leaked` clears
+  them afterwards, once the result has been read.
+- **A leak that predates the soak is measured as a baseline, not counted as
+  one.** The report prints non-terminal sandboxes before and after, so a cluster
+  that was already holding machines - the trap recorded in
+  [`BASELINE.md`](BASELINE.md) - cannot be mistaken for one the soak broke.
+
+`--max-parallel` above 64 is refused, and `--max-duration` stops the loop on a
+wall clock, with the report saying it stopped early and why. See
+[`README.md`](README.md) for the rest.

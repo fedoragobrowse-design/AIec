@@ -1,0 +1,463 @@
+{
+  "source_evidence_sha256": "93411237a5db0426321af78577b4dc9f572cabf11aa8f217f8224e243093b842",
+  "note": "Sanitized tool execution events extracted from authoritative recovered Run transcript artifacts; full transcripts remain on remote host paths recorded by the measurement.",
+  "harness_forward_difference": {
+    "measurement_harness_sha256": "b795da05fdf3bbbd1b7f7a82c758f2998f4ec8677a8448995a178c4b4191d9a8",
+    "forward_harness_sha256": "ddc458fefadbba0865a24a5c6cc915e8496b64560f37d5c3f2ab745d2b545c5f",
+    "semantic_setup_change": "The version gate now explicitly sets HOME=/workspace and OMP_CODING_AGENT_DIR on its own command; BEFORE already passed with the same paths supplied by the Run workload environment.",
+    "metadata_changes": "Transcript filenames and judgment check labels use the full run UUID rather than a colliding prefix. Distinct BEFORE transcripts were recovered from unchanged authoritative artifacts without rerunning the workload.",
+    "unchanged_conditions": "Repository, target commit, OMP refs/commits, model/schema, task, resources, repetitions, retries, credential delivery, validations and retention remain unchanged."
+  },
+  "sides": {
+    "baseline": {
+      "run_id": "01a0f591-69a0-71bf-8921-e4d1cae389c0",
+      "full_transcript_sha256": "bfcdac64a0d0cea8a35a3163abbfd2d38004b32dcbbeddd58b12cf7925fc6856",
+      "tool_events": [
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591d6bd74529f4d5d3e",
+          "toolName": "ls",
+          "args": {
+            "path": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591d6bd74529f4d5d3e",
+          "toolName": "ls",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": ".git/ (just now)\nREADME (just now)"
+              }
+            ],
+            "details": {
+              "entries": [
+                ".git/ (just now)",
+                "README (just now)"
+              ],
+              "rawEntries": [
+                ".git/",
+                "README"
+              ],
+              "dirCount": 1,
+              "fileCount": 1
+            }
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591d6bd74529f4d5d3f",
+          "toolName": "find",
+          "args": {
+            "pattern": "PROOF.md"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591d6bd74529f4d5d3f",
+          "toolName": "find",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Path not found: /workspace/repository/PROOF.md"
+              }
+            ],
+            "details": {}
+          },
+          "isError": true
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591e1d3769b89052cc3",
+          "toolName": "write",
+          "args": {
+            "path": "/workspace/repository/PROOF.md",
+            "content": "6 times 7 is 42"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591e1d3769b89052cc3",
+          "toolName": "write",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Successfully wrote 15 bytes to /workspace/repository/PROOF.md"
+              }
+            ],
+            "details": {}
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591e1d3769b89052cc4",
+          "toolName": "calc",
+          "args": {
+            "calculations": [
+              {
+                "expression": "6*7",
+                "prefix": "6 times 7 is"
+              }
+            ]
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591e1d3769b89052cc4",
+          "toolName": "calc",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Validation failed for tool \"calc\":\n  - calculations/0: must have required property 'suffix'\n\nReceived arguments:\n{\n  \"calculations\": [\n    {\n      \"expression\": \"6*7\",\n      \"prefix\": \"6 times 7 is\"\n    }\n  ]\n}"
+              }
+            ],
+            "details": {}
+          },
+          "isError": true
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591f4ba74d2b784fa3b",
+          "toolName": "bash",
+          "args": {
+            "command": "wc -c -l /workspace/repository/PROOF.md; od -c /workspace/repository/PROOF.md"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591f4ba74d2b784fa3b",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": " 0 15 /workspace/repository/PROOF.md\n0000000   6       t   i   m   e   s       7       i   s       4   2\n0000017\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f59200a4772d85cc812a",
+          "toolName": "bash",
+          "args": {
+            "command": "printf '\\n' >> /workspace/repository/PROOF.md && od -c /workspace/repository/PROOF.md && wc -l /workspace/repository/PROOF.md"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f59200a4772d85cc812a",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "0000000   6       t   i   m   e   s       7       i   s       4   2  \\n\n0000020\n1 /workspace/repository/PROOF.md\n"
+              }
+            ]
+          },
+          "isError": false
+        }
+      ]
+    },
+    "candidate": {
+      "run_id": "01a0f591-69a0-71bf-8921-e4d21bbb70b5",
+      "full_transcript_sha256": "c0d363404aac1023467c6d1a4cdd3caf861959f72889008c4099df3257e15332",
+      "tool_events": [
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591e6c87010a34fac87",
+          "toolName": "calc",
+          "args": {
+            "calculations": [
+              {
+                "expression": "6*7",
+                "prefix": "6 times 7 is:",
+                "suffix": ""
+              }
+            ]
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591e6c87010a34fac87",
+          "toolName": "calc",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "6 times 7 is:42"
+              }
+            ],
+            "details": {
+              "results": [
+                {
+                  "expression": "6*7",
+                  "value": 42,
+                  "output": "6 times 7 is:42"
+                }
+              ]
+            }
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591e6c87010a34fac88",
+          "toolName": "bash",
+          "args": {
+            "command": "ls -a /workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591e6c87010a34fac88",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": ".\n..\n.git\nREADME\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591ede77789bd85eeed",
+          "toolName": "write",
+          "args": {
+            "path": "/workspace/repository/PROOF.md",
+            "content": "6 times 7 is 42"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591ede77789bd85eeed",
+          "toolName": "write",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Successfully wrote 15 bytes to /workspace/repository/PROOF.md"
+              }
+            ],
+            "details": {}
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f591f5c7704a8ff40ab4",
+          "toolName": "bash",
+          "args": {
+            "command": "wc -l -c PROOF.md && od -c PROOF.md",
+            "cwd": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f591f5c7704a8ff40ab4",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": " 0 15 PROOF.md\n0000000   6       t   i   m   e   s       7       i   s       4   2\n0000017\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f5921187735f9b264256",
+          "toolName": "bash",
+          "args": {
+            "command": "tail -c 20 README | od -c | tail -3",
+            "cwd": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f5921187735f9b264256",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "0000000   H   e   l   l   o       W   o   r   l   d   !  \\n\n0000015\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f59218ef7359b83780fa",
+          "toolName": "edit",
+          "args": {
+            "path": "/workspace/repository/PROOF.md",
+            "diff": "@@\n 6 times 7 is 42\n+"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f59218ef7359b83780fa",
+          "toolName": "edit",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Updated /workspace/repository/PROOF.md"
+              }
+            ],
+            "details": {
+              "diff": "@@ -1,1 +1,1 @@\n-6 times 7 is 42\n\\ No newline at end of file\n+times 7 is 42\n\\ No newline at end of file",
+              "firstChangedLine": 1,
+              "op": "update"
+            },
+            "$normative": {
+              "path": "/workspace/repository/PROOF.md",
+              "op": "update",
+              "diff": "@@ \\ No newline at end of file\n-6 times 7 is 42\n\\ No newline at end of file\n+times 7 is 42\n\\ No newline at end of file"
+            }
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f5921c907299a3a50ba6",
+          "toolName": "bash",
+          "args": {
+            "command": "wc -l -c PROOF.md && od -c PROOF.md && git status --short",
+            "cwd": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f5921c907299a3a50ba6",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": " 0 13 PROOF.md\n0000000   t   i   m   e   s       7       i   s       4   2\n0000015\n?? PROOF.md\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f59239ea71be83178612",
+          "toolName": "write",
+          "args": {
+            "content": "6 times 7 is 42",
+            "path": "/workspace/repository/PROOF.md"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f59239ea71be83178612",
+          "toolName": "write",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "Successfully wrote 15 bytes to /workspace/repository/PROOF.md"
+              }
+            ],
+            "details": {}
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f5923f237063bd579316",
+          "toolName": "bash",
+          "args": {
+            "command": "od -c PROOF.md",
+            "cwd": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f5923f237063bd579316",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "0000000   6       t   i   m   e   s       7       i   s       4   2\n0000017\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f592473877a1b6502c2c",
+          "toolName": "bash",
+          "args": {
+            "command": "printf '6 times 7 is 42\\n' > PROOF.md && od -c PROOF.md && wc -l PROOF.md",
+            "cwd": "/workspace/repository"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f592473877a1b6502c2c",
+          "toolName": "bash",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "0000000   6       t   i   m   e   s       7       i   s       4   2  \\n\n0000020\n1 PROOF.md\n"
+              }
+            ]
+          },
+          "isError": false
+        },
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_01a0f5924caf70fb9dd1999d",
+          "toolName": "read",
+          "args": {
+            "path": "/workspace/repository/PROOF.md"
+          }
+        },
+        {
+          "type": "tool_execution_end",
+          "toolCallId": "call_01a0f5924caf70fb9dd1999d",
+          "toolName": "read",
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "6 times 7 is 42\n"
+              }
+            ],
+            "details": {
+              "meta": {
+                "source": {
+                  "type": "path",
+                  "value": "/workspace/repository/PROOF.md"
+                }
+              }
+            }
+          },
+          "isError": false
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,552 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "run",
+  "generated_at": "2026-10-01T05:50:07+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 38,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "empty-exec"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 20,
+      "parallelism": 1,
+      "checkpoint_every": 5
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 25
+  },
+  "conditions_fingerprint": "da72fa17be641958",
+  "scenarios": {
+    "empty-exec": {
+      "succeeded": 25,
+      "not_succeeded": 0,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 25
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 13.85,
+        "max_s": 20.532,
+        "mean_s": 16.2251,
+        "median_s": 16.1046,
+        "p50_s": 16.1046,
+        "p95_s": 19.3439,
+        "p99_s": 20.532
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 5.4094,
+        "max_s": 8.2399,
+        "mean_s": 6.9264,
+        "median_s": 6.8421,
+        "p50_s": 6.8421,
+        "p95_s": 8.1453,
+        "p99_s": 8.2399
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.0495,
+        "max_s": 11.6914,
+        "mean_s": 8.5778,
+        "median_s": 8.0391,
+        "p50_s": 8.0391,
+        "p95_s": 10.8245,
+        "p99_s": 11.6914
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.0495,
+        "max_s": 11.6914,
+        "mean_s": 8.5778,
+        "median_s": 8.0391,
+        "p50_s": 8.0391,
+        "p95_s": 10.8245,
+        "p99_s": 11.6914
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 12.1857,
+        "max_s": 18.7097,
+        "mean_s": 13.9695,
+        "median_s": 13.3231,
+        "p50_s": 13.3231,
+        "p95_s": 17.0724,
+        "p99_s": 18.7097
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 2.785,
+        "max_s": 4.326,
+        "mean_s": 3.3897,
+        "median_s": 3.255,
+        "p50_s": 3.255,
+        "p95_s": 4.215,
+        "p99_s": 4.326
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 4.222,
+        "max_s": 7.058,
+        "mean_s": 5.1776,
+        "median_s": 4.765,
+        "p50_s": 4.765,
+        "p95_s": 6.85,
+        "p99_s": 7.058
+      },
+      "phase_placement.allocation": {
+        "metric": "phase_placement.allocation",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.481,
+        "max_s": 0.748,
+        "mean_s": 0.5403,
+        "median_s": 0.523,
+        "p50_s": 0.523,
+        "p95_s": 0.678,
+        "p99_s": 0.748
+      },
+      "phase_placement.boot": {
+        "metric": "phase_placement.boot",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.489,
+        "max_s": 0.817,
+        "mean_s": 0.5486,
+        "median_s": 0.539,
+        "p50_s": 0.539,
+        "p95_s": 0.615,
+        "p99_s": 0.817
+      },
+      "phase_placement.scheduler": {
+        "metric": "phase_placement.scheduler",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 1.628,
+        "max_s": 3.378,
+        "mean_s": 2.2608,
+        "median_s": 1.958,
+        "p50_s": 1.958,
+        "p95_s": 3.352,
+        "p99_s": 3.378
+      },
+      "phase_placement.workspace": {
+        "metric": "phase_placement.workspace",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.675,
+        "max_s": 1.095,
+        "mean_s": 0.7314,
+        "median_s": 0.712,
+        "p50_s": 0.712,
+        "p95_s": 0.884,
+        "p99_s": 1.095
+      },
+      "workload": {
+        "image": "python:3.13",
+        "command": [
+          "true"
+        ],
+        "runtime_requested": null,
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048
+        },
+        "repo": null,
+        "validations": [],
+        "artifacts": [],
+        "retention": "destroy"
+      },
+      "first_sample": {
+        "state": "succeeded",
+        "seconds": 20.532
+      },
+      "api_request_accounting": {
+        "available": true,
+        "definition": "aiec_api_requests_total delta, which counts HTTP requests, not database queries",
+        "before": 260.0,
+        "after": 818.0,
+        "delta": 558.0,
+        "per_run": 22.32
+      },
+      "run_events": {
+        "available": true,
+        "runs_sampled": 3,
+        "first_event_after_request": {
+          "metric": "first_event_after_request",
+          "available": true,
+          "unit": "s",
+          "samples": 3,
+          "min_s": 0.8146,
+          "max_s": 1.1388,
+          "mean_s": 1.0183,
+          "median_s": 1.1015,
+          "percentiles_withheld": "3 samples is below the 20 needed for a p50/p95/p99"
+        },
+        "timelines": [
+          {
+            "run_id": "01a0f5fd-1399-717d-9847-bfdcc644f606",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 1.1388
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 11.078
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 11.7406
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 12.836
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 17.4431
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 18.9991
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f5fd-63d2-7161-beb4-e2901f3171d5",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 1.1015
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 10.2651
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 10.8608
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 11.7453
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 15.8005
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 17.4528
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f5fd-afb8-701d-9fa6-b41d4ff00c95",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.8146
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 10.3002
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 10.8556
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 11.5326
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 15.301
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 16.7632
+              }
+            ]
+          }
+        ]
+      },
+      "rate_limit_429s": 0
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-10-01T05:43:16+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T05:43:17+00:00",
+        "total": 796,
+        "by_state": {
+          "destroyed": 768,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T05:43:17+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 257.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T05:43:17+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T05:43:18+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T05:43:18+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.91,
+          1.82,
+          1.83
+        ],
+        "memory_available_bytes": 27192029184,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T05:43:18+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T05:50:06+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T05:50:06+00:00",
+        "total": 821,
+        "by_state": {
+          "destroyed": 793,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T05:50:06+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 828.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T05:50:07+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T05:50:07+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T05:50:07+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.6,
+          1.6,
+          1.72
+        ],
+        "memory_available_bytes": 27186114560,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T05:50:07+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 0,
+      "nonterminal_at_end": 0,
+      "new_nonterminal_sandbox_ids": [],
+      "by_state_at_end": {
+        "destroyed": 793,
+        "failed": 28
+      },
+      "available_vcpus_before": 12.0,
+      "available_vcpus_after": 12.0,
+      "vcpus_returned_to_baseline": true
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  }
+}

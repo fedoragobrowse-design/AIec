@@ -72,12 +72,17 @@ impl Repository {
         } else {
             String::new()
         };
-        let changed_files = changed_files(&self.root, &self.status());
+        // Once. The changed-file list is parsed out of the status, so reading
+        // it twice means the evidence can disagree with itself: a file written
+        // between the two calls appears in one field and not the other, and
+        // nothing downstream can tell which list is the real one.
+        let status = self.status();
+        let changed_files = changed_files(&self.root, &status);
         GitEvidence {
             head_before: None,
             head_after,
             branch: self.branch(),
-            status: self.status(),
+            status,
             diff_truncated: diff.len() >= MAX_DIFF,
             diff,
             changed_files,

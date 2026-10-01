@@ -1,0 +1,5208 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "current-deployed-after",
+  "generated_at": "2026-10-01T04:09:44+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 213,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "control-plane",
+      "empty-exec"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 20,
+      "parallelism": 1,
+      "checkpoint_every": 5
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 25
+  },
+  "conditions_fingerprint": "602f511b90348c50",
+  "scenarios": {
+    "control-plane": {
+      "endpoints": [
+        {
+          "endpoint": "health",
+          "path": "/health",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "health",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.0023,
+            "max_s": 0.0048,
+            "mean_s": 0.0031,
+            "median_s": 0.0029,
+            "p50_s": 0.0029,
+            "p95_s": 0.0042,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "ready",
+          "path": "/ready",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "ready",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.136,
+            "max_s": 0.1857,
+            "mean_s": 0.1625,
+            "median_s": 0.1653,
+            "p50_s": 0.1653,
+            "p95_s": 0.1786,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "list_sandboxes",
+          "path": "/v1/sandboxes",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_sandboxes",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.3505,
+            "max_s": 0.8393,
+            "mean_s": 0.5645,
+            "median_s": 0.5579,
+            "p50_s": 0.5579,
+            "p95_s": 0.6687,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "list_runs",
+          "path": "/v1/runs?limit=20",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_runs",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.425,
+            "max_s": 0.5879,
+            "mean_s": 0.4885,
+            "median_s": 0.4728,
+            "p50_s": 0.4728,
+            "p95_s": 0.5774,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "list_queued_runs",
+          "path": "/v1/runs?state=queued&limit=100",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "list_queued_runs",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2816,
+            "max_s": 0.3412,
+            "mean_s": 0.3115,
+            "median_s": 0.3104,
+            "p50_s": 0.3104,
+            "p95_s": 0.3403,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "current_account",
+          "path": "/v1/account",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "current_account",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2765,
+            "max_s": 0.4202,
+            "mean_s": 0.3374,
+            "median_s": 0.3251,
+            "p50_s": 0.3251,
+            "p95_s": 0.4123,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        },
+        {
+          "endpoint": "usage",
+          "path": "/v1/usage",
+          "requests": 25,
+          "statuses": {
+            "200": 25
+          },
+          "latency": {
+            "metric": "usage",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 0.2889,
+            "max_s": 0.4092,
+            "mean_s": 0.3359,
+            "median_s": 0.3286,
+            "p50_s": 0.3286,
+            "p95_s": 0.4089,
+            "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+          }
+        }
+      ]
+    },
+    "empty-exec": {
+      "succeeded": 25,
+      "not_succeeded": 0,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 25
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 13.4118,
+        "max_s": 17.5415,
+        "mean_s": 15.3289,
+        "median_s": 15.0486,
+        "p50_s": 15.0486,
+        "p95_s": 17.4977,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 5.317,
+        "max_s": 7.6385,
+        "mean_s": 6.3421,
+        "median_s": 6.0744,
+        "p50_s": 6.0744,
+        "p95_s": 7.5445,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.1915,
+        "max_s": 9.5411,
+        "mean_s": 8.0378,
+        "median_s": 7.769,
+        "p50_s": 7.769,
+        "p95_s": 9.5303,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 7.1915,
+        "max_s": 9.5411,
+        "mean_s": 8.0378,
+        "median_s": 7.769,
+        "p50_s": 7.769,
+        "p95_s": 9.5303,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 12.0406,
+        "max_s": 16.0353,
+        "mean_s": 13.3702,
+        "median_s": 13.1777,
+        "p50_s": 13.1777,
+        "p95_s": 15.7106,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 2.939,
+        "max_s": 6.505,
+        "mean_s": 3.4146,
+        "median_s": 3.094,
+        "p50_s": 3.094,
+        "p95_s": 4.515,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 4.319,
+        "max_s": 6.139,
+        "mean_s": 4.8684,
+        "median_s": 4.678,
+        "p50_s": 4.678,
+        "p95_s": 6.038,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 25,
+        "min_s": 0.657,
+        "max_s": 0.787,
+        "mean_s": 0.7039,
+        "median_s": 0.704,
+        "p50_s": 0.704,
+        "p95_s": 0.753,
+        "p99_withheld": "Fewer than 100 samples; empirical maximum is not a meaningful p99 tail estimate."
+      },
+      "workload": {
+        "image": "python:3.13",
+        "command": [
+          "true"
+        ],
+        "runtime_requested": null,
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048
+        },
+        "repo": null,
+        "validations": [],
+        "artifacts": [],
+        "retention": "destroy"
+      },
+      "first_sample": {
+        "state": "succeeded",
+        "seconds": 16.3156
+      },
+      "api_request_accounting": {
+        "available": true,
+        "definition": "aiec_api_requests_total delta, which counts HTTP requests, not database queries",
+        "before": 926.0,
+        "after": 1539.0,
+        "delta": 613.0,
+        "per_run": 24.52
+      },
+      "run_events": {
+        "available": true,
+        "runs_sampled": 3,
+        "first_event_after_request": {
+          "metric": "first_event_after_request",
+          "available": true,
+          "unit": "s",
+          "samples": 3,
+          "min_s": 0.6246,
+          "max_s": 0.8426,
+          "mean_s": 0.7666,
+          "median_s": 0.8326,
+          "percentiles_withheld": "3 samples is below the 20 needed for a p50/p95/p99"
+        },
+        "timelines": [
+          {
+            "run_id": "01a0f5a1-8450-77f0-90d0-7d4566d406c7",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.8326
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 8.7976
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 9.3645
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 10.1034
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 13.2278
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 14.785
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f5a1-c3fb-7289-bb6e-dbd51b66de26",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.6246
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 7.1487
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 7.6089
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 8.2944
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 12.2871
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 13.6095
+              }
+            ]
+          },
+          {
+            "run_id": "01a0f5a2-004e-727b-8bf5-31f06d954ffc",
+            "timeline": [
+              {
+                "event_type": "run.created",
+                "seconds_after_request": 0.8426
+              },
+              {
+                "event_type": "sandbox.assigned",
+                "seconds_after_request": 9.0801
+              },
+              {
+                "event_type": "task.started",
+                "seconds_after_request": 9.5425
+              },
+              {
+                "event_type": "task.finished",
+                "seconds_after_request": 10.2432
+              },
+              {
+                "event_type": "sandbox.destroyed",
+                "seconds_after_request": 13.5299
+              },
+              {
+                "event_type": "run.completed",
+                "seconds_after_request": 14.9782
+              }
+            ]
+          }
+        ]
+      },
+      "rate_limit_429s": 0
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-10-01T04:02:14+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T04:02:15+00:00",
+        "total": 538,
+        "by_state": {
+          "destroyed": 507,
+          "failed": 28,
+          "restoring": 1,
+          "running": 2
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4c1-ecf0-71fa-820e-7a6d296a90b0",
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T04:02:15+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 686.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T04:02:16+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T04:02:16+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T04:02:16+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.7,
+          1.92,
+          2.0
+        ],
+        "memory_available_bytes": 26872098816,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624345088,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T04:02:16+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 3,
+        "names": [
+          "aiec-testdb",
+          "aiec-01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "aiec-01a0f4b7-538a-712f-9566-7512c654403f"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T04:09:42+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T04:09:43+00:00",
+        "total": 563,
+        "by_state": {
+          "destroyed": 533,
+          "failed": 28,
+          "running": 2
+        },
+        "nonterminal_count": 2,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T04:09:43+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 10.0,
+        "available_memory_bytes": 11811160064.0,
+        "api_requests_total": 1551.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T04:09:44+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T04:09:44+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T04:09:44+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.61,
+          1.87,
+          1.96
+        ],
+        "memory_available_bytes": 26498023424,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624336896,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T04:09:44+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 3,
+        "names": [
+          "aiec-testdb",
+          "aiec-01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "aiec-01a0f4b7-538a-712f-9566-7512c654403f"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 3,
+      "nonterminal_at_end": 2,
+      "new_nonterminal_sandbox_ids": [],
+      "by_state_at_end": {
+        "destroyed": 533,
+        "failed": 28,
+        "running": 2
+      },
+      "available_vcpus_before": 10.0,
+      "available_vcpus_after": 10.0,
+      "vcpus_returned_to_baseline": true
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  },
+  "comparison": {
+    "before": {
+      "label": "run",
+      "generated_at": "2026-09-30T23:32:53+00:00",
+      "fingerprint": "602f511b90348c50"
+    },
+    "after": {
+      "label": "current-deployed-after",
+      "generated_at": "2026-10-01T04:09:44+00:00",
+      "fingerprint": "602f511b90348c50"
+    },
+    "comparable": true,
+    "metric_deltas": {
+      "control-plane.endpoints[0].latency": {
+        "before": 0.0027,
+        "after": 0.0029,
+        "delta": 0.0002,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.0741
+      },
+      "control-plane.endpoints[1].latency": {
+        "before": 0.1616,
+        "after": 0.1653,
+        "delta": 0.0037,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.0229
+      },
+      "control-plane.endpoints[2].latency": {
+        "before": 0.5572,
+        "after": 0.5579,
+        "delta": 0.0007,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.0013
+      },
+      "control-plane.endpoints[3].latency": {
+        "before": 0.3953,
+        "after": 0.4728,
+        "delta": 0.0775,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.1961
+      },
+      "control-plane.endpoints[4].latency": {
+        "before": 0.3158,
+        "after": 0.3104,
+        "delta": -0.0054,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": -0.0171
+      },
+      "control-plane.endpoints[5].latency": {
+        "before": 0.3247,
+        "after": 0.3251,
+        "delta": 0.0004,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.0012
+      },
+      "control-plane.endpoints[6].latency": {
+        "before": 0.3172,
+        "after": 0.3286,
+        "delta": 0.0114,
+        "before_samples": 25,
+        "after_samples": 25,
+        "change_fraction": 0.0359
+      },
+      "empty-exec.admission": {
+        "before": 0.0,
+        "after": 0.0,
+        "delta": 0.0,
+        "before_samples": 22,
+        "after_samples": 25
+      },
+      "empty-exec.phase_cleanup": {
+        "before": 13.349,
+        "after": 3.094,
+        "delta": -10.255,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.7682
+      },
+      "empty-exec.phase_collection": {
+        "before": 0.0,
+        "after": 0.0,
+        "delta": 0.0,
+        "before_samples": 22,
+        "after_samples": 25
+      },
+      "empty-exec.phase_placement": {
+        "before": 5.1175,
+        "after": 4.678,
+        "delta": -0.4395,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.0859
+      },
+      "empty-exec.phase_task": {
+        "before": 0.87,
+        "after": 0.704,
+        "delta": -0.166,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.1908
+      },
+      "empty-exec.queue_wait": {
+        "before": 8.2741,
+        "after": 7.769,
+        "delta": -0.5051,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.061
+      },
+      "empty-exec.residual_unattributed": {
+        "before": 6.0032,
+        "after": 6.0744,
+        "delta": 0.0712,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": 0.0119
+      },
+      "empty-exec.run_events.first_event_after_request": {
+        "before": 0.828,
+        "after": 0.8326,
+        "delta": 0.0046,
+        "before_samples": 3,
+        "after_samples": 3,
+        "change_fraction": 0.0056
+      },
+      "empty-exec.run_total": {
+        "before": 25.5837,
+        "after": 15.0486,
+        "delta": -10.5351,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.4118
+      },
+      "empty-exec.start_latency": {
+        "before": 8.2741,
+        "after": 7.769,
+        "delta": -0.5051,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.061
+      },
+      "empty-exec.wall_time": {
+        "before": 23.7805,
+        "after": 13.1777,
+        "delta": -10.6028,
+        "before_samples": 22,
+        "after_samples": 25,
+        "change_fraction": -0.4459
+      }
+    },
+    "evidence": {
+      "before_successful_runs": {
+        "empty-exec": {
+          "succeeded": 22,
+          "not_succeeded": 3,
+          "rejected_before_execution": 0
+        }
+      },
+      "after_successful_runs": {
+        "empty-exec": {
+          "succeeded": 25,
+          "not_succeeded": 0,
+          "rejected_before_execution": 0
+        }
+      },
+      "note": "a latency delta next to a drop in successful runs is not an improvement; read the counts first"
+    }
+  },
+  "raw_outcomes": [
+    {
+      "run": {
+        "id": "01a0f5a1-8450-77f0-90d0-7d4566d406c7",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:03:18.224083Z",
+        "queued_at": "2026-10-01T04:03:18.224083Z",
+        "started_at": "2026-10-01T04:03:27.551828Z",
+        "completed_at": "2026-10-01T04:03:32.756259Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3078,
+            "collection": 0,
+            "placement": 5503,
+            "task": 738
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 16.31561127200257,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a1-c3fb-7289-bb6e-dbd51b66de26",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:03:34.523816Z",
+        "queued_at": "2026-10-01T04:03:34.523816Z",
+        "started_at": "2026-10-01T04:03:42.095985Z",
+        "completed_at": "2026-10-01T04:03:47.882916Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 41,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3740,
+            "collection": 0,
+            "placement": 4322,
+            "task": 685
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.447315266996156,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a2-004e-727b-8bf5-31f06d954ffc",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:03:49.966474Z",
+        "queued_at": "2026-10-01T04:03:49.966474Z",
+        "started_at": "2026-10-01T04:03:59.471404Z",
+        "completed_at": "2026-10-01T04:04:04.695627Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 38,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3091,
+            "collection": 0,
+            "placement": 6038,
+            "task": 700
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 17.373506251955405,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a2-4442-7014-b8c3-a3043353ea80",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:04:07.362477Z",
+        "queued_at": "2026-10-01T04:04:07.362477Z",
+        "started_at": "2026-10-01T04:04:16.903545Z",
+        "completed_at": "2026-10-01T04:04:22.191037Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 49,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3143,
+            "collection": 0,
+            "placement": 6007,
+            "task": 753
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 17.54148376302328,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a2-88ca-76e6-9373-5db0b06224f0",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:04:24.906749Z",
+        "queued_at": "2026-10-01T04:04:24.906749Z",
+        "started_at": "2026-10-01T04:04:33.131001Z",
+        "completed_at": "2026-10-01T04:04:38.628659Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 39,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3475,
+            "collection": 0,
+            "placement": 4709,
+            "task": 704
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 16.268058221030515,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a2-c840-722e-99a3-51b4dbf3f8a9",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:04:41.152599Z",
+        "queued_at": "2026-10-01T04:04:41.152599Z",
+        "started_at": "2026-10-01T04:04:50.682938Z",
+        "completed_at": "2026-10-01T04:04:57.187885Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 4392,
+            "collection": 0,
+            "placement": 5849,
+            "task": 707
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 17.49766227195505,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a3-0c97-7062-8766-53895749cece",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:04:58.647435Z",
+        "queued_at": "2026-10-01T04:04:58.647435Z",
+        "started_at": "2026-10-01T04:05:07.455044Z",
+        "completed_at": "2026-10-01T04:05:12.496753Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3216,
+            "collection": 0,
+            "placement": 5482,
+            "task": 691
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.269131321983878,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a3-483a-7774-ae7e-71873545e785",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:05:13.914462Z",
+        "queued_at": "2026-10-01T04:05:13.914462Z",
+        "started_at": "2026-10-01T04:05:21.768628Z",
+        "completed_at": "2026-10-01T04:05:28.155692Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 47,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 4515,
+            "collection": 0,
+            "placement": 4709,
+            "task": 701
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.905543219996616,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a3-8667-7427-90f0-9a4c0a079cfc",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:05:29.831105Z",
+        "queued_at": "2026-10-01T04:05:29.831105Z",
+        "started_at": "2026-10-01T04:05:39.311467Z",
+        "completed_at": "2026-10-01T04:05:44.219131Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 43,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3063,
+            "collection": 0,
+            "placement": 6139,
+            "task": 685
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.724195896007586,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a3-c3ea-76a5-bc6c-6b3a631109d1",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:05:45.578002Z",
+        "queued_at": "2026-10-01T04:05:45.578002Z",
+        "started_at": "2026-10-01T04:05:53.346979Z",
+        "completed_at": "2026-10-01T04:05:58.755750Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 41,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3407,
+            "collection": 0,
+            "placement": 5079,
+            "task": 710
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 16.102984875964466,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a4-02b3-7370-8e81-cd45a35232b8",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:06:01.651738Z",
+        "queued_at": "2026-10-01T04:06:01.651738Z",
+        "started_at": "2026-10-01T04:06:10.082938Z",
+        "completed_at": "2026-10-01T04:06:15.259684Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 78,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3318,
+            "collection": 0,
+            "placement": 4730,
+            "task": 733
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.820543502981309,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a4-3cad-7503-b958-e1a70d8aff76",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:06:16.493279Z",
+        "queued_at": "2026-10-01T04:06:16.493279Z",
+        "started_at": "2026-10-01T04:06:23.919760Z",
+        "completed_at": "2026-10-01T04:06:28.847672Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 42,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3068,
+            "collection": 0,
+            "placement": 4468,
+            "task": 660
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 13.693785027018748,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a4-722d-750a-92c4-45a34acb0e0a",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:06:30.189557Z",
+        "queued_at": "2026-10-01T04:06:30.189557Z",
+        "started_at": "2026-10-01T04:06:37.511626Z",
+        "completed_at": "2026-10-01T04:06:42.455891Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 39,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3094,
+            "collection": 0,
+            "placement": 4469,
+            "task": 678
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.126570228021592,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a4-ad33-738c-af1b-0c6fcf595bbb",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:06:45.299890Z",
+        "queued_at": "2026-10-01T04:06:45.299890Z",
+        "started_at": "2026-10-01T04:06:52.491753Z",
+        "completed_at": "2026-10-01T04:06:57.340489Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 71,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3027,
+            "collection": 0,
+            "placement": 4354,
+            "task": 715
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 13.41304679994937,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a4-e1af-77a3-b80d-cfaf88d1158e",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:06:58.735022Z",
+        "queued_at": "2026-10-01T04:06:58.735022Z",
+        "started_at": "2026-10-01T04:07:06.156751Z",
+        "completed_at": "2026-10-01T04:07:11.071476Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3106,
+            "collection": 0,
+            "placement": 4594,
+            "task": 666
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.04826295899693,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a5-1c58-7174-89f7-1f82eb80449b",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:07:13.752149Z",
+        "queued_at": "2026-10-01T04:07:13.752149Z",
+        "started_at": "2026-10-01T04:07:20.943642Z",
+        "completed_at": "2026-10-01T04:07:26.583578Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3754,
+            "collection": 0,
+            "placement": 4461,
+            "task": 704
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.946911171020474,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a5-56cc-7299-b709-164fca62e431",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:07:28.716272Z",
+        "queued_at": "2026-10-01T04:07:28.716272Z",
+        "started_at": "2026-10-01T04:07:35.991970Z",
+        "completed_at": "2026-10-01T04:07:40.784438Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 46,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 2939,
+            "collection": 0,
+            "placement": 4431,
+            "task": 713
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 13.411795698979404,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a5-8b1c-778c-a8aa-584884f7673b",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:07:42.108332Z",
+        "queued_at": "2026-10-01T04:07:42.108332Z",
+        "started_at": "2026-10-01T04:07:49.350085Z",
+        "completed_at": "2026-10-01T04:07:54.235683Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 41,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3081,
+            "collection": 0,
+            "placement": 4350,
+            "task": 657
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.912459368002601,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a5-c572-7361-b380-7d61eb33c3e1",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:07:57.042966Z",
+        "queued_at": "2026-10-01T04:07:57.042966Z",
+        "started_at": "2026-10-01T04:08:05.099950Z",
+        "completed_at": "2026-10-01T04:08:09.943502Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3050,
+            "collection": 0,
+            "placement": 4678,
+            "task": 697
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.383685201988555,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a5-fd95-760d-9a2d-d459a7d33a38",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:08:11.413063Z",
+        "queued_at": "2026-10-01T04:08:11.413063Z",
+        "started_at": "2026-10-01T04:08:19.634904Z",
+        "completed_at": "2026-10-01T04:08:24.623645Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 39,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3084,
+            "collection": 0,
+            "placement": 4783,
+            "task": 678
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.619393730012234,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a6-36b2-7151-b1dd-2453daa7e3f6",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:08:26.034858Z",
+        "queued_at": "2026-10-01T04:08:26.034858Z",
+        "started_at": "2026-10-01T04:08:33.364669Z",
+        "completed_at": "2026-10-01T04:08:38.443100Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 49,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3176,
+            "collection": 0,
+            "placement": 4319,
+            "task": 724
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.048564377997536,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a6-718a-761c-9b7c-21a18beb22da",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:08:41.098131Z",
+        "queued_at": "2026-10-01T04:08:41.098131Z",
+        "started_at": "2026-10-01T04:08:48.419881Z",
+        "completed_at": "2026-10-01T04:08:53.308679Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 41,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3031,
+            "collection": 0,
+            "placement": 4599,
+            "task": 676
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 15.026654399989638,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a6-ac28-77e5-ad68-3f09cb65c528",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:08:56.104330Z",
+        "queued_at": "2026-10-01T04:08:56.104330Z",
+        "started_at": "2026-10-01T04:09:04.179256Z",
+        "completed_at": "2026-10-01T04:09:09.111792Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3049,
+            "collection": 0,
+            "placement": 4819,
+            "task": 787
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 14.216420507989824,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a6-e3af-75e0-9d5c-8b5a416ee9a8",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:09:10.319352Z",
+        "queued_at": "2026-10-01T04:09:10.319352Z",
+        "started_at": "2026-10-01T04:09:17.808112Z",
+        "completed_at": "2026-10-01T04:09:22.631770Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 41,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 2962,
+            "collection": 0,
+            "placement": 4483,
+            "task": 710
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 13.634784388006665,
+      "state": "succeeded"
+    },
+    {
+      "run": {
+        "id": "01a0f5a7-1909-75bf-a230-1fa5c8c46693",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T04:09:23.977799Z",
+        "queued_at": "2026-10-01T04:09:23.977799Z",
+        "started_at": "2026-10-01T04:09:31.315085Z",
+        "completed_at": "2026-10-01T04:09:39.688361Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": null,
+          "setup": [],
+          "command": [
+            "true"
+          ],
+          "validations": [],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": null,
+          "git_evidence": false
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": false
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "policy selected Docker from available capable runtimes"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "true"
+            ],
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "duration_ms": 40,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [],
+          "setup": [],
+          "commit": null,
+          "git_status": "",
+          "git_diff": "",
+          "changed_files": [],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 6505,
+            "collection": 0,
+            "placement": 4335,
+            "task": 725
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "seconds": 17.474280955037102,
+      "state": "succeeded"
+    }
+  ],
+  "correct_throughput": {
+    "succeeded": 25,
+    "not_succeeded": 0,
+    "window_started_at": "2026-10-01T04:03:18.224083+00:00",
+    "window_ended_at": "2026-10-01T04:09:39.688361+00:00",
+    "wall_seconds": 381.464278,
+    "succeeded_per_second": 0.06553693606927986,
+    "scope": "Durable Run first request to last completion, includes intervening client submission gaps; excludes preceding control-plane reads and post-run observations."
+  },
+  "raw_durable_runs": [
+    {
+      "id": "01a0f5a1-8450-77f0-90d0-7d4566d406c7",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:03:18.224083+00:00",
+      "queued_at": "2026-10-01T04:03:18.224083+00:00",
+      "started_at": "2026-10-01T04:03:27.551828+00:00",
+      "completed_at": "2026-10-01T04:03:32.756259+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 738,
+          "cleanup": 3078,
+          "placement": 5503,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a1-c3fb-7289-bb6e-dbd51b66de26",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:03:34.523816+00:00",
+      "queued_at": "2026-10-01T04:03:34.523816+00:00",
+      "started_at": "2026-10-01T04:03:42.095985+00:00",
+      "completed_at": "2026-10-01T04:03:47.882916+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 41,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 685,
+          "cleanup": 3740,
+          "placement": 4322,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a2-004e-727b-8bf5-31f06d954ffc",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:03:49.966474+00:00",
+      "queued_at": "2026-10-01T04:03:49.966474+00:00",
+      "started_at": "2026-10-01T04:03:59.471404+00:00",
+      "completed_at": "2026-10-01T04:04:04.695627+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 38,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 700,
+          "cleanup": 3091,
+          "placement": 6038,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a2-4442-7014-b8c3-a3043353ea80",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:04:07.362477+00:00",
+      "queued_at": "2026-10-01T04:04:07.362477+00:00",
+      "started_at": "2026-10-01T04:04:16.903545+00:00",
+      "completed_at": "2026-10-01T04:04:22.191037+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 49,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 753,
+          "cleanup": 3143,
+          "placement": 6007,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a2-88ca-76e6-9373-5db0b06224f0",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:04:24.906749+00:00",
+      "queued_at": "2026-10-01T04:04:24.906749+00:00",
+      "started_at": "2026-10-01T04:04:33.131001+00:00",
+      "completed_at": "2026-10-01T04:04:38.628659+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 39,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 704,
+          "cleanup": 3475,
+          "placement": 4709,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a2-c840-722e-99a3-51b4dbf3f8a9",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:04:41.152599+00:00",
+      "queued_at": "2026-10-01T04:04:41.152599+00:00",
+      "started_at": "2026-10-01T04:04:50.682938+00:00",
+      "completed_at": "2026-10-01T04:04:57.187885+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 707,
+          "cleanup": 4392,
+          "placement": 5849,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a3-0c97-7062-8766-53895749cece",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:04:58.647435+00:00",
+      "queued_at": "2026-10-01T04:04:58.647435+00:00",
+      "started_at": "2026-10-01T04:05:07.455044+00:00",
+      "completed_at": "2026-10-01T04:05:12.496753+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 691,
+          "cleanup": 3216,
+          "placement": 5482,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a3-483a-7774-ae7e-71873545e785",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:05:13.914462+00:00",
+      "queued_at": "2026-10-01T04:05:13.914462+00:00",
+      "started_at": "2026-10-01T04:05:21.768628+00:00",
+      "completed_at": "2026-10-01T04:05:28.155692+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 47,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 701,
+          "cleanup": 4515,
+          "placement": 4709,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a3-8667-7427-90f0-9a4c0a079cfc",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:05:29.831105+00:00",
+      "queued_at": "2026-10-01T04:05:29.831105+00:00",
+      "started_at": "2026-10-01T04:05:39.311467+00:00",
+      "completed_at": "2026-10-01T04:05:44.219131+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 43,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 685,
+          "cleanup": 3063,
+          "placement": 6139,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a3-c3ea-76a5-bc6c-6b3a631109d1",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:05:45.578002+00:00",
+      "queued_at": "2026-10-01T04:05:45.578002+00:00",
+      "started_at": "2026-10-01T04:05:53.346979+00:00",
+      "completed_at": "2026-10-01T04:05:58.75575+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 41,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 710,
+          "cleanup": 3407,
+          "placement": 5079,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a4-02b3-7370-8e81-cd45a35232b8",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:06:01.651738+00:00",
+      "queued_at": "2026-10-01T04:06:01.651738+00:00",
+      "started_at": "2026-10-01T04:06:10.082938+00:00",
+      "completed_at": "2026-10-01T04:06:15.259684+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 78,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 733,
+          "cleanup": 3318,
+          "placement": 4730,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a4-3cad-7503-b958-e1a70d8aff76",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:06:16.493279+00:00",
+      "queued_at": "2026-10-01T04:06:16.493279+00:00",
+      "started_at": "2026-10-01T04:06:23.91976+00:00",
+      "completed_at": "2026-10-01T04:06:28.847672+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 42,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 660,
+          "cleanup": 3068,
+          "placement": 4468,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a4-722d-750a-92c4-45a34acb0e0a",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:06:30.189557+00:00",
+      "queued_at": "2026-10-01T04:06:30.189557+00:00",
+      "started_at": "2026-10-01T04:06:37.511626+00:00",
+      "completed_at": "2026-10-01T04:06:42.455891+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 39,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 678,
+          "cleanup": 3094,
+          "placement": 4469,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a4-ad33-738c-af1b-0c6fcf595bbb",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:06:45.29989+00:00",
+      "queued_at": "2026-10-01T04:06:45.29989+00:00",
+      "started_at": "2026-10-01T04:06:52.491753+00:00",
+      "completed_at": "2026-10-01T04:06:57.340489+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 71,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 715,
+          "cleanup": 3027,
+          "placement": 4354,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a4-e1af-77a3-b80d-cfaf88d1158e",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:06:58.735022+00:00",
+      "queued_at": "2026-10-01T04:06:58.735022+00:00",
+      "started_at": "2026-10-01T04:07:06.156751+00:00",
+      "completed_at": "2026-10-01T04:07:11.071476+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 666,
+          "cleanup": 3106,
+          "placement": 4594,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a5-1c58-7174-89f7-1f82eb80449b",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:07:13.752149+00:00",
+      "queued_at": "2026-10-01T04:07:13.752149+00:00",
+      "started_at": "2026-10-01T04:07:20.943642+00:00",
+      "completed_at": "2026-10-01T04:07:26.583578+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 704,
+          "cleanup": 3754,
+          "placement": 4461,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a5-56cc-7299-b709-164fca62e431",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:07:28.716272+00:00",
+      "queued_at": "2026-10-01T04:07:28.716272+00:00",
+      "started_at": "2026-10-01T04:07:35.99197+00:00",
+      "completed_at": "2026-10-01T04:07:40.784438+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 46,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 713,
+          "cleanup": 2939,
+          "placement": 4431,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a5-8b1c-778c-a8aa-584884f7673b",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:07:42.108332+00:00",
+      "queued_at": "2026-10-01T04:07:42.108332+00:00",
+      "started_at": "2026-10-01T04:07:49.350085+00:00",
+      "completed_at": "2026-10-01T04:07:54.235683+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 41,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 657,
+          "cleanup": 3081,
+          "placement": 4350,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a5-c572-7361-b380-7d61eb33c3e1",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:07:57.042966+00:00",
+      "queued_at": "2026-10-01T04:07:57.042966+00:00",
+      "started_at": "2026-10-01T04:08:05.09995+00:00",
+      "completed_at": "2026-10-01T04:08:09.943502+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 697,
+          "cleanup": 3050,
+          "placement": 4678,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a5-fd95-760d-9a2d-d459a7d33a38",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:08:11.413063+00:00",
+      "queued_at": "2026-10-01T04:08:11.413063+00:00",
+      "started_at": "2026-10-01T04:08:19.634904+00:00",
+      "completed_at": "2026-10-01T04:08:24.623645+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 39,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 678,
+          "cleanup": 3084,
+          "placement": 4783,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a6-36b2-7151-b1dd-2453daa7e3f6",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:08:26.034858+00:00",
+      "queued_at": "2026-10-01T04:08:26.034858+00:00",
+      "started_at": "2026-10-01T04:08:33.364669+00:00",
+      "completed_at": "2026-10-01T04:08:38.4431+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 49,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 724,
+          "cleanup": 3176,
+          "placement": 4319,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a6-718a-761c-9b7c-21a18beb22da",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:08:41.098131+00:00",
+      "queued_at": "2026-10-01T04:08:41.098131+00:00",
+      "started_at": "2026-10-01T04:08:48.419881+00:00",
+      "completed_at": "2026-10-01T04:08:53.308679+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 41,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 676,
+          "cleanup": 3031,
+          "placement": 4599,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a6-ac28-77e5-ad68-3f09cb65c528",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:08:56.10433+00:00",
+      "queued_at": "2026-10-01T04:08:56.10433+00:00",
+      "started_at": "2026-10-01T04:09:04.179256+00:00",
+      "completed_at": "2026-10-01T04:09:09.111792+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 787,
+          "cleanup": 3049,
+          "placement": 4819,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a6-e3af-75e0-9d5c-8b5a416ee9a8",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:09:10.319352+00:00",
+      "queued_at": "2026-10-01T04:09:10.319352+00:00",
+      "started_at": "2026-10-01T04:09:17.808112+00:00",
+      "completed_at": "2026-10-01T04:09:22.63177+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 41,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 710,
+          "cleanup": 2962,
+          "placement": 4483,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    },
+    {
+      "id": "01a0f5a7-1909-75bf-a230-1fa5c8c46693",
+      "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+      "state": "succeeded",
+      "requested_at": "2026-10-01T04:09:23.977799+00:00",
+      "queued_at": "2026-10-01T04:09:23.977799+00:00",
+      "started_at": "2026-10-01T04:09:31.315085+00:00",
+      "completed_at": "2026-10-01T04:09:39.688361+00:00",
+      "workload": {
+        "repo": null,
+        "image": "python:3.13",
+        "setup": [],
+        "command": [
+          "true"
+        ],
+        "secrets": [],
+        "artifacts": [],
+        "environment": {},
+        "validations": [],
+        "git_evidence": false,
+        "timeout_seconds": null
+      },
+      "environment": {},
+      "requirements": {
+        "pty": false,
+        "pause": false,
+        "coding_guest": false,
+        "memory_resume": false,
+        "network_policy": false,
+        "portable_workspace": false,
+        "workspace_snapshot": false,
+        "full_kernel_isolation": false
+      },
+      "resources": {
+        "cpu": 1,
+        "disk_mb": 2048,
+        "network": {
+          "enabled": false
+        },
+        "memory_mb": 512
+      },
+      "placement": {
+        "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+        "reasons": [
+          "policy selected Docker from available capable runtimes"
+        ],
+        "runtime": "docker"
+      },
+      "results": {
+        "task": {
+          "ok": true,
+          "stderr": "",
+          "stdout": "",
+          "command": [
+            "true"
+          ],
+          "exit_code": 0,
+          "truncated": false,
+          "duration_ms": 40,
+          "output_preview_truncated": false
+        },
+        "setup": [],
+        "commit": null,
+        "git_diff": "",
+        "phase_ms": {
+          "task": 725,
+          "cleanup": 6505,
+          "placement": 4335,
+          "collection": 0
+        },
+        "artifacts": [],
+        "git_status": "",
+        "validations": [],
+        "changed_files": [],
+        "git_evidence_truncated": false
+      },
+      "failure_reason": null,
+      "retention": "destroy",
+      "retained_sandbox_id": null,
+      "retained_until": null,
+      "idempotency_key": null,
+      "parent_run_id": null,
+      "matrix_id": null,
+      "artifacts_expired_at": null,
+      "matrix_cell": null
+    }
+  ],
+  "raw_durable_runs_provenance": "Recovered production rows in isolated flock measurement window after post-run serializer failure; per-run client roundtrip durations were not persisted.",
+  "measurement_limitations": [
+    "Host/SQL monitoring arrays were lost to a numeric-vs-list samples serializer error; no benchmark host peak or production DB baseline-to-final claim is made. Full baseline/checkpoint/final monitoring is recorded in subsequent soak proofs."
+  ]
+}

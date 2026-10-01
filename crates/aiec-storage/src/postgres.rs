@@ -8,7 +8,9 @@ use aiec_core::{
         Placement, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
         RunSandbox, RunState, WorkloadSpec,
     },
-    scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler},
+    run_queue::{RunQueueClaim, RunQueueLimits},
+    runtime::RuntimeCapabilities,
+    scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler, WorkerDispatch},
     storage::{
         AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
         SandboxOperation, SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment,
@@ -275,7 +277,7 @@ fn attempt_state_as_str(value: RunState) -> Result<&'static str, StoreError> {
     }
 }
 
-fn run_from_row(row: &sqlx::postgres::PgRow) -> Result<Run, StoreError> {
+pub(crate) fn run_from_row(row: &sqlx::postgres::PgRow) -> Result<Run, StoreError> {
     let state: String = row.try_get("state")?;
     let retention: String = row.try_get("retention")?;
     let environment: Value = row.try_get("environment")?;
@@ -308,6 +310,16 @@ fn run_from_row(row: &sqlx::postgres::PgRow) -> Result<Run, StoreError> {
         idempotency_key: row.try_get("idempotency_key")?,
         parent_run_id: row.try_get("parent_run_id")?,
         matrix_id: row.try_get("matrix_id")?,
+        // The cell this run was admitted as. A document that does not parse is
+        // a corrupt ledger rather than an absent label, so it is reported
+        // instead of being read as a run that was never a cell.
+        matrix_cell: row
+            .try_get::<Option<Value>, _>("matrix_cell")?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                StoreError::Conflict(format!("invalid persisted matrix cell: {error}"))
+            })?,
     })
 }
 
@@ -330,6 +342,26 @@ fn run_sandbox_from_row(row: &sqlx::postgres::PgRow) -> Result<RunSandbox, Store
     })
 }
 
+/// Reads a non-negative `bigint` column as a count.
+fn quota_count(row: &sqlx::postgres::PgRow, column: &str) -> Result<u32, StoreError> {
+    let value: i64 = row.try_get(column)?;
+    u32::try_from(value).map_err(|_| {
+        StoreError::Conflict(format!(
+            "persisted quota column {column} is not a count: {value}"
+        ))
+    })
+}
+
+/// Reads a non-negative `bigint` column as an amount.
+fn quota_amount(row: &sqlx::postgres::PgRow, column: &str) -> Result<u64, StoreError> {
+    let value: i64 = row.try_get(column)?;
+    u64::try_from(value).map_err(|_| {
+        StoreError::Conflict(format!(
+            "persisted quota column {column} is negative: {value}"
+        ))
+    })
+}
+
 fn run_attempt_from_row(row: &sqlx::postgres::PgRow) -> Result<RunAttempt, StoreError> {
     let state: String = row.try_get("state")?;
     Ok(RunAttempt {
@@ -341,6 +373,8 @@ fn run_attempt_from_row(row: &sqlx::postgres::PgRow) -> Result<RunAttempt, Store
         failure_reason: row.try_get("failure_reason")?,
         started_at: row.try_get("started_at")?,
         completed_at: row.try_get("completed_at")?,
+        placement: serde_json::from_value(row.try_get("placement")?)?,
+        results: serde_json::from_value(row.try_get("results")?)?,
     })
 }
 
@@ -405,13 +439,104 @@ async fn fetch_run(
     run_from_row(&row)
 }
 
-/// Confirms a run is reachable by this tenant before a child record is written.
-async fn ensure_tenant_run(
-    executor: impl sqlx::Executor<'_, Database = Postgres>,
-    tenant: Uuid,
-    run: Uuid,
+pub(crate) async fn insert_run_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    value: Run,
+) -> Result<Run, StoreError> {
+    if value.tenant_id.is_nil() {
+        return Err(StoreError::Conflict("run tenant is required".into()));
+    }
+    let workload = serde_json::to_value(&value.workload)?;
+    // The environment is stored twice on purpose: once inside the workload
+    // document, which is what actually executes, and once in its own column
+    // so a run can be found by an environment name without unnesting every
+    // workload in the tenant. `run_from_row` reads the column back into the
+    // document, so the two can never disagree.
+    let environment = serde_json::to_value(&value.workload.environment)?;
+    let requirements = serde_json::to_value(&value.requirements)?;
+    let resources = serde_json::to_value(&value.resources)?;
+    let placement = serde_json::to_value(&value.placement)?;
+    let results = serde_json::to_value(&value.results)?;
+    // The conflict target names the partial unique index, so a retry
+    // carrying the same key collides here instead of inserting a second run.
+    // `DO UPDATE` with a write that changes nothing is what brings the row
+    // back in this same statement: `DO NOTHING` would return no row and cost
+    // a second round trip to read a run the caller already knows exists, and
+    // a read-then-insert pair would let two concurrent retries both insert.
+    let row = sqlx::query(
+        "INSERT INTO runs (id, tenant_id, state, requested_at, queued_at, started_at, \
+             completed_at, workload, environment, requirements, resources, placement, results, \
+             failure_reason, retention, retained_sandbox_id, retained_until, idempotency_key, \
+             parent_run_id, matrix_id, matrix_cell) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) \
+             ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL \
+             DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
+    )
+    .bind(value.id)
+    .bind(value.tenant_id)
+    .bind(value.state.as_str())
+    .bind(value.requested_at)
+    .bind(value.queued_at)
+    .bind(value.started_at)
+    .bind(value.completed_at)
+    .bind(&workload)
+    .bind(&environment)
+    .bind(&requirements)
+    .bind(&resources)
+    .bind(&placement)
+    .bind(&results)
+    .bind(&value.failure_reason)
+    .bind(value.retention.as_str())
+    .bind(value.retained_sandbox_id)
+    .bind(value.retained_until)
+    .bind(&value.idempotency_key)
+    .bind(value.parent_run_id)
+    .bind(value.matrix_id)
+    // Written with the run itself: the cell's axis exists nowhere else, and a
+    // matrix whose labels are attached after the fact loses every label whose
+    // cell failed, or whose submission never came back.
+    .bind(
+        value
+            .matrix_cell
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?,
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    run_from_row(&row)
+}
+
+/// Links compute before placement commits, so cancellation can always find it.
+async fn link_attempt_sandbox(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    attempt_id: Uuid,
+    sandbox_id: Uuid,
 ) -> Result<(), StoreError> {
-    fetch_run(executor, tenant, run).await.map(|_| ())
+    let assigned = sqlx::query(
+        "UPDATE run_attempts SET sandbox_id=$3 WHERE id=$1 AND run_id=$2 \
+         AND state='running' AND completed_at IS NULL AND sandbox_id IS NULL",
+    )
+    .bind(attempt_id)
+    .bind(run_id)
+    .bind(sandbox_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if assigned.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "attempt is not awaiting compute".into(),
+        ));
+    }
+    sqlx::query("INSERT INTO run_sandboxes (run_id,sandbox_id,role) VALUES ($1,$2,'primary')")
+        .bind(run_id)
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 /// Confirms a run exists before an append that names no tenant of its own.
@@ -478,15 +603,36 @@ async fn insert_sandbox_event(
 async fn insert_sandbox(
     tx: &mut Transaction<'_, Postgres>,
     value: &Sandbox,
+    required: Option<&aiec_core::runtime::RuntimeCapabilities>,
 ) -> Result<(), StoreError> {
     if value.tenant_id.is_nil() {
         return Err(StoreError::Conflict("sandbox tenant is required".into()));
     }
+    let predicate = match required {
+        Some(required) => {
+            let mut value = serde_json::to_value(required)?;
+            if let Value::Object(fields) = &mut value {
+                // Only what the workload actually demands: a false boolean is
+                // "no requirement", and containment compares the rest exactly,
+                // so demanding `false` would refuse a worker that has it true.
+                fields.retain(|_, value| value == &Value::Bool(true));
+                // Same reasoning for the isolation class. `Process` means the
+                // caller did not ask for a class, so naming it would exclude
+                // every microVM and container worker alike.
+                if fields.get("isolation") == Some(&serde_json::json!("process")) {
+                    fields.remove("isolation");
+                }
+            }
+            value
+        }
+        None => json!({ "exec": true, "files": true }),
+    };
     sqlx::query(
         "INSERT INTO sandboxes \
          (id, tenant_id, node_id, image_id, state, runtime, cpu, memory_mb, disk_mb, \
-          timeout_seconds, network, environment, runtime_path, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+          timeout_seconds, network, environment, runtime_path, created_at, updated_at, \
+          required_capabilities) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(value.id)
     .bind(value.tenant_id)
@@ -512,6 +658,7 @@ async fn insert_sandbox(
     .bind(&value.runtime_path)
     .bind(value.created_at)
     .bind(value.updated_at)
+    .bind(predicate)
     .execute(&mut **tx)
     .await
     .map_err(database_error)?;
@@ -586,14 +733,24 @@ async fn apply_state_transition(
     Ok(value)
 }
 
-/// Reads the fencing generation of the sandbox's active, unexpired lease.
-async fn active_lease_generation(
+/// The active, unexpired lease that currently owns a sandbox, if any.
+struct ActiveLease {
+    id: Uuid,
+    generation: i64,
+}
+
+/// Reads the sandbox's active, unexpired lease.
+///
+/// Expired leases are excluded deliberately. A lease past `expires_at` has already lost
+/// the sandbox to recovery, so treating it as an owner would let the previous worker
+/// commit state while its replacement is being placed.
+async fn active_lease(
     tx: &mut Transaction<'_, Postgres>,
     tenant: Uuid,
     sandbox: Uuid,
-) -> Result<Option<i64>, StoreError> {
-    sqlx::query_scalar(
-        "SELECT generation FROM sandbox_leases \
+) -> Result<Option<ActiveLease>, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, generation FROM sandbox_leases \
          WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND expires_at > now() \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -601,7 +758,14 @@ async fn active_lease_generation(
     .bind(sandbox)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(database_error)
+    .map_err(database_error)?;
+    row.map(|row| {
+        Ok(ActiveLease {
+            id: row.try_get("id")?,
+            generation: row.try_get("generation")?,
+        })
+    })
+    .transpose()
 }
 
 async fn update_state_transaction(
@@ -620,24 +784,81 @@ async fn update_state_transaction(
     Ok(value)
 }
 
-/// Compare-and-set transition fenced by the sandbox's current lease generation.
+/// Compare-and-set transition fenced by the sandbox's lease identity.
 ///
-/// The sandbox row lock and the lease generation read share one transaction, so a lease
-/// reassignment committed by another transaction is always observed here.
-async fn update_state_with_generation_transaction(
+/// The sandbox row lock and the lease read share one transaction, so a reassignment
+/// committed by another transaction is always observed here. The lease *id* is the
+/// fence; the generation only orders writes on that one lease. `renew_worker_lease`
+/// and assignment claims both increment the generation of the lease they extend, so a
+/// caller that read ownership just before such a commit holds a lease that is still
+/// its own at an older generation. Comparing generations for equality refused that
+/// caller on a sandbox nobody had taken from it, which is the failure this fixes;
+/// a newer generation from a *different* lease is still refused, because the ids
+/// differ, and a generation ahead of the lease it names is refused because no such
+/// state of that lease was ever issued.
+///
+/// Every refusal is logged with the supplied and current lease identity and
+/// generation, so a refusal here is attributable to the store rather than being
+/// indistinguishable from the worker's own fence.
+async fn update_state_with_lease_transaction(
     pool: &sqlx::PgPool,
     tenant: Uuid,
     id: Uuid,
     expected: SandboxState,
     next: SandboxState,
+    lease_id: Uuid,
     generation: i64,
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await.map_err(database_error)?;
     let row = lock_sandbox(&mut tx, tenant, id).await?;
-    if active_lease_generation(&mut tx, tenant, id).await? != Some(generation) {
-        return Err(StoreError::Transient(
-            "stale sandbox lease generation".into(),
-        ));
+    let current = active_lease(&mut tx, tenant, id).await?;
+    match &current {
+        None => {
+            tracing::warn!(
+                sandbox_id = %id,
+                %lease_id,
+                supplied_generation = generation,
+                "fenced state change refused: the sandbox has no active unexpired lease"
+            );
+            return Err(StoreError::Transient(
+                "sandbox has no active unexpired lease".into(),
+            ));
+        }
+        Some(current) if current.id != lease_id => {
+            tracing::warn!(
+                sandbox_id = %id,
+                %lease_id,
+                supplied_generation = generation,
+                current_lease_id = %current.id,
+                current_generation = current.generation,
+                "fenced state change refused: this sandbox was reassigned to another lease"
+            );
+            return Err(StoreError::Transient(
+                "sandbox lease was reassigned to another owner".into(),
+            ));
+        }
+        // Same lease, but the caller claims a generation this lease never reached.
+        // Accepting it would let a caller act on a state the store cannot vouch for.
+        Some(current) if current.generation < generation => {
+            tracing::warn!(
+                sandbox_id = %id,
+                %lease_id,
+                supplied_generation = generation,
+                current_generation = current.generation,
+                "fenced state change refused: the supplied generation is ahead of its own lease"
+            );
+            return Err(StoreError::Conflict(
+                "sandbox lease generation is ahead of its lease".into(),
+            ));
+        }
+        Some(current) if current.generation > generation => tracing::debug!(
+            sandbox_id = %id,
+            %lease_id,
+            supplied_generation = generation,
+            current_generation = current.generation,
+            "the lease was renewed between the ownership read and this change; same lease, accepting"
+        ),
+        Some(_) => {}
     }
     apply_state_transition(
         &mut tx,
@@ -672,11 +893,15 @@ fn schedule_fingerprint(
     value: &Sandbox,
     preferred_node: Option<Uuid>,
     lease_ttl_seconds: u64,
+    required: &aiec_core::runtime::RuntimeCapabilities,
+    run_id: Option<Uuid>,
 ) -> Result<Vec<u8>, StoreError> {
     let semantic = json!({
         "sandbox": sandbox_fingerprint(value)?,
         "preferred_node": preferred_node,
         "lease_ttl_seconds": lease_ttl_seconds,
+        "required_capabilities": required,
+        "run_id": run_id,
     });
     Ok(Sha256::digest(serde_json::to_vec(&semantic)?).to_vec())
 }
@@ -722,33 +947,71 @@ async fn select_schedulable_node(
     preferred_node: Option<Uuid>,
 ) -> Result<Option<sqlx::postgres::PgRow>, StoreError> {
     let (vcpus, memory_bytes, disk_bytes) = sandbox_capacity_demand(sandbox)?;
-    sqlx::query(
-        "SELECT * FROM nodes \
-         WHERE healthy = true \
-           AND last_heartbeat >= now() - ($1 * interval '1 second') \
-           AND accepting_sandboxes = true \
-           AND available_vcpus >= $2 \
-           AND available_memory_bytes >= $3 \
-           AND available_disk_bytes >= $4 AND runtime = $5 \
-           AND capabilities @> $6 \
-           AND ($7::uuid IS NULL OR id = $7) \
-         ORDER BY \
-           (1.0 / GREATEST(available_vcpus, 1)) + \
-           (1.0 / GREATEST(available_memory_bytes::numeric / 1073741824, 0.25)) + \
-           (sandbox_count::numeric * 0.0001), \
-           last_heartbeat DESC \
-         LIMIT 1 FOR UPDATE SKIP LOCKED",
-    )
-    .bind(NODE_HEARTBEAT_TTL_SECONDS)
-    .bind(vcpus)
-    .bind(memory_bytes)
-    .bind(disk_bytes)
-    .bind(sandbox.runtime.as_str())
-    .bind(serde_json::json!({ "exec": true, "files": true }))
-    .bind(preferred_node)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(database_error)
+    let mut excluded_hosts: Vec<String> = Vec::new();
+    // Try-locks avoid both cross-host deadlocks and a busy host stalling others.
+    for _ in 0..8 {
+        let candidate = sqlx::query(
+            "SELECT * FROM nodes n \
+             WHERE n.healthy = true \
+               AND n.last_heartbeat >= now() - ($1 * interval '1 second') \
+               AND n.accepting_sandboxes = true \
+               AND n.available_vcpus >= $2 \
+               AND n.available_memory_bytes >= $3 \
+               AND n.available_disk_bytes >= $4 AND n.runtime = $5 \
+               AND n.capabilities @> (SELECT required_capabilities FROM sandboxes WHERE id=$6) \
+               AND ($7::uuid IS NULL OR n.id = $7) \
+               AND NOT (n.metadata #>> '{pressure,host_id}' = ANY($8::text[])) \
+               AND aiec_host_has_headroom(n.metadata #>> '{pressure,host_id}', $2, $3, $4, $1) \
+             ORDER BY \
+               (1.0 / GREATEST(n.available_vcpus, 1)) + \
+               (1.0 / GREATEST(n.available_memory_bytes::numeric / 1073741824, 0.25)) + \
+               (n.sandbox_count::numeric * 0.0001), n.last_heartbeat DESC \
+             LIMIT 1 FOR UPDATE OF n SKIP LOCKED",
+        )
+        .bind(NODE_HEARTBEAT_TTL_SECONDS)
+        .bind(vcpus)
+        .bind(memory_bytes)
+        .bind(disk_bytes)
+        .bind(sandbox.runtime.as_str())
+        .bind(sandbox.id)
+        .bind(preferred_node)
+        .bind(&excluded_hosts)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let metadata: Value = candidate.try_get("metadata")?;
+        let host = metadata["pressure"]["host_id"]
+            .as_str()
+            .ok_or_else(|| StoreError::Conflict("worker host identity is missing".into()))?;
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('host:' || $1::text, 0))",
+        )
+        .bind(host)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        if locked {
+            // A new statement after the lock sees any reservation committed
+            // since candidate selection, including debits on sibling workers.
+            let fits: bool = sqlx::query_scalar("SELECT aiec_host_has_headroom($1,$2,$3,$4,$5)")
+                .bind(host)
+                .bind(vcpus)
+                .bind(memory_bytes)
+                .bind(disk_bytes)
+                .bind(NODE_HEARTBEAT_TTL_SECONDS)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(database_error)?;
+            if fits {
+                return Ok(Some(candidate));
+            }
+        }
+        excluded_hosts.push(host.to_owned());
+    }
+    Ok(None)
 }
 
 /// Debits a placement from a worker's advertised capacity.
@@ -849,12 +1112,20 @@ impl PostgresScheduler {
 impl PostgresScheduler {
     async fn schedule_on_node(
         &self,
-        tenant: Uuid,
-        request_id: Uuid,
-        mut sandbox: Sandbox,
-        lease_ttl_seconds: u64,
-        preferred_node: Option<Uuid>,
+        request: ScheduleRequest,
     ) -> Result<ScheduledSandbox, StoreError> {
+        let ScheduleRequest {
+            tenant_id: tenant,
+            request_id,
+            mut sandbox,
+            lease_ttl,
+            preferred_worker: preferred_node,
+            mut required_capabilities,
+            run_id,
+        } = request;
+        let lease_ttl_seconds = lease_ttl.as_secs();
+        required_capabilities.exec = true;
+        required_capabilities.files = true;
         if !(1..=3_600).contains(&lease_ttl_seconds) {
             return Err(StoreError::Conflict(
                 "lease TTL must be between 1 and 3600 seconds".into(),
@@ -867,6 +1138,20 @@ impl PostgresScheduler {
         }
         let mut tx = self.repository.pool.begin().await.map_err(database_error)?;
         advisory_lock(&mut tx, tenant, request_id).await?;
+        if let Some(run_id) = run_id {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+            )
+            .bind(tenant)
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::NotFound)?;
+            if !run_state_from_str(&state)?.is_active() {
+                return Err(StoreError::Conflict("run is no longer active".into()));
+            }
+        }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("tenant-quota:{tenant}"))
             .execute(&mut *tx)
@@ -885,7 +1170,13 @@ impl PostgresScheduler {
         if let Some(row) = existing_request {
             let existing_fingerprint: Vec<u8> = row.try_get("fingerprint")?;
             if existing_fingerprint
-                != schedule_fingerprint(&sandbox, preferred_node, lease_ttl_seconds)?
+                != schedule_fingerprint(
+                    &sandbox,
+                    preferred_node,
+                    lease_ttl_seconds,
+                    &required_capabilities,
+                    run_id,
+                )?
             {
                 return Err(StoreError::Conflict(
                     "sandbox idempotency key was reused".into(),
@@ -976,7 +1267,7 @@ impl PostgresScheduler {
                     "tenant resource quota exceeded".into(),
                 ));
             }
-            insert_sandbox(&mut tx, &sandbox).await?;
+            insert_sandbox(&mut tx, &sandbox, Some(&required_capabilities)).await?;
             sqlx::query(
                 "INSERT INTO sandbox_requests (tenant_id, request_id, sandbox_id, fingerprint) \
                  VALUES ($1,$2,$3,$4)",
@@ -988,6 +1279,8 @@ impl PostgresScheduler {
                 &sandbox,
                 preferred_node,
                 lease_ttl_seconds,
+                &required_capabilities,
+                run_id,
             )?)
             .execute(&mut *tx)
             .await
@@ -1074,6 +1367,9 @@ impl PostgresScheduler {
             Some("sandbox reserved on worker"),
         )
         .await?;
+        if let Some(run_id) = run_id {
+            link_attempt_sandbox(&mut tx, run_id, request_id, sandbox.id).await?;
+        }
         let mut assigned_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox.id).await?;
         assigned_sandbox.node_id = Some(node_id);
         assigned_sandbox.updated_at = now;
@@ -1097,47 +1393,49 @@ impl PostgresScheduler {
 #[async_trait]
 impl Scheduler for PostgresScheduler {
     async fn schedule(&self, request: ScheduleRequest) -> Result<ScheduledSandbox, CoreError> {
-        self.schedule_on_node(
-            request.tenant_id,
-            request.request_id,
-            request.sandbox,
-            request.lease_ttl.as_secs(),
-            request.preferred_worker,
-        )
-        .await
-        .map_err(core_error)
+        self.schedule_on_node(request).await.map_err(core_error)
     }
 
-    async fn worker_endpoint(
+    /// Resolves the dispatch authority for a sandbox in one snapshot.
+    ///
+    /// Endpoint and fencing identity are read from the same statement, so a caller
+    /// cannot dispatch to a worker under a lease generation that belongs to a
+    /// different one. `expires_at > now()` is part of the same predicate: an
+    /// expired-but-still-`active` row is not an owner, and handing back its
+    /// endpoint would dispatch work to a machine recovery is already reclaiming.
+    async fn dispatch_target(
         &self,
         tenant_id: Uuid,
         sandbox_id: Uuid,
-    ) -> Result<String, CoreError> {
-        sqlx::query_scalar(
-            "SELECT nodes.control_endpoint FROM sandbox_leases \
+    ) -> Result<WorkerDispatch, CoreError> {
+        let row = sqlx::query(
+            "SELECT sandbox_leases.id AS lease_id, sandbox_leases.generation, \
+             nodes.control_endpoint AS endpoint FROM sandbox_leases \
              JOIN nodes ON nodes.id = sandbox_leases.node_id \
              WHERE sandbox_leases.tenant_id = $1 AND sandbox_leases.sandbox_id = $2 \
-             AND sandbox_leases.status = 'active'",
+             AND sandbox_leases.status = 'active' AND sandbox_leases.expires_at > now() \
+             ORDER BY sandbox_leases.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(sandbox_id)
         .fetch_optional(&self.repository.pool)
         .await
         .map_err(|error| core_error(database_error(error)))?
-        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))
-    }
-    async fn lease_generation(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<i64, CoreError> {
-        sqlx::query_scalar(
-            "SELECT generation FROM sandbox_leases \
-             WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND expires_at > now() \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(tenant_id)
-        .bind(sandbox_id)
-        .fetch_optional(&self.repository.pool)
-        .await
-        .map_err(|error| core_error(database_error(error)))?
-        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))
+        .ok_or_else(|| CoreError::NotFound("active sandbox lease not found".into()))?;
+        let endpoint = row
+            .try_get("endpoint")
+            .map_err(|error| core_error(error.into()))?;
+        let lease_id = row
+            .try_get("lease_id")
+            .map_err(|error| core_error(error.into()))?;
+        let generation = row
+            .try_get("generation")
+            .map_err(|error| core_error(error.into()))?;
+        Ok(WorkerDispatch {
+            endpoint,
+            lease_id,
+            generation,
+        })
     }
 
     async fn release(&self, tenant_id: Uuid, sandbox_id: Uuid) -> Result<(), CoreError> {
@@ -1249,9 +1547,34 @@ impl PostgresRepository {
     }
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
-        insert_sandbox(&mut tx, &value).await?;
+        insert_sandbox(&mut tx, &value, None).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(())
+    }
+
+    async fn create_attempt_sandbox(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        sandbox: Sandbox,
+        required: RuntimeCapabilities,
+    ) -> Result<Sandbox, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+                .bind(sandbox.tenant_id)
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::NotFound)?;
+        if !run_state_from_str(&state)?.is_active() {
+            return Err(StoreError::Conflict("run is no longer active".into()));
+        }
+        insert_sandbox(&mut tx, &sandbox, Some(&required)).await?;
+        link_attempt_sandbox(&mut tx, run_id, attempt_id, sandbox.id).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(sandbox)
     }
 
     async fn get_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<Sandbox, StoreError> {
@@ -1880,7 +2203,7 @@ impl PostgresRepository {
             tx.commit().await.map_err(database_error)?;
             return Ok(result);
         }
-        insert_sandbox(&mut tx, &sandbox).await?;
+        insert_sandbox(&mut tx, &sandbox, None).await?;
         sqlx::query(
             "INSERT INTO sandbox_requests (tenant_id, request_id, sandbox_id, fingerprint) \
              VALUES ($1,$2,$3,$4)",
@@ -2118,6 +2441,54 @@ impl PostgresRepository {
         }
         .map_err(database_error)?;
         rows.iter().map(worker_status_from_row).collect()
+    }
+
+    /// The tenant's quota policy and its current aggregate usage.
+    ///
+    /// The same two queries `schedule` runs under its transaction lock, read
+    /// here without one: this exists so a caller sizing a batch has the
+    /// scheduler's own numbers in front of it, and taking the lock would only
+    /// make concurrent batch sizing queue up behind each other. It decides
+    /// nothing - every cell still passes through `schedule`, which re-reads
+    /// these rows and refuses anything that does not fit.
+    async fn tenant_quota_usage(
+        &self,
+        tenant: Uuid,
+    ) -> Result<(aiec_core::QuotaLimits, aiec_core::QuotaUsage), StoreError> {
+        let limits = sqlx::query(
+            "SELECT max_active_sandboxes::bigint AS max_active_sandboxes, \
+             max_vcpus::bigint AS max_vcpus, max_memory_mb, max_disk_mb \
+             FROM tenant_quotas WHERE tenant_id = $1",
+        )
+        .bind(tenant)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| StoreError::Conflict(format!("tenant {tenant} has no configured quota")))?;
+        let usage = sqlx::query(
+            "SELECT count(*)::bigint AS active, COALESCE(sum(cpu),0)::bigint AS vcpus, \
+             COALESCE(sum(memory_mb),0)::bigint AS memory_mb, \
+             COALESCE(sum(disk_mb),0)::bigint AS disk_mb \
+             FROM sandboxes WHERE tenant_id = $1 AND state NOT IN ('destroyed','failed')",
+        )
+        .bind(tenant)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok((
+            aiec_core::QuotaLimits {
+                max_active_sandboxes: quota_count(&limits, "max_active_sandboxes")?,
+                max_vcpus: quota_count(&limits, "max_vcpus")?,
+                max_memory_mb: quota_amount(&limits, "max_memory_mb")?,
+                max_disk_mb: quota_amount(&limits, "max_disk_mb")?,
+            },
+            aiec_core::QuotaUsage {
+                active_sandboxes: quota_count(&usage, "active")?,
+                vcpus: quota_count(&usage, "vcpus")?,
+                memory_mb: quota_amount(&usage, "memory_mb")?,
+                disk_mb: quota_amount(&usage, "disk_mb")?,
+            },
+        ))
     }
 
     /// Starts or stops a worker draining without touching its health.
@@ -2576,16 +2947,19 @@ impl PostgresRepository {
         rows.iter().map(action_from_row).collect()
     }
 
-    async fn update_state_with_generation(
+    async fn update_state_with_lease(
         &self,
         tenant: Uuid,
         id: Uuid,
         expected: SandboxState,
         next: SandboxState,
+        lease_id: Uuid,
         generation: i64,
     ) -> Result<(), StoreError> {
-        update_state_with_generation_transaction(&self.pool, tenant, id, expected, next, generation)
-            .await
+        update_state_with_lease_transaction(
+            &self.pool, tenant, id, expected, next, lease_id, generation,
+        )
+        .await
     }
 
     /// Reads the active lease that currently owns a sandbox, expired or not.
@@ -2884,59 +3258,10 @@ impl PostgresRepository {
     }
 
     async fn create_run(&self, value: Run) -> Result<Run, StoreError> {
-        if value.tenant_id.is_nil() {
-            return Err(StoreError::Conflict("run tenant is required".into()));
-        }
-        let workload = serde_json::to_value(&value.workload)?;
-        // The environment is stored twice on purpose: once inside the workload
-        // document, which is what actually executes, and once in its own column
-        // so a run can be found by an environment name without unnesting every
-        // workload in the tenant. `run_from_row` reads the column back into the
-        // document, so the two can never disagree.
-        let environment = serde_json::to_value(&value.workload.environment)?;
-        let requirements = serde_json::to_value(&value.requirements)?;
-        let resources = serde_json::to_value(&value.resources)?;
-        let placement = serde_json::to_value(&value.placement)?;
-        let results = serde_json::to_value(&value.results)?;
-        // The conflict target names the partial unique index, so a retry
-        // carrying the same key collides here instead of inserting a second run.
-        // `DO UPDATE` with a write that changes nothing is what brings the row
-        // back in this same statement: `DO NOTHING` would return no row and cost
-        // a second round trip to read a run the caller already knows exists, and
-        // a read-then-insert pair would let two concurrent retries both insert.
-        let row = sqlx::query(
-            "INSERT INTO runs (id, tenant_id, state, requested_at, queued_at, started_at, \
-             completed_at, workload, environment, requirements, resources, placement, results, \
-             failure_reason, retention, retained_sandbox_id, retained_until, idempotency_key, \
-             parent_run_id, matrix_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
-             ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL \
-             DO UPDATE SET idempotency_key = EXCLUDED.idempotency_key RETURNING *",
-        )
-        .bind(value.id)
-        .bind(value.tenant_id)
-        .bind(value.state.as_str())
-        .bind(value.requested_at)
-        .bind(value.queued_at)
-        .bind(value.started_at)
-        .bind(value.completed_at)
-        .bind(&workload)
-        .bind(&environment)
-        .bind(&requirements)
-        .bind(&resources)
-        .bind(&placement)
-        .bind(&results)
-        .bind(&value.failure_reason)
-        .bind(value.retention.as_str())
-        .bind(value.retained_sandbox_id)
-        .bind(value.retained_until)
-        .bind(&value.idempotency_key)
-        .bind(value.parent_run_id)
-        .bind(value.matrix_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        run_from_row(&row)
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let run = insert_run_tx(&mut tx, value).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(run)
     }
 
     async fn get_run(&self, tenant: Uuid, id: Uuid) -> Result<Run, StoreError> {
@@ -3164,6 +3489,26 @@ impl PostgresRepository {
         run_from_row(&row)
     }
 
+    async fn clear_run_retention(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+    ) -> Result<Run, StoreError> {
+        let row = sqlx::query(
+            "UPDATE runs SET retained_sandbox_id=NULL, retained_until=NULL \
+             WHERE tenant_id=$1 AND id=$2 AND retained_sandbox_id=$3 RETURNING *",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        run_from_row(&row)
+    }
+
     async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
         let result = sqlx::query("DELETE FROM runs WHERE tenant_id = $1 AND id = $2")
             .bind(tenant)
@@ -3261,9 +3606,8 @@ impl PostgresRepository {
         rows.iter().map(run_sandbox_from_row).collect()
     }
 
-    /// Records one attempt of a run. Attempts are evidence of a try, so they are
-    /// written once and never edited: a second write for the same attempt number
-    /// is refused rather than allowed to rewrite what the first try did.
+    /// Starts an attempt or imports already-completed historical evidence.
+    /// Allocation assigns compute once; completion seals the attempt once.
     async fn record_run_attempt(&self, value: RunAttempt) -> Result<(), StoreError> {
         if value.attempt_number <= 0 {
             return Err(StoreError::Conflict(
@@ -3275,7 +3619,7 @@ impl PostgresRepository {
         sqlx::query(
             "INSERT INTO run_attempts \
              (id, run_id, attempt_number, sandbox_id, state, failure_reason, started_at, \
-              completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+              completed_at,placement,results) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
         )
         .bind(value.id)
         .bind(value.run_id)
@@ -3285,9 +3629,46 @@ impl PostgresRepository {
         .bind(&value.failure_reason)
         .bind(value.started_at)
         .bind(value.completed_at)
+        .bind(serde_json::to_value(&value.placement)?)
+        .bind(serde_json::to_value(&value.results)?)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn complete_run_attempt(
+        &self,
+        tenant: Uuid,
+        attempt: RunAttempt,
+    ) -> Result<(), StoreError> {
+        if !attempt.state.is_terminal() || attempt.completed_at.is_none() {
+            return Err(StoreError::Conflict(
+                "attempt completion must be terminal".into(),
+            ));
+        }
+        let changed = sqlx::query(
+            "UPDATE run_attempts a SET state=$4,failure_reason=$5,completed_at=$6, \
+             placement=$7,results=$8 FROM runs r WHERE a.id=$2 AND a.run_id=$3 \
+             AND r.id=a.run_id AND r.tenant_id=$1 AND a.state='running' \
+             AND a.completed_at IS NULL",
+        )
+        .bind(tenant)
+        .bind(attempt.id)
+        .bind(attempt.run_id)
+        .bind(attempt_state_as_str(attempt.state)?)
+        .bind(&attempt.failure_reason)
+        .bind(attempt.completed_at)
+        .bind(serde_json::to_value(&attempt.placement)?)
+        .bind(serde_json::to_value(&attempt.results)?)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if changed.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "attempt is already complete or unavailable".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -3315,7 +3696,23 @@ impl PostgresRepository {
         artifacts: Vec<RunArtifactRef>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
-        ensure_tenant_run(&mut *tx, tenant, run).await?;
+        let owner = sqlx::query(
+            "SELECT artifacts_expired_at FROM runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(run)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        if owner
+            .try_get::<Option<DateTime<Utc>>, _>("artifacts_expired_at")?
+            .is_some()
+        {
+            return Err(StoreError::Conflict("Run artifacts have expired".into()));
+        }
+        let mut artifacts = artifacts;
+        artifacts.sort_by(|a, b| a.object_key.cmp(&b.object_key));
         // Replacing rather than appending: a run's artifacts are what the
         // collection pass found, and a re-run that collects fewer files must not
         // leave the files it no longer produced listed against the run.
@@ -3363,7 +3760,8 @@ impl PostgresRepository {
         let rows = sqlx::query(
             "SELECT f.name, f.object_key, f.size_bytes, f.checksum_sha256, f.content_type \
              FROM run_artifacts f JOIN runs r ON r.id = f.run_id \
-             WHERE r.tenant_id = $1 AND f.run_id = $2 ORDER BY f.name",
+             WHERE r.tenant_id = $1 AND f.run_id = $2 \
+             AND r.artifacts_expired_at IS NULL ORDER BY f.name",
         )
         .bind(tenant)
         .bind(run)
@@ -3387,8 +3785,17 @@ impl PostgresRepository {
         now: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<Run>, StoreError> {
+        // Terminal states only. `retain_run_sandbox` is called from `cleanup()`,
+        // which runs BEFORE the run settles, so a row can carry `retained_until`
+        // while the executor is still writing results against that machine. With
+        // `retained_seconds` at its validated minimum the 15 s sweeper sees such
+        // a row, destroys the machine under a live run, and clears the retention
+        // fields - so the caller who asked to keep a debugging machine is told
+        // there is none. The artifact GC query filters on the same thing for the
+        // same reason.
         let rows = sqlx::query(
             "SELECT * FROM runs WHERE retained_until IS NOT NULL AND retained_until <= $1 \
+             AND state IN ('succeeded','failed','cancelled') \
              ORDER BY retained_until LIMIT $2",
         )
         .bind(now)
@@ -3404,6 +3811,17 @@ impl PostgresRepository {
 impl MetadataStore for PostgresRepository {
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError> {
         Self::create_sandbox(self, value).await.map_err(core_error)
+    }
+    async fn create_attempt_sandbox(
+        &self,
+        run_id: Uuid,
+        attempt_id: Uuid,
+        sandbox: Sandbox,
+        required: RuntimeCapabilities,
+    ) -> Result<Sandbox, CoreError> {
+        Self::create_attempt_sandbox(self, run_id, attempt_id, sandbox, required)
+            .await
+            .map_err(core_error)
     }
     async fn get_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<Sandbox, CoreError> {
         Self::get_sandbox(self, tenant, id)
@@ -3425,15 +3843,16 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn update_state_with_generation(
+    async fn update_state_with_lease(
         &self,
         tenant: Uuid,
         id: Uuid,
         expected: SandboxState,
         next: SandboxState,
+        lease_id: Uuid,
         generation: i64,
     ) -> Result<(), CoreError> {
-        Self::update_state_with_generation(self, tenant, id, expected, next, generation)
+        Self::update_state_with_lease(self, tenant, id, expected, next, lease_id, generation)
             .await
             .map_err(core_error)
     }
@@ -3831,6 +4250,16 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn clear_run_retention(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+    ) -> Result<Run, CoreError> {
+        Self::clear_run_retention(self, tenant, id, sandbox_id)
+            .await
+            .map_err(core_error)
+    }
     async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
         Self::delete_run(self, tenant, id).await.map_err(core_error)
     }
@@ -3858,6 +4287,15 @@ impl MetadataStore for PostgresRepository {
     }
     async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
         Self::record_run_attempt(self, attempt)
+            .await
+            .map_err(core_error)
+    }
+    async fn complete_run_attempt(
+        &self,
+        tenant: Uuid,
+        attempt: RunAttempt,
+    ) -> Result<(), CoreError> {
+        Self::complete_run_attempt(self, tenant, attempt)
             .await
             .map_err(core_error)
     }
@@ -3889,12 +4327,149 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn reserve_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        Self::reserve_artifact_upload(self, tenant, run, key)
+            .await
+            .map_err(core_error)
+    }
+    async fn complete_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        Self::complete_artifact_upload(self, tenant, run, key)
+            .await
+            .map_err(core_error)
+    }
+    async fn claim_artifact_deletions(
+        &self,
+        now: DateTime<Utc>,
+        retention_seconds: i64,
+        pending_grace_seconds: i64,
+        limit: u32,
+        lease_seconds: i64,
+    ) -> Result<Vec<aiec_core::storage::ArtifactDeletion>, CoreError> {
+        Self::claim_artifact_deletions(
+            self,
+            now,
+            retention_seconds,
+            pending_grace_seconds,
+            limit,
+            lease_seconds,
+        )
+        .await
+        .map_err(core_error)
+    }
+    async fn finish_artifact_deletion(
+        &self,
+        key: &str,
+        claim: Uuid,
+        deleted: bool,
+        retry_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        Self::finish_artifact_deletion(self, key, claim, deleted, retry_at)
+            .await
+            .map_err(core_error)
+    }
     async fn retained_runs_due(
         &self,
         now: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<Run>, CoreError> {
         Self::retained_runs_due(self, now, limit)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_matrix_cells(
+        &self,
+        tenant: Uuid,
+        matrix: Uuid,
+        limit: u32,
+        after: Option<aiec_core::storage::MatrixCursor>,
+    ) -> Result<aiec_core::storage::MatrixCellPage, CoreError> {
+        crate::matrix::list_matrix_cells(self, tenant, matrix, limit, after)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_tenant_quota_usage(
+        &self,
+        tenant: Uuid,
+    ) -> Result<(aiec_core::QuotaLimits, aiec_core::QuotaUsage), CoreError> {
+        Self::tenant_quota_usage(self, tenant)
+            .await
+            .map_err(core_error)
+    }
+    fn supports_run_queue(&self) -> bool {
+        true
+    }
+    async fn enqueue_run(
+        &self,
+        run: Run,
+        request: Value,
+        limits: RunQueueLimits,
+    ) -> Result<Run, CoreError> {
+        Self::enqueue_run(self, run, request, limits)
+            .await
+            .map_err(core_error)
+    }
+    async fn claim_run_queue(
+        &self,
+        owner: Uuid,
+        limits: RunQueueLimits,
+    ) -> Result<Option<RunQueueClaim>, CoreError> {
+        Self::claim_run_queue(self, owner, limits)
+            .await
+            .map_err(core_error)
+    }
+    async fn recover_run_queue(
+        &self,
+        owner: Uuid,
+        limits: RunQueueLimits,
+    ) -> Result<Option<RunQueueClaim>, CoreError> {
+        Self::recover_run_queue(self, owner, limits)
+            .await
+            .map_err(core_error)
+    }
+    async fn heartbeat_run_queue(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+        owner: Uuid,
+        lease_seconds: u32,
+    ) -> Result<bool, CoreError> {
+        Self::heartbeat_run_queue(self, tenant, run, owner, lease_seconds)
+            .await
+            .map_err(core_error)
+    }
+    async fn fail_run_queue(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+        owner: Uuid,
+        reason: String,
+    ) -> Result<bool, CoreError> {
+        Self::fail_run_queue(self, tenant, run, owner, reason)
+            .await
+            .map_err(core_error)
+    }
+    async fn finish_run_queue(
+        &self,
+        tenant: Uuid,
+        run: Uuid,
+        owner: Uuid,
+    ) -> Result<bool, CoreError> {
+        Self::finish_run_queue(self, tenant, run, owner)
+            .await
+            .map_err(core_error)
+    }
+    async fn run_queue_finished(&self, tenant: Uuid, run: Uuid) -> Result<bool, CoreError> {
+        Self::run_queue_finished(self, tenant, run)
             .await
             .map_err(core_error)
     }
@@ -4029,6 +4604,8 @@ async fn release_capacity(
 
 #[cfg(test)]
 mod tests {
+    use sqlx::postgres::PgPoolOptions;
+
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -4103,6 +4680,8 @@ mod tests {
                 sandbox,
                 preferred_worker,
                 lease_ttl: Duration::from_secs(60),
+                required_capabilities: Default::default(),
+                run_id: None,
             })
             .await
     }
@@ -4147,7 +4726,12 @@ mod tests {
                 available_disk_bytes: 512 * 1_048_576,
                 healthy: true,
                 version: 1,
-                metadata: json!({}),
+                metadata: test_pressure_metadata(
+                    tenant,
+                    HOST_VCPUS,
+                    HOST_MEMORY_BYTES,
+                    HOST_DISK_BYTES,
+                ),
                 started_at: Utc::now(),
                 last_heartbeat: Utc::now(),
             })
@@ -4232,6 +4816,140 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    /// A worker of a stated shape on a host of a stated ceiling: the shared
+    /// fixtures all declare an implausibly large machine, and this is the one
+    /// that has to place against a real number of logical CPUs.
+    async fn register_worker_on_host(
+        repository: &PostgresRepository,
+        tenant: Uuid,
+        vcpus: u32,
+        host_vcpus: u32,
+    ) -> Uuid {
+        let node_id = new_id();
+        repository
+            .register_worker(WorkerRegistration {
+                node_id,
+                name: format!("cpu-node-{tenant}-{node_id}"),
+                runtime: RuntimeKind::Firecracker,
+                capabilities: aiec_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    streaming: false,
+                    ..Default::default()
+                },
+                control_endpoint: "https://127.0.0.1:9000".into(),
+                total_vcpus: vcpus,
+                total_memory_bytes: 128 * 1_048_576,
+                total_disk_bytes: 1024 * 1_048_576,
+                available_vcpus: vcpus,
+                available_memory_bytes: 128 * 1_048_576,
+                available_disk_bytes: 1024 * 1_048_576,
+                healthy: true,
+                version: 1,
+                metadata: test_pressure_metadata(
+                    tenant,
+                    host_vcpus,
+                    HOST_MEMORY_BYTES,
+                    HOST_DISK_BYTES,
+                ),
+                started_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+            })
+            .await
+            .unwrap();
+        node_id
+    }
+
+    /// Two workers on one machine each read every vCPU free, and each is right
+    /// about its own worker. The machine has eight, so a fourth vCPU on top of
+    /// the five the first worker took does not exist: the second placement is
+    /// refused even though the worker it names has eight free of its own.
+    ///
+    /// The vCPUs come back when the placement that spent them is released, and
+    /// they come back once - the same request that was refused succeeds
+    /// afterwards, against a worker holding exactly what it started with.
+    #[tokio::test]
+    async fn two_workers_on_one_host_cannot_both_spend_the_machines_vcpus() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        const CEILING: u32 = 8;
+        let first = register_worker_on_host(&repository, tenant, CEILING, CEILING).await;
+        let second = register_worker_on_host(&repository, tenant, CEILING, CEILING).await;
+
+        let taken = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, 5, 128, 1024),
+            Some(first),
+        )
+        .await
+        .expect("five vCPUs fit a machine that has eight");
+
+        let refused = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, 4, 128, 1024),
+            Some(second),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(CoreError::Transient(message)) if message.contains("no schedulable worker has capacity")),
+            "two workers must not spend more vCPUs than the host has: {refused:?}"
+        );
+        let untouched = repository.get_worker(second).await.unwrap();
+        assert_eq!(
+            untouched.registration.available_vcpus, CEILING,
+            "the refusal must leave the second worker's own ledger alone"
+        );
+
+        // Releasing the first placement hands its five vCPUs back exactly once.
+        repository
+            .delete_sandbox(tenant, taken.sandbox.id)
+            .await
+            .unwrap();
+        let released = repository.get_worker(first).await.unwrap();
+        assert_eq!(released.registration.available_vcpus, CEILING);
+        assert_eq!(released.sandbox_count, 0);
+        schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, 4, 128, 1024),
+            Some(second),
+        )
+        .await
+        .expect("the vCPUs a released placement held are spendable again");
+
+        // A host whose ceiling nobody could observe lends no CPU at all, however
+        // perfectly it measured memory and disk: a missing measurement is not a
+        // measurement of unlimited capacity.
+        sqlx::query(
+            "UPDATE nodes SET metadata = jsonb_set(metadata, '{pressure}', \
+             (metadata #> '{pressure}') - 'total_vcpus' - 'available_vcpus') \
+             WHERE id = ANY($1::uuid[])",
+        )
+        .bind(vec![first, second])
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        let unmeasured = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, 1, 128, 1024),
+            Some(first),
+        )
+        .await;
+        assert!(
+            matches!(&unmeasured, Err(CoreError::Transient(message)) if message.contains("no schedulable worker has capacity")),
+            "a host whose ceiling was never observed must refuse: {unmeasured:?}"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
     async fn repository_and_tenant() -> Option<(Arc<PostgresRepository>, Uuid)> {
         let database_url = std::env::var("DATABASE_URL")
             .ok()
@@ -4252,6 +4970,63 @@ mod tests {
             .await
             .unwrap();
         Some((repository, tenant))
+    }
+
+    // Recovery and sweep queries cross tenants, so a fresh tenant alone cannot
+    // isolate their inputs from other tests or rows left by previous runs.
+    async fn isolated_repository_and_tenant()
+    -> Option<(Arc<PostgresRepository>, Uuid, sqlx::PgPool, String)> {
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let schema = format!("storage_test_{}", new_id().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let search_path = format!("SET search_path TO {schema}");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |connection, _| {
+                let search_path = search_path.clone();
+                Box::pin(async move {
+                    sqlx::query(&search_path).execute(connection).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        let repository = Arc::new(PostgresRepository::from_pool(pool));
+        repository.migrate().await.unwrap();
+        let tenant = new_id();
+        repository
+            .put_tenant(TenantRecord {
+                id: tenant,
+                name: format!("storage-invariant-{tenant}"),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        Some((repository, tenant, admin, schema))
+    }
+
+    async fn drop_test_schema(
+        repository: &PostgresRepository,
+        admin: sqlx::PgPool,
+        schema: String,
+    ) {
+        repository.pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
     }
 
     async fn register_test_worker(repository: &PostgresRepository, tenant: Uuid) -> Uuid {
@@ -4276,7 +5051,12 @@ mod tests {
                 available_disk_bytes: 1024 * 1_048_576,
                 healthy: true,
                 version: 1,
-                metadata: json!({}),
+                metadata: test_pressure_metadata(
+                    tenant,
+                    HOST_VCPUS,
+                    HOST_MEMORY_BYTES,
+                    HOST_DISK_BYTES,
+                ),
                 started_at: Utc::now(),
                 last_heartbeat: Utc::now(),
             })
@@ -4432,6 +5212,56 @@ mod tests {
         .unwrap();
     }
 
+    /// Host-scale headroom, deliberately far larger than any node's own
+    /// allocation. A node advertises what it was allocated; the host is a
+    /// machine several nodes share, and admission is checked against the
+    /// machine.
+    const HOST_MEMORY_BYTES: u64 = 64 * 1_073_741_824;
+    /// Larger than the biggest sandbox any fixture places (a ~976 GiB
+    /// disk-shaped one), because admission is checked against the machine and
+    /// every fixture worker shares one.
+    const HOST_DISK_BYTES: u64 = 2 * 1_099_511_627_776;
+    /// Logical CPUs of the machine those fixtures share. Deliberately far
+    /// above every node's own allocation, because CPU is a ceiling the whole
+    /// host is capped against rather than a store each worker fills: a fixture
+    /// that declared a realistic ceiling would have every test placing against
+    /// it, and the tests that are about placement are not about CPU. The one
+    /// test that is states its own ceiling through `test_pressure_metadata`.
+    const HOST_VCPUS: u32 = 256;
+
+    /// The worker metadata a real worker publishes: a host pressure reading,
+    /// which the scheduler requires before it will place anything.
+    ///
+    /// Scoped to the tenant so two tests running against one database do not
+    /// aggregate their workers into one imaginary machine, while the several
+    /// workers a single test registers still share a host as they would in a
+    /// cluster. Absent figures are refused by design - a worker that never
+    /// published a reading is one nobody asked about, and refusing to place on
+    /// it is the point of the gate.
+    fn test_pressure_metadata(
+        tenant: Uuid,
+        host_vcpus: u32,
+        host_memory_bytes: u64,
+        host_disk_bytes: u64,
+    ) -> Value {
+        json!({
+            "pressure": aiec_core::host_pressure::HostPressure::from_measurements(
+                format!("test-host-{tenant}"),
+                chrono::Utc::now(),
+                aiec_core::host_pressure::HostMeasurements {
+                    total_vcpus: Some(host_vcpus),
+                    available_vcpus: Some(host_vcpus),
+                    total_memory_bytes: Some(host_memory_bytes),
+                    memory_available_bytes: Some(host_memory_bytes),
+                    total_disk_bytes: Some(host_disk_bytes),
+                    disk_available_bytes: Some(host_disk_bytes),
+                },
+                aiec_core::host_pressure::HostReserves::from_mib(0, 0),
+            )
+            .to_metadata(),
+        })
+    }
+
     /// Registers a worker of an explicit shape so a recovery test can use a sandbox that
     /// only workers of that shape can hold.
     async fn register_worker_with(
@@ -4464,7 +5294,12 @@ mod tests {
                 available_disk_bytes: disk_bytes,
                 healthy: true,
                 version: 1,
-                metadata: json!({}),
+                metadata: test_pressure_metadata(
+                    tenant,
+                    HOST_VCPUS,
+                    HOST_MEMORY_BYTES,
+                    HOST_DISK_BYTES,
+                ),
                 started_at: Utc::now(),
                 last_heartbeat: Utc::now(),
             })
@@ -4503,16 +5338,23 @@ mod tests {
             .collect()
     }
 
-    /// Workers sized so that only [`MEMORY_WORKER`] can hold the memory-shaped sandbox and
-    /// only [`DISK_WORKER`] can hold the disk-shaped one. The two recovery tests therefore
-    /// never select each other's workers on the shared test database.
+    /// Resource shapes exercise memory-heavy and disk-heavy recovery separately.
     const MEMORY_WORKER: (u32, u64, u64) = (32, 61_000, 4_096);
     const MEMORY_SANDBOX: (u32, u32, u32) = (31, 60_000, 3_072);
     const DISK_WORKER: (u32, u64, u64) = (32, 4_096, 1_010_000);
     const DISK_SANDBOX: (u32, u32, u32) = (31, 3_072, 1_000_000);
 
+    /// A lease renewed between the ownership read and the state change is still ours.
+    ///
+    /// `renew_worker_lease` increments the generation of the lease it extends, and
+    /// `claim_worker_assignments` does the same when a worker claims its assignment.
+    /// A control plane that read ownership a moment before either of those commits
+    /// holds a lease that is still its own at an older generation. Comparing the two
+    /// generations for equality refused exactly that caller, on a sandbox nobody had
+    /// taken from it, which is how a lifecycle change on a live machine came back as
+    /// a stale generation and was indistinguishable from a genuine takeover.
     #[tokio::test]
-    async fn fenced_state_update_accepts_only_the_current_lease_generation() {
+    async fn a_lease_renewed_after_the_ownership_read_still_owns_the_change() {
         let Some((repository, tenant)) = repository_and_tenant().await else {
             return;
         };
@@ -4530,23 +5372,185 @@ mod tests {
             .claim_worker_assignments(node_id, 1, 60)
             .await
             .unwrap();
-        let generation = claimed[0].lease.generation;
+        let lease_id = claimed[0].lease.id;
+        let read = claimed[0].lease.generation;
         let sandbox_id = scheduled.sandbox.id;
-        for stale in [generation - 1, generation + 1] {
-            let error = repository
-                .update_state_with_generation(
+
+        // The renewal lands between this caller's ownership read and its change.
+        let renewed = repository
+            .renew_worker_lease(tenant, lease_id, read, 60)
+            .await
+            .unwrap();
+        assert_eq!(renewed.generation, read + 1);
+        assert_eq!(renewed.id, lease_id, "a renewal keeps the lease");
+
+        repository
+            .update_state_with_lease(
+                tenant,
+                sandbox_id,
+                SandboxState::Creating,
+                SandboxState::Starting,
+                lease_id,
+                read,
+            )
+            .await
+            .expect("a renewal must not be read as a reassignment");
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Starting
+        );
+
+        // The renewed generation is accepted too, so the caller that re-read
+        // ownership after the renewal is not the only one that can commit.
+        repository
+            .update_state_with_lease(
+                tenant,
+                sandbox_id,
+                SandboxState::Starting,
+                SandboxState::Running,
+                lease_id,
+                renewed.generation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Running
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A renewal racing the fenced change changes nothing about the outcome.
+    ///
+    /// The renewal and the state change are separate transactions, so either can commit
+    /// first. Both orders describe the same owner: the lease is the same lease either
+    /// way, and a fence that refused one of the two orders would be refusing a sandbox
+    /// nobody had taken over. Run against a real database rather than a mock, because
+    /// the interleaving is what the fence has to be correct about.
+    #[tokio::test]
+    async fn a_renewal_concurrent_with_a_fenced_change_never_refuses_the_owner() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        let lease = claimed[0].lease.clone();
+        let sandbox_id = scheduled.sandbox.id;
+        // Renewals only ever move forward, so each round reads the generation this
+        // owner currently holds rather than reusing the one it started with.
+        let mut owned = lease.clone();
+        for _ in 0..8 {
+            let (renewed, changed) = tokio::join!(
+                repository.renew_worker_lease(tenant, lease.id, owned.generation, 60),
+                repository.update_state_with_lease(
                     tenant,
                     sandbox_id,
                     SandboxState::Creating,
                     SandboxState::Starting,
-                    stale,
+                    lease.id,
+                    owned.generation,
+                ),
+            );
+            assert!(
+                changed.is_ok(),
+                "the owner was refused while its own lease was being renewed: {changed:?}"
+            );
+            assert!(renewed.is_ok(), "the renewal itself must succeed");
+            owned = repository.get_worker_lease(tenant, lease.id).await.unwrap();
+            assert_eq!(owned.status, "active", "the lease stays the owner's");
+        }
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Starting
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A lease that no longer owns the sandbox is refused at any generation, including
+    /// the replacement's own higher one.
+    ///
+    /// A fence that reasoned about the number rather than the lease would have to take
+    /// this caller's side here, because the generation it presents is the higher one.
+    /// That is precisely the direction that lets a dead owner keep committing after
+    /// recovery handed the sandbox to a replacement.
+    #[tokio::test]
+    async fn a_previous_owner_is_refused_even_at_its_replacements_generation() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let (vcpus, memory_mb, disk_mb) = MEMORY_WORKER;
+        let dead_node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let _replacement_worker =
+            register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox_with(tenant, MEMORY_SANDBOX.0, MEMORY_SANDBOX.1, MEMORY_SANDBOX.2),
+            Some(dead_node),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(dead_node, 1, 60)
+            .await
+            .unwrap();
+        let dead_lease = claimed[0].lease.id;
+        let sandbox_id = scheduled.sandbox.id;
+        mark_worker_dead(&repository, dead_node).await;
+        expire_lease(&repository, dead_lease).await;
+        let recovery = repository
+            .reassign_expired_lease(dead_lease)
+            .await
+            .unwrap()
+            .expect("an expired lease of a dead worker is reassigned");
+        assert_ne!(recovery.lease.id, dead_lease, "recovery issues a new lease");
+
+        // The generation recovery published, and one further ahead of it.
+        for supplied_generation in [recovery.lease.generation, recovery.lease.generation + 1] {
+            let error = repository
+                .update_state_with_lease(
+                    tenant,
+                    sandbox_id,
+                    SandboxState::Creating,
+                    SandboxState::Starting,
+                    dead_lease,
+                    supplied_generation,
                 )
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                &error,
-                StoreError::Conflict(message) if message == "stale sandbox lease generation"
-            ));
+            assert!(
+                matches!(
+                    &error,
+                    StoreError::Transient(message)
+                        if message == "sandbox lease was reassigned to another owner"
+                ),
+                "the previous owner must be refused whatever it presents: {error}"
+            );
             assert_eq!(
                 repository
                     .get_sandbox(tenant, sandbox_id)
@@ -4556,40 +5560,55 @@ mod tests {
                 SandboxState::Creating
             );
         }
-        MetadataStore::update_state_with_generation(
-            &*repository,
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// An expired lease is not an owner, and the fence fails closed on it.
+    ///
+    /// The row is still `active`: expiry is a timestamp, and recovery is what turns it
+    /// into a replacement. Until then the sandbox has no unexpired owner, so the honest
+    /// answer is that nobody may commit on this lease's behalf - which is a different
+    /// refusal from a reassignment, and says so.
+    #[tokio::test]
+    async fn an_expired_or_absent_lease_cannot_commit_and_says_which_it_was() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
             tenant,
-            sandbox_id,
-            SandboxState::Creating,
-            SandboxState::Starting,
-            generation,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
         )
         .await
         .unwrap();
-        assert_eq!(
-            repository
-                .get_sandbox(tenant, sandbox_id)
-                .await
-                .unwrap()
-                .state,
-            SandboxState::Starting
-        );
-        let renewed = repository
-            .renew_worker_lease(tenant, scheduled.lease_id, generation, 60)
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
             .await
             .unwrap();
-        assert_eq!(renewed.generation, generation + 1);
+        let lease = claimed[0].lease.clone();
+        let sandbox_id = scheduled.sandbox.id;
+        expire_lease(&repository, lease.id).await;
+        let error = repository
+            .update_state_with_lease(
+                tenant,
+                sandbox_id,
+                SandboxState::Creating,
+                SandboxState::Starting,
+                lease.id,
+                lease.generation,
+            )
+            .await
+            .unwrap_err();
         assert!(
-            repository
-                .update_state_with_generation(
-                    tenant,
-                    sandbox_id,
-                    SandboxState::Starting,
-                    SandboxState::Running,
-                    generation,
-                )
-                .await
-                .is_err()
+            matches!(
+                &error,
+                StoreError::Transient(message)
+                    if message == "sandbox has no active unexpired lease"
+            ),
+            "expiry must fail closed, and be distinguishable from a takeover: {error}"
         );
         assert_eq!(
             repository
@@ -4597,8 +5616,157 @@ mod tests {
                 .await
                 .unwrap()
                 .state,
-            SandboxState::Starting
+            SandboxState::Creating
         );
+
+        // Another sandbox's lease is not an owner of this one either, so a live lease
+        // somewhere cannot stand in for a missing fence here.
+        let unleased = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                repository
+                    .update_state_with_lease(
+                        tenant,
+                        unleased.sandbox.id,
+                        SandboxState::Creating,
+                        SandboxState::Starting,
+                        lease.id,
+                        lease.generation,
+                    )
+                    .await,
+                Err(StoreError::Transient(message))
+                    if message == "sandbox lease was reassigned to another owner"
+            ),
+            "another sandbox's lease must not fence this one"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A generation ahead of the lease it names belongs to no issued state.
+    ///
+    /// Generations only move forward on a lease, so a caller holding a number above the
+    /// stored one is not describing this lease. It is refused as a conflict rather than
+    /// as a retryable race, because retrying cannot make the number become true.
+    #[tokio::test]
+    async fn a_generation_ahead_of_its_own_lease_is_refused() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        let lease = claimed[0].lease.clone();
+        let sandbox_id = scheduled.sandbox.id;
+        let error = repository
+            .update_state_with_lease(
+                tenant,
+                sandbox_id,
+                SandboxState::Creating,
+                SandboxState::Starting,
+                lease.id,
+                lease.generation + 1,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                StoreError::Conflict(message)
+                    if message == "sandbox lease generation is ahead of its lease"
+            ),
+            "an unissued generation must be refused: {error}"
+        );
+        assert_eq!(
+            repository
+                .get_sandbox(tenant, sandbox_id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Creating
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// Endpoint and fencing identity come from one lease, so a dispatch can never pair
+    /// a worker's address with another lease's generation.
+    #[tokio::test]
+    async fn dispatch_target_reports_the_endpoint_and_identity_of_one_lease() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let scheduler = PostgresScheduler::new(repository.as_ref().clone());
+        let dispatch = scheduler
+            .dispatch_target(tenant, scheduled.sandbox.id)
+            .await
+            .unwrap();
+        assert_eq!(dispatch.lease_id, scheduled.lease_id);
+        assert_eq!(dispatch.generation, scheduled.lease_generation);
+        assert_eq!(
+            dispatch.endpoint,
+            sqlx::query_scalar::<_, String>("SELECT control_endpoint FROM nodes WHERE id = $1")
+                .bind(node_id)
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap()
+        );
+
+        // A renewal moves the generation the next dispatch carries, under the same lease.
+        let renewed = repository
+            .renew_worker_lease(tenant, scheduled.lease_id, scheduled.lease_generation, 60)
+            .await
+            .unwrap();
+        let after = scheduler
+            .dispatch_target(tenant, scheduled.sandbox.id)
+            .await
+            .unwrap();
+        assert_eq!(after.lease_id, scheduled.lease_id);
+        assert_eq!(after.generation, renewed.generation);
+
+        // An expired lease is not an owner, so it is not a dispatch target either:
+        // handing back its endpoint would send work to a machine that has lost it.
+        expire_lease(&repository, scheduled.lease_id).await;
+        assert!(
+            matches!(
+                scheduler
+                    .dispatch_target(tenant, scheduled.sandbox.id)
+                    .await,
+                Err(CoreError::NotFound(_))
+            ),
+            "an expired lease must not remain a dispatch target"
+        );
+        assert!(matches!(
+            scheduler.dispatch_target(tenant, new_id()).await,
+            Err(CoreError::NotFound(_))
+        ));
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
@@ -4663,12 +5831,13 @@ mod tests {
 
     #[tokio::test]
     async fn reassignment_moves_the_sandbox_and_fences_the_dead_owner() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let (vcpus, memory_mb, disk_mb) = MEMORY_WORKER;
         let dead_node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
-        let _second_worker =
+        let second_worker =
             register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
         let scheduled = schedule_test_sandbox(
             &repository,
@@ -4683,6 +5852,7 @@ mod tests {
             .claim_worker_assignments(dead_node, 1, 60)
             .await
             .unwrap();
+        let dead_lease = claimed[0].lease.id;
         let dead_generation = claimed[0].lease.generation;
         let sandbox_id = scheduled.sandbox.id;
         for (expected, next) in [
@@ -4690,7 +5860,14 @@ mod tests {
             (SandboxState::Starting, SandboxState::Running),
         ] {
             repository
-                .update_state_with_generation(tenant, sandbox_id, expected, next, dead_generation)
+                .update_state_with_lease(
+                    tenant,
+                    sandbox_id,
+                    expected,
+                    next,
+                    dead_lease,
+                    dead_generation,
+                )
                 .await
                 .unwrap();
         }
@@ -4703,7 +5880,7 @@ mod tests {
             .unwrap()
             .expect("an expired lease of a dead worker is reassigned");
         let replacement = recovery.lease.node_id;
-        assert_ne!(replacement, dead_node);
+        assert_eq!(replacement, second_worker);
         assert_eq!(recovery.lease.generation, dead_generation + 1);
         assert_eq!(recovery.lease.status, "active");
         assert!(recovery.lease.expires_at > Utc::now());
@@ -4758,18 +5935,23 @@ mod tests {
                 .is_err()
         );
         let late = repository
-            .update_state_with_generation(
+            .update_state_with_lease(
                 tenant,
                 sandbox_id,
                 SandboxState::Creating,
                 SandboxState::Starting,
+                dead_lease,
                 dead_generation,
             )
             .await;
-        assert!(matches!(
-            late,
-            Err(StoreError::Conflict(message)) if message == "stale sandbox lease generation"
-        ));
+        assert!(
+            matches!(
+                late,
+                Err(StoreError::Transient(message))
+                    if message == "sandbox lease was reassigned to another owner"
+            ),
+            "the previous owner must be refused after recovery moved the sandbox"
+        );
         assert_eq!(
             repository
                 .get_sandbox(tenant, sandbox_id)
@@ -4779,11 +5961,12 @@ mod tests {
             SandboxState::Creating
         );
         repository
-            .update_state_with_generation(
+            .update_state_with_lease(
                 tenant,
                 sandbox_id,
                 SandboxState::Creating,
                 SandboxState::Starting,
+                ownership.lease_id,
                 ownership.generation,
             )
             .await
@@ -4803,7 +5986,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+        drop_test_schema(&repository, admin, schema).await;
     }
 
     #[tokio::test]
@@ -4853,12 +6036,13 @@ mod tests {
 
     #[tokio::test]
     async fn reassignment_recovers_a_lease_the_reconciler_already_expired() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let (vcpus, memory_mb, disk_mb) = DISK_WORKER;
         let dead_node = register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
-        let _second_worker =
+        let second_worker =
             register_worker_with(&repository, tenant, vcpus, memory_mb, disk_mb).await;
         let scheduled = schedule_test_sandbox(
             &repository,
@@ -4898,7 +6082,7 @@ mod tests {
             .unwrap()
             .expect("a lease the reconciler expired is still recoverable");
         assert_eq!(recovery.lease.generation, scheduled.lease_generation + 1);
-        assert_ne!(recovery.lease.node_id, dead_node);
+        assert_eq!(recovery.lease.node_id, second_worker);
         assert_eq!(recovery.sandbox.node_id, Some(recovery.lease.node_id));
         assert_eq!(recovery.sandbox.state, SandboxState::Creating);
         let after = node_capacity(&repository).await;
@@ -4908,7 +6092,7 @@ mod tests {
             after[&recovery.lease.node_id],
             (replacement_vcpus - 31, replacement_count + 1)
         );
-        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+        drop_test_schema(&repository, admin, schema).await;
     }
 
     fn audit_event(
@@ -5134,7 +6318,7 @@ mod tests {
         )
         .await;
         let refusal = match &refused {
-            Err(CoreError::Conflict(message)) => message.as_str(),
+            Err(CoreError::Transient(message)) => message.as_str(),
             other => {
                 panic!("a draining worker must not be offered to the scheduler, got {other:?}")
             }
@@ -5484,6 +6668,7 @@ mod tests {
             idempotency_key: None,
             parent_run_id: None,
             matrix_id: None,
+            matrix_cell: None,
         }
     }
 
@@ -5569,6 +6754,7 @@ mod tests {
             memory_mb: 2_048,
             disk_mb: 8_192,
             network: aiec_core::network::NetworkPolicy::Internet,
+            guard: None,
         };
         value.requirements = aiec_core::run::CapabilityRequirements {
             full_kernel_isolation: true,
@@ -5588,6 +6774,7 @@ mod tests {
                 stderr: "one test failed".into(),
                 duration_ms: 1_200,
                 truncated: false,
+                output_preview_truncated: false,
                 ok: false,
             }),
             validations: vec![aiec_core::run::CommandOutcome {
@@ -5597,12 +6784,14 @@ mod tests {
                 stderr: String::new(),
                 duration_ms: 40,
                 truncated: false,
+                output_preview_truncated: false,
                 ok: true,
             }],
             setup: Vec::new(),
             commit: Some("0f1e2d3".into()),
             git_status: " M src/main.rs".into(),
             git_diff: "+ println!();".into(),
+            git_evidence_truncated: false,
             changed_files: vec!["src/main.rs".into()],
             artifacts: vec![run_artifact("report.json")],
             phase_ms: BTreeMap::from([("collect".to_owned(), 90)]),
@@ -5824,6 +7013,7 @@ mod tests {
                 stderr: String::new(),
                 duration_ms: 900,
                 truncated: false,
+                output_preview_truncated: false,
                 ok: true,
             }),
             commit: Some("0f1e2d3".into()),
@@ -5971,6 +7161,8 @@ mod tests {
                     failure_reason: reason.map(str::to_owned),
                     started_at: Utc::now(),
                     completed_at: Some(Utc::now()),
+                    placement: Default::default(),
+                    results: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -6033,6 +7225,8 @@ mod tests {
                     failure_reason: None,
                     started_at: Utc::now(),
                     completed_at: None,
+                    placement: Default::default(),
+                    results: Default::default(),
                 })
                 .await,
             Err(CoreError::Conflict(_))
@@ -6048,6 +7242,8 @@ mod tests {
                     failure_reason: None,
                     started_at: Utc::now(),
                     completed_at: None,
+                    placement: Default::default(),
+                    results: Default::default(),
                 })
                 .await,
             Err(CoreError::Conflict(_))
@@ -6091,23 +7287,36 @@ mod tests {
 
     #[tokio::test]
     async fn retained_runs_due_returns_only_runs_whose_retention_expired() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let now = whole_microsecond_ago(0);
+        // A retained machine belongs to a run that has settled, which is the
+        // only state in which expiring one is safe.
         let mut expired = run(tenant);
+        expired.state = RunState::Failed;
         expired.retained_sandbox_id = Some(new_id());
         expired.retained_until = Some(now - chrono::Duration::hours(1));
         let mut held = run(tenant);
+        held.state = RunState::Failed;
         held.retained_sandbox_id = Some(new_id());
         held.retained_until = Some(now + chrono::Duration::hours(1));
-        let released = run(tenant);
-        for value in [&expired, &held, &released] {
+        let mut released = run(tenant);
+        released.state = RunState::Succeeded;
+        // Retention is recorded before the run settles, so a run that is still
+        // executing can already carry an expiring `retained_until`. Sweeping it
+        // would destroy a machine the executor is still writing results against
+        // and clear the fields, telling the caller who asked to keep a debugging
+        // machine that there is none.
+        let mut settling = run(tenant);
+        settling.state = RunState::Collecting;
+        settling.retained_sandbox_id = Some(new_id());
+        settling.retained_until = Some(now - chrono::Duration::hours(1));
+        for value in [&expired, &held, &released, &settling] {
             repository.create_run(value.clone()).await.unwrap();
         }
 
-        // The sweeper is the one run read that crosses tenants, so the check is
-        // scoped to the runs this test made rather than to the whole table.
         let due = repository.retained_runs_due(now, 100).await.unwrap();
         assert!(due.contains(&expired));
         assert!(
@@ -6118,8 +7327,14 @@ mod tests {
             !due.contains(&released),
             "a run that retained nothing has nothing to sweep"
         );
+        assert!(
+            !due.contains(&settling),
+            "a run that has not settled is not swept, however long ago its \
+             retention was recorded"
+        );
         assert!(expired.retention_expired(now));
         assert!(!held.retention_expired(now));
         assert!(!released.retention_expired(now));
+        drop_test_schema(&repository, admin, schema).await;
     }
 }

@@ -1,0 +1,941 @@
+{
+  "schema": "aiec-repository-cache-live/1",
+  "generated_at": "2026-10-01T05:19:12.568612+00:00",
+  "phase": "off",
+  "conditions": {
+    "workload": {
+      "image": "python:3.13",
+      "repo": {
+        "url": "https://github.com/octocat/Hello-World",
+        "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d"
+      },
+      "command": [
+        "python3",
+        "-c",
+        "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+      ],
+      "git_evidence": true,
+      "validations": [
+        [
+          "git",
+          "-C",
+          "/workspace/repository",
+          "rev-parse",
+          "--verify",
+          "HEAD"
+        ]
+      ],
+      "timeout_seconds": 300
+    },
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048,
+      "network": {
+        "enabled": true
+      }
+    },
+    "requested_runtime": "docker",
+    "retention": "destroy",
+    "max_attempts": 1
+  },
+  "runs": [
+    {
+      "index": 0,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.15471728896955,
+      "run": {
+        "id": "01a0f5e7-0350-7244-b0f0-f83a782f4e9f",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:19:12.720812Z",
+        "queued_at": "2026-10-01T05:19:12.720812Z",
+        "started_at": "2026-10-01T05:19:22.799058Z",
+        "completed_at": "2026-10-01T05:19:30.047034Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9280, \"tx\": 3279}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9280, \"tx\": 3279}\n",
+            "stderr": "",
+            "duration_ms": 179,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 39,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 2805,
+            "collection": 1201,
+            "placement": 6042,
+            "placement.allocation": 508,
+            "placement.boot": 598,
+            "placement.scheduler": 1782,
+            "placement.workspace": 1206,
+            "task": 951,
+            "validation": 787
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9280,
+            "tx": 3279
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9280,
+        "tx": 3279
+      },
+      "cleanup": null
+    },
+    {
+      "index": 1,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.1327165979892,
+      "run": {
+        "id": "01a0f5e7-4e5f-72fb-95a5-284ebf6f8f77",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:19:31.935357Z",
+        "queued_at": "2026-10-01T05:19:31.935357Z",
+        "started_at": "2026-10-01T05:19:42.079360Z",
+        "completed_at": "2026-10-01T05:19:49.227533Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9616, \"tx\": 3405}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9616, \"tx\": 3405}\n",
+            "stderr": "",
+            "duration_ms": 172,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 38,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 2969,
+            "collection": 1182,
+            "placement": 6963,
+            "placement.allocation": 546,
+            "placement.boot": 567,
+            "placement.scheduler": 2973,
+            "placement.workspace": 1174,
+            "task": 920,
+            "validation": 688
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9616,
+            "tx": 3405
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9616,
+        "tx": 3405
+      },
+      "cleanup": null
+    },
+    {
+      "index": 2,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.9412761789863,
+      "run": {
+        "id": "01a0f5e7-9922-779e-9701-8bfd9697255c",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:19:51.074553Z",
+        "queued_at": "2026-10-01T05:19:51.074553Z",
+        "started_at": "2026-10-01T05:20:01.539062Z",
+        "completed_at": "2026-10-01T05:20:09.266983Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9829, \"tx\": 3801}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9829, \"tx\": 3801}\n",
+            "stderr": "",
+            "duration_ms": 222,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 44,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3275,
+            "collection": 1181,
+            "placement": 6945,
+            "placement.allocation": 518,
+            "placement.boot": 556,
+            "placement.scheduler": 2808,
+            "placement.workspace": 1096,
+            "task": 926,
+            "validation": 698
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9829,
+            "tx": 3801
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9829,
+        "tx": 3801
+      },
+      "cleanup": null
+    },
+    {
+      "index": 3,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.41007661499316,
+      "run": {
+        "id": "01a0f5e7-e73b-748a-a7b7-bf362be1bfc7",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:20:11.067788Z",
+        "queued_at": "2026-10-01T05:20:11.067788Z",
+        "started_at": "2026-10-01T05:20:20.815186Z",
+        "completed_at": "2026-10-01T05:20:29.054921Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9711, \"tx\": 3351}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9711, \"tx\": 3351}\n",
+            "stderr": "",
+            "duration_ms": 190,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 39,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3888,
+            "collection": 1167,
+            "placement": 6012,
+            "placement.allocation": 461,
+            "placement.boot": 594,
+            "placement.scheduler": 1717,
+            "placement.workspace": 1169,
+            "task": 962,
+            "validation": 897
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9711,
+            "tx": 3351
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9711,
+        "tx": 3351
+      },
+      "cleanup": null
+    },
+    {
+      "index": 4,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.704841323022265,
+      "run": {
+        "id": "01a0f5e8-330b-7706-aae7-03e5d44bdbc1",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:20:30.475983Z",
+        "queued_at": "2026-10-01T05:20:30.475983Z",
+        "started_at": "2026-10-01T05:20:40.951025Z",
+        "completed_at": "2026-10-01T05:20:48.623973Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9654, \"tx\": 3351}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9654, \"tx\": 3351}\n",
+            "stderr": "",
+            "duration_ms": 201,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 40,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3316,
+            "collection": 1125,
+            "placement": 7400,
+            "placement.allocation": 546,
+            "placement.boot": 546,
+            "placement.scheduler": 3401,
+            "placement.workspace": 1200,
+            "task": 966,
+            "validation": 722
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9654,
+            "tx": 3351
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9654,
+        "tx": 3351
+      },
+      "cleanup": null
+    },
+    {
+      "index": 5,
+      "authorization_bypass": false,
+      "http_status": 201,
+      "wall_seconds": 19.588121436012443,
+      "run": {
+        "id": "01a0f5e8-7fb0-7699-a436-59a899c097c5",
+        "tenant_id": "0cb54769-f9df-4218-a988-92685dd6d42b",
+        "state": "succeeded",
+        "requested_at": "2026-10-01T05:20:50.096510Z",
+        "queued_at": "2026-10-01T05:20:50.096510Z",
+        "started_at": "2026-10-01T05:21:00.527102Z",
+        "completed_at": "2026-10-01T05:21:08.191890Z",
+        "workload": {
+          "image": "python:3.13",
+          "repo": {
+            "url": "https://github.com/octocat/Hello-World",
+            "reference": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+            "path": "/workspace/repository"
+          },
+          "setup": [],
+          "command": [
+            "python3",
+            "-c",
+            "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+          ],
+          "validations": [
+            [
+              "git",
+              "-C",
+              "/workspace/repository",
+              "rev-parse",
+              "--verify",
+              "HEAD"
+            ]
+          ],
+          "artifacts": [],
+          "environment": {},
+          "secrets": [],
+          "timeout_seconds": 300,
+          "git_evidence": true
+        },
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048,
+          "network": {
+            "enabled": true
+          }
+        },
+        "requirements": {
+          "full_kernel_isolation": false,
+          "coding_guest": false,
+          "network_policy": false,
+          "workspace_snapshot": false,
+          "portable_workspace": false,
+          "memory_resume": false,
+          "pty": false,
+          "pause": false
+        },
+        "placement": {
+          "runtime": "docker",
+          "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "reasons": [
+            "explicit runtime Docker selected",
+            "repository workspace required"
+          ]
+        },
+        "results": {
+          "task": {
+            "command": [
+              "python3",
+              "-c",
+              "import hashlib,json,pathlib,subprocess\nroot=pathlib.Path('/workspace/repository')\nassert subprocess.check_output(['git','-C',str(root),'status','--porcelain']) == b''\nassert not pathlib.Path('/workspace/.aiec-repo-objects').exists()\noriginal=(root/'README').read_bytes()\nassert b'CACHE_ISOLATION_MARKER' not in original\nactual=subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD']).decode().strip()\nassert actual=='7fd1a60b01f91b314f59955a4e4d4e80d8edf11d'\ninterfaces={}\nfor line in pathlib.Path('/proc/net/dev').read_text().splitlines()[2:]:\n name,columns=line.split(':',1); fields=columns.split()\n if name.strip()!='lo': interfaces[name.strip()]={'rx':int(fields[0]),'tx':int(fields[8])}\n(root/'README').write_bytes(original+b'\\nCACHE_ISOLATION_MARKER\\n')\nprint(json.dumps({'interfaces':interfaces,'rx':sum(v['rx'] for v in interfaces.values()),'tx':sum(v['tx'] for v in interfaces.values()),'original_sha256':hashlib.sha256(original).hexdigest(),'commit':actual,'fresh_clean_checkout':True,'private_mirror_absent':True},sort_keys=True))\n"
+            ],
+            "exit_code": 0,
+            "stdout": "{\"commit\": \"7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\", \"fresh_clean_checkout\": true, \"interfaces\": {\"eth0\": {\"rx\": 9600, \"tx\": 3351}}, \"original_sha256\": \"03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340\", \"private_mirror_absent\": true, \"rx\": 9600, \"tx\": 3351}\n",
+            "stderr": "",
+            "duration_ms": 189,
+            "truncated": false,
+            "output_preview_truncated": false,
+            "ok": true
+          },
+          "validations": [
+            {
+              "command": [
+                "git",
+                "-C",
+                "/workspace/repository",
+                "rev-parse",
+                "--verify",
+                "HEAD"
+              ],
+              "exit_code": 0,
+              "stdout": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d\n",
+              "stderr": "",
+              "duration_ms": 40,
+              "truncated": false,
+              "output_preview_truncated": false,
+              "ok": true
+            }
+          ],
+          "setup": [],
+          "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+          "git_status": " M README\n",
+          "git_diff": "diff --git a/README b/README\nindex 980a0d5..2fbb114 100644\n--- a/README\n+++ b/README\n@@ -1 +1,3 @@\n Hello World!\n+\n+CACHE_ISOLATION_MARKER\n",
+          "changed_files": [
+            "README"
+          ],
+          "git_evidence_truncated": false,
+          "artifacts": [],
+          "phase_ms": {
+            "cleanup": 3550,
+            "collection": 1163,
+            "placement": 7147,
+            "placement.allocation": 526,
+            "placement.boot": 575,
+            "placement.scheduler": 3328,
+            "placement.workspace": 1159,
+            "task": 829,
+            "validation": 693
+          }
+        },
+        "failure_reason": null,
+        "retention": "destroy",
+        "retained_sandbox_id": null,
+        "retained_until": null,
+        "idempotency_key": null,
+        "parent_run_id": null,
+        "matrix_id": null,
+        "matrix_cell": null
+      },
+      "observation": {
+        "commit": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+        "fresh_clean_checkout": true,
+        "interfaces": {
+          "eth0": {
+            "rx": 9600,
+            "tx": 3351
+          }
+        },
+        "original_sha256": "03ba204e50d126e4674c005e04d82e84c21366780af1f43bd54a37816b6ab340",
+        "private_mirror_absent": true,
+        "rx": 9600,
+        "tx": 3351
+      },
+      "cleanup": null
+    }
+  ],
+  "limit": "Guest non-loopback interface counters cover all pre-task guest network traffic, not a Git server object-transfer log. No task network requests are made; Docker exec uses the host daemon socket. Cache phase must be changed in the API process, not this client.",
+  "summary": {
+    "worker": "01a0e51d-7af1-7637-b114-5c4094840c15",
+    "rx_first": 9280,
+    "rx_rest_median": 9654,
+    "placement_ms_first": 6042,
+    "placement_ms_rest_median": 6963,
+    "every_sandbox_terminal": true
+  }
+}

@@ -27,3 +27,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "json"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = "1"
+# The syscall interface, not a feature. It is here for exactly one call:
+# killing a timed-out command's whole process group, because a shell that
+# backgrounds a job and then waits is killed by killing the shell.
+libc = "0.2"

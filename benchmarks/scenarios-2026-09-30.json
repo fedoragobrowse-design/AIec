@@ -1,0 +1,1058 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "run",
+  "generated_at": "2026-09-30T23:59:10+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 63,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "matrix",
+      "snapshot",
+      "soak"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 20,
+      "parallelism": 1,
+      "checkpoint_every": 5
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 25
+  },
+  "conditions_fingerprint": "4283960eec2cb341",
+  "scenarios": {
+    "matrix": {
+      "conditions": {
+        "repetitions": 1,
+        "max_parallel": 2,
+        "repo": null,
+        "ref": null,
+        "ref_kind": "unset",
+        "image": "python:3.13",
+        "runtime_requested": null,
+        "resources": {
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 2048
+        },
+        "command": [
+          "true"
+        ]
+      },
+      "matrix": {
+        "metric": "matrix",
+        "available": false,
+        "reason": "not run: pass --repo to measure a matrix over a real repository"
+      },
+      "repetitions": {
+        "available": true,
+        "endpoint": "POST /v1/eval/repetitions",
+        "requested": 1,
+        "returned": 1,
+        "cell_seconds": {
+          "metric": "repetition_wall_time",
+          "available": true,
+          "unit": "s",
+          "samples": 1,
+          "min_s": 26.4836,
+          "max_s": 26.4836,
+          "mean_s": 26.4836,
+          "median_s": 26.4836,
+          "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+        },
+        "outcomes": {
+          "succeeded": 1,
+          "not_succeeded": 0,
+          "rejected_before_execution": 0,
+          "states": {
+            "succeeded": 1
+          },
+          "run_total": {
+            "metric": "run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 26.4836,
+            "max_s": 26.4836,
+            "mean_s": 26.4836,
+            "median_s": 26.4836,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "residual_unattributed": {
+            "metric": "residual_unattributed",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 4.7466,
+            "max_s": 4.7466,
+            "mean_s": 4.7466,
+            "median_s": 4.7466,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "admission": {
+            "metric": "admission",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 0.0,
+            "max_s": 0.0,
+            "mean_s": 0.0,
+            "median_s": 0.0,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "queue_wait": {
+            "metric": "queue_wait",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 10.1052,
+            "max_s": 10.1052,
+            "mean_s": 10.1052,
+            "median_s": 10.1052,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "start_latency": {
+            "metric": "start_latency",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 10.1052,
+            "max_s": 10.1052,
+            "mean_s": 10.1052,
+            "median_s": 10.1052,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "wall_time": {
+            "metric": "wall_time",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 26.4836,
+            "max_s": 26.4836,
+            "mean_s": 26.4836,
+            "median_s": 26.4836,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "phase_cleanup": {
+            "metric": "phase_cleanup",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 14.231,
+            "max_s": 14.231,
+            "mean_s": 14.231,
+            "median_s": 14.231,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "phase_collection": {
+            "metric": "phase_collection",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 0.0,
+            "max_s": 0.0,
+            "mean_s": 0.0,
+            "median_s": 0.0,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "phase_placement": {
+            "metric": "phase_placement",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 6.608,
+            "max_s": 6.608,
+            "mean_s": 6.608,
+            "median_s": 6.608,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          },
+          "phase_task": {
+            "metric": "phase_task",
+            "available": true,
+            "unit": "s",
+            "samples": 1,
+            "min_s": 0.898,
+            "max_s": 0.898,
+            "mean_s": 0.898,
+            "median_s": 0.898,
+            "percentiles_withheld": "1 samples is below the 20 needed for a p50/p95/p99"
+          }
+        }
+      }
+    },
+    "soak": {
+      "succeeded": 18,
+      "not_succeeded": 2,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 18,
+        "failed": 2
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 24.06,
+        "max_s": 26.5676,
+        "mean_s": 24.9612,
+        "median_s": 24.7084,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 5.1821,
+        "max_s": 6.6853,
+        "mean_s": 5.9124,
+        "median_s": 5.9904,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 7.4598,
+        "max_s": 9.75,
+        "mean_s": 8.119,
+        "median_s": 7.9931,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 7.4598,
+        "max_s": 9.75,
+        "mean_s": 8.119,
+        "median_s": 7.9931,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 22.373,
+        "max_s": 24.9329,
+        "mean_s": 23.3627,
+        "median_s": 23.1349,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 12.882,
+        "max_s": 13.638,
+        "mean_s": 13.2298,
+        "median_s": 13.203,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 4.508,
+        "max_s": 6.056,
+        "mean_s": 4.9666,
+        "median_s": 4.8025,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 18,
+        "min_s": 0.802,
+        "max_s": 0.953,
+        "mean_s": 0.8524,
+        "median_s": 0.842,
+        "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+      },
+      "failure_reasons": {
+        "backend unavailable: stale sandbox lease generation": 2
+      },
+      "shape": {
+        "iterations_requested": 20,
+        "iterations_executed": 20,
+        "parallelism": 1,
+        "mode": "sequential",
+        "wall_clock_s": 491.324,
+        "stopped_early": "no: every requested iteration was executed",
+        "checkpoint_every": 5
+      },
+      "throughput": {
+        "available": true,
+        "runs_per_minute": 2.442,
+        "note": "successful runs per minute of wall clock, including the time spent waiting for machines; a queue that refuses work lowers this without making the control plane slower"
+      },
+      "checkpoints": [
+        {
+          "at": "2026-09-30T23:52:37+00:00",
+          "iterations": 5,
+          "wall_clock_s": 125.475,
+          "succeeded": 4,
+          "not_succeeded": 1,
+          "run_states": {
+            "succeeded": 4,
+            "failed": 1
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 4,
+            "min_s": 24.4952,
+            "max_s": 26.5676,
+            "mean_s": 25.4633,
+            "median_s": 25.3952,
+            "percentiles_withheld": "4 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-09-30T23:54:30+00:00",
+          "iterations": 10,
+          "wall_clock_s": 239.126,
+          "succeeded": 8,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 8,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 8,
+            "min_s": 24.4952,
+            "max_s": 26.5676,
+            "mean_s": 25.3466,
+            "median_s": 24.9382,
+            "percentiles_withheld": "8 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-09-30T23:56:36+00:00",
+          "iterations": 15,
+          "wall_clock_s": 364.95,
+          "succeeded": 13,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 13,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 13,
+            "min_s": 24.0641,
+            "max_s": 26.5676,
+            "mean_s": 25.16,
+            "median_s": 24.9174,
+            "percentiles_withheld": "13 samples is below the 20 needed for a p50/p95/p99"
+          }
+        },
+        {
+          "at": "2026-09-30T23:58:40+00:00",
+          "iterations": 20,
+          "wall_clock_s": 488.596,
+          "succeeded": 18,
+          "not_succeeded": 2,
+          "run_states": {
+            "succeeded": 18,
+            "failed": 2
+          },
+          "nonterminal_sandboxes": 3,
+          "available_vcpus": 9.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 18,
+            "min_s": 24.06,
+            "max_s": 26.5676,
+            "mean_s": 24.9612,
+            "median_s": 24.7084,
+            "percentiles_withheld": "18 samples is below the 20 needed for a p50/p95/p99"
+          }
+        }
+      ],
+      "census_at_end": {
+        "sandboxes": {
+          "available": true,
+          "at": "2026-09-30T23:58:42+00:00",
+          "total": 503,
+          "by_state": {
+            "destroyed": 473,
+            "failed": 27,
+            "running": 3
+          },
+          "nonterminal_count": 3,
+          "nonterminal_sandbox_ids": [
+            "01a0f4b7-538a-712f-9566-7512c654403f",
+            "01a0f4b7-4021-729d-b4d7-79efe175b012",
+            "01a0f4b5-5278-7209-a59a-2b650358b979"
+          ],
+          "nonterminal_truncated": false
+        },
+        "node_capacity": {
+          "available": true,
+          "at": "2026-09-30T23:58:42+00:00",
+          "scope": "reserved by the scheduler, not measured on the host",
+          "available_vcpus": 9.0,
+          "available_memory_bytes": 11274289152.0,
+          "api_requests_total": 4332.0
+        },
+        "containers": {
+          "metric": "containers",
+          "available": false,
+          "reason": "docker is not installed on the harness host"
+        },
+        "postgres": {
+          "metric": "postgres",
+          "available": false,
+          "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+        }
+      },
+      "rate_limit_429s": 0,
+      "sandbox_histogram": {
+        "succeeded": 18,
+        "failed": 2
+      }
+    },
+    "snapshot": {
+      "available": false,
+      "reason": "this runtime could not restore a workspace snapshot: 500 backend io: No such file or directory (os error 2)",
+      "refusal": {
+        "step": "restore",
+        "status": 500,
+        "code": "backend",
+        "reason": "this runtime could not restore a workspace snapshot: 500 backend io: No such file or directory (os error 2)"
+      },
+      "samples_completed": 1
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-09-30T23:49:58+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:49:58+00:00",
+        "total": 482,
+        "by_state": {
+          "destroyed": 452,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:49:58+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3509.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:49:59+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:49:59+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-09-30T23:49:59+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.78,
+          1.78,
+          1.86
+        ],
+        "memory_available_bytes": 27114463232,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16638582784,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "metric": "containers",
+        "available": false,
+        "reason": "docker is not installed on the harness host"
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:49:59+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:49:59+00:00",
+        "total": 482,
+        "by_state": {
+          "destroyed": 452,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:50:00+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3518.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:50:00+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:50:00+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-09-30T23:50:00+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.78,
+          1.78,
+          1.86
+        ],
+        "memory_available_bytes": 27108712448,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16638582784,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "metric": "containers",
+        "available": false,
+        "reason": "docker is not installed on the harness host"
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "matrix-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:50:30+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:50:30+00:00",
+        "total": 483,
+        "by_state": {
+          "destroyed": 453,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:50:30+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3567.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:50:31+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:50:31+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-09-30T23:50:31+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.95,
+          1.82,
+          1.87
+        ],
+        "memory_available_bytes": 27120132096,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16638582784,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "metric": "containers",
+        "available": false,
+        "reason": "docker is not installed on the harness host"
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:52:37+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:52:37+00:00",
+        "total": 488,
+        "by_state": {
+          "destroyed": 458,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:52:37+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3756.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:52:38+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:52:38+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-5",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:54:30+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:54:31+00:00",
+        "total": 493,
+        "by_state": {
+          "destroyed": 463,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:54:31+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 3939.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:54:31+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:54:32+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-10",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:56:36+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:56:37+00:00",
+        "total": 498,
+        "by_state": {
+          "destroyed": 468,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:56:37+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 4129.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:56:37+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:56:37+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-15",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:58:40+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:58:40+00:00",
+        "total": 503,
+        "by_state": {
+          "destroyed": 473,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:58:40+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 4328.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:58:41+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:58:41+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-20",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:58:41+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:58:42+00:00",
+        "total": 503,
+        "by_state": {
+          "destroyed": 473,
+          "failed": 27,
+          "running": 3
+        },
+        "nonterminal_count": 3,
+        "nonterminal_sandbox_ids": [
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:58:42+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 9.0,
+        "available_memory_bytes": 11274289152.0,
+        "api_requests_total": 4332.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:58:42+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:58:42+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-09-30T23:58:42+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.87,
+          2.02,
+          1.97
+        ],
+        "memory_available_bytes": 27138322432,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16638578688,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "metric": "containers",
+        "available": false,
+        "reason": "docker is not installed on the harness host"
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-final",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-09-30T23:59:09+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-09-30T23:59:09+00:00",
+        "total": 505,
+        "by_state": {
+          "destroyed": 474,
+          "failed": 27,
+          "restoring": 1,
+          "running": 3
+        },
+        "nonterminal_count": 4,
+        "nonterminal_sandbox_ids": [
+          "01a0f4c1-ecf0-71fa-820e-7a6d296a90b0",
+          "01a0f4b7-538a-712f-9566-7512c654403f",
+          "01a0f4b7-4021-729d-b4d7-79efe175b012",
+          "01a0f4b5-5278-7209-a59a-2b650358b979"
+        ],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-09-30T23:59:09+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 8.0,
+        "available_memory_bytes": 10737418240.0,
+        "api_requests_total": 4390.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-09-30T23:59:10+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-09-30T23:59:10+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-09-30T23:59:10+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.89,
+          2.01,
+          1.97
+        ],
+        "memory_available_bytes": 27067125760,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16638578688,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "metric": "containers",
+        "available": false,
+        "reason": "docker is not installed on the harness host"
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 3,
+      "nonterminal_at_end": 4,
+      "new_nonterminal_sandbox_ids": [
+        "01a0f4c1-ecf0-71fa-820e-7a6d296a90b0"
+      ],
+      "by_state_at_end": {
+        "destroyed": 474,
+        "failed": 27,
+        "restoring": 1,
+        "running": 3
+      },
+      "available_vcpus_before": 9.0,
+      "available_vcpus_after": 8.0,
+      "vcpus_returned_to_baseline": false
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [
+    "this runtime could not restore a workspace snapshot: 500 backend io: No such file or directory (os error 2)"
+  ],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  }
+}

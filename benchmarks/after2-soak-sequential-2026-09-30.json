@@ -1,0 +1,862 @@
+{
+  "schema": "aiec-bench/1",
+  "harness_version": "1.0.0",
+  "label": "run",
+  "generated_at": "2026-10-01T06:15:48+00:00",
+  "target": {
+    "base_url": "https://127.0.0.1:18443",
+    "tls": "ca:/home/gobrowse/aiec/tls/ca.crt",
+    "requests": 132,
+    "rate_limit_429s": 0,
+    "credential_source": "file:/tmp/bench-key.txt"
+  },
+  "conditions": {
+    "scenarios": [
+      "soak"
+    ],
+    "image": "python:3.13",
+    "runtime_requested": null,
+    "resources": {
+      "cpu": 1,
+      "memory_mb": 512,
+      "disk_mb": 2048
+    },
+    "command": [
+      "true"
+    ],
+    "setup": [],
+    "validations": [],
+    "artifacts": [],
+    "workload_timeout_seconds": null,
+    "repo": {
+      "url": null,
+      "ref": null,
+      "ref_kind": "unset"
+    },
+    "soak": {
+      "iterations": 100,
+      "parallelism": 1,
+      "checkpoint_every": 25
+    },
+    "snapshot": {
+      "kind": "workspace"
+    },
+    "matrix": {
+      "max_parallel": 2
+    },
+    "omp": {
+      "omp_repo": null,
+      "baseline_ref": null,
+      "candidate_ref": null,
+      "target_repo": null,
+      "target_ref": null,
+      "task": null,
+      "repetitions": 1,
+      "max_parallel": 2
+    },
+    "samples_requested": 10
+  },
+  "conditions_fingerprint": "95da75d5bebfde9a",
+  "scenarios": {
+    "soak": {
+      "succeeded": 100,
+      "not_succeeded": 0,
+      "rejected_before_execution": 0,
+      "states": {
+        "succeeded": 100
+      },
+      "run_total": {
+        "metric": "run_total",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 13.3287,
+        "max_s": 21.8038,
+        "mean_s": 15.2638,
+        "median_s": 15.1225,
+        "p50_s": 15.1147,
+        "p95_s": 17.806,
+        "p99_s": 19.7436
+      },
+      "residual_unattributed": {
+        "metric": "residual_unattributed",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 5.2352,
+        "max_s": 8.9628,
+        "mean_s": 6.37,
+        "median_s": 6.1058,
+        "p50_s": 6.0934,
+        "p95_s": 7.569,
+        "p99_s": 8.5986
+      },
+      "admission": {
+        "metric": "admission",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "queue_wait": {
+        "metric": "queue_wait",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 7.1231,
+        "max_s": 12.9624,
+        "mean_s": 8.0018,
+        "median_s": 7.8046,
+        "p50_s": 7.8005,
+        "p95_s": 9.8424,
+        "p99_s": 10.5386
+      },
+      "start_latency": {
+        "metric": "start_latency",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 7.1231,
+        "max_s": 12.9624,
+        "mean_s": 8.0018,
+        "median_s": 7.8046,
+        "p50_s": 7.8005,
+        "p95_s": 9.8424,
+        "p99_s": 10.5386
+      },
+      "wall_time": {
+        "metric": "wall_time",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 12.0067,
+        "max_s": 19.6494,
+        "mean_s": 13.2866,
+        "median_s": 12.9163,
+        "p50_s": 12.9157,
+        "p95_s": 15.2302,
+        "p99_s": 16.6757
+      },
+      "phase_cleanup": {
+        "metric": "phase_cleanup",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 2.901,
+        "max_s": 5.739,
+        "mean_s": 3.3533,
+        "median_s": 3.136,
+        "p50_s": 3.136,
+        "p95_s": 4.487,
+        "p99_s": 5.623
+      },
+      "phase_collection": {
+        "metric": "phase_collection",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_placement": {
+        "metric": "phase_placement",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 4.261,
+        "max_s": 7.702,
+        "mean_s": 4.827,
+        "median_s": 4.728,
+        "p50_s": 4.727,
+        "p95_s": 6.075,
+        "p99_s": 6.704
+      },
+      "phase_placement.allocation": {
+        "metric": "phase_placement.allocation",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.466,
+        "max_s": 0.791,
+        "mean_s": 0.523,
+        "median_s": 0.518,
+        "p50_s": 0.518,
+        "p95_s": 0.563,
+        "p99_s": 0.603
+      },
+      "phase_placement.boot": {
+        "metric": "phase_placement.boot",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.486,
+        "max_s": 0.753,
+        "mean_s": 0.5441,
+        "median_s": 0.539,
+        "p50_s": 0.538,
+        "p95_s": 0.588,
+        "p99_s": 0.693
+      },
+      "phase_placement.scheduler": {
+        "metric": "phase_placement.scheduler",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 1.613,
+        "max_s": 3.529,
+        "mean_s": 2.0048,
+        "median_s": 1.946,
+        "p50_s": 1.945,
+        "p95_s": 3.296,
+        "p99_s": 3.363
+      },
+      "phase_placement.workspace": {
+        "metric": "phase_placement.workspace",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.0,
+        "max_s": 0.0,
+        "mean_s": 0.0,
+        "median_s": 0.0,
+        "p50_s": 0.0,
+        "p95_s": 0.0,
+        "p99_s": 0.0
+      },
+      "phase_task": {
+        "metric": "phase_task",
+        "available": true,
+        "unit": "s",
+        "samples": 100,
+        "min_s": 0.654,
+        "max_s": 0.875,
+        "mean_s": 0.7135,
+        "median_s": 0.712,
+        "p50_s": 0.711,
+        "p95_s": 0.758,
+        "p99_s": 0.83
+      },
+      "shape": {
+        "iterations_requested": 100,
+        "iterations_executed": 100,
+        "parallelism": 1,
+        "mode": "sequential",
+        "wall_clock_s": 1535.071,
+        "stopped_early": "no: every requested iteration was executed",
+        "checkpoint_every": 25
+      },
+      "throughput": {
+        "available": true,
+        "runs_per_minute": 3.909,
+        "note": "successful runs per minute of wall clock, including the time spent waiting for machines; a queue that refuses work lowers this without making the control plane slower"
+      },
+      "checkpoints": [
+        {
+          "at": "2026-10-01T05:56:26+00:00",
+          "iterations": 25,
+          "wall_clock_s": 374.976,
+          "succeeded": 25,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 25
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 25,
+            "min_s": 13.4118,
+            "max_s": 17.6605,
+            "mean_s": 14.999,
+            "median_s": 15.1147,
+            "p50_s": 15.1147,
+            "p95_s": 17.0525,
+            "p99_s": 17.6605
+          }
+        },
+        {
+          "at": "2026-10-01T06:02:37+00:00",
+          "iterations": 50,
+          "wall_clock_s": 746.111,
+          "succeeded": 50,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 50
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 50,
+            "min_s": 13.3287,
+            "max_s": 17.6605,
+            "mean_s": 14.891,
+            "median_s": 14.5571,
+            "p50_s": 14.5262,
+            "p95_s": 16.4002,
+            "p99_s": 17.6605
+          }
+        },
+        {
+          "at": "2026-10-01T06:08:52+00:00",
+          "iterations": 75,
+          "wall_clock_s": 1120.952,
+          "succeeded": 75,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 75
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 75,
+            "min_s": 13.3287,
+            "max_s": 17.806,
+            "mean_s": 14.9035,
+            "median_s": 14.5262,
+            "p50_s": 14.5262,
+            "p95_s": 16.4002,
+            "p99_s": 17.806
+          }
+        },
+        {
+          "at": "2026-10-01T06:15:42+00:00",
+          "iterations": 100,
+          "wall_clock_s": 1531.042,
+          "succeeded": 100,
+          "not_succeeded": 0,
+          "run_states": {
+            "succeeded": 100
+          },
+          "nonterminal_sandboxes": 0,
+          "available_vcpus": 12.0,
+          "summarise_run_total": {
+            "metric": "soak_run_total",
+            "available": true,
+            "unit": "s",
+            "samples": 100,
+            "min_s": 13.3287,
+            "max_s": 21.8038,
+            "mean_s": 15.2638,
+            "median_s": 15.1225,
+            "p50_s": 15.1147,
+            "p95_s": 17.806,
+            "p99_s": 19.7436
+          }
+        }
+      ],
+      "census_at_end": {
+        "sandboxes": {
+          "available": true,
+          "at": "2026-10-01T06:15:45+00:00",
+          "total": 921,
+          "by_state": {
+            "destroyed": 893,
+            "failed": 28
+          },
+          "nonterminal_count": 0,
+          "nonterminal_sandbox_ids": [],
+          "nonterminal_truncated": false
+        },
+        "node_capacity": {
+          "available": true,
+          "at": "2026-10-01T06:15:45+00:00",
+          "scope": "reserved by the scheduler, not measured on the host",
+          "available_vcpus": 12.0,
+          "available_memory_bytes": 12884901888.0,
+          "api_requests_total": 3029.0
+        },
+        "containers": {
+          "available": true,
+          "at": "2026-10-01T06:15:46+00:00",
+          "scope": "the podman daemon on the harness host",
+          "running": 1,
+          "names": [
+            "aiec-testdb"
+          ],
+          "names_truncated": false
+        },
+        "postgres": {
+          "metric": "postgres",
+          "available": false,
+          "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+        }
+      },
+      "rate_limit_429s": 0,
+      "sandbox_histogram": {
+        "succeeded": 100
+      }
+    }
+  },
+  "scenario_errors": {},
+  "observations": [
+    {
+      "at": "2026-10-01T05:50:07+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T05:50:08+00:00",
+        "total": 821,
+        "by_state": {
+          "destroyed": 793,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T05:50:08+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 832.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T05:50:09+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T05:50:09+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T05:50:09+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.6,
+          1.6,
+          1.72
+        ],
+        "memory_available_bytes": 27194265600,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T05:50:09+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T05:50:09+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T05:50:10+00:00",
+        "total": 821,
+        "by_state": {
+          "destroyed": 793,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T05:50:10+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 838.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T05:50:10+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T05:50:10+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T05:50:10+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.6,
+          1.6,
+          1.72
+        ],
+        "memory_available_bytes": 27197177856,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T05:50:11+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-baseline",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T05:56:26+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T05:56:26+00:00",
+        "total": 846,
+        "by_state": {
+          "destroyed": 818,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T05:56:26+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 1377.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T05:56:27+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T05:56:27+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-25",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:02:37+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:02:37+00:00",
+        "total": 871,
+        "by_state": {
+          "destroyed": 843,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:02:38+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 1913.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:02:38+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:02:38+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-50",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:08:52+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:08:52+00:00",
+        "total": 896,
+        "by_state": {
+          "destroyed": 868,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:08:52+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 2464.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:08:53+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:08:53+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-75",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:15:42+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:15:42+00:00",
+        "total": 921,
+        "by_state": {
+          "destroyed": 893,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:15:43+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3024.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:15:43+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:15:44+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "label": "soak-checkpoint-100",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:15:44+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:15:45+00:00",
+        "total": 921,
+        "by_state": {
+          "destroyed": 893,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:15:45+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3029.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:15:45+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:15:46+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:15:46+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.64,
+          1.6,
+          1.71
+        ],
+        "memory_available_bytes": 27148333056,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:15:46+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "soak-final",
+      "owned_sandboxes_alive": []
+    },
+    {
+      "at": "2026-10-01T06:15:46+00:00",
+      "sandboxes": {
+        "available": true,
+        "at": "2026-10-01T06:15:47+00:00",
+        "total": 921,
+        "by_state": {
+          "destroyed": 893,
+          "failed": 28
+        },
+        "nonterminal_count": 0,
+        "nonterminal_sandbox_ids": [],
+        "nonterminal_truncated": false
+      },
+      "node_capacity": {
+        "available": true,
+        "at": "2026-10-01T06:15:48+00:00",
+        "scope": "reserved by the scheduler, not measured on the host",
+        "available_vcpus": 12.0,
+        "available_memory_bytes": 12884901888.0,
+        "api_requests_total": 3037.0
+      },
+      "accounting": {
+        "available": true,
+        "at": "2026-10-01T06:15:48+00:00",
+        "by_metric": {}
+      },
+      "queued_runs": {
+        "available": true,
+        "at": "2026-10-01T06:15:48+00:00",
+        "page_limit": 100,
+        "at_least": 0,
+        "may_be_truncated": false,
+        "by_state": {}
+      },
+      "harness_host": {
+        "available": true,
+        "at": "2026-10-01T06:15:48+00:00",
+        "scope": "the harness host itself, not the worker or the control plane",
+        "loadavg": [
+          1.67,
+          1.61,
+          1.71
+        ],
+        "memory_available_bytes": 27153358848,
+        "memory_total_bytes": 33336291328,
+        "temp_disk_free_bytes": 16624353280,
+        "temp_disk_total_bytes": 16668147712
+      },
+      "containers": {
+        "available": true,
+        "at": "2026-10-01T06:15:48+00:00",
+        "scope": "the podman daemon on the harness host",
+        "running": 1,
+        "names": [
+          "aiec-testdb"
+        ],
+        "names_truncated": false
+      },
+      "postgres": {
+        "metric": "postgres",
+        "available": false,
+        "reason": "not measured: set AIEC_BENCH_DATABASE_URL in the environment to enable it"
+      },
+      "label": "harness-final",
+      "owned_sandboxes_alive": []
+    }
+  ],
+  "leak_accounting": {
+    "run_cleanup_failures": [],
+    "sandbox_census_delta": {
+      "available": true,
+      "pre_existing_nonterminal": 0,
+      "nonterminal_at_end": 0,
+      "new_nonterminal_sandbox_ids": [],
+      "by_state_at_end": {
+        "destroyed": 893,
+        "failed": 28
+      },
+      "available_vcpus_before": 12.0,
+      "available_vcpus_after": 12.0,
+      "vcpus_returned_to_baseline": true
+    }
+  },
+  "harness_cleanup": {
+    "owned_at_end": 0,
+    "destroyed": 0,
+    "already_gone": 0,
+    "failed": [],
+    "leaked_sandboxes_reported": [],
+    "leaked_sandboxes_reclaimed": [],
+    "note": "only sandboxes this harness created are destroyed; leaked platform sandboxes are reported, and reclaimed only with --reclaim-leaked"
+  },
+  "limitations": [],
+  "harness": {
+    "python": "3.14.7",
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43"
+  }
+}

@@ -10,6 +10,12 @@ use crate::task::{Event, EventKind, StopReason};
 
 /// How many events are kept. Enough to reconstruct the shape of a run, small
 /// enough that the result document stays readable.
+///
+/// The **most recent** this many. The result document documents this field as
+/// the tail of the transcript, and a tail that drops from the front is the only
+/// kind that keeps the events worth having: a bound that refuses new events
+/// once it is full loses the end of the run, which is where `stopped`,
+/// `failed` and every late compaction live.
 const MAX_EVENTS: usize = 400;
 
 /// Collects events for the result document.
@@ -30,15 +36,16 @@ impl Sink {
 
     fn push(&self, kind: EventKind, detail: Option<String>) {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        if events.len() >= MAX_EVENTS {
-            return;
-        }
         events.push(Event {
             at: chrono::Utc::now(),
             turn: *self.turn.lock().unwrap_or_else(|e| e.into_inner()),
             kind,
-            detail: detail.map(|text| clip(&text, 240)),
+            detail: detail.map(|text| crate::clip(&text, 240)),
         });
+        if events.len() > MAX_EVENTS {
+            let excess = events.len() - MAX_EVENTS;
+            events.drain(..excess);
+        }
     }
 
     pub fn started(&self) {
@@ -113,16 +120,6 @@ impl Sink {
     }
 }
 
-/// Trims a detail string so a tool result or a model quote cannot fill the
-/// document.
-fn clip(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    let kept: String = text.chars().take(limit).collect();
-    format!("{kept}…")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,8 +135,33 @@ mod tests {
 
     #[test]
     fn details_are_clipped() {
-        assert_eq!(clip("short", 10), "short");
-        let long = clip(&"x".repeat(50), 10);
+        assert_eq!(crate::clip("short", 10), "short");
+        let long = crate::clip(&"x".repeat(50), 10);
         assert_eq!(long.chars().count(), 11); // ten characters plus the ellipsis
+    }
+
+    /// The bound must not cost the end of the run.
+    ///
+    /// `stopped` is the field an operator reads first and it is written last,
+    /// so a bound that stops accepting events once it is full deletes exactly
+    /// the answer to "why did this stop" from every long run's result document.
+    #[test]
+    fn a_long_run_still_records_how_it_ended() {
+        let sink = Sink::new("test");
+        sink.started();
+        for index in 0..MAX_EVENTS * 3 {
+            sink.tool_call("read");
+            sink.tool_result("read", index % 7 == 0);
+        }
+        sink.stopped(StopReason::TurnBudget);
+        let events = sink.drain();
+        assert_eq!(events.len(), MAX_EVENTS, "the bound still holds");
+        assert!(
+            events
+                .last()
+                .is_some_and(|event| matches!(event.kind, EventKind::Stopped { .. })),
+            "the last event is not the one that says the run stopped: {:?}",
+            events.last().map(|event| &event.kind)
+        );
     }
 }

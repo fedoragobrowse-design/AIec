@@ -1,0 +1,1007 @@
+{
+  "metadata": {
+    "title": "AIec database pressure, query cost, queue fairness and host reservation evidence",
+    "captured_at_utc": "2026-10-01T04:00:41Z",
+    "target": "https://127.0.0.1:18443 (deployed control plane) and its Neon production database from /home/gobrowse/aiec/env.systemd",
+    "production_code_changes": "none",
+    "production_retention_changes": "none",
+    "credentials": "read from deployed environment files; never printed, never placed in argv; a throwaway SQL bridge passed them as container environment variables only"
+  },
+  "scope": "production database from deployed service DATABASE_URL; API workloads run in real sandboxes; rollback-only SQL fixtures",
+  "prerequisites_met": [
+    "deployed API TLS verified with /home/gobrowse/aiec/tls/api.crt",
+    "invite-gated signup available (AIEC_INVITE_CODES set)",
+    "pg_stat_statements extension created against preloaded library without restart or statistics reset",
+    "docker worker registered with 8 vCPU capacity",
+    "two tenant credentials obtained through the documented invite route"
+  ],
+  "database_catalog_at_capture": {
+    "runs": 554,
+    "matrix_runs": 4,
+    "queue": {
+      "finished": 160
+    },
+    "connections": 20,
+    "max_connections": "901",
+    "extensions": [
+      "plpgsql",
+      "pgcrypto"
+    ],
+    "preload": "neon,pg_stat_statements,timescaledb,pg_cron,pg_partman_bgw,rag_bge_small_en_v15,rag_jina_reranker_v1_tiny_en,lakebase_vector,lakebase_text"
+  },
+  "pg_stat_statements": {
+    "extension": "pg_stat_statements",
+    "version": "1.12"
+  },
+  "host_pressure": {
+    "host_inputs": {
+      "MemAvailable_bytes": 26708283392,
+      "MemTotal_bytes": 33336291328,
+      "disk_available_unprivileged_bytes": 801554046976,
+      "disk_total_bytes": 997426462720,
+      "affinity_cpus": 12,
+      "loadavg": [
+        2.388671875,
+        2.07568359375,
+        2.0361328125
+      ],
+      "memory_reserve_bytes": 536870912,
+      "disk_reserve_bytes": 2147483648
+    },
+    "deployed_worker_readings": [
+      {
+        "runtime": "firecracker",
+        "pressure": {
+          "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+          "reserves": {
+            "disk_bytes": 2147483648,
+            "memory_bytes": 536870912
+          },
+          "observed_at": "2026-10-01T04:00:42.040189413Z",
+          "total_vcpus": 12,
+          "available_vcpus": 10,
+          "total_disk_bytes": 997426462720,
+          "total_memory_bytes": 33336291328,
+          "disk_available_bytes": 799407947776,
+          "memory_available_bytes": 26442514432
+        }
+      },
+      {
+        "runtime": "docker",
+        "pressure": {
+          "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+          "reserves": {
+            "disk_bytes": 2147483648,
+            "memory_bytes": 536870912
+          },
+          "observed_at": "2026-10-01T04:00:42.748541310Z",
+          "total_vcpus": 12,
+          "available_vcpus": 10,
+          "total_disk_bytes": 997426462720,
+          "total_memory_bytes": 33336291328,
+          "disk_available_bytes": 799407947776,
+          "memory_available_bytes": 26470866944
+        }
+      }
+    ],
+    "ledger_note": "docker worker ledger available_vcpus moved 6 -> 5 -> 6 across samples while total_* stayed fixed; that is scheduler debit/release, not a heartbeat resize. Heartbeats advanced pressure observations and last_heartbeat without changing totals.",
+    "idle_window_comparison": {
+      "before": [
+        {
+          "id": "01a0e4b5-b3da-725a-9a51-b23717207c11",
+          "healthy": true,
+          "runtime": "firecracker",
+          "last_heartbeat": "2026-10-01T04:08:02.160641+00:00",
+          "total_vcpus": 4,
+          "available_vcpus": 4,
+          "total_memory_bytes": 4294967296,
+          "available_memory_bytes": 4294967296,
+          "total_disk_bytes": 42949672960,
+          "available_disk_bytes": 42949672960,
+          "pressure": {
+            "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+            "reserves": {
+              "disk_bytes": 2147483648,
+              "memory_bytes": 536870912
+            },
+            "observed_at": "2026-10-01T04:08:02.040847266Z",
+            "total_vcpus": 12,
+            "available_vcpus": 10,
+            "total_disk_bytes": 997426462720,
+            "total_memory_bytes": 33336291328,
+            "disk_available_bytes": 799407558656,
+            "memory_available_bytes": 26038226944
+          }
+        },
+        {
+          "id": "01a0e513-755e-72a8-ac11-be9419b364d6",
+          "healthy": true,
+          "runtime": "bwrap-dev",
+          "last_heartbeat": "2026-09-27T23:04:54.503665+00:00",
+          "total_vcpus": 2,
+          "available_vcpus": 2,
+          "total_memory_bytes": 2147483648,
+          "available_memory_bytes": 2147483648,
+          "total_disk_bytes": 21474836480,
+          "available_disk_bytes": 21474836480,
+          "pressure": null
+        },
+        {
+          "id": "5c977424-ef03-4069-b90e-913a61e4b6d6",
+          "healthy": true,
+          "runtime": "firecracker",
+          "last_heartbeat": "2026-09-27T21:10:29.879254+00:00",
+          "total_vcpus": 4,
+          "available_vcpus": 4,
+          "total_memory_bytes": 4294967296,
+          "available_memory_bytes": 4294967296,
+          "total_disk_bytes": 42949672960,
+          "available_disk_bytes": 42949672960,
+          "pressure": null
+        },
+        {
+          "id": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "healthy": true,
+          "runtime": "docker",
+          "last_heartbeat": "2026-10-01T04:08:02.851863+00:00",
+          "total_vcpus": 8,
+          "available_vcpus": 5,
+          "total_memory_bytes": 8589934592,
+          "available_memory_bytes": 6979321856,
+          "total_disk_bytes": 85899345920,
+          "available_disk_bytes": 82141249536,
+          "pressure": {
+            "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+            "reserves": {
+              "disk_bytes": 2147483648,
+              "memory_bytes": 536870912
+            },
+            "observed_at": "2026-10-01T04:08:02.747965426Z",
+            "total_vcpus": 12,
+            "available_vcpus": 10,
+            "total_disk_bytes": 997426462720,
+            "total_memory_bytes": 33336291328,
+            "disk_available_bytes": 799407558656,
+            "memory_available_bytes": 26029559808
+          }
+        }
+      ],
+      "after": [
+        {
+          "id": "01a0e4b5-b3da-725a-9a51-b23717207c11",
+          "healthy": true,
+          "runtime": "firecracker",
+          "last_heartbeat": "2026-10-01T04:08:12.17166+00:00",
+          "total_vcpus": 4,
+          "available_vcpus": 4,
+          "total_memory_bytes": 4294967296,
+          "available_memory_bytes": 4294967296,
+          "total_disk_bytes": 42949672960,
+          "available_disk_bytes": 42949672960,
+          "pressure": {
+            "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+            "reserves": {
+              "disk_bytes": 2147483648,
+              "memory_bytes": 536870912
+            },
+            "observed_at": "2026-10-01T04:08:12.043607005Z",
+            "total_vcpus": 12,
+            "available_vcpus": 9,
+            "total_disk_bytes": 997426462720,
+            "total_memory_bytes": 33336291328,
+            "disk_available_bytes": 799407546368,
+            "memory_available_bytes": 26062925824
+          }
+        },
+        {
+          "id": "01a0e513-755e-72a8-ac11-be9419b364d6",
+          "healthy": true,
+          "runtime": "bwrap-dev",
+          "last_heartbeat": "2026-09-27T23:04:54.503665+00:00",
+          "total_vcpus": 2,
+          "available_vcpus": 2,
+          "total_memory_bytes": 2147483648,
+          "available_memory_bytes": 2147483648,
+          "total_disk_bytes": 21474836480,
+          "available_disk_bytes": 21474836480,
+          "pressure": null
+        },
+        {
+          "id": "5c977424-ef03-4069-b90e-913a61e4b6d6",
+          "healthy": true,
+          "runtime": "firecracker",
+          "last_heartbeat": "2026-09-27T21:10:29.879254+00:00",
+          "total_vcpus": 4,
+          "available_vcpus": 4,
+          "total_memory_bytes": 4294967296,
+          "available_memory_bytes": 4294967296,
+          "total_disk_bytes": 42949672960,
+          "available_disk_bytes": 42949672960,
+          "pressure": null
+        },
+        {
+          "id": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "healthy": true,
+          "runtime": "docker",
+          "last_heartbeat": "2026-10-01T04:08:12.867142+00:00",
+          "total_vcpus": 8,
+          "available_vcpus": 6,
+          "total_memory_bytes": 8589934592,
+          "available_memory_bytes": 7516192768,
+          "total_disk_bytes": 85899345920,
+          "available_disk_bytes": 84288733184,
+          "pressure": {
+            "host_id": "0dd6796f39d2173de7004a354d3f8b6c",
+            "reserves": {
+              "disk_bytes": 2147483648,
+              "memory_bytes": 536870912
+            },
+            "observed_at": "2026-10-01T04:08:12.748261391Z",
+            "total_vcpus": 12,
+            "available_vcpus": 9,
+            "total_disk_bytes": 997426462720,
+            "total_memory_bytes": 33336291328,
+            "disk_available_bytes": 799407546368,
+            "memory_available_bytes": 26055024640
+          }
+        }
+      ],
+      "comparisons": [
+        {
+          "runtime": "firecracker",
+          "id": "01a0e4b5-b3da-725a-9a51-b23717207c11",
+          "heartbeat_advanced": true,
+          "pressure_changed": true,
+          "ledger_unchanged": true
+        },
+        {
+          "runtime": "bwrap-dev",
+          "id": "01a0e513-755e-72a8-ac11-be9419b364d6",
+          "heartbeat_advanced": false,
+          "pressure_changed": false,
+          "ledger_unchanged": true
+        },
+        {
+          "runtime": "firecracker",
+          "id": "5c977424-ef03-4069-b90e-913a61e4b6d6",
+          "heartbeat_advanced": false,
+          "pressure_changed": false,
+          "ledger_unchanged": true
+        },
+        {
+          "runtime": "docker",
+          "id": "01a0e51d-7af1-7637-b114-5c4094840c15",
+          "heartbeat_advanced": true,
+          "pressure_changed": true,
+          "ledger_unchanged": false
+        }
+      ]
+    },
+    "admission_function_sql_cases": [
+      {
+        "case": "healthy",
+        "admitted": true
+      },
+      {
+        "case": "below_memory_reserve_zero",
+        "admitted": false
+      },
+      {
+        "case": "below_disk_reserve_zero",
+        "admitted": false
+      },
+      {
+        "case": "missing_cpu_reading",
+        "admitted": false
+      },
+      {
+        "case": "stale_heartbeat",
+        "admitted": false
+      },
+      {
+        "case": "two_siblings_hold_10_of_8_cpu",
+        "admitted": false
+      },
+      {
+        "case": "two_siblings_hold_14000_of_12000_memory",
+        "admitted": false
+      },
+      {
+        "case": "two_siblings_hold_28000_of_24000_disk",
+        "admitted": false
+      },
+      {
+        "case": "recovered_reservations",
+        "admitted": true
+      },
+      {
+        "case": "missing_memory_reading",
+        "admitted": false
+      },
+      {
+        "case": "missing_disk_reading",
+        "admitted": false
+      },
+      {
+        "case": "unknown_host",
+        "admitted": false
+      },
+      {
+        "case": "negative_demand",
+        "admitted": false
+      },
+      {
+        "case": "stale_sibling_reservations_still_held",
+        "admitted": false
+      },
+      {
+        "case": "old_pressure_observed_at_fresh_heartbeat",
+        "admitted": true
+      }
+    ],
+    "fixture_notes": [
+      "Temporary nodes table shadows production nodes for actual public.aiec_host_has_headroom evaluation; all tables and mutations rolled back.",
+      "Below reserve cases provide zero post-reserve readings. They exercise SQL admission saturation output, not core Rust measurement subtraction in an exhausted host.",
+      "Deployed workers separately report 512MiB memory and 2GiB disk reserves; no host exhaustion attempted.",
+      "Missing CPU and stale heartbeat fixtures refuse; sibling CPU/memory/disk held ledger sums refuse; releasing ledger reservations admits."
+    ],
+    "function_definition_sha256": "17aca591d4c6a59910070603a4887a65d0d52fb1b4ba81356d92acf1a31c5abe"
+  },
+  "query_cost": {
+    "plans_on_production_data": {
+      "runs_tenant_page": {
+        "execution_ms": 0.181,
+        "rows": 26.0,
+        "nodes": [
+          {
+            "node": "Limit",
+            "index": null,
+            "actual_rows": 26.0,
+            "shared_hit_blocks": 48,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Index Scan",
+            "index": "runs_tenant_created_idx",
+            "actual_rows": 26.0,
+            "shared_hit_blocks": 48,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "matrix_page": {
+        "execution_ms": 0.092,
+        "rows": 2.0,
+        "nodes": [
+          {
+            "node": "Limit",
+            "index": null,
+            "actual_rows": 2.0,
+            "shared_hit_blocks": 3,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Index Scan",
+            "index": "runs_matrix_ordered_idx",
+            "actual_rows": 2.0,
+            "shared_hit_blocks": 3,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "run_events": {
+        "execution_ms": 0.314,
+        "rows": 173.0,
+        "nodes": [
+          {
+            "node": "Sort",
+            "index": null,
+            "actual_rows": 173.0,
+            "shared_hit_blocks": 58,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Bitmap Heap Scan",
+            "index": null,
+            "actual_rows": 173.0,
+            "shared_hit_blocks": 52,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Bitmap Index Scan",
+            "index": "run_events_run_time_idx",
+            "actual_rows": 173.0,
+            "shared_hit_blocks": 2,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "run_attempts": {
+        "execution_ms": 0.13,
+        "rows": 1.0,
+        "nodes": [
+          {
+            "node": "Index Scan",
+            "index": "run_attempts_run_idx",
+            "actual_rows": 1.0,
+            "shared_hit_blocks": 3,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "run_artifacts": {
+        "execution_ms": 0.13,
+        "rows": 0.0,
+        "nodes": [
+          {
+            "node": "Sort",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 6,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Seq Scan",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 3,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "queue_claim_current": {
+        "execution_ms": 0.191,
+        "rows": 0.0,
+        "nodes": [
+          {
+            "node": "Limit",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 10,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "LockRows",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 10,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Sort",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 10,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Nested Loop",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 1,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Nested Loop",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 1,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Nested Loop",
+            "index": null,
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 1,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Index Scan",
+            "index": "run_queue_pending_tenant_idx",
+            "actual_rows": 0.0,
+            "shared_hit_blocks": 1,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Seq Scan",
+            "index": null,
+            "actual_rows": 0,
+            "shared_hit_blocks": 0,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Index Scan",
+            "index": "runs_state_queued_idx",
+            "actual_rows": 0,
+            "shared_hit_blocks": 0,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Subquery Scan",
+            "index": null,
+            "actual_rows": 0,
+            "shared_hit_blocks": 0,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Aggregate",
+            "index": null,
+            "actual_rows": 0,
+            "shared_hit_blocks": 0,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Index Scan",
+            "index": "run_queue_pending_tenant_idx",
+            "actual_rows": 0,
+            "shared_hit_blocks": 0,
+            "shared_read_blocks": 0
+          }
+        ]
+      },
+      "run_artifacts_populated": {
+        "execution_ms": 0.144,
+        "rows": 2.0,
+        "nodes": [
+          {
+            "node": "Sort",
+            "index": null,
+            "actual_rows": 2.0,
+            "shared_hit_blocks": 6,
+            "shared_read_blocks": 0
+          },
+          {
+            "node": "Seq Scan",
+            "index": null,
+            "actual_rows": 2.0,
+            "shared_hit_blocks": 3,
+            "shared_read_blocks": 0
+          }
+        ]
+      }
+    },
+    "representative_ids": {
+      "run_id": "01a0f593-c0e4-711b-9697-29f17a9a5a09",
+      "artifacts": 2
+    },
+    "catalog_notes": "run_artifacts read used a sequential scan on 38 rows; run_events returned 173 rows for one Run (bounded by one Run, not paginated)"
+  },
+  "live_fairness": {
+    "accounts": [
+      {
+        "label": "A",
+        "tenant_id": "01a0f5a8-1d95-7487-b055-59e7f6e7bdc7",
+        "key_id": "01a0f5a8-1fbf-70b6-9705-1314cc276446"
+      },
+      {
+        "label": "B",
+        "tenant_id": "01a0f5a8-2118-75e0-b9f3-279b8e130b18",
+        "key_id": "01a0f5a8-233a-7733-9716-884f638584de"
+      }
+    ],
+    "registration_route": "POST /v1/account using deployed AIEC_INVITE_CODES (first configured code)",
+    "workload": "tenant A: 8 concurrent Run submissions (sleep 12); tenant B: 1 Run submitted (sleep 2) while A still had queued work; runtime docker, python:3.13, 1 vCPU/256MiB/512MiB, network disabled",
+    "observation_window_seconds": 71,
+    "samples": 65,
+    "peak_executing": 4,
+    "deployed_max_active": 4,
+    "b_first_executing_at": "04:11:02.155Z",
+    "a_runs_still_queued_when_b_started": 4,
+    "distinct_owners_per_run": {
+      "01a0f5a8-2780-7053-a06f-180a98be220f": [
+        "01a0f5a8-26f3-72d7-b247-39ff16dfd8f9"
+      ],
+      "01a0f5a8-279b-74be-98ab-98c4d7f78e06": [
+        "01a0f5a8-2e5b-765b-9b65-c292fc6e2430"
+      ],
+      "01a0f5a8-293d-7192-bf0b-2d211eb6694e": [
+        "01a0f5a8-3f6f-756e-85b6-d4482d4b1b25"
+      ],
+      "01a0f5a8-2944-72c1-8c76-0bd07abc70f0": [
+        "01a0f5a8-434f-73d1-a6f9-c94e78981bf1"
+      ],
+      "01a0f5a8-4993-76cb-ab67-b43609bd2e85": [
+        "01a0f5a8-9139-73cc-a365-1241373fde09"
+      ],
+      "01a0f5a8-2938-7200-9ac4-4e2883df1d2e": [
+        "01a0f5a8-a474-7413-ad53-126063f701e6"
+      ],
+      "01a0f5a8-2938-7200-9ac4-4e2979a3df11": [
+        "01a0f5a8-b000-7122-a023-e344c8d0306e"
+      ],
+      "01a0f5a8-2987-77c4-a16d-d808dcb4520b": [
+        "01a0f5a8-ba7b-74d2-ae4a-0891759283ee"
+      ],
+      "01a0f5a8-2982-72bb-9fe4-fc67da365c55": [
+        "01a0f5a8-dbbf-71c8-abe0-e567ba191b7e"
+      ]
+    },
+    "runs_with_multiple_distinct_owners": 0,
+    "peak_database_connections": 16,
+    "peak_transactions_open_over_2s": 4,
+    "run_outcomes": {
+      "A0": "succeeded",
+      "A1": "succeeded",
+      "A2": "succeeded",
+      "A3": "succeeded",
+      "A4": "succeeded",
+      "A5": "succeeded",
+      "A6": "succeeded",
+      "A7": "succeeded",
+      "B0": "succeeded"
+    },
+    "queue_claim_plan_while_pending": {
+      "execution_ms": 0.357,
+      "rows": 1.0,
+      "nodes": [
+        {
+          "node": "Limit",
+          "index": null,
+          "actual_rows": 1.0,
+          "shared_hit_blocks": 98,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "LockRows",
+          "index": null,
+          "actual_rows": 1.0,
+          "shared_hit_blocks": 98,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Sort",
+          "index": null,
+          "actual_rows": 1.0,
+          "shared_hit_blocks": 97,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Nested Loop",
+          "index": null,
+          "actual_rows": 5.0,
+          "shared_hit_blocks": 88,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Nested Loop",
+          "index": null,
+          "actual_rows": 5.0,
+          "shared_hit_blocks": 41,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Nested Loop",
+          "index": null,
+          "actual_rows": 5.0,
+          "shared_hit_blocks": 16,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Index Scan",
+          "index": "run_queue_pending_tenant_idx",
+          "actual_rows": 5.0,
+          "shared_hit_blocks": 11,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Seq Scan",
+          "index": null,
+          "actual_rows": 2.2,
+          "shared_hit_blocks": 5,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Index Scan",
+          "index": "runs_state_queued_idx",
+          "actual_rows": 3.0,
+          "shared_hit_blocks": 24,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Subquery Scan",
+          "index": null,
+          "actual_rows": 1.0,
+          "shared_hit_blocks": 47,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Aggregate",
+          "index": null,
+          "actual_rows": 1.0,
+          "shared_hit_blocks": 47,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Index Scan",
+          "index": "run_queue_pending_tenant_idx",
+          "actual_rows": 4.0,
+          "shared_hit_blocks": 47,
+          "shared_read_blocks": 0
+        }
+      ]
+    },
+    "all_succeeded": true
+  },
+  "live_matrix_recovery": {
+    "matrix_id": "7286ce59-c7aa-8a49-88f6-c7c6dba99cfc",
+    "cells": 6,
+    "max_parallel_requested": 8,
+    "effective_parallel": 4,
+    "unequal_durations_seconds": [
+      5,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "submission_order_result_order": [
+      [
+        0,
+        "0",
+        "succeeded",
+        "2026-10-01T04:11:46.531813Z",
+        "2026-10-01T04:12:08.711570Z"
+      ],
+      [
+        1,
+        "1",
+        "succeeded",
+        "2026-10-01T04:11:46.531849Z",
+        "2026-10-01T04:12:08.287516Z"
+      ],
+      [
+        2,
+        "2",
+        "succeeded",
+        "2026-10-01T04:11:46.531870Z",
+        "2026-10-01T04:12:02.163245Z"
+      ],
+      [
+        3,
+        "3",
+        "succeeded",
+        "2026-10-01T04:11:46.531888Z",
+        "2026-10-01T04:12:09.327370Z"
+      ],
+      [
+        4,
+        "4",
+        "succeeded",
+        "2026-10-01T04:12:04.922692Z",
+        "2026-10-01T04:12:18.442885Z"
+      ],
+      [
+        5,
+        "5",
+        "succeeded",
+        "2026-10-01T04:12:09.994679Z",
+        "2026-10-01T04:12:23.155662Z"
+      ]
+    ],
+    "axis_preserved_in_submission_order": true,
+    "paging_limit2": [
+      {
+        "status": 200,
+        "cells": 2,
+        "indexes": [
+          0,
+          1
+        ],
+        "successes": 2,
+        "next": {
+          "requested_at": "2026-10-01T04:11:46.531849Z",
+          "id": "01a0f5a9-45e3-72b2-a92c-914149041b4a"
+        }
+      },
+      {
+        "status": 200,
+        "cells": 2,
+        "indexes": [
+          2,
+          3
+        ],
+        "successes": 2,
+        "next": {
+          "requested_at": "2026-10-01T04:11:46.531888Z",
+          "id": "01a0f5a9-45e3-72b2-a92c-914353332e52"
+        }
+      },
+      {
+        "status": 200,
+        "cells": 2,
+        "indexes": [
+          4,
+          5
+        ],
+        "successes": 2,
+        "next": null
+      }
+    ],
+    "unique_runs_across_pages": true,
+    "paged_cell_ids_match_submission_order": true,
+    "limit256_cells": 6,
+    "limit9999_cells": 6,
+    "other_tenant_status": 404,
+    "other_tenant_code": "not_found",
+    "incomplete_cursor_status": 400,
+    "incomplete_cursor_code": "invalid_request",
+    "replay_same_matrix_id": true,
+    "replay_reused_runs": true,
+    "replay_states": [
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded",
+      "succeeded"
+    ],
+    "pg_stat_statements": {
+      "matrix_page_query_calls": 6,
+      "matrix_page_query_rows": 20,
+      "recovery_requests_issued": 6,
+      "queries_per_page": 1
+    },
+    "matrix_page_plan": {
+      "execution_ms": 0.092,
+      "rows": 3.0,
+      "nodes": [
+        {
+          "node": "Limit",
+          "index": null,
+          "actual_rows": 3.0,
+          "shared_hit_blocks": 4,
+          "shared_read_blocks": 0
+        },
+        {
+          "node": "Index Scan",
+          "index": "runs_matrix_ordered_idx",
+          "actual_rows": 3.0,
+          "shared_hit_blocks": 4,
+          "shared_read_blocks": 0
+        }
+      ]
+    },
+    "capacity_deferral": {
+      "cells_0_3_requested_at": "2026-10-01T04:11:46Z",
+      "cells_4_5_requested_at": [
+        "2026-10-01T04:12:04.922692Z",
+        "2026-10-01T04:12:09.994679Z"
+      ],
+      "note": "with effective_parallel 4 the last two cells were admitted after slots freed rather than dropped; all six succeeded in submission order"
+    }
+  },
+  "post_workload_cleanup": {
+    "proof_tenant_sandbox_states": {
+      "destroyed": 15
+    },
+    "proof_tenant_lease_status": {
+      "released": 15
+    },
+    "queue_states": {
+      "finished": 15
+    },
+    "run_states": {
+      "succeeded": 15
+    },
+    "proof_artifact_objects": 0
+  },
+  "artifact_gc": {
+    "sql_ownership_fixture": {
+      "cases": [
+        {
+          "case": "reference_creates_available",
+          "actual": {
+            "state": "available"
+          }
+        },
+        {
+          "case": "protected_references_exclude_deletion",
+          "actual": {
+            "eligible_keys": [
+              "proof/abandoned"
+            ]
+          }
+        },
+        {
+          "case": "expired_run_reference",
+          "actual": {
+            "rejected": true
+          }
+        },
+        {
+          "case": "deleting_reference",
+          "actual": {
+            "rejected": true
+          }
+        },
+        {
+          "case": "failure_retry_deferred",
+          "actual": {
+            "state": "deleting",
+            "eligible_now": false
+          }
+        },
+        {
+          "case": "late_upload_cannot_resurrect",
+          "actual": {
+            "state": "deleting"
+          }
+        }
+      ],
+      "objects": [
+        {
+          "key": "proof/snapshot",
+          "state": "available",
+          "attempts": 0
+        },
+        {
+          "key": "proof/abandoned",
+          "state": "deleting",
+          "attempts": 1
+        },
+        {
+          "key": "proof/retained",
+          "state": "deleting",
+          "attempts": 1
+        }
+      ],
+      "production_mutations": 0
+    },
+    "backend_object_fixture": {
+      "key": "acceptance-fixtures/dbpressure-5b412fad702349b699d914b4764f19aa/owned.bin",
+      "scope": "new unique proof-owned backend object only; no production ledger/retention changes",
+      "payload_sha256": "6c00907be3d3e77ca784b123d3efcb3c527b0e1e70d33415fe7f5f3808585342",
+      "payload_size": 20,
+      "put_status": 200,
+      "get_status": 200,
+      "exact_bytes": true,
+      "delete_status": 204,
+      "after_delete_status": 404,
+      "cleanup_delete_status": 204
+    }
+  },
+  "deployed_queue_limits": {
+    "global_pending": 1024,
+    "tenant_pending": 128,
+    "max_active": 4,
+    "queue_timeout_seconds": 300,
+    "lease_seconds": 30,
+    "source": "no overrides in deployed env.systemd; core RunQueueLimits defaults"
+  },
+  "cleanup_and_tenant_hygiene": {
+    "proof_tenants": [
+      "01a0f5a8-1d95-7487-b055-59e7f6e7bdc7",
+      "01a0f5a8-2118-75e0-b9f3-279b8e130b18"
+    ],
+    "runs": "15 succeeded, 15 queue rows finished, 15 sandboxes destroyed, 15 leases released, 0 artifact objects",
+    "api_keys": "signup keys remain active because a key may not revoke itself (documented 409 cannot_revoke_current_key); proof tenants hold no quota-bearing state"
+  },
+  "limitations": [
+    "EXPLAIN plans are production datasets (554 Runs, 4 matrix cells at capture) not a large synthetic capacity benchmark; block counts are all shared hits with zero shared reads.",
+    "list_run_events returned 173 rows for one Run: per-Run child reads are complete reads bounded by one Run, not SQL-paginated. Matrix recovery is the only keyset-paged path proven here.",
+    "Initial queue-claim plan saw an empty pending queue; the populated claim plan was captured live during the fairness workload.",
+    "Queue per-tenant pending limit (128) and global limit (1024) were not exercised to refusal; only max_active=4 was reached and held.",
+    "Artifact GC SQL fixture drives the deployed reference guards against temp-table clones and source-equivalent deletion/late-upload statements. It proves ownership/reference blocking, not the production sweeper end-to-end retention expiry path.",
+    "Backend object proof is a new unique S3 key PUT/GET byte-exact/DELETE 204/HEAD 404 under the deployed MinIO; it is not an API sweeper artifact deletion proof.",
+    "Host pressure fixtures are controlled SQL/node-table cases. No host was exhausted; below-reserve zero readings were injected rather than produced by real exhaustion.",
+    "pressure.observed_at staleness is not enforced: a one-hour-old pressure snapshot with a fresh last_heartbeat is admitted. Admission freshness is the worker heartbeat interval; per Main decision this is recorded as accepted/unproven, not a defect.",
+    "An early probe hit the unrelated local aiec-testdb database and was discarded; every retained measurement used the deployed DATABASE_URL (Neon).",
+    "The two signup API keys remain active because a key cannot revoke itself (documented 409); proof tenants hold no compute, quota or artifact state.",
+    "pg_stat_statements was created on the deployed instance against an already-preloaded library, without restart or statistics reset, so call counts are cumulative and per-query deltas were measured only for the isolated matrix window."
+  ],
+  "connection_bounds_under_concurrent_soak": {
+    "samples": 30,
+    "sample_interval_seconds": 2,
+    "peak_total_connections": 17,
+    "max_connections_setting": 901,
+    "max_idle_in_transaction_xact_age_s": 1.56,
+    "max_active_query_age_s": 0.0,
+    "states_seen": [
+      "active",
+      "idle",
+      "idle in transaction"
+    ],
+    "note": "sampled while a separate sequential soak was running; no long-lived transaction observed"
+  }
+}
