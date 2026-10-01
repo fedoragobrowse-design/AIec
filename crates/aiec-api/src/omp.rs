@@ -57,6 +57,15 @@ pub struct OmpRunSpec {
     pub runtime: Option<String>,
     #[serde(default)]
     pub resources: Option<ResourceRequirements>,
+    /// Extra hosts the run may reach, beyond the two it clones.
+    ///
+    /// An evaluation drives an agent loop and builds a project, so it usually
+    /// needs a model endpoint and a package registry that nothing in the
+    /// repository URL says. Deriving only the clone hosts would produce a
+    /// policy that compiles and then fails at the first model call, which is
+    /// worse than being asked to name the destinations.
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
     #[serde(default)]
     pub requirements: CapabilityRequirements,
     #[serde(default)]
@@ -106,25 +115,34 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Resources for an evaluation run, governed by the repositories it clones.
+/// Resources for an evaluation run, governed by the hosts it needs.
 ///
 /// An evaluation needs the network: it clones two repositories and runs a
 /// build. Asking for bare `NetworkPolicy::Internet` used to work, and no longer
 /// does on a Guard worker, which refuses an ungoverned attachment - so the
-/// default silently broke the very deployments Guard targets. The destinations
-/// are known here: the harness repository and the target repository, and
-/// nothing else. Naming them is a read-only allowlist, which is the honest
-/// version of what the run actually does.
+/// default silently broke the very deployments Guard targets.
+///
+/// The clone hosts are derivable; the rest are not. An evaluation also drives
+/// an agent loop and builds a project, so it usually needs a model endpoint and
+/// a package registry that no repository URL names, and those belong in
+/// `OmpRunSpec::network_hosts`. Without them the run gets a policy permitting
+/// its clones and nothing else, which is correct as far as it goes and fails at
+/// the first model call rather than at admission.
 fn evaluation_resources(spec: &OmpRunSpec) -> ResourceRequirements {
     // Two repositories on one host - a fork and its upstream - are one
     // destination, not two, and Guard refuses a policy that names the same
     // destination twice.
     let mut hosts: Vec<String> = Vec::new();
     for repo in [spec.omp_repo.as_str(), spec.target_repo.as_str()] {
-        if let Some(host) = aiec_core::repository_host(repo)
+        if let Some(host) = aiec_core::https_repository_host(repo)
             && !hosts.contains(&host)
         {
             hosts.push(host);
+        }
+    }
+    for host in &spec.network_hosts {
+        if !hosts.contains(host) {
+            hosts.push(host.clone());
         }
     }
     ResourceRequirements {
@@ -578,6 +596,7 @@ mod tests {
             timeout_seconds: None,
             runtime: None,
             resources: None,
+            network_hosts: Vec::new(),
             requirements: Default::default(),
             retention: None,
             retained_seconds: None,

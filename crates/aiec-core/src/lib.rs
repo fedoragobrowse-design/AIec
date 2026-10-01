@@ -460,27 +460,19 @@ fn validate_git_repo(repo: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// The host a repository URL names, for a policy that has to permit it.
+/// The host a repository URL names, for an HTTP policy that has to permit it.
 ///
-/// Only the transports [`EnvironmentSpec::validate`] accepts are read, and a
-/// shape it cannot parse yields `None` rather than a guess. That asymmetry is
-/// deliberate: a host derived wrongly here would authorize a destination the
-/// caller never named, and a missing one fails loudly at policy compile time
-/// instead.
-pub fn repository_host(repo: &str) -> Option<String> {
-    let authority = if let Some(rest) = repo
+/// Only transports a governed guest can actually use are read. An SSH
+/// repository is deliberately **not**: `git@host:path` and `ssh://` clone over
+/// port 22 and never touch the HTTP proxy, so a port-443 rule naming their host
+/// would compile, look correct, and fail at the clone. Returning `None` for
+/// them means the caller either omits the host or says why, rather than
+/// shipping a policy that cannot work.
+pub fn https_repository_host(repo: &str) -> Option<String> {
+    let rest = repo
         .strip_prefix("https://")
-        .or_else(|| repo.strip_prefix("git://"))
-        .or_else(|| repo.strip_prefix("ssh://"))
-    {
-        rest.split('/').next().filter(|a| !a.is_empty())?
-    } else {
-        // `git@host:path` carries no scheme, and its separator is `:`.
-        repo.strip_prefix("git@")?
-            .split(':')
-            .next()
-            .filter(|a| !a.is_empty())?
-    };
+        .or_else(|| repo.strip_prefix("git://"))?;
+    let authority = rest.split('/').next().filter(|a| !a.is_empty())?;
     let host = match authority.rsplit_once('@') {
         Some((user, host)) if !user.is_empty() && !host.is_empty() => host,
         _ => authority,

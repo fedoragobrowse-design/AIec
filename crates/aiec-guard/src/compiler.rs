@@ -1324,6 +1324,59 @@ mod tests {
         ));
     }
 
+    /// The benchmark range is the one non-public range a local mock may use, and
+    /// it was classified as public space for a while because the mask was
+    /// written `0x18` rather than `0x12` - 18 and 19 are 0x12 and 0x13. Nothing
+    /// else pins that, so the boundaries of the range are asserted here.
+    #[test]
+    fn the_benchmarking_range_is_the_only_one_a_mock_may_use() {
+        for address in ["198.18.0.10", "198.19.255.254"] {
+            assert!(
+                is_non_public(&address.parse().expect("ip")),
+                "{address} is inside 198.18.0.0/15 and must be usable by a local mock"
+            );
+        }
+        // One address past the range, and one before it, are public space.
+        for address in ["198.20.0.1", "198.17.255.254"] {
+            assert!(
+                !is_non_public(&address.parse().expect("ip")),
+                "{address} is outside 198.18.0.0/15 and must stay public"
+            );
+        }
+    }
+
+    /// A mapping authorizes one exact host and address, not a range and not a
+    /// neighbour. The mask fix above made this true; nothing asserted it.
+    #[test]
+    fn a_test_mapping_authorizes_exactly_its_own_address() {
+        let local: OperatorBoundary = serde_yaml_ng::from_str(include_str!(
+            "../../../policies/guard/boundary.local-test.yaml"
+        ))
+        .expect("local boundary");
+        let mock_policy = GuardPolicy::from_yaml(include_str!(
+            "../../../policies/guard/model-only.local-mock.yaml"
+        ))
+        .expect("local mock policy");
+        let mock = compile(&mock_policy, &local).expect("local mock compiles");
+        assert!(mock.allows_plain_http_upstream(
+            "mock.model.test",
+            8080,
+            "198.18.0.10".parse().unwrap()
+        ));
+        // A neighbouring address in the same range is not covered.
+        assert!(!mock.allows_plain_http_upstream(
+            "mock.model.test",
+            8080,
+            "198.18.0.99".parse().unwrap()
+        ));
+        // Nor is loopback, which is where a worker's own services live.
+        assert!(!mock.allows_plain_http_upstream(
+            "mock.model.test",
+            8080,
+            "127.0.0.1".parse().unwrap()
+        ));
+    }
+
     #[test]
     fn operator_protected_range_beats_test_mapping_in_shipped_boundary() {
         let mut local: OperatorBoundary = serde_yaml_ng::from_str(include_str!(

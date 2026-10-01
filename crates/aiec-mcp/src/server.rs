@@ -214,6 +214,11 @@ pub struct TestOmpArgs {
     pub memory_mb: Option<u32>,
     #[serde(default)]
     pub disk_mb: Option<u32>,
+    /// Extra hosts the run may reach beyond the two it clones: a model endpoint,
+    /// a package registry. Without these the governed policy covers only the
+    /// clones and the run fails at its first call to anything else.
+    #[serde(default)]
+    pub network_hosts: Option<Vec<String>>,
     #[serde(default)]
     pub requirements: Option<crate::runs::RunRequirements>,
     /// Non-secret environment only. Use `secrets` for tenant credential references.
@@ -258,6 +263,11 @@ pub struct CompareOmpArgs {
     pub memory_mb: Option<u32>,
     #[serde(default)]
     pub disk_mb: Option<u32>,
+    /// Extra hosts the run may reach beyond the two it clones: a model endpoint,
+    /// a package registry. Without these the governed policy covers only the
+    /// clones and the run fails at its first call to anything else.
+    #[serde(default)]
+    pub network_hosts: Option<Vec<String>>,
     #[serde(default)]
     pub requirements: Option<crate::runs::RunRequirements>,
     /// Non-secret environment only. Use `secrets` for tenant credential references.
@@ -565,13 +575,13 @@ return real setup, task, validation, git and cleanup evidence. Set keep_sandbox 
                     timeout_seconds: args.timeout_seconds,
                     keep_sandbox: args.keep_sandbox.unwrap_or(false),
                     repetitions: 1,
-                    resources: Some(aiec_core::run::ResourceRequirements {
-                        cpu: args.cpu.unwrap_or(2),
-                        memory_mb: args.memory_mb.unwrap_or(2048),
-                        disk_mb: args.disk_mb.unwrap_or(2048),
-                        network: aiec_core::network::NetworkPolicy::Internet,
-                        guard: None,
-                    }),
+                    // Left as `None` on purpose: the derived default governs
+                    // egress with the repositories this run clones plus any
+                    // `network_hosts` the caller named. A bare `Internet`
+                    // here would both widen the policy past what the run needs
+                    // and be refused outright by a Guard worker.
+                    resources: None,
+                    network_hosts: args.network_hosts.unwrap_or_default(),
                     requirements: args.requirements.unwrap_or_default().into(),
                     environment: args.environment.unwrap_or_default(),
                     secrets: args.secrets.unwrap_or_default(),
@@ -617,13 +627,11 @@ measurements. Returns measurements only, never a judgement about which is better
                     repetitions: args.repetitions,
                     timeout_seconds: args.timeout_seconds,
                     max_parallel: Some(max_parallel),
-                    resources: Some(aiec_core::run::ResourceRequirements {
-                        cpu: args.cpu.unwrap_or(2),
-                        memory_mb: args.memory_mb.unwrap_or(2048),
-                        disk_mb: args.disk_mb.unwrap_or(2048),
-                        network: aiec_core::network::NetworkPolicy::Internet,
-                        guard: None,
-                    }),
+                    // As in `aiec_test_omp`: the derived policy governs, and a
+                    // bare `Internet` here would widen it and be refused by a
+                    // Guard worker.
+                    resources: None,
+                    network_hosts: args.network_hosts.unwrap_or_default(),
                     requirements: args.requirements.unwrap_or_default().into(),
                     environment: args.environment.unwrap_or_default(),
                     secrets: args.secrets.unwrap_or_default(),

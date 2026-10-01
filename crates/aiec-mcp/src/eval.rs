@@ -409,6 +409,10 @@ pub struct OmpRunRequest {
     pub timeout_seconds: Option<u64>,
     pub keep_sandbox: bool,
     pub resources: Option<ResourceRequirements>,
+    /// Extra hosts the run may reach beyond the two it clones: a model
+    /// endpoint, a package registry. Without these the governed policy covers
+    /// only the clones and the run fails at its first call to anything else.
+    pub network_hosts: Vec<String>,
     pub requirements: CapabilityRequirements,
     pub environment: BTreeMap<String, String>,
     pub secrets: Vec<String>,
@@ -493,6 +497,10 @@ fn durable_omp_request(
         timeout_seconds: Some(resolve_timeout(request.timeout_seconds)),
         runtime: Some(runtime.to_owned()),
         resources: request.resources.clone(),
+        // Destinations the run needs beyond its two clones - a model endpoint,
+        // a package registry. Deriving only the clones would produce a policy
+        // that compiles and then fails at the first model call.
+        network_hosts: request.network_hosts.clone(),
         requirements: request.requirements.clone(),
         retention: Some(if request.keep_sandbox {
             RetentionPolicy::KeepAlways
@@ -565,6 +573,8 @@ pub struct CompareOmpRequest {
     /// the server's own configured limit.
     pub max_parallel: Option<usize>,
     pub resources: Option<ResourceRequirements>,
+    /// Extra hosts every side may reach beyond the repositories it clones.
+    pub network_hosts: Vec<String>,
     pub requirements: CapabilityRequirements,
     pub environment: BTreeMap<String, String>,
     pub secrets: Vec<String>,
@@ -829,6 +839,7 @@ pub async fn compare_omp(
                 keep_sandbox: false,
                 repetitions: 1,
                 resources: request.resources.clone(),
+                network_hosts: request.network_hosts.clone(),
                 requirements: request.requirements.clone(),
                 environment: request.environment.clone(),
                 secrets: request.secrets.clone(),
@@ -1000,7 +1011,7 @@ async fn create_sandbox_with_repo(
         // destination is named rather than left open. A repository host the
         // platform cannot read yields `None`, and the sandbox call then
         // refuses with a message saying which flag to use.
-        aiec_core::repository_host(repo_url).map(|host| vec![host]),
+        aiec_core::https_repository_host(repo_url).map(|host| vec![host]),
     )
     .await
 }
@@ -1808,6 +1819,7 @@ mod tests {
             keep_sandbox: false,
             repetitions: 1,
             resources: None,
+            network_hosts: Vec::new(),
             requirements: Default::default(),
             environment: BTreeMap::new(),
             secrets: Vec::new(),

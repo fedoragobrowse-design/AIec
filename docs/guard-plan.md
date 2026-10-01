@@ -152,13 +152,23 @@ with every claim tied to a command that was run.
 
 ## Why the live run has not happened here
 
-The acceptance needs a Firecracker host with KVM, a built guest image, and a
-control plane to place against. This workstation has KVM and Docker but no
-running AIec control plane (`https://127.0.0.1:18443/health` does not answer),
+The acceptance needs three things, and this workstation has only the first:
+KVM, a built guest image, a control plane to place against, and — less
+obviously — the privilege to install nftables rules. It has KVM and Docker but
+no running control plane (`https://127.0.0.1:18443/health` does not answer),
 and the deployment host's Firecracker environment is reached over SSH rather
-than exercised in place. Running the driver against a control plane the
-operator has not started would mean starting one, and that is a deployment
-change rather than a test.
+than exercised in place.
+
+The privilege one is a property of the code, not of the host, and is worth
+stating plainly: a worker probes `nft list ruleset` at startup and advertises
+`network_policy: false` without `CAP_NET_ADMIN`. On this workstation that
+probe returns "Operation not permitted", so a worker started here would refuse
+every governed placement — correctly, and for a reason that has nothing to do
+with the acceptance driver. This is also why
+`scripts/guard-core-acceptance.sh` runs the whole thing under
+`unshare --user --map-root-user --net`: the namespace is what supplies the
+privilege. Treat a run that reports "cannot enforce" as a missing prerequisite,
+not as a Guard bug.
 
 So the driver and launcher are delivered, compile, and are written to fail
 loudly - a missing route, an unreachable sentinel, an absent counter, a wrong

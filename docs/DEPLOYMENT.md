@@ -28,12 +28,18 @@ AIEC_GUARD_BOUNDARY_FILE=/etc/aiec/guard/boundary.json
 
 The worker needs the privileges the existing network backend already required
 — `CAP_NET_ADMIN` and `CAP_NET_RAW` — because Guard installs nftables tables
-and TAP devices of its own. A worker without them is still *admitted* a guarded
-sandbox: the placement path does not probe the privilege, so the sandbox fails
-to start, at boot, with the enforcement backend reporting that it could not
-install its rules. That is fail-closed but late. If you need the refusal to
-happen at placement instead, run the capability probe in
-`firecracker_capabilities()` rather than leaving `network_policy` hardcoded.
+and TAP devices of its own.
+
+That is checked rather than assumed. The worker probes `nft list ruleset` once
+at startup — a read, which does not modify the firewall — and advertises the
+`network_policy` capability only if it succeeds. A host without `nft`, or
+without the privilege to use it, therefore reports `network_policy: false`, and
+a guarded run or sandbox is refused *at placement* rather than admitted and
+then failing at boot. Check it yourself with:
+
+```bash
+nft list ruleset >/dev/null && echo "can enforce" || echo "cannot"
+```
 
 The pre-Guard network backend is available only when the operator asks for it
 explicitly:
