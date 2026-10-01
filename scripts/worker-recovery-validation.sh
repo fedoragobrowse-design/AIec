@@ -178,7 +178,12 @@ trap cleanup EXIT
 log "generating disposable CA and certificates for api, worker A and worker B"
 openssl genrsa -out "$OUT/pki/ca.key" 2048 2>/dev/null
 openssl req -x509 -new -nodes -key "$OUT/pki/ca.key" -sha256 -days 2 \
-  -subj '/CN=AIec recovery CA' -out "$OUT/pki/ca.crt" 2>/dev/null
+  # The CA needs its extensions stated. Minted without them it carries no
+  # basicConstraints and no keyUsage, which OpenSSL's own verify accepts
+  # but a real TLS handshake rejects - so a CA built that way makes some
+  # clients (Python 3.13+) unable to reach the control plane while others
+  # keep working. `req -x509` takes `-addext`; it rejects `-extfile`.
+  -subj '/CN=AIec recovery CA' -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' -out "$OUT/pki/ca.crt" 2>/dev/null
 for name in api worker-a worker-b; do
   openssl genrsa -out "$OUT/pki/$name.key" 2048 2>/dev/null
   openssl req -new -key "$OUT/pki/$name.key" -subj "/CN=$name" -out "$OUT/pki/$name.csr" 2>/dev/null

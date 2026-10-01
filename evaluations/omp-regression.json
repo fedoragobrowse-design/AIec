@@ -18,11 +18,6 @@
     "task": "Add a regression test that covers truncated command output, and make it pass.",
     "target_repo": "https://github.com/octocat/Hello-World",
     "target_ref": null,
-    "setup_command": [
-      "/bin/sh", "-lc",
-      "set -e; git clone --depth 1 --branch v18.3.5 https://github.com/can1357/oh-my-pi /workspace/omp"
-    ],
-    "omp_command": ["/bin/sh", "-lc", "export PATH=/workspace/omp:$PATH; cd /workspace/repository && omp run"],
     "validations": [
       ["git", "status", "--porcelain=v1"],
       ["test", "-f", "README"]
@@ -36,11 +31,6 @@
     "task": "Add a regression test that covers truncated command output, and make it pass.",
     "target_repo": "https://github.com/octocat/Hello-World",
     "target_ref": null,
-    "setup_command": [
-      "/bin/sh", "-lc",
-      "set -e; git clone --depth 1 --branch v18.4.0 https://github.com/can1357/oh-my-pi /workspace/omp"
-    ],
-    "omp_command": ["/bin/sh", "-lc", "export PATH=/workspace/omp:$PATH; cd /workspace/repository && omp run"],
     "validations": [
       ["git", "status", "--porcelain=v1"],
       ["test", "-f", "README"]

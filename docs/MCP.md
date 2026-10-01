@@ -58,8 +58,14 @@ left open so a supervisor can probe it without holding a credential.
 | `aiec_read_file` / `aiec_write_file` / `aiec_list_files` | Files inside a sandbox |
 | `aiec_prepare_repo` | Clone a repo into a fresh sandbox |
 | `aiec_run_repo_task` | Clone → setup → task → validate → diff → destroy |
-| `aiec_test_omp` | Build one OMP revision in a clean sandbox and run it |
-| `aiec_compare_omp` | Baseline vs candidate, each in its own clean sandbox |
+| `aiec_test_omp` | Submit one durable Run for an OMP revision and task |
+| `aiec_compare_omp` | Bounded generic Run batch for baseline vs candidate |
+| `aiec_run` | Run one workload and return the settled result |
+| `aiec_run_batch` | Run several workloads, bounded concurrency |
+| `aiec_run_matrix` | Run a matrix of cells, summarised per axis |
+| `aiec_run_status` | Current state of one run |
+| `aiec_run_events` | A run's history, in order |
+| `aiec_run_cancel` | Stop a run and reclaim its machines |
 | `aiec_health` | Local control-plane and capacity status |
 
 A typical loop from an agent:
@@ -69,6 +75,33 @@ A typical loop from an agent:
 {"name": "aiec_exec", "arguments": {"sandbox_id": "<id>", "command": ["git", "status"]}}
 {"name": "aiec_destroy_sandbox", "arguments": {"sandbox_id": "<id>"}}
 ```
+
+The same loop as one durable run, which is the shape to reach for when the work
+is a self-contained task rather than an interactive session:
+
+```json
+{"name": "aiec_run", "arguments": {
+  "repo_url": "https://github.com/me/fixture",
+  "command": ["pytest", "-q"],
+  "validation_commands": [["pytest", "-q"]],
+  "artifacts": ["report.txt"],
+  "requirements": {"full_kernel_isolation": true}
+}}
+```
+
+`aiec_run` returns the settled run: state, the task's exit code, bounded
+stdout/stderr, changed files, artifact URLs and any machine that outlived it.
+A workload that *failed* is reported on that document, not as a tool error --
+"the work failed" is an outcome you asked for.
+
+Runs are the control plane's own workflow, so this server does not rebuild it:
+the API reserves the record, places the machine through the same registry the
+sandbox API uses, runs the command, collects artifacts and reclaims the machine
+before it answers. That is why a run keeps a history (`aiec_run_events`) and why
+`idempotency_key` returns the run that already exists instead of doing the work
+twice. `aiec_run_batch`, `aiec_run_matrix` and OMP comparisons use the generic
+client's bounded Run batch, with `max_parallel` enforced before submission.
+Generic HTTP evaluation routes also exist under `/v1/eval/`.
 
 Resources: `aiec://sandboxes`, `aiec://sandboxes/{id}`, `aiec://local-capacity`.
 Prompts: `test-repo-in-clean-sandbox`, `reproduce-bug-in-clean-machine`.
@@ -89,8 +122,10 @@ These are enforced in code, with tests, not just documented:
   cluster is full you get `LOCAL_CAPACITY_UNAVAILABLE`, never a silent handoff.
 - **Bounded.** Exec output is clipped and commands are subject to a timeout,
   enforced by AIec itself.
-- **Clean.** High-level tools destroy their sandbox on success *and* on failure.
-  Shutdown cleans only sandboxes this server created.
+- **Clean.** Durable workflows use the Run's retention policy; destruction
+  failures are returned as `cleanup_failed`, never silently treated as cleanup.
+  `keep_sandbox` retains an OMP Run's machine for the configured debugging TTL.
+  Legacy interactive sandbox ownership remains scoped to this server.
 
 ### Errors
 
@@ -110,7 +145,7 @@ These are enforced in code, with tests, not just documented:
 | `AIEC_LOCAL_API_KEY` | — | **Required**; the control-plane key |
 | `AIEC_MCP_TOKEN` | generated | Token MCP clients present |
 | `AIEC_MCP_TOKEN_FILE` | `~/.config/aiec/mcp-token` | Where the token lives |
-| `AIEC_MCP_MAX_PARALLEL` | `2` | Concurrent sandboxes for comparison runs |
+| `AIEC_MCP_MAX_PARALLEL` | `2` | Maximum concurrent Runs in comparisons |
 | `AIEC_MCP_DEFAULT_TTL` | `1800` | Sandbox lifetime in seconds |
 | `AIEC_MCP_MAX_OUTPUT_BYTES` | `1048576` | Output and file size bound |
 | `AIEC_MCP_ALLOW_PRIVATE_NETWORK` | off | Permit a control plane on your LAN |
@@ -119,9 +154,10 @@ These are enforced in code, with tests, not just documented:
 
 ## The OMP workflow
 
-`aiec_compare_omp` runs a baseline and a candidate revision of a coding agent
-against the same target repository, task, validations and resources, each in its
-**own** clean sandbox, and returns measurements:
+`aiec_test_omp` and `aiec_compare_omp` are thin adapters to ordinary durable
+Runs, not another sandbox scheduler. A comparison submits a bounded generic
+batch for the baseline and candidate, with each repetition in its **own**
+clean sandbox against the same target repository, task, validations and resources:
 
 > I changed OMP's compaction implementation. Does it actually improve things?
 
@@ -136,14 +172,42 @@ against the same target repository, task, validations and resources, each in its
 }}
 ```
 
-You get successful/failed runs, validation passes, wall time, exit codes,
-changed-file counts and diff sizes, per side. All sandboxes are destroyed
-afterwards. It returns measurements, never a verdict about which is better.
+Results contain real durable `run_id`s, setup/task/validation outcomes, timing
+phases, actual agent and target commits, git evidence and cleanup failures.
+The `omp` task outcome and its exit-code slot are `null` if preparation failed
+before execution; unknown wall time is `null`, not zero. Side summaries include
+successful output as well as failed setup and validation diagnostics, and every
+run's evidence remains in `baseline_runs` / `candidate_runs`. A rejected
+submission is listed in `submission_failures`, not dropped or turned into a
+fabricated task failure. Measurements are returned without choosing a winner.
 
-The generic tools work with any agent; OMP-specific conveniences live in this
-layer only. If OMP needs a model, give the sandbox the provider credentials it
-expects (`models.yml`, or the provider's own environment variable) — the server
-deliberately does not hold model credentials for you.
+The adapter always fetches the requested OMP branch, tag or commit into
+`/workspace/omp`. By default it runs `bun install && bun run build` there;
+`build_command` overrides that step. `setup_command` prepares the **target**
+repository afterwards and cannot silently skip the OMP checkout. For a custom
+invocation that does not need a build, explicitly use `build_command: ["true"]`.
+The default invocation is the checkout's
+`/bin/sh /workspace/omp/packages/coding-agent/scripts/omp --print -- <task>`,
+not an assumed global `omp` executable. The upstream launcher starts Bun with
+the checkout CLI/preload and restores the target working directory; the task
+is one literal positional argument. An `omp_command` override gets the same
+task on stdin and in `OMP_TASK`. The invocation is recorded in the task outcome.
+The guest must provide Bun and whatever that revision's build requires.
+
+OMP tools preserve `runtime`, `timeout_seconds`, `cpu`, `memory_mb`, `disk_mb`
+and the generic `requirements` capability demands. Defaults are Firecracker,
+900 seconds, 2 CPUs, 2048 MiB RAM and 2048 MiB disk, with outbound Internet
+enabled for both repository checkouts and dependency/model access. Comparisons
+use destroy retention; `aiec_test_omp` can request `keep_sandbox: true`, with
+expiry managed by the control plane rather than MCP-private lifetime code.
+Cleanup failure details are still returned when destruction fails.
+
+Pass model credential **references** in `secrets`, resolved by the tenant's
+secret store at execution time. `environment` is only for non-secret settings,
+such as model selection and cache paths. Do not embed credentials in repository
+URLs, command arguments, setup scripts or reports. Secrets are never copied
+into the OMP adapter's request/report as values. Generic Run tools remain
+agent-agnostic; OMP conventions live only in this adapter.
 
 ---
 

@@ -43,6 +43,8 @@ pub struct GuestArtifact {
     pub git_version: Option<String>,
     /// Version of the AIec guest agent inside the image.
     pub guest_agent_version: String,
+    /// Exact wire revision implemented by the baked guest agent.
+    pub guest_protocol_version: u16,
     /// Hex-encoded SHA-256 of the root filesystem.
     pub rootfs_sha256: String,
     /// Hex-encoded SHA-256 of the kernel, when the build recorded one.
@@ -51,6 +53,17 @@ pub struct GuestArtifact {
 }
 
 impl GuestArtifact {
+    pub(crate) fn verify_protocol(&self) -> Result<(), RuntimeError> {
+        if self.guest_protocol_version != aiec_core::protocol::PROTOCOL_VERSION {
+            return Err(RuntimeError::Unavailable(format!(
+                "guest artifact implements protocol {}, required {} (bounded artifact chunks)",
+                self.guest_protocol_version,
+                aiec_core::protocol::PROTOCOL_VERSION,
+            )));
+        }
+        Ok(())
+    }
+
     /// Reports whether the artifact describes a coding-capable guest.
     pub fn is_coding_guest(&self) -> bool {
         self.profile == CODING_PROFILE
@@ -75,12 +88,14 @@ pub fn load_guest_artifact(path: &Path) -> Result<GuestArtifact, RuntimeError> {
             path.display()
         ))
     })?;
-    serde_json::from_str(&contents).map_err(|error| {
+    let artifact: GuestArtifact = serde_json::from_str(&contents).map_err(|error| {
         RuntimeError::Unavailable(format!(
             "guest artifact metadata {} is malformed: {error}",
             path.display()
         ))
-    })
+    })?;
+    artifact.verify_protocol()?;
+    Ok(artifact)
 }
 
 /// Loads the artifact recorded in `dir` and verifies the images it describes.
@@ -158,7 +173,7 @@ mod tests {
         std::fs::write(
             dir.join(GUEST_ARTIFACT_FILE),
             format!(
-                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding","capabilities":{capabilities},"git_version":"git version 2.39.5","guest_agent_version":"0.1.0","rootfs_sha256":"{rootfs_sha256}"}}"#
+                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding","capabilities":{capabilities},"git_version":"git version 2.39.5","guest_agent_version":"0.1.0","guest_protocol_version":2,"rootfs_sha256":"{rootfs_sha256}"}}"#
             ),
         )
         .expect("artifact metadata");
@@ -236,7 +251,7 @@ mod tests {
         std::fs::write(
             dir.join(GUEST_ARTIFACT_FILE),
             format!(
-                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding","capabilities":["git"],"guest_agent_version":"0.1.0","rootfs_sha256":"{rootfs_digest}","kernel_sha256":"{kernel_digest}"}}"#
+                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding","capabilities":["git"],"guest_agent_version":"0.1.0","guest_protocol_version":2,"rootfs_sha256":"{rootfs_digest}","kernel_sha256":"{kernel_digest}"}}"#
             ),
         )
         .expect("artifact metadata");
@@ -257,6 +272,7 @@ mod tests {
             capabilities: vec![CAPABILITY_GIT.into()],
             git_version: Some("git version 2.39.5".into()),
             guest_agent_version: "0.1.0".into(),
+            guest_protocol_version: aiec_core::protocol::PROTOCOL_VERSION,
             rootfs_sha256: "c".repeat(64),
             kernel_sha256: None,
         };
@@ -271,5 +287,26 @@ mod tests {
             ..coding
         };
         assert!(!wrong_profile.is_coding_guest());
+    }
+
+    #[test]
+    fn metadata_without_the_protocol_revision_is_refused() {
+        let dir = artifact_dir("no-protocol");
+        let rootfs = dir.join("aiec-rootfs.ext4");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&rootfs, b"root filesystem bytes").expect("rootfs");
+        std::fs::write(&kernel, b"kernel bytes").expect("kernel");
+        let digest = file_sha256(&rootfs).expect("digest");
+        std::fs::write(
+            dir.join(GUEST_ARTIFACT_FILE),
+            format!(
+                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding","capabilities":["git"],"guest_agent_version":"0.1.0","rootfs_sha256":"{digest}"}}"#
+            ),
+        )
+        .expect("artifact metadata");
+        let error = load_guest_artifact(&dir.join(GUEST_ARTIFACT_FILE))
+            .expect_err("a pre-chunk guest must fail closed");
+        assert!(error.to_string().contains("missing field"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

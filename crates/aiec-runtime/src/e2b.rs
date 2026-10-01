@@ -21,7 +21,9 @@
 //! a faked result.
 
 use crate::SandboxRuntime;
-use aiec_core::runtime::{RuntimeCapabilities, RuntimeHealth, RuntimeIsolation};
+use aiec_core::runtime::{
+    FileChunk, FileChunkRequest, RuntimeCapabilities, RuntimeHealth, RuntimeIsolation,
+};
 use aiec_core::snapshots::MAX_WORKSPACE_ARCHIVE_BYTES;
 use aiec_core::{
     CoreError, DeleteFileRequest, ExecRequest, ExecResult, FileContent, FileEntry,
@@ -286,6 +288,15 @@ pub struct E2bRuntime {
     /// id. The persisted [`Sandbox::runtime_path`] stays authoritative; this
     /// only saves a control-plane round trip between operations.
     bindings: Mutex<HashMap<Uuid, ProviderSandbox>>,
+}
+
+/// One guest command invocation, bundled so a caller cannot pass a partial set.
+struct GuestExec {
+    working_directory: Option<String>,
+    environment: BTreeMap<String, String>,
+    stdin: Option<String>,
+    timeout_seconds: u64,
+    stdout_limit: Option<usize>,
 }
 
 impl fmt::Debug for E2bRuntime {
@@ -562,6 +573,33 @@ impl E2bRuntime {
         stdin: Option<String>,
         timeout_seconds: u64,
     ) -> Result<ExecResult, CoreError> {
+        self.run_exec(
+            binding,
+            command,
+            GuestExec {
+                working_directory,
+                environment,
+                stdin,
+                timeout_seconds,
+                stdout_limit: None,
+            },
+        )
+        .await
+    }
+
+    async fn run_exec(
+        &self,
+        binding: &ProviderSandbox,
+        command: &[String],
+        options: GuestExec,
+    ) -> Result<ExecResult, CoreError> {
+        let GuestExec {
+            working_directory,
+            environment,
+            stdin,
+            timeout_seconds,
+            stdout_limit,
+        } = options;
         let Some((program, arguments)) = command.split_first() else {
             return Err(CoreError::InvalidRequest("empty command".into()));
         };
@@ -604,7 +642,10 @@ impl E2bRuntime {
         }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
-        let mut decoder = StreamDecoder::default();
+        let mut decoder = StreamDecoder {
+            stdout_limit,
+            ..StreamDecoder::default()
+        };
         let mut timed_out = false;
         while !decoder.finished {
             match tokio::time::timeout_at(deadline, response.chunk()).await {
@@ -769,6 +810,122 @@ impl SandboxRuntime for E2bRuntime {
             .await
     }
 
+    async fn get_file_chunk(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError> {
+        request.validate()?;
+        let mut request = request;
+        request.path = workspace_path(&request.path)?
+            .to_string_lossy()
+            .into_owned();
+        let binding = self.binding(sandbox).await?;
+        // envd /files follows symlinks: a separate stat + HTTP range cannot
+        // protect against link swaps. Read the range through one guest-held
+        // descriptor and emit a bounded byte array on its existing RPC stream.
+        const READ: &str = r#"import os,sys,stat,json
+r=json.loads(sys.argv[1])
+def opened():
+ fd=os.open('/workspace',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  parts=r['path'].removeprefix('/workspace/').split('/')
+  for i,part in enumerate(parts):
+   n=os.open(part,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(os.O_DIRECTORY if i<len(parts)-1 else 0),dir_fd=fd)
+   os.close(fd)
+   fd=n
+  return fd
+ except:
+  os.close(fd)
+  raise
+def version(s):
+ return f'{s.st_dev}:{s.st_ino}:{s.st_size}:{s.st_mtime_ns}:{s.st_ctime_ns}'
+fd=None
+try:
+ if not 1<=r['length']<=65536: raise ValueError('invalid chunk length')
+ fd=opened()
+ s=os.fstat(fd)
+ if not stat.S_ISREG(s.st_mode): raise ValueError('not a regular file')
+ if s.st_size>16777216:
+  print(json.dumps({'code':'limit_exceeded','error':'file too large'}))
+ else:
+  v=version(s)
+  if r['offset']>s.st_size or r['offset']<0 or (r['expected_version'] is not None and r['expected_version']!=v):
+   raise ValueError('file changed or invalid offset')
+  n=min(r['length'],s.st_size-r['offset'])
+  data=os.pread(fd,n,r['offset'])
+  after=opened()
+  try:
+   if len(data)!=n or version(os.fstat(fd))!=v or version(os.fstat(after))!=v:
+    raise ValueError('file changed while reading')
+  finally:
+   os.close(after)
+  print(json.dumps({'content':list(data),'size_bytes':s.st_size,'version':v,'eof':r['offset']+n==s.st_size},separators=(',',':')))
+except Exception as e:
+ print(json.dumps({'code':'not_found' if isinstance(e,FileNotFoundError) else 'conflict','error':str(e)[:1024]}))
+finally:
+ if fd is not None: os.close(fd)
+"#;
+        let result = self
+            .run_exec(
+                &binding,
+                &[
+                    "python3".into(),
+                    "-c".into(),
+                    READ.into(),
+                    serde_json::to_string(&request)
+                        .map_err(|error| CoreError::Backend(error.to_string()))?,
+                ],
+                GuestExec {
+                    working_directory: None,
+                    environment: BTreeMap::new(),
+                    stdin: None,
+                    timeout_seconds: 30,
+                    stdout_limit: Some(request.length * 4 + 4096),
+                },
+            )
+            .await?;
+        if result.exit_code != 0 {
+            return Err(CoreError::Backend(format!(
+                "guest range read failed: {}",
+                result.stderr.trim()
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct GuestChunk {
+            #[serde(
+                default,
+                deserialize_with = "aiec_core::runtime::deserialize_file_chunk_bytes"
+            )]
+            content: Vec<u8>,
+            #[serde(default)]
+            size_bytes: u64,
+            #[serde(default)]
+            version: String,
+            #[serde(default)]
+            eof: bool,
+            error: Option<String>,
+            code: Option<String>,
+        }
+        let reply: GuestChunk = serde_json::from_str(&result.stdout).map_err(|error| {
+            CoreError::Backend(format!("invalid guest range response: {error}"))
+        })?;
+        if let Some(error) = reply.error {
+            return Err(match reply.code.as_deref() {
+                Some("limit_exceeded") => CoreError::LimitExceeded(error),
+                Some("not_found") => CoreError::NotFound(error),
+                _ => CoreError::Conflict(error),
+            });
+        }
+        let chunk = FileChunk {
+            bytes: reply.content.into(),
+            size_bytes: reply.size_bytes,
+            version: reply.version,
+            eof: reply.eof,
+        };
+        request.validate_chunk(&chunk)?;
+        Ok(chunk)
+    }
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         let path = workspace_path(path)?;
         let binding = self.binding(sandbox).await?;
@@ -942,6 +1099,9 @@ impl SandboxRuntime for E2bRuntime {
             pause: true,
             pause_reclaims_resources: true,
             workspace_snapshot: false,
+            // A hosted provider materializes its own machine; there is no local
+            // immutable base image whose writable size we would have to reserve.
+            minimum_disk_mb: 0,
             vsock: false,
             coding_guest: self.config.coding_guest,
         }
@@ -1076,10 +1236,19 @@ struct StreamDecoder {
     exit_code: Option<i32>,
     error: Option<String>,
     finished: bool,
+    stdout_limit: Option<usize>,
 }
 
 impl StreamDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<(), CoreError> {
+        let frame_limit = self
+            .stdout_limit
+            .map_or(MAX_STDERR, |limit| limit.div_ceil(3) * 4 + 4096);
+        if self.stdout_limit.is_some()
+            && chunk.len() > (frame_limit + ENVELOPE_HEADER).saturating_sub(self.buffer.len())
+        {
+            return Err(CoreError::LimitExceeded("E2B range response frame".into()));
+        }
         self.buffer.extend_from_slice(chunk);
         loop {
             if self.finished {
@@ -1097,7 +1266,7 @@ impl StreamDecoder {
                 self.buffer[4],
             ]))
             .unwrap_or(usize::MAX);
-            if length > MAX_STDERR {
+            if length > frame_limit {
                 return Err(CoreError::LimitExceeded(format!(
                     "E2B exec frame of {length} bytes exceeds the AIec bound"
                 )));
@@ -1134,10 +1303,18 @@ impl StreamDecoder {
         };
         if let Some(data) = event.get("data") {
             if let Some(chunk) = data.get("stdout").and_then(Value::as_str) {
-                append_bounded(&mut self.stdout, &decode_chunk(chunk)?, MAX_STDOUT)?;
+                let limit = self.stdout_limit.unwrap_or(MAX_STDOUT);
+                if chunk.len() > limit.div_ceil(3) * 4 {
+                    return Err(CoreError::LimitExceeded("E2B range output".into()));
+                }
+                append_bounded(&mut self.stdout, &decode_chunk(chunk)?, limit)?;
             }
             if let Some(chunk) = data.get("stderr").and_then(Value::as_str) {
-                append_bounded(&mut self.stderr, &decode_chunk(chunk)?, MAX_STDERR)?;
+                let limit = self.stdout_limit.map_or(MAX_STDERR, |_| 4096);
+                if self.stdout_limit.is_some() && chunk.len() > limit.div_ceil(3) * 4 {
+                    return Err(CoreError::LimitExceeded("E2B range error output".into()));
+                }
+                append_bounded(&mut self.stderr, &decode_chunk(chunk)?, limit)?;
             }
         }
         if let Some(end) = event.get("end") {
@@ -1250,6 +1427,14 @@ async fn read_bounded(
     bound: usize,
     what: &str,
 ) -> Result<Vec<u8>, CoreError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > bound as u64)
+    {
+        return Err(CoreError::LimitExceeded(format!(
+            "{what} exceeds {bound} bytes"
+        )));
+    }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -1547,6 +1732,32 @@ mod tests {
             assert!(decoder.push(&frame).is_ok());
         }
         assert!(decoder.push(&frame).is_err());
+    }
+
+    #[test]
+    fn range_decoder_bounds_cumulative_output_and_declared_frames() {
+        let frame = envelope(&encode_json(&json!({
+            "event": { "data": { "stdout": base64::engine::general_purpose::STANDARD.encode(b"123456") } }
+        })).unwrap()).unwrap();
+        let mut decoder = StreamDecoder {
+            stdout_limit: Some(10),
+            ..StreamDecoder::default()
+        };
+        decoder.push(&frame).unwrap();
+        assert!(matches!(
+            decoder.push(&frame),
+            Err(CoreError::LimitExceeded(_))
+        ));
+        let mut decoder = StreamDecoder {
+            stdout_limit: Some(10),
+            ..StreamDecoder::default()
+        };
+        let mut header = [0; ENVELOPE_HEADER];
+        header[1..].copy_from_slice(&100_000u32.to_be_bytes());
+        assert!(matches!(
+            decoder.push(&header),
+            Err(CoreError::LimitExceeded(_))
+        ));
     }
 
     #[test]

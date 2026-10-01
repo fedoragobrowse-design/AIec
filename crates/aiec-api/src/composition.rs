@@ -80,19 +80,14 @@ impl Scheduler for DevelopmentScheduler {
         })
     }
 
-    async fn lease_generation(
+    async fn dispatch_target(
         &self,
         _tenant_id: TenantId,
         _sandbox_id: SandboxId,
-    ) -> Result<i64, CoreError> {
-        Ok(0)
-    }
-    async fn worker_endpoint(
-        &self,
-        _tenant_id: TenantId,
-        _sandbox_id: SandboxId,
-    ) -> Result<String, CoreError> {
-        Ok(String::new())
+    ) -> Result<aiec_core::scheduler::WorkerDispatch, CoreError> {
+        Err(CoreError::Unsupported(
+            "development execution does not dispatch to workers".into(),
+        ))
     }
 
     async fn release(&self, _tenant_id: TenantId, _sandbox_id: SandboxId) -> Result<(), CoreError> {

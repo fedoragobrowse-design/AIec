@@ -267,6 +267,18 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
                 }
                 _ => Err("path payload required".into()),
             },
+            Operation::ReadFileChunk => match request.payload {
+                RequestPayload::ReadFileChunk { request } => request
+                    .read_workspace(Path::new("/workspace"))
+                    .map(|chunk| ResponsePayload::ReadFileChunk {
+                        content: chunk.bytes.into(),
+                        size_bytes: chunk.size_bytes,
+                        version: chunk.version,
+                        eof: chunk.eof,
+                    })
+                    .map_err(|error| error.to_string()),
+                _ => Err("chunk payload required".into()),
+            },
             Operation::WriteFile => match request.payload {
                 RequestPayload::WriteFile {
                     path,
@@ -296,14 +308,29 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
                     let mut entries = Vec::new();
                     for item in fs::read_dir(path).map_err(|error| error.to_string())? {
                         let item = item.map_err(|error| error.to_string())?;
-                        let metadata = item.metadata().map_err(|error| error.to_string())?;
+                        // `symlink_metadata` rather than `metadata`: a link is
+                        // described by what it is, not by what it points at, so
+                        // a link out of the tree is not reported as the
+                        // directory it targets and a walker does not descend
+                        // through it.
+                        let metadata =
+                            fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
                         let kind = if metadata.is_dir() {
                             FileKind::Directory
                         } else {
                             FileKind::File
                         };
-                        let child = safe_path(&item.path().to_string_lossy())
-                            .map_err(|error| error.to_string())?;
+                        // The path reported is the one the caller asked about
+                        // plus this entry's name, which is inside the workspace
+                        // by construction. Resolving it is left to the
+                        // operation that uses it: a link whose target escapes
+                        // is still listed, so the caller can see that it is
+                        // there, and still cannot read through it, because
+                        // every read resolves the path again and refuses.
+                        // Resolving here instead aborted the whole listing on
+                        // the first escaping link, which is how a repository
+                        // containing one lost its entire file list.
+                        let child = item.path();
                         entries.push(DirectoryEntry {
                             name: item.file_name().to_string_lossy().into_owned(),
                             path: child.to_string_lossy().into_owned(),

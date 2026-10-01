@@ -38,6 +38,7 @@ fn firecracker_fails_closed_without_prerequisites() {
         guest_artifact_dir: None,
         guest_artifact: None,
         require_coding_guest: false,
+        host_reserves: aiec_core::host_pressure::HostReserves::default(),
     };
     let error = config.check().expect_err("missing prerequisites must fail");
     assert!(error.to_string().contains("Firecracker binary"));

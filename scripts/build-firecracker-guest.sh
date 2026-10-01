@@ -66,6 +66,8 @@ else
   GUEST_AGENT_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$GUEST_CARGO")
 fi
 [ -n "$GUEST_AGENT_VERSION" ] || fail "could not read the aiec-guest version from $GUEST_CARGO"
+GUEST_PROTOCOL_VERSION=$(awk '/^pub const PROTOCOL_VERSION:/{gsub(/;/,"",$NF); print $NF}' "$ROOT/crates/aiec-core/src/protocol.rs")
+[[ "$GUEST_PROTOCOL_VERSION" =~ ^[0-9]+$ ]] || fail "could not read the guest wire protocol version"
 step "building aiec-guest $GUEST_AGENT_VERSION (musl)"
 cargo build --release -p aiec-guest --target x86_64-unknown-linux-musl
 [ -x "$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest" ] || fail "guest agent binary was not produced"
@@ -165,7 +167,7 @@ else
 fi
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cat > "$OUT/guest-capabilities.json" <<EOF
-{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"coding","capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
+{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"coding","capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","guest_protocol_version":$GUEST_PROTOCOL_VERSION,"rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
 EOF
 if command -v python3 >/dev/null 2>&1; then
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/guest-capabilities.json" || fail "guest-capabilities.json is not valid JSON"

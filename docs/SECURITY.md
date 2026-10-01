@@ -14,6 +14,11 @@ AIec treats every tenant workload as hostile. `bwrap-dev` is retained only for l
 - Worker RPC requires bearer authentication, bounded request/response handling, and HTTPS endpoints in production composition. Native mTLS identity verification and certificate rotation are not implemented; HTTPS admission is not equivalent to mTLS.
 - PostgreSQL CAS transitions, transition events, row locks, `SKIP LOCKED`, monotonic worker versions, fenced/renewable leases, and reconciliation history.
 - S3 Signature V4, SHA-256 checksums, safe keys, and explicit development-only filesystem object storage.
+- Run workloads name tenant secrets; the values live only in an operator-owned
+  per-tenant file under `AIEC_RUN_SECRETS_DIR` (`0600`, owner-only, symlinks and
+  group/other access refused), are injected as process environment at exec time,
+  and are never returned by any endpoint. See the root
+  [SECURITY.md](../SECURITY.md#secrets).
 - Firecracker full memory/device snapshot code paths plus checksummed disk copies and restore validation are implemented, but live Firecracker execution is currently environment-blocked; do not treat this as current production evidence.
 
 ## Threats still requiring deployment controls

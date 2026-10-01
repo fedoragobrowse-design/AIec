@@ -6,7 +6,8 @@ use std::io::{Read, Write};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Version 2 requires bounded, version-consistent artifact range reads.
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME: usize = 2 * 1024 * 1024;
 pub const DEFAULT_CONTROL_PORT: u32 = 1024;
 const MAGIC: [u8; 4] = *b"AFG1";
@@ -38,6 +39,7 @@ pub enum Operation {
     Health,
     Exec,
     ReadFile,
+    ReadFileChunk,
     WriteFile,
     ListDirectory,
     CreateDirectory,
@@ -73,6 +75,9 @@ pub enum RequestPayload {
     },
     Path {
         path: String,
+    },
+    ReadFileChunk {
+        request: crate::runtime::FileChunkRequest,
     },
     WriteFile {
         path: String,
@@ -115,6 +120,13 @@ pub enum ResponsePayload {
     ReadFile {
         #[serde(with = "base64_bytes")]
         content: Vec<u8>,
+    },
+    ReadFileChunk {
+        #[serde(deserialize_with = "crate::runtime::deserialize_file_chunk_bytes")]
+        content: Vec<u8>,
+        size_bytes: u64,
+        version: String,
+        eof: bool,
     },
     WriteFile,
     ListDirectory {

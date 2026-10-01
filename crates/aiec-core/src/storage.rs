@@ -1,15 +1,18 @@
 //! Metadata persistence and large artifact storage boundaries.
 
 use crate::{
-    ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Snapshot,
-    UsageEvent, UsageSummary,
+    ApiKeyRecord, CoreError, ImageRecord, Node, QuotaLimits, QuotaUsage, RuntimeKind, Sandbox,
+    SandboxState, Snapshot, UsageEvent, UsageSummary,
     run::{Placement, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState},
+    run_queue::{RunQueueClaim, RunQueueLimits},
     runtime::RuntimeCapabilities,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub use crate::{LeaseId, RequestId, SandboxId, SnapshotId, TenantId, WorkerId};
@@ -36,11 +39,48 @@ pub struct GetObjectOptions {
     pub expected_checksum_sha256: Option<String>,
 }
 
+/// A durable, fenced claim to delete an unreferenced object.
+#[derive(Clone, Debug)]
+pub struct ArtifactDeletion {
+    pub key: String,
+    pub tenant_id: TenantId,
+    pub claim: Uuid,
+}
+
+/// A bounded, pull-based artifact body. Producers yield at most 64 KiB per chunk.
+#[async_trait]
+pub trait ArtifactSource: Send {
+    /// Returns the next chunk, or `None` after the body is exhausted.
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, CoreError>;
+}
+
+/// An artifact whose entire body has been verified before it becomes readable.
+pub struct ArtifactDownload {
+    /// Metadata computed from the verified bytes and accepted backend version.
+    pub metadata: ObjectMetadata,
+    /// Bounded spool reader; dropping it releases all staging storage.
+    pub body: Box<dyn ArtifactSource>,
+}
+
 /// Stores large opaque artifacts independently from relational metadata.
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
-    /// Writes bytes at `key`; existing-key behavior is defined by the backend.
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<ObjectMetadata, CoreError>;
+    /// Takes ownership of the body, allowing HTTP backends to send it without copying.
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectMetadata, CoreError>;
+    /// Writes bounded chunks, refusing a body larger than `max_bytes`.
+    async fn put_stream(
+        &self,
+        key: &str,
+        source: &mut dyn ArtifactSource,
+        max_bytes: u64,
+    ) -> Result<ObjectMetadata, CoreError>;
+    /// Spools and verifies the complete body before returning a bounded reader.
+    async fn get_verified(
+        &self,
+        key: &str,
+        options: &GetObjectOptions,
+        max_bytes: u64,
+    ) -> Result<ArtifactDownload, CoreError>;
     /// Reads an artifact without integrity preconditions.
     async fn get(&self, key: &str) -> Result<Vec<u8>, CoreError>;
     /// Reads an artifact only when all supplied preconditions match.
@@ -58,6 +98,15 @@ pub trait ArtifactStore: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, CoreError>;
     /// Deletes an artifact only when its version tag matches.
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), CoreError>;
+    /// Reclaims abandoned, backend-owned upload files, inspecting at most `limit` entries.
+    /// Backends without local staging files have nothing to reclaim.
+    async fn cleanup_temporary_uploads(
+        &self,
+        _older_than: DateTime<Utc>,
+        _limit: u32,
+    ) -> Result<u32, CoreError> {
+        Ok(0)
+    }
 }
 
 /// A tenant record persisted by the metadata store.
@@ -364,6 +413,46 @@ pub struct SandboxOperation {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Where the next page of a matrix starts.
+///
+/// The two fields together are the cell's own position in the ordering, so a
+/// page boundary is a value that already exists rather than an offset a reader
+/// has to keep consistent with rows that moved.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixCursor {
+    /// `requested_at` of the last cell of the previous page.
+    pub requested_at: DateTime<Utc>,
+    /// Identifier of that cell, which breaks a `requested_at` tie.
+    pub id: Uuid,
+}
+
+/// One cell of a matrix: the run it became, and how it was labelled.
+///
+/// The label is read from the run rather than from a record beside it, because
+/// the run is where it was written: a cell whose submission failed, or an API
+/// that restarted before the last cell finished, still comes back labelled.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MatrixCell {
+    /// The run this cell ran as.
+    pub run: Run,
+    /// Position in the submitted matrix, when the run was admitted as a cell.
+    pub index: Option<u32>,
+    /// The cell's axis values, or `None` when the run carries none.
+    ///
+    /// Absent is a real answer: the run is here and its labels are not, which
+    /// is a different thing from a cell that had no axis to begin with.
+    pub axis: Option<BTreeMap<String, String>>,
+}
+
+/// One bounded page of a matrix.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MatrixCellPage {
+    /// Cells in submission order, at most the requested limit.
+    pub cells: Vec<MatrixCell>,
+    /// Where the next page starts, or `None` when this page is the last.
+    pub next: Option<MatrixCursor>,
+}
+
 /// What one pass of the orphaned-lease reclaim did.
 ///
 /// Two counts rather than one, because "released a lease" and "found a lease
@@ -396,16 +485,32 @@ pub trait MetadataStore: Send + Sync {
         next: SandboxState,
         runtime_path: Option<String>,
     ) -> Result<Sandbox, CoreError>;
-    /// Performs a compare-and-set state transition fenced by the sandbox lease generation.
+    /// Performs a compare-and-set state transition fenced by the sandbox's lease identity.
     ///
-    /// The transition is rejected unless the sandbox's current active, unexpired lease has
-    /// exactly `generation`, so a worker that lost its lease can never commit state.
-    async fn update_state_with_generation(
+    /// The fence is the lease, not its generation counter. `lease_id` and `generation`
+    /// are one ownership read, so the transition is rejected unless the sandbox's
+    /// current active, unexpired lease *is* `lease_id`: a worker that lost its lease
+    /// can never commit state, whatever generation it presents.
+    ///
+    /// On that same lease a `generation` at or behind the stored one is accepted. Both
+    /// [`renew_worker_lease`](Self::renew_worker_lease) and assignment claims advance
+    /// the generation of the lease they are extending, so a caller that read ownership
+    /// a moment before such a commit is *behind* a fence it still legitimately holds.
+    /// Comparing generations alone turned that renewal race into a refusal on a sandbox
+    /// nobody had taken away. A generation *ahead* of the stored one is refused: it
+    /// belongs to no issued state of this lease.
+    ///
+    /// Refusals are distinguishable, so a store refusal is never read as a worker
+    /// refusal: a different lease is a reassignment, no unexpired lease is expiry or
+    /// an unfinished placement, and a generation ahead of its lease is a caller the
+    /// store cannot vouch for.
+    async fn update_state_with_lease(
         &self,
         tenant: TenantId,
         id: SandboxId,
         expected: SandboxState,
         next: SandboxState,
+        lease_id: LeaseId,
         generation: i64,
     ) -> Result<(), CoreError>;
     /// Deletes a tenant-owned sandbox.
@@ -742,6 +847,15 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Clears a reclaimed retention marker without clearing a different machine.
+    async fn clear_run_retention(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _sandbox_id: Uuid,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Deletes a tenant-owned run.
     ///
     /// A run whose history has been recorded is retained: the record of what
@@ -780,6 +894,24 @@ pub trait MetadataStore: Send + Sync {
     async fn record_run_attempt(&self, _attempt: RunAttempt) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Completes an in-progress attempt once, retaining its own outcomes.
+    async fn complete_run_attempt(
+        &self,
+        _tenant: TenantId,
+        _attempt: RunAttempt,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+    /// Atomically creates and assigns an attempt's unleased compute.
+    async fn create_attempt_sandbox(
+        &self,
+        _run_id: Uuid,
+        _attempt_id: Uuid,
+        _sandbox: Sandbox,
+        _required: crate::runtime::RuntimeCapabilities,
+    ) -> Result<Sandbox, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Lists every attempt of a run, including the ones that did not work.
     async fn list_run_attempts(
         &self,
@@ -797,6 +929,47 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Records upload ownership before external I/O. Keys cannot be reused after deletion.
+    async fn reserve_artifact_upload(
+        &self,
+        _tenant: TenantId,
+        _run: Option<Uuid>,
+        _key: &str,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("artifact lifecycle storage".into()))
+    }
+    /// Records a successful upload even if collecting the Run metadata later fails.
+    async fn complete_artifact_upload(
+        &self,
+        _tenant: TenantId,
+        _run: Option<Uuid>,
+        _key: &str,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("artifact lifecycle storage".into()))
+    }
+    /// Expires at most `limit` terminal Runs and leases at most `limit` safe deletions.
+    /// All reference checks and ownership changes happen atomically; no object I/O occurs here.
+    async fn claim_artifact_deletions(
+        &self,
+        _now: DateTime<Utc>,
+        _retention_seconds: i64,
+        _pending_grace_seconds: i64,
+        _limit: u32,
+        _lease_seconds: i64,
+    ) -> Result<Vec<ArtifactDeletion>, CoreError> {
+        Err(CoreError::Unsupported("artifact lifecycle storage".into()))
+    }
+    /// Acknowledges success or schedules a failed deletion for another attempt.
+    /// Stale claim acknowledgements cannot change a newer worker's intent.
+    async fn finish_artifact_deletion(
+        &self,
+        _key: &str,
+        _claim: Uuid,
+        _deleted: bool,
+        _retry_at: DateTime<Utc>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("artifact lifecycle storage".into()))
+    }
     /// Lists the artifacts collected for a run, by name.
     async fn list_run_artifacts(
         &self,
@@ -805,6 +978,43 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<RunArtifactRef>, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    // Matrix results. A matrix is a set of runs that were submitted together,
+    // and each run carries the cell it was admitted as. There is deliberately
+    // no write here: a second copy of that membership could disagree with the
+    // Run it describes, and the Run is the thing that exists.
+
+    /// One bounded page of a matrix's cells, oldest first.
+    ///
+    /// Tenant-scoped and paged rather than complete on purpose: a matrix is
+    /// only as large as its caller made it, and a reader that cannot ask for
+    /// the rest of a large one has no way to see any of it. `after` is the last
+    /// cell of the previous page, so the next page starts where that one
+    /// stopped without re-reading what came before it.
+    async fn list_matrix_cells(
+        &self,
+        _tenant: TenantId,
+        _matrix: Uuid,
+        _limit: u32,
+        _after: Option<MatrixCursor>,
+    ) -> Result<MatrixCellPage, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+
+    /// A tenant's durable quota policy beside its current aggregate usage.
+    ///
+    /// The rows the scheduler itself enforces against, read without locking: a
+    /// caller that sizes a batch from this still has the scheduler decide
+    /// whether each cell is admitted, so a lock here would only serialise
+    /// concurrent readers behind each other. A store that cannot answer says
+    /// `Unsupported` rather than zero, because no ledger must not read as no
+    /// capacity.
+    async fn get_tenant_quota_usage(
+        &self,
+        _tenant: TenantId,
+    ) -> Result<(QuotaLimits, QuotaUsage), CoreError> {
+        Err(CoreError::Unsupported("tenant quota storage".into()))
+    }
+
     /// Lists runs whose retained machine has passed its expiry.
     ///
     /// This is the sweeper's read, and it crosses tenants on purpose: expiry is
@@ -844,5 +1054,94 @@ pub trait MetadataStore: Send + Sync {
         _limit: u32,
     ) -> Result<Vec<Run>, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
+    }
+
+    // Durable Run queue. Execution ownership is separate from admission: an
+    // accepted Run sits in a bounded queue until a dispatcher claims it, and a
+    // dispatcher that dies mid-execution is recovered by lease expiry rather
+    // than by the HTTP request that asked for the work.
+    //
+    // A store without a queue answers `Unsupported` for all of these, which is
+    // how the in-memory development store keeps its direct-execution path.
+
+    /// Whether this store can durably queue Runs at all.
+    ///
+    /// The composition root asks once so an executor is only spawned against a
+    /// store that can actually feed it.
+    fn supports_run_queue(&self) -> bool {
+        false
+    }
+    /// Admits a queued Run and the request that will execute it, atomically.
+    ///
+    /// The Run row and its queue row commit together, so a refused admission
+    /// never leaves an orphan Run behind, and an idempotency key is resolved
+    /// before the capacity check so a retry joins its original run even when
+    /// the queue is full.
+    async fn enqueue_run(
+        &self,
+        _run: Run,
+        _request: Value,
+        _limits: RunQueueLimits,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Claims the next queued Run for `owner`, or `None` when nothing is due.
+    ///
+    /// Fair across tenants: selection prefers the tenant with the fewest
+    /// in-flight runs, then whichever tenant has waited longest. One Run
+    /// cannot be claimed twice, and a slow executor does not hold the queue.
+    async fn claim_run_queue(
+        &self,
+        _owner: Uuid,
+        _limits: RunQueueLimits,
+    ) -> Result<Option<RunQueueClaim>, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Claims abandoned work whose owner lease expired, for teardown only.
+    ///
+    /// A recovered grant authorizes destroying whatever the lost owner left
+    /// behind. It never authorizes executing the request a second time.
+    async fn recover_run_queue(
+        &self,
+        _owner: Uuid,
+        _limits: RunQueueLimits,
+    ) -> Result<Option<RunQueueClaim>, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Extends `owner`'s lease, never past the run's fixed execution deadline.
+    ///
+    /// Returns false once the lease has expired: a lapsed owner cannot be
+    /// revived, because another dispatcher has already been handed the work.
+    async fn heartbeat_run_queue(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+        _owner: Uuid,
+        _lease_seconds: u32,
+    ) -> Result<bool, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Relinquishes execution ownership while keeping teardown owed.
+    async fn fail_run_queue(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+        _owner: Uuid,
+        _reason: String,
+    ) -> Result<bool, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Marks the queue entry done once the run is terminal and clean.
+    async fn finish_run_queue(
+        &self,
+        _tenant: TenantId,
+        _run: Uuid,
+        _owner: Uuid,
+    ) -> Result<bool, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
+    }
+    /// Whether this Run's queue entry is finished, or was never queued.
+    async fn run_queue_finished(&self, _tenant: TenantId, _run: Uuid) -> Result<bool, CoreError> {
+        Err(CoreError::Unsupported("run queue".into()))
     }
 }

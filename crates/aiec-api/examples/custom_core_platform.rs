@@ -51,19 +51,14 @@ impl Scheduler for InlineScheduler {
         })
     }
 
-    async fn lease_generation(
+    async fn dispatch_target(
         &self,
         _tenant_id: aiec_core::TenantId,
         _sandbox_id: aiec_core::SandboxId,
-    ) -> Result<i64, aiec_core::CoreError> {
-        Ok(1)
-    }
-    async fn worker_endpoint(
-        &self,
-        _tenant_id: aiec_core::TenantId,
-        _sandbox_id: aiec_core::SandboxId,
-    ) -> Result<String, aiec_core::CoreError> {
-        Ok("inline://worker".into())
+    ) -> Result<aiec_core::scheduler::WorkerDispatch, aiec_core::CoreError> {
+        Err(aiec_core::CoreError::Unsupported(
+            "inline execution does not dispatch to workers".into(),
+        ))
     }
 
     async fn release(
@@ -166,6 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sandbox: sandbox(tenant_id),
             preferred_worker: None,
             lease_ttl: std::time::Duration::from_secs(60),
+            required_capabilities: Default::default(),
+            run_id: None,
         })
         .await?;
     assert_eq!(scheduled.worker_endpoint, "inline://worker");
@@ -193,7 +190,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let metadata = platform.artifact_store().expect("artifact store");
     let stored = metadata
-        .put("validation/artifact", b"core-extension")
+        .put(
+            "validation/artifact",
+            bytes::Bytes::from_static(b"core-extension"),
+        )
         .await?;
     assert_eq!(stored.size_bytes, 14);
     assert_eq!(

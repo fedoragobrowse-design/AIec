@@ -49,6 +49,14 @@ def main() -> int:
     for key in ("base", "profile", "capabilities", "rootfs_sha256", "guest_agent_version"):
         if not metadata.get(key):
             fail(f"{metadata_path} is missing required key {key!r}")
+    if not isinstance(metadata.get("guest_protocol_version"), int):
+        fail(f"{metadata_path} is missing required key 'guest_protocol_version'")
+    if metadata["guest_protocol_version"] != REQUIRED_PROTOCOL_VERSION:
+        fail(
+            f"{metadata_path} records guest protocol "
+            f"{metadata['guest_protocol_version']}, this control plane requires "
+            f"{REQUIRED_PROTOCOL_VERSION}"
+        )
 
     rootfs = Path(sys.argv[2]) if len(sys.argv) > 2 else directory / metadata.get(
         "rootfs", "aiec-rootfs.ext4"
@@ -89,6 +97,9 @@ def main() -> int:
     print(f"profile:             {metadata['profile']}")
     print(f"artifact version:    {metadata.get('artifact_version', 'unknown')}")
     print(f"guest agent version: {metadata['guest_agent_version']}")
+    print(
+        f"guest protocol:      {metadata['guest_protocol_version']}"
+    )
     print(f"git version:         {metadata.get('git_version', 'unknown')}")
     print(f"capabilities:        {', '.join(capabilities)}")
     print(f"rootfs sha256:       {actual}")

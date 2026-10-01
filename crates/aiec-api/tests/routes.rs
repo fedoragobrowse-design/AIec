@@ -61,6 +61,13 @@ impl SandboxRuntime for MockRuntime {
             content_base64: "aGk=".into(),
         })
     }
+    async fn get_file_chunk(
+        &self,
+        _: &Sandbox,
+        _: aiec_core::runtime::FileChunkRequest,
+    ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+        Err(CoreError::Backend("unused".into()))
+    }
     async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
         Ok(vec![])
     }
@@ -136,6 +143,13 @@ impl SandboxRuntime for TaggedRuntime {
             path: p.into(),
             content_base64: String::new(),
         })
+    }
+    async fn get_file_chunk(
+        &self,
+        _: &Sandbox,
+        _: aiec_core::runtime::FileChunkRequest,
+    ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+        Err(CoreError::Backend("unused".into()))
     }
     async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
         Ok(Vec::new())
@@ -2021,11 +2035,17 @@ async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
     )
     .unwrap();
     let snapshot_id = snapshot_value["id"].as_str().unwrap();
+    // The key names its tenant, the way every other object key in the system
+    // does. It used to be asserted flat instead, which is what forced the
+    // control plane to name snapshots `{sandbox}-{uuid}` and left the runtime
+    // deciding what an object may be called. The VM snapshot key just below has
+    // always been `{sandbox}/vm-state`, so the flat rule was not even
+    // self-consistent.
     assert!(
         snapshot_value["object_key"]
             .as_str()
-            .is_some_and(|key| !key.contains('/')),
-        "snapshot object key must satisfy runtime archive key rules: {snapshot_value}"
+            .is_some_and(|key| key.starts_with(&format!("tenants/{tenant}/snapshots/"))),
+        "snapshot object key must name its tenant: {snapshot_value}"
     );
     let vm_snapshot_id = Uuid::now_v7();
     repo_for_test

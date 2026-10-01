@@ -73,16 +73,17 @@ debugfs -R 'cat /etc/resolv.conf' .aiec/images/aiec-rootfs.ext4
 ```json
 {"schema":1,"artifact_version":"1.0.0","base":"<base image digest>","profile":"coding",
  "capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],
- "git_version":"<measured>","guest_agent_version":"<Cargo version>","rootfs_sha256":"<sha256>",
+ "git_version":"<measured>","guest_agent_version":"<Cargo version>","guest_protocol_version":2,"rootfs_sha256":"<sha256>",
  "kernel_sha256":"<sha256>|null","built_at":"<RFC3339 UTC>"}
 ```
 
 - `profile: "coding"` marks the image as a coding-capable guest rather than a minimal shell.
 - `capabilities` are stable identifiers, not versions: `sh`, `coreutils`, `git`, `ca-certificates`, `dns`, `https`, `tar`, `gzip`, `curl`, `python3`.
 - `git_version` and `guest_agent_version` are the measured `git --version` output and the `aiec-guest` crate version from the workspace manifest.
+- `guest_protocol_version` is the wire protocol revision the baked agent implements, read from `aiec-core`'s `PROTOCOL_VERSION` by the build. Revision 2 adds the bounded, version-consistent artifact range reads (`ReadFileChunk`) that collection depends on.
 - `rootfs_sha256` covers `aiec-rootfs.ext4` as written by the script; `kernel_sha256` covers the kernel and is `null` when the build had none.
 
-The runtime consumes this file through `aiec-runtime`'s `guest_artifact` module (`load_guest_artifact`/`verify_guest_artifact`): it fails closed when the file is missing, when the rootfs is unreadable, or when the recorded `rootfs_sha256` does not match the image on disk, and it verifies `kernel_sha256` whenever it is present. `profile == "coding"` together with `git` in `capabilities` is what marks the artifact as coding-capable; a stricter deployment can additionally require `ca-certificates`. `schema` and `built_at` are informational.
+The runtime consumes this file through `aiec-runtime`'s `guest_artifact` module (`load_guest_artifact`/`verify_guest_artifact`): it fails closed when the file is missing, when the rootfs is unreadable, when the recorded `rootfs_sha256` does not match the image on disk, when `guest_protocol_version` is absent or is not the revision this runtime speaks, and it verifies `kernel_sha256` whenever it is present. `profile == "coding"` together with `git` in `capabilities` is what marks the artifact as coding-capable; a stricter deployment can additionally require `ca-certificates`. `schema` and `built_at` are informational.
 
 ## Networking
 

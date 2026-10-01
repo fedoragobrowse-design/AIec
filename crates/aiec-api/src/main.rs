@@ -188,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         vm_snapshot: true,
                         memory_resume: true,
                         vsock: true,
+                        minimum_disk_mb: firecracker_config.minimum_disk_mb(),
                         coding_guest: firecracker_config.guest_artifact.as_ref().is_some_and(
                             aiec_runtime::guest_artifact::GuestArtifact::is_coding_guest,
                         ),
@@ -286,6 +287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_hosted_only(hosted_only)
         .with_invites(invite_codes())
         .with_rate_limit(rate_limit());
+    state = state
+        .with_run_secrets(aiec_api::run_secrets::RunSecretResolver::from_env()?)
+        .with_run_queue_limits(aiec_core::run_queue::RunQueueLimits::from_env()?);
     if let Some(limit) = execution_budget_units() {
         state = state.with_execution_budget(limit);
     }

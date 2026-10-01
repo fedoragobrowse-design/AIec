@@ -1,5 +1,6 @@
 //! Placement requests and lease-aware scheduling contracts.
 
+use crate::runtime::RuntimeCapabilities;
 use crate::{Sandbox, TenantId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,12 @@ pub struct ScheduleRequest {
     pub preferred_worker: Option<WorkerId>,
     /// Duration of the worker lease.
     pub lease_ttl: Duration,
+    /// Capabilities required of the actual worker, not only its runtime kind.
+    #[serde(default)]
+    pub required_capabilities: RuntimeCapabilities,
+    /// Owning Run, linked atomically before any slow provisioning begins.
+    #[serde(default)]
+    pub run_id: Option<uuid::Uuid>,
 }
 
 /// Result of successfully acquiring capacity and a lease.
@@ -37,6 +44,14 @@ pub struct ScheduledSandbox {
     pub lease_generation: i64,
 }
 
+/// Dispatch authority read from one active lease and its worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerDispatch {
+    pub endpoint: String,
+    pub lease_id: LeaseId,
+    pub generation: i64,
+}
+
 /// Selects a worker and maintains the correctness boundary for work leases.
 #[async_trait]
 pub trait Scheduler: Send + Sync {
@@ -45,18 +60,12 @@ pub trait Scheduler: Send + Sync {
         &self,
         request: ScheduleRequest,
     ) -> Result<ScheduledSandbox, crate::CoreError>;
-    /// Resolves the current worker endpoint for a sandbox.
-    async fn worker_endpoint(
+    /// Resolves endpoint and fencing identity atomically from an unexpired lease.
+    async fn dispatch_target(
         &self,
         tenant_id: TenantId,
         sandbox_id: SandboxId,
-    ) -> Result<String, crate::CoreError>;
-    /// Returns the current active lease generation for a sandbox.
-    async fn lease_generation(
-        &self,
-        tenant_id: TenantId,
-        sandbox_id: SandboxId,
-    ) -> Result<i64, crate::CoreError>;
+    ) -> Result<WorkerDispatch, crate::CoreError>;
     /// Releases any active lease for a sandbox.
     async fn release(
         &self,
