@@ -113,32 +113,71 @@ fn guard_config(name: &str) -> Result<aiec_guard::policy::GuardConfig, McpError>
     })
 }
 
-/// A read-only Guard policy permitting exactly the named hosts.
+/// A Guard policy permitting exactly the named hosts, and the methods a clone
+/// needs.
 ///
 /// Shared by the run and sandbox tools: both need "these hosts, and nothing
 /// else", and two spellings of that is how a client and a control plane drift.
+///
+/// An explicit document rather than a template, because neither shipped
+/// template can express a governed clone. `read-only-api` refuses a rule
+/// carrying `POST` by design; `model-plus-allowlist` accepts per-rule methods
+/// but demands a model endpoint, and a clone has none.
 pub fn allowlist_guard(hosts: Vec<String>) -> Result<aiec_guard::policy::GuardConfig, McpError> {
-    use aiec_guard::policy::{EgressRule, GuardConfig, PolicyTemplate, Topology};
+    use aiec_guard::policy::{
+        DnsPolicy, EgressRule, GuardConfig, GuardPolicy, NetworkPolicy, PolicyTemplate, Topology,
+    };
+    if hosts.is_empty() {
+        return Err(McpError::invalid(
+            "a Guard allowlist must name at least one host, or leave the network off",
+        ));
+    }
     if hosts.len() > 16 {
         return Err(McpError::invalid(
             "a Guard allowlist may name at most 16 hosts",
         ));
     }
+    // Zones and rules come from one list, so a name can never resolve without a
+    // route behind it or a route exist that never resolves.
+    // Two repositories on one host - a fork and its upstream - must not become
+    // two identical zones, which the policy refuses as a duplicate.
+    let mut zones: Vec<String> = Vec::new();
+    for host in &hosts {
+        if !zones.contains(host) {
+            zones.push(host.clone());
+        }
+    }
+    // The egress rules keep the original order; only the zones are deduplicated.
     Ok(GuardConfig {
         topology: Topology::Inside,
-        policy_template: PolicyTemplate::ReadOnlyApi,
-        policy: None,
+        policy_template: PolicyTemplate::NoNetwork,
+        policy: Some(GuardPolicy {
+            version: 1,
+            network: NetworkPolicy {
+                dns: DnsPolicy {
+                    allowed_zones: zones,
+                    allowed_record_types: vec!["A".into(), "AAAA".into()],
+                },
+                egress: hosts
+                    .into_iter()
+                    .map(|host| EgressRule {
+                        host,
+                        port: 443,
+                        protocol: "tcp".to_string(),
+                        // POST because a clone is a read that uses POST as its
+                        // transport verb; read-only is carried by the host and
+                        // the path, not by the verb.
+                        allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
+                        allowed_paths: Vec::new(),
+                    })
+                    .collect(),
+            },
+            model: None,
+            credentials: Vec::new(),
+            limits: Default::default(),
+        }),
         model_endpoint: None,
-        allowlist: hosts
-            .into_iter()
-            .map(|host| EgressRule {
-                host,
-                port: 443,
-                protocol: "tcp".to_string(),
-                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
-                allowed_paths: Vec::new(),
-            })
-            .collect(),
+        allowlist: Vec::new(),
     })
 }
 

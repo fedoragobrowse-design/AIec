@@ -116,37 +116,75 @@ fn shell_quote(value: &str) -> String {
 /// nothing else. Naming them is a read-only allowlist, which is the honest
 /// version of what the run actually does.
 fn evaluation_resources(spec: &OmpRunSpec) -> ResourceRequirements {
-    let allowlist = [spec.omp_repo.as_str(), spec.target_repo.as_str()]
-        .into_iter()
-        .filter_map(aiec_core::repository_host)
-        .collect::<Vec<_>>();
+    // Two repositories on one host - a fork and its upstream - are one
+    // destination, not two, and Guard refuses a policy that names the same
+    // destination twice.
+    let mut hosts: Vec<String> = Vec::new();
+    for repo in [spec.omp_repo.as_str(), spec.target_repo.as_str()] {
+        if let Some(host) = aiec_core::repository_host(repo)
+            && !hosts.contains(&host)
+        {
+            hosts.push(host);
+        }
+    }
     ResourceRequirements {
         cpu: 2,
         memory_mb: 2048,
         disk_mb: 2048,
         network: NetworkPolicy::Disabled,
-        guard: Some(evaluation_guard(allowlist)),
+        guard: Some(evaluation_guard(hosts)),
     }
 }
 
-/// A read-only Guard policy permitting exactly the named hosts.
+/// A Guard policy permitting exactly the named hosts, and the methods a clone
+/// needs.
+///
+/// Built as an explicit document rather than from a template, because neither
+/// shipped template can express this. `read-only-api` refuses a rule carrying
+/// `POST` by design, which is right for an API and wrong here: `git clone`
+/// fetches its pack with `POST /<repo>/git-upload-pack`. `model-plus-allowlist`
+/// accepts per-rule methods but demands a model endpoint, and an evaluation has
+/// none. The document below is what a governed clone actually is: a hostname,
+/// and the verbs that host needs to serve one.
 fn evaluation_guard(allowlist: Vec<String>) -> aiec_guard::policy::GuardConfig {
-    use aiec_guard::policy::{EgressRule, GuardConfig, PolicyTemplate, Topology};
+    use aiec_guard::policy::{
+        DnsPolicy, EgressRule, GuardConfig, GuardPolicy, NetworkPolicy, PolicyTemplate, Topology,
+    };
+    // Zones come from the same deduplicated list as the rules: a DNS name with
+    // no route behind it widens resolution for no reason, and a route with no
+    // zone never resolves at all.
+    let zones = allowlist.clone();
     GuardConfig {
         topology: Topology::Inside,
-        policy_template: PolicyTemplate::ReadOnlyApi,
-        policy: None,
+        policy_template: PolicyTemplate::NoNetwork,
+        policy: Some(GuardPolicy {
+            version: 1,
+            network: NetworkPolicy {
+                dns: DnsPolicy {
+                    allowed_zones: zones,
+                    allowed_record_types: vec!["A".into(), "AAAA".into()],
+                },
+                egress: allowlist
+                    .into_iter()
+                    .map(|host| EgressRule {
+                        host,
+                        port: 443,
+                        protocol: "tcp".to_string(),
+                        // POST because a clone is a read that uses POST as its
+                        // transport verb. The read-only property is carried by
+                        // the host and the path, not by the verb, which for
+                        // smart HTTP says nothing about mutation.
+                        allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
+                        allowed_paths: Vec::new(),
+                    })
+                    .collect(),
+            },
+            model: None,
+            credentials: Vec::new(),
+            limits: Default::default(),
+        }),
         model_endpoint: None,
-        allowlist: allowlist
-            .into_iter()
-            .map(|host| EgressRule {
-                host,
-                port: 443,
-                protocol: "tcp".to_string(),
-                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
-                allowed_paths: Vec::new(),
-            })
-            .collect(),
+        allowlist: Vec::new(),
     }
 }
 
@@ -561,6 +599,40 @@ mod tests {
             request.target_repo = remote.into();
             assert!(to_run_request(&request).is_err());
         }
+    }
+
+    /// The default resources have to be a policy Guard will actually accept.
+    ///
+    /// This is a regression, not a formality: the first version of this default
+    /// used the `read-only-api` template with `GET`/`HEAD`, which compiles and
+    /// then cannot clone, because `git clone` fetches its pack with
+    /// `POST /<repo>/git-upload-pack`. `effective_policy` is what the API
+    /// validates at admission, so running it here is the same check.
+    #[test]
+    fn the_derived_default_is_a_policy_guard_accepts() {
+        let request = to_run_request(&spec()).expect("a valid spec builds");
+        let guard = request
+            .resources
+            .guard
+            .as_ref()
+            .expect("the default carries a Guard selection");
+        let effective = guard.effective_policy().expect("the policy compiles");
+        assert!(
+            effective
+                .network
+                .egress
+                .iter()
+                .all(|rule| rule.allowed_methods.iter().any(|m| m == "POST")),
+            "a governed clone needs POST, whatever the template says"
+        );
+        // And it reaches exactly the two repositories the run clones.
+        let hosts: Vec<&str> = effective
+            .network
+            .egress
+            .iter()
+            .map(|rule| rule.host.as_str())
+            .collect();
+        assert!(hosts.contains(&"github.com"), "{hosts:?}");
     }
 
     #[test]
