@@ -166,23 +166,12 @@ impl GuardNetworkManager {
             .collect();
         aiec_guard::deployment::validate_operator_test_mode(&boundary, self.local_test_mode)
             .map_err(guard_error)?;
-        // Test exceptions cannot authorize any guarded peer or gateway. Only
-        // isolated benchmark-network mock listeners escape host-address checks.
-        // Deduplicated: `occupied` includes addresses the boundary already
-        // protects, and Guard refuses a boundary that names the same range
-        // twice. Without this the second sandbox on a host can never attach,
-        // because its mock's address is already protected by the operator file.
-        for address in occupied
-            .iter()
-            .copied()
-            .filter(|address| !mock_addresses.contains(&std::net::IpAddr::V4(*address)))
-            .chain([gateway_ip, guest_ip])
-        {
-            let range = ipnet_from_v4(address);
-            if !boundary.protected_cidrs.contains(&range) {
-                boundary.protected_cidrs.push(range);
-            }
-        }
+        protect_attached_addresses(
+            &mut boundary,
+            occupied.iter().copied(),
+            &mock_addresses,
+            [gateway_ip, guest_ip],
+        );
         let compiled = compile(&policy, &boundary).map_err(guard_error)?;
         if sandbox
             .environment
@@ -394,6 +383,33 @@ fn ipnet_from_v4(address: Ipv4Addr) -> ipnet::IpNet {
     ipnet::IpNet::from(std::net::IpAddr::V4(address))
 }
 
+/// Protects every address this attachment depends on, without naming a range
+/// twice.
+///
+/// A test exception can never authorize a guarded peer or the gateway, so each
+/// occupied host address and each end of this attachment's own link is added.
+/// Occupied addresses include the local mocks the boundary already protects, and
+/// Guard refuses a boundary that names the same destination or zone twice - so
+/// without the deduplication the *second* sandbox on a host can never attach,
+/// because the first one's mocks are already protected by the operator file.
+fn protect_attached_addresses(
+    boundary: &mut OperatorBoundary,
+    occupied: impl IntoIterator<Item = Ipv4Addr>,
+    mock_addresses: &HashSet<std::net::IpAddr>,
+    link: [Ipv4Addr; 2],
+) {
+    for address in occupied
+        .into_iter()
+        .filter(|address| !mock_addresses.contains(&std::net::IpAddr::V4(*address)))
+        .chain(link)
+    {
+        let range = ipnet_from_v4(address);
+        if !boundary.protected_cidrs.contains(&range) {
+            boundary.protected_cidrs.push(range);
+        }
+    }
+}
+
 fn addresses(slot: u32) -> (Ipv4Addr, Ipv4Addr) {
     let third = 8 + (slot / 64) as u8;
     let fourth = ((slot % 64) * 4) as u8;
@@ -520,4 +536,70 @@ async fn tool(program: &str, args: &[&str]) -> Result<Vec<u8>, CoreError> {
     })
     .await
     .map_err(|_| CoreError::Unavailable(format!("{program} timed out")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boundary_protecting(address: &str) -> OperatorBoundary {
+        let mut boundary = OperatorBoundary::default();
+        boundary
+            .protected_cidrs
+            .push(address.parse().expect("cidr"));
+        boundary
+    }
+
+    /// The second sandbox on a host used to be unable to attach at all: the
+    /// occupied-address set includes the local mocks, and the boundary already
+    /// protected them, so the range was pushed twice and Guard - correctly -
+    /// refused a document naming the same destination twice.
+    #[test]
+    fn an_address_the_boundary_already_protects_is_not_added_twice() {
+        let mut boundary = boundary_protecting("198.18.0.21/32");
+        let mocks: HashSet<std::net::IpAddr> = ["198.18.0.21", "198.18.0.10"]
+            .iter()
+            .map(|a| a.parse().expect("ip"))
+            .collect();
+        protect_attached_addresses(
+            &mut boundary,
+            [Ipv4Addr::new(198, 18, 0, 21), Ipv4Addr::new(198, 18, 0, 10)],
+            &mocks,
+            [Ipv4Addr::new(172, 30, 8, 1), Ipv4Addr::new(172, 30, 8, 2)],
+        );
+        let protected: Vec<String> = boundary
+            .protected_cidrs
+            .iter()
+            .map(|range| range.to_string())
+            .collect();
+        // The mock is skipped because it is a test destination, the pre-existing
+        // range appears once, and the attachment's own link is added.
+        assert_eq!(
+            protected,
+            vec!["198.18.0.21/32", "172.30.8.1/32", "172.30.8.2/32"],
+            "a protected range must not be named twice: {protected:?}",
+        );
+    }
+
+    /// A non-mock occupied address is protected, and a repeated attachment does
+    /// not grow the list.
+    #[test]
+    fn a_guarded_peer_is_protected_once_however_often_it_appears() {
+        let mocks = HashSet::new();
+        let mut boundary = OperatorBoundary::default();
+        for _ in 0..2 {
+            protect_attached_addresses(
+                &mut boundary,
+                [Ipv4Addr::new(10, 0, 0, 5)],
+                &mocks,
+                [Ipv4Addr::new(172, 30, 9, 1), Ipv4Addr::new(172, 30, 9, 2)],
+            );
+        }
+        assert_eq!(
+            boundary.protected_cidrs.len(),
+            3,
+            "{:?}",
+            boundary.protected_cidrs,
+        );
+    }
 }

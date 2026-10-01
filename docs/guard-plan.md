@@ -134,30 +134,55 @@ does not support.
 
 ### What the run found that the tests did not
 
-Four real defects, all fixed and covered:
+Four real defects, all fixed. Three now have regression tests and one is
+covered by the acceptance run itself - stated per item rather than as a blanket
+claim:
 
 1. **A worker could never admit its first sandbox.** Host headroom is measured
    with `statvfs` on the state directory, which does not exist until something
    creates it; the reading came back empty, which reads as an unmeasurable host
    and refuses every placement. The measurement now walks to the nearest
-   existing ancestor.
+   existing ancestor. *Covered:* `a_path_that_does_not_exist_yet_still_yields_its_filesystem`
+   and `a_worker_can_admit_with_a_state_directory_it_has_not_created_yet`.
 2. **An unavailable backend was reported as an I/O error.** `into_core` collapsed
    every non-`Core` runtime error into `CoreError::Io`, discarding the class a
    caller branches on and burying "Guard refused" under a category that says
-   nothing about who refused.
+   nothing about who refused. *Covered:* the acceptance run, which is how the
+   message was read to the point of the four fixes; there is no unit test
+   asserting the variant survives the conversion.
 3. **A second sandbox could never attach.** The boundary accumulates the
    host's occupied addresses as protected ranges without deduplicating, so the
    second sandbox re-added a range the operator file already protected and Guard
-   refused the duplicate.
+   refused the duplicate. *Covered:*
+   `an_address_the_boundary_already_protects_is_not_added_twice` and
+   `a_guarded_peer_is_protected_once_however_often_it_appears`.
 4. **The local-mock validator could not pass in the namespace it exists for.** It
    compared `/proc/self/ns/net` against `/proc/1/ns/net`, and PID 1's namespace
    link is unreadable from inside a fresh user+network namespace - so it failed
    with a permission error on exactly the configuration it was written to
    permit. The launcher now records the host's namespace inode before unsharing
-   and the validator compares against that.
+   and the validator compares against that. *Covered:* five tests in
+   `crates/aiec-guard/src/deployment.rs` covering both directions of the
+   comparison, the unrecorded case, and a mock address outside the benchmarking
+   range.
 
 Guard's own failure messages were also a bare errno at every layer that could
-refuse; those sites now name the operation, the address, and the reason.
+refuse; those sites now name the operation, the address, and the reason. Finding
+all four above depended on that, and no test asserts the labelling.
+
+### A note on commit `f530393`
+
+That commit's message describes an experiment with configuring the guest's IPv6
+address through a raw `SIOCSIFADDR` ioctl. The experiment was run, did not work
+(`ENODEV` on a synthetic interface, `EINVAL` in the guest once the interface is
+up, because the prefix length belongs in a netlink `RTM_NEWADDR` message rather
+than in the ifreq a socket ioctl takes), and was reverted. The commit itself
+contains one line: it removed the trailing newline from
+`scripts/guard_core_guest_probe.py`. The message is wrong about its own contents.
+It was pushed before the discrepancy was noticed, and force-pushing to correct
+it would be worse than leaving history alone, so the record is corrected here
+instead: the probe now reports `{"configured": false, "reason": "no ip binary
+on the guest"}`, and the image prerequisite is unchanged.
 
 ## What is still not proven
 
