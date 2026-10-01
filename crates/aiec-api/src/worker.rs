@@ -1,6 +1,6 @@
 use aiec_core::*;
 use aiec_core::{
-    runtime::{RuntimeCapabilities, RuntimeHealth, SandboxRuntime},
+    runtime::{FileChunk, FileChunkRequest, RuntimeCapabilities, RuntimeHealth, SandboxRuntime},
     snapshots::{SnapshotCapabilities, SnapshotMetadata, SnapshotProvider, SnapshotRequest},
 };
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
 pub const WORKER_TOKEN_HEADER: &str = "authorization";
@@ -75,6 +75,14 @@ impl ResponseCache {
                 complete: false,
             },
         );
+        // Enrolled as it is claimed, not only once it has a response. The
+        // eviction pass walks this list, so an entry that only appeared here
+        // when it was finished could never be a candidate: a request whose
+        // client disconnected is dropped before it reaches `complete`, and its
+        // entry would sit in the map for the lifetime of the process with
+        // nothing the byte or entry bound could reclaim. `complete` repositions
+        // the id it is given, so claiming one here does not duplicate it.
+        self.insertion_order.push_back(request_id);
         response
     }
 
@@ -114,11 +122,19 @@ impl ResponseCache {
             let Some(candidate) = self.insertion_order.pop_front() else {
                 break;
             };
-            if self
-                .entries
-                .get(&candidate)
-                .is_some_and(|entry| entry.complete)
-            {
+            let Some(entry) = self.entries.get(&candidate) else {
+                continue;
+            };
+            // Finished slots are reclaimable. Empty slots require both an
+            // unlocked mutex and no handler-owned Arc: an active handler may
+            // have obtained the slot but not yet locked it.
+            let abandoned = !entry.complete
+                && Arc::strong_count(&entry.response) == 1
+                && entry
+                    .response
+                    .try_lock()
+                    .is_ok_and(|response| response.is_none());
+            if entry.complete || abandoned {
                 if let Some(evicted) = self.entries.remove(&candidate) {
                     self.encoded_bytes = self.encoded_bytes.saturating_sub(evicted.encoded_size);
                 }
@@ -133,10 +149,24 @@ impl ResponseCache {
         }
     }
 
+    /// Drops an entry and its place in the eviction order together.
+    ///
+    /// Both, because the order list is what the eviction pass walks: an id left
+    /// behind here is a candidate that can never be reclaimed, so an entry
+    /// removed this way would otherwise leak a slot in a list that is supposed
+    /// to be bounded by the same number of entries.
     fn remove(&mut self, request_id: Uuid) {
+        self.insertion_order
+            .retain(|entry_id| *entry_id != request_id);
         if let Some(entry) = self.entries.remove(&request_id) {
             self.encoded_bytes = self.encoded_bytes.saturating_sub(entry.encoded_size);
         }
+    }
+
+    /// Cached entries, for the bound a test asserts.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -250,9 +280,22 @@ impl From<CoreError> for WorkerError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRequest {
     pub request_id: Uuid,
-    #[serde(default)]
+    pub lease_id: Uuid,
     pub lease_generation: i64,
     pub operation: WorkerOperation,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkerChunkRequest {
+    authorization: WorkerRequest,
+    request: FileChunkRequest,
+    /// How many consecutive chunks to serve under the one authorization.
+    #[serde(default = "one_chunk")]
+    chunks: usize,
+}
+
+fn one_chunk() -> usize {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,7 +321,14 @@ pub struct OwnershipRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnershipCheck {
     /// The calling worker holds the active lease at this generation.
-    Owned { generation: i64 },
+    ///
+    /// The lease id travels with the generation on purpose. A renewal keeps the
+    /// same lease while advancing the generation, so generation alone cannot
+    /// tell "the same lease, renewed" from "a different lease, reassigned" -
+    /// and refusing the first is what made artifact reads fail on a machine the
+    /// run still owned, while refusing the second is the whole point of the
+    /// fence.
+    Owned { generation: i64, lease_id: Uuid },
     /// The sandbox is durably owned by someone else, or has no active lease.
     Rejected(String),
 }
@@ -377,6 +427,7 @@ impl OwnershipVerifier for HttpOwnershipVerifier {
                 }
                 Ok(OwnershipCheck::Owned {
                     generation: record.generation,
+                    lease_id: record.lease_id,
                 })
             }
             StatusCode::NOT_FOUND => Ok(OwnershipCheck::Rejected(format!(
@@ -398,6 +449,10 @@ struct LearnedGeneration {
     sandbox_id: Uuid,
     node_id: Uuid,
     generation: i64,
+    /// Absent on ledgers written before this field existed, which is why it is
+    /// optional rather than required: a worker upgrading must still load them.
+    #[serde(default)]
+    lease_id: Option<Uuid>,
 }
 
 /// Durable per-sandbox generation floor, persisted in the worker state dir.
@@ -437,6 +492,14 @@ impl GenerationLedger {
             .map(|record| record.generation)
     }
 
+    /// The lease the learned floor belongs to, when it is known.
+    #[cfg(test)]
+    fn lease(&self, sandbox_id: Uuid) -> Option<Uuid> {
+        self.records
+            .get(&sandbox_id)
+            .and_then(|record| record.lease_id)
+    }
+
     /// Raises the durable generation floor for a sandbox and persists it.
     ///
     /// The floor never moves backwards: a control-plane answer below what this
@@ -447,13 +510,21 @@ impl GenerationLedger {
         sandbox_id: Uuid,
         node_id: Uuid,
         generation: i64,
+        lease_id: Uuid,
     ) -> Result<(), std::io::Error> {
-        if self
-            .records
-            .get(&sandbox_id)
-            .is_some_and(|record| record.generation >= generation)
-        {
-            return Ok(());
+        if let Some(existing) = self.records.get(&sandbox_id) {
+            if existing.generation > generation {
+                return Ok(());
+            }
+            // An entry written before this field existed loads with no lease, and
+            // a sandbox whose floor is already correct would otherwise keep the
+            // old over-strict refusal forever: the renewal that could tell us its
+            // lease arrives at exactly the generation already on record, so an
+            // unconditional `>=` would skip it and the entry would never be
+            // upgraded. Re-learning at the same generation fills the lease in.
+            if existing.generation == generation && existing.lease_id.is_some() {
+                return Ok(());
+            }
         }
         self.records.insert(
             sandbox_id,
@@ -461,6 +532,7 @@ impl GenerationLedger {
                 sandbox_id,
                 node_id,
                 generation,
+                lease_id: Some(lease_id),
             },
         );
         self.persist()
@@ -497,6 +569,8 @@ pub struct WorkerGuestProfile {
     pub capabilities: Vec<String>,
     pub git_version: Option<String>,
     pub guest_agent_version: String,
+    /// Wire revision the baked guest agent implements.
+    pub guest_protocol_version: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -573,21 +647,18 @@ impl WorkerRuntime {
         sandbox: &Sandbox,
         operation: WorkerOperation,
     ) -> Result<WorkerValue, CoreError> {
-        let lease_generation = self
+        let dispatch = self
             .scheduler
-            .lease_generation(sandbox.tenant_id, sandbox.id)
-            .await?;
-        let endpoint = self
-            .scheduler
-            .worker_endpoint(sandbox.tenant_id, sandbox.id)
+            .dispatch_target(sandbox.tenant_id, sandbox.id)
             .await?;
         let response = self
             .client
             .invoke(
-                &endpoint,
+                &dispatch.endpoint,
                 WorkerRequest {
                     request_id: new_id(),
-                    lease_generation,
+                    lease_id: dispatch.lease_id,
+                    lease_generation: dispatch.generation,
                     operation,
                 },
             )
@@ -705,6 +776,61 @@ impl SandboxRuntime for WorkerRuntime {
             WorkerValue::File(result) => Ok(result),
             _ => Err(CoreError::Conflict("invalid worker file response".into())),
         }
+    }
+
+    async fn get_file_chunk(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError> {
+        request.validate()?;
+        let dispatch = self
+            .scheduler
+            .dispatch_target(sandbox.tenant_id, sandbox.id)
+            .await?;
+        let authorization = WorkerRequest {
+            request_id: new_id(),
+            lease_id: dispatch.lease_id,
+            lease_generation: dispatch.generation,
+            operation: WorkerOperation::GetFile {
+                sandbox: sandbox.clone(),
+                path: request.path.clone(),
+            },
+        };
+        let chunk = self
+            .client
+            .get_file_chunk(&dispatch.endpoint, authorization, request.clone())
+            .await?;
+        request.validate_chunk(&chunk)?;
+        Ok(chunk)
+    }
+    /// One dispatch and one authorized worker read for the whole group. This
+    /// is the only runtime that overrides it, because it is the only one whose
+    /// single read costs a network round trip plus two ownership checks.
+    async fn get_file_chunks(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+        count: usize,
+    ) -> Result<Vec<FileChunk>, CoreError> {
+        request.validate()?;
+        let count = count.clamp(1, aiec_core::runtime::FILE_CHUNK_BURST);
+        let dispatch = self
+            .scheduler
+            .dispatch_target(sandbox.tenant_id, sandbox.id)
+            .await?;
+        let authorization = WorkerRequest {
+            request_id: new_id(),
+            lease_id: dispatch.lease_id,
+            lease_generation: dispatch.generation,
+            operation: WorkerOperation::GetFile {
+                sandbox: sandbox.clone(),
+                path: request.path.clone(),
+            },
+        };
+        self.client
+            .get_file_chunks(&dispatch.endpoint, authorization, request, count)
+            .await
     }
 
     async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
@@ -927,6 +1053,31 @@ pub trait WorkerClient: Send + Sync {
         endpoint: &str,
         request: WorkerRequest,
     ) -> Result<WorkerResponse, WorkerClientError>;
+    async fn get_file_chunk(
+        &self,
+        endpoint: &str,
+        authorization: WorkerRequest,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError>;
+    /// Reads a bounded group under one authorization. The default repeats
+    /// single reads, so a client without the group endpoint still works.
+    async fn get_file_chunks(
+        &self,
+        endpoint: &str,
+        authorization: WorkerRequest,
+        request: FileChunkRequest,
+        count: usize,
+    ) -> Result<Vec<FileChunk>, CoreError> {
+        let mut chunks = Vec::new();
+        for index in 0..count {
+            let step = aiec_core::runtime::burst_request(&request, index);
+            chunks.push(
+                self.get_file_chunk(endpoint, authorization.clone(), step)
+                    .await?,
+            );
+        }
+        Ok(chunks)
+    }
 }
 
 #[derive(Clone)]
@@ -966,6 +1117,127 @@ impl HttpWorkerClient {
 
 #[async_trait]
 impl WorkerClient for HttpWorkerClient {
+    async fn get_file_chunk(
+        &self,
+        endpoint: &str,
+        authorization: WorkerRequest,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError> {
+        self.get_file_chunks(endpoint, authorization, request, 1)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Backend("worker returned no chunk".into()))
+    }
+    async fn get_file_chunks(
+        &self,
+        endpoint: &str,
+        authorization: WorkerRequest,
+        request: FileChunkRequest,
+        count: usize,
+    ) -> Result<Vec<FileChunk>, CoreError> {
+        request.validate()?;
+        let count = count.clamp(1, aiec_core::runtime::FILE_CHUNK_BURST);
+        if self.require_https
+            && reqwest::Url::parse(endpoint)
+                .map_err(|error| CoreError::InvalidRequest(error.to_string()))?
+                .scheme()
+                != "https"
+        {
+            return Err(CoreError::Unavailable(
+                "production worker endpoint must use HTTPS".into(),
+            ));
+        }
+        let request_id = authorization.request_id;
+        let mut response = self
+            .client
+            .post(format!("{}/v1/files/chunk", endpoint.trim_end_matches('/')))
+            .bearer_auth(self.token.as_ref())
+            .json(&WorkerChunkRequest {
+                authorization,
+                request: request.clone(),
+                chunks: count,
+            })
+            .send()
+            .await
+            .map_err(|error| CoreError::Unavailable(error.to_string()))?;
+        let binary = response.status().is_success()
+            && response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                == Some("application/octet-stream");
+        if !binary {
+            let body = bounded_worker_body(&mut response, 16 * 1024).await?;
+            let response: WorkerResponse = serde_json::from_slice(&body).map_err(|error| {
+                CoreError::Backend(format!("invalid worker chunk error: {error}"))
+            })?;
+            if response.request_id != request_id {
+                return Err(CoreError::Backend("worker request id mismatch".into()));
+            }
+            return Err(response
+                .result
+                .err()
+                .map(runtime_worker_error)
+                .unwrap_or_else(|| CoreError::Backend("invalid worker chunk response".into())));
+        }
+        let header = |name: &str| -> Result<&str, CoreError> {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| CoreError::Backend(format!("missing worker chunk header {name}")))
+        };
+        if header("x-aiec-request-id")? != request_id.to_string() {
+            return Err(CoreError::Backend("worker request id mismatch".into()));
+        }
+        let size_bytes = header("x-aiec-file-size")?
+            .parse::<u64>()
+            .map_err(|_| CoreError::Backend("invalid worker file size".into()))?;
+        let version = header("x-aiec-file-version")?.to_owned();
+        let eof = header("x-aiec-file-eof")?
+            .parse::<bool>()
+            .map_err(|_| CoreError::Backend("invalid worker eof".into()))?;
+        let frames = header("x-aiec-chunk-count")?
+            .parse::<usize>()
+            .map_err(|_| CoreError::Backend("invalid worker chunk count".into()))?;
+        if frames == 0 || frames > count {
+            return Err(CoreError::Backend("invalid worker chunk count".into()));
+        }
+        // The bound has to cover the frame headers as well as the payload, or a
+        // full group of maximum-size chunks is refused for being 128 bytes
+        // larger than the bytes it carries.
+        let limit = count.saturating_mul(request.length.saturating_add(4));
+        let body = bounded_worker_body(&mut response, limit).await?;
+        let mut chunks = Vec::with_capacity(frames);
+        let mut rest = body.as_ref();
+        for index in 0..frames {
+            if rest.len() < 4 {
+                return Err(CoreError::Backend("truncated worker chunk frame".into()));
+            }
+            let length = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            rest = &rest[4..];
+            if length > request.length || length > rest.len() {
+                return Err(CoreError::Backend("invalid worker chunk frame".into()));
+            }
+            let step = aiec_core::runtime::burst_request(&request, index);
+            let chunk = FileChunk {
+                bytes: bytes::Bytes::copy_from_slice(&rest[..length]),
+                size_bytes,
+                version: version.clone(),
+                // Only the last frame of a group can end the file, and only if
+                // its own offset plus length reaches the recorded size.
+                eof: eof && index + 1 == frames,
+            };
+            step.validate_chunk(&chunk)?;
+            rest = &rest[length..];
+            chunks.push(chunk);
+        }
+        if !rest.is_empty() {
+            return Err(CoreError::Backend("trailing worker chunk bytes".into()));
+        }
+        Ok(chunks)
+    }
     async fn invoke(
         &self,
         endpoint: &str,
@@ -1019,6 +1291,30 @@ impl WorkerClient for HttpWorkerClient {
     }
 }
 
+async fn bounded_worker_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<bytes::Bytes, CoreError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(CoreError::LimitExceeded("worker chunk response".into()));
+    }
+    let mut body = bytes::BytesMut::with_capacity(limit);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| CoreError::Backend(error.to_string()))?
+    {
+        if chunk.len() > limit - body.len() {
+            return Err(CoreError::LimitExceeded("worker chunk response".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
 #[derive(Clone)]
 pub struct WorkerService {
     runtime: Arc<dyn SandboxRuntime>,
@@ -1034,6 +1330,15 @@ pub struct WorkerService {
     cache: Arc<Mutex<ResponseCache>>,
     in_flight: Arc<AtomicUsize>,
     sandboxes: Arc<Mutex<std::collections::HashSet<Uuid>>>,
+    /// One gate per sandbox for the operations that change whether it exists.
+    ///
+    /// Separate from the runtime's own gate on purpose: this one is also where
+    /// a request is re-authorized after it waits, which is a worker concern, and
+    /// it holds for every backend the worker can be given, not only the ones
+    /// that serialize themselves.
+    lifecycle: Arc<aiec_runtime::SandboxLifecycle>,
+    boot_slots: Arc<Semaphore>,
+    snapshot_slots: Arc<Semaphore>,
 }
 
 impl WorkerService {
@@ -1060,6 +1365,9 @@ impl WorkerService {
             cache: Arc::new(Mutex::new(ResponseCache::default())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             sandboxes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            lifecycle: Arc::new(aiec_runtime::SandboxLifecycle::new()),
+            boot_slots: Arc::new(Semaphore::new((capacity as usize).clamp(1, 2))),
+            snapshot_slots: Arc::new(Semaphore::new((capacity as usize).clamp(1, 2))),
         }
     }
 
@@ -1086,7 +1394,15 @@ impl WorkerService {
     #[cfg(test)]
     fn with_generation(self, sandbox_id: Uuid, generation: i64) -> Self {
         let mut ledger = GenerationLedger::in_memory();
-        let _ = ledger.record(sandbox_id, self.node_id, generation);
+        // A different lease from the one `stable_lease_id()` reports: a floor
+        // that outlives a restart exists to stop this worker acting on a lease
+        // that has since been replaced, and "replaced" means a different id.
+        let _ = ledger.record(
+            sandbox_id,
+            self.node_id,
+            generation,
+            Uuid::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef),
+        );
         Self {
             generations: Arc::new(Mutex::new(ledger)),
             ..self
@@ -1105,6 +1421,10 @@ impl WorkerService {
         Router::new()
             .route("/health", get(status))
             .route("/v1/operations", post(operation))
+            .route(
+                "/v1/files/chunk",
+                post(file_chunk).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
+            )
             .layer(axum::extract::DefaultBodyLimit::max(MAX_WORKER_TRANSFER))
             .layer(axum::middleware::from_fn_with_state(state, authenticate))
             .with_state(self)
@@ -1123,12 +1443,12 @@ impl WorkerService {
 
     /// Persists the generation the control plane just confirmed, keeping the
     /// in-memory map as a cache of the durable ledger.
-    async fn learn_generation(&self, sandbox_id: Uuid, generation: i64) {
+    async fn learn_generation(&self, sandbox_id: Uuid, generation: i64, lease_id: Uuid) {
         if let Err(error) =
             self.generations
                 .lock()
                 .await
-                .record(sandbox_id, self.node_id, generation)
+                .record(sandbox_id, self.node_id, generation, lease_id)
         {
             tracing::warn!(
                 %sandbox_id,
@@ -1313,10 +1633,9 @@ fn rejected(request_id: Uuid, code: &str, message: impl Into<String>) -> Respons
 
 /// Fences a worker request against durable ownership before the runtime runs.
 ///
-/// Rejects a sandbox this worker does not own, a request whose generation is
-/// below the durable floor learned from the control plane, and a request whose
-/// generation the control plane has never issued. Verification failures are
-/// retryable: nothing executes until ownership is established.
+/// Rejects foreign or superseded leases and generations the authority has not
+/// issued. Renewals preserve lease identity and may advance after dispatch.
+/// Unavailable ownership verification always fails closed.
 async fn authorize(state: &WorkerService, request: &WorkerRequest) -> Result<(), Box<Response>> {
     let request_id = request.request_id;
     if !operation_belongs_to_worker(&request.operation, state.node_id) {
@@ -1327,34 +1646,108 @@ async fn authorize(state: &WorkerService, request: &WorkerRequest) -> Result<(),
         )));
     }
     let sandbox_id = operation_sandbox_id(&request.operation);
+    // Ownership is asked *before* the floor is judged. `renew_worker_lease`
+    // increments the generation on every renewal, so a renewal that commits
+    // between the control plane reading the generation and dispatching this
+    // operation leaves the dispatched value one behind what this worker has
+    // already served - observed live as `sent=2 learned=3`, refusing artifact
+    // reads on a machine the run still owned. Judging that floor without asking
+    // first meant the benign case was rejected and the real one never ran.
     let learned = state.generations.lock().await.generation(sandbox_id);
-    if learned.is_some_and(|learned| request.lease_generation < learned) {
-        return Err(Box::new(rejected(
-            request_id,
-            "conflict",
-            "stale sandbox lease generation",
-        )));
-    }
-    match state.verify_ownership(sandbox_id).await {
-        Ok(OwnershipCheck::Rejected(message)) => {
-            Err(Box::new(rejected(request_id, "conflict", message)))
-        }
-        Ok(OwnershipCheck::Owned { generation }) => {
-            if request.lease_generation > generation {
+    // When ownership cannot be verified there is nothing to compare a lease id
+    // against, so the local floor has to stand on its own and refuse. That is
+    // the fail-closed case these tests pin: a worker that cannot ask who owns
+    // the sandbox must not act on its own cached belief.
+    let verified = match state.verify_ownership(sandbox_id).await {
+        Ok(verified) => verified,
+        Err(error) => {
+            if learned.is_some_and(|learned| request.lease_generation < learned) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    sent = request.lease_generation,
+                    learned = learned,
+                    "ownership could not be verified and this dispatch is behind the floor; refusing"
+                );
                 return Err(Box::new(rejected(
                     request_id,
                     "conflict",
-                    "sandbox lease generation is ahead of the control plane",
+                    "stale sandbox lease generation",
                 )));
             }
-            state.learn_generation(sandbox_id, generation).await;
+            return Err(Box::new(rejected(
+                request_id,
+                runtime_worker_code(&error),
+                error_message(&error),
+            )));
+        }
+    };
+    match verified {
+        OwnershipCheck::Rejected(message) => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                sent = request.lease_generation,
+                %message,
+                "the control plane refused ownership for this sandbox"
+            );
+            Err(Box::new(rejected(request_id, "conflict", message)))
+        }
+        OwnershipCheck::Owned {
+            generation,
+            lease_id,
+        } => {
+            // Compare the dispatched identity, not the learned identity: an old
+            // dispatch may arrive after recovery placed a new lease on this
+            // same worker and the ledger has already learned the replacement.
+            if request.lease_id != lease_id || learned.is_some_and(|floor| generation < floor) {
+                tracing::warn!(
+                    %sandbox_id,
+                    sent_lease = %request.lease_id,
+                    current_lease = %lease_id,
+                    sent = request.lease_generation,
+                    verified = generation,
+                    "worker refused a superseded lease or regressed ownership generation"
+                );
+                return Err(Box::new(rejected(
+                    request_id,
+                    "conflict",
+                    "stale sandbox lease generation",
+                )));
+            }
+            if generation < request.lease_generation {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    sent = request.lease_generation,
+                    verified = generation,
+                    "the control plane is behind the dispatched generation; this worker may be acting on a stale lease"
+                );
+                return Err(Box::new(rejected(
+                    request_id,
+                    "conflict",
+                    "sandbox lease generation does not match the control plane",
+                )));
+            }
+            if generation > request.lease_generation {
+                tracing::debug!(
+                    sandbox_id = %sandbox_id,
+                    sent = request.lease_generation,
+                    verified = generation,
+                    "lease was renewed between dispatch and authorization; adopting the newer generation"
+                );
+            }
+            // Debug, not warn: this runs on every authorized operation, and it is
+            // the evidence that the durable floor actually moved - without it,
+            // a floor that never advances and a floor that advances twice look
+            // identical from the outside.
+            tracing::debug!(
+                sandbox_id = %sandbox_id,
+                generation,
+                "authorized; advancing this worker's generation floor"
+            );
+            state
+                .learn_generation(sandbox_id, generation, lease_id)
+                .await;
             Ok(())
         }
-        Err(error) => Err(Box::new(rejected(
-            request_id,
-            runtime_worker_code(&error),
-            error_message(&error),
-        ))),
     }
 }
 
@@ -1383,6 +1776,151 @@ fn error_message(error: &CoreError) -> String {
     }
 }
 
+/// The sandbox whose lifecycle an operation changes, if it changes one.
+///
+/// Exec and the file operations are deliberately absent. They act on a running
+/// sandbox's contents rather than on whether that sandbox exists, and queueing
+/// them would make a destroy wait for the command it exists to interrupt.
+fn lifecycle_sandbox(operation: &WorkerOperation) -> Option<Uuid> {
+    match operation {
+        WorkerOperation::Create { sandbox }
+        | WorkerOperation::Start { sandbox }
+        | WorkerOperation::Stop { sandbox }
+        | WorkerOperation::Pause { sandbox }
+        | WorkerOperation::Resume { sandbox }
+        | WorkerOperation::Destroy { sandbox }
+        | WorkerOperation::Snapshot { sandbox, .. }
+        | WorkerOperation::Restore { sandbox, .. } => Some(sandbox.id),
+        WorkerOperation::Exec { .. }
+        | WorkerOperation::PutFile { .. }
+        | WorkerOperation::GetFile { .. }
+        | WorkerOperation::ListFiles { .. }
+        | WorkerOperation::DeleteFile { .. }
+        | WorkerOperation::MakeDirectory { .. }
+        | WorkerOperation::ImportWorkspaceArchive { .. } => None,
+    }
+}
+
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn file_chunk(
+    State(state): State<WorkerService>,
+    Json(request): Json<WorkerChunkRequest>,
+) -> Response {
+    let authorization = &request.authorization;
+    let WorkerOperation::GetFile { sandbox, path } = &authorization.operation else {
+        return rejected(
+            authorization.request_id,
+            "invalid_request",
+            "file authorization required",
+        );
+    };
+    if path != &request.request.path {
+        return rejected(
+            authorization.request_id,
+            "invalid_request",
+            "chunk path mismatch",
+        );
+    }
+    if let Err(error) = request.request.validate() {
+        let error = WorkerError::from_runtime(error);
+        return rejected(authorization.request_id, &error.code, error.message);
+    }
+    if let Err(response) = authorize(&state, authorization).await {
+        return *response;
+    }
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _in_flight = InFlight(&state.in_flight);
+    // The whole group is read between the two checks and buffered, so a lease
+    // replaced while it is being read still stops the bytes before any of them
+    // is written. Grouping removes the per-chunk round trip; it does not
+    // remove the check that gates publication.
+    let read = state
+        .runtime
+        .get_file_chunks(sandbox, request.request.clone(), request.chunks)
+        .await;
+    // A lease replacement during the read must never publish bytes.
+    if let Err(response) = authorize(&state, authorization).await {
+        return *response;
+    }
+    let chunks = match read {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            let error = WorkerError::from_runtime(error);
+            return rejected(authorization.request_id, &error.code, error.message);
+        }
+    };
+    if chunks.is_empty() || chunks.len() > request.chunks {
+        return rejected(
+            authorization.request_id,
+            "internal",
+            "invalid worker chunk group",
+        );
+    }
+    // The group describes one file, so its shared metadata has to be true
+    // before a single frame is encoded. The response carries one version and
+    // one size for the whole group and the client stamps them onto every
+    // chunk it reconstructs, so a group whose chunks disagree - from a
+    // runtime that serves its own group, or from a file replaced between two
+    // reads - would be published as one consistent artifact under a checksum
+    // that authenticates the splice. Each chunk is validated against its own
+    // request, and every chunk against the first one's version and size.
+    let first = &chunks[0];
+    for (index, chunk) in chunks.iter().enumerate() {
+        let step = aiec_core::runtime::burst_request(&request.request, index);
+        if chunk.size_bytes != first.size_bytes || chunk.version != first.version {
+            return rejected(
+                authorization.request_id,
+                "conflict",
+                "file changed during chunk group",
+            );
+        }
+        if let Err(error) = step.validate_chunk(chunk) {
+            let error = WorkerError::from_runtime(error);
+            return rejected(authorization.request_id, &error.code, error.message);
+        }
+    }
+    let mut body = Vec::with_capacity(chunks.iter().map(|c| c.bytes.len() + 4).sum());
+    for chunk in &chunks {
+        body.extend_from_slice(&(chunk.bytes.len() as u32).to_le_bytes());
+        body.extend_from_slice(&chunk.bytes);
+    }
+    let last = chunks.last().expect("checked non-empty above");
+    let mut response = axum::body::Body::from(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    for (name, value) in [
+        ("x-aiec-request-id", authorization.request_id.to_string()),
+        ("x-aiec-file-size", first.size_bytes.to_string()),
+        ("x-aiec-file-version", first.version.clone()),
+        ("x-aiec-file-eof", last.eof.to_string()),
+        ("x-aiec-chunk-count", chunks.len().to_string()),
+    ] {
+        match axum::http::HeaderValue::from_str(&value) {
+            Ok(value) => {
+                headers.insert(name, value);
+            }
+            Err(_) => {
+                return rejected(
+                    authorization.request_id,
+                    "internal",
+                    "invalid chunk metadata",
+                );
+            }
+        }
+    }
+    response
+}
+
 async fn operation(
     State(state): State<WorkerService>,
     Json(request): Json<WorkerRequest>,
@@ -1393,19 +1931,80 @@ async fn operation(
     if let Some(response) = state.cache.lock().await.get(request.request_id) {
         return (StatusCode::OK, Json(response)).into_response();
     }
+    let slots = match &request.operation {
+        WorkerOperation::Create { .. }
+        | WorkerOperation::Start { .. }
+        | WorkerOperation::Resume { .. }
+        | WorkerOperation::Restore { .. } => Some(&state.boot_slots),
+        WorkerOperation::Snapshot { .. } | WorkerOperation::ImportWorkspaceArchive { .. } => {
+            Some(&state.snapshot_slots)
+        }
+        _ => None,
+    };
+    let _permit = match slots {
+        Some(slots) => match slots.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return rejected(
+                    request.request_id,
+                    "runtime_unavailable",
+                    "worker heavy-operation capacity exhausted",
+                );
+            }
+        },
+        None => None,
+    };
+    // One lifecycle operation per sandbox at a time. Without this a destroy
+    // and a create for the same sandbox run together, and the answer each gets
+    // is wrong: the destroy reports a machine that is gone while the create is
+    // still copying into the directory it removed, and the create's copy is
+    // what survives. The response cache above only collapses one request id;
+    // these are two different ones.
+    //
+    // Both this and the re-authorization below run before this request claims a
+    // response slot. A refusal at either of them is final for this attempt and
+    // has no response to store, so it must not leave a cache entry behind: an
+    // entry with no response is one the eviction pass will not reclaim, and a
+    // caller that keeps sending superseded generations would otherwise grow the
+    // cache for the lifetime of the process.
+    // Counted from here rather than from just before the runtime runs: a
+    // request queued behind another request for the same sandbox is work this
+    // worker has accepted and not finished, and `/health` should say so.
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _in_flight = InFlight(&state.in_flight);
+    let lifecycle = match lifecycle_sandbox(&request.operation) {
+        Some(sandbox_id) => match state.lifecycle.clone().enter(sandbox_id).await {
+            Ok(guard) => Some(guard),
+            Err(busy) => {
+                return rejected(request.request_id, "runtime_unavailable", busy.to_string());
+            }
+        },
+        None => None,
+    };
+    // Ownership was established before the wait, and a wait is a window in
+    // which the control plane can move the sandbox to another worker or fence
+    // this request's generation. It is established again here, so what runs is
+    // authorized as of the moment it runs rather than as of the moment it
+    // arrived. The guard is held until this handler returns its response, which
+    // is what keeps a destroy behind a create that is still materializing.
+    if lifecycle.is_some()
+        && let Err(response) = authorize(&state, &request).await
+    {
+        return *response;
+    }
     let response_slot = state.cache.lock().await.entry(request.request_id);
     let mut response_slot = response_slot.lock().await;
     if let Some(response) = response_slot.clone() {
+        // A concurrent duplicate of this request id already ran it. Counted
+        // above, so it is released here.
         return (StatusCode::OK, Json(response)).into_response();
     }
-    state.in_flight.fetch_add(1, Ordering::Relaxed);
     let sandbox_event = match &request.operation {
         WorkerOperation::Create { sandbox } => Some((sandbox.id, true)),
         WorkerOperation::Destroy { sandbox } => Some((sandbox.id, false)),
         _ => None,
     };
     let result = state.execute(request.operation).await;
-    state.in_flight.fetch_sub(1, Ordering::Relaxed);
     if result.is_ok()
         && let Some((sandbox_id, create)) = sandbox_event
     {
@@ -1482,7 +2081,9 @@ fn leaked_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aiec_core::runtime::FILE_CHUNK_BYTES;
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
     use tower::util::ServiceExt;
 
     fn sandbox(node_id: Option<Uuid>) -> Sandbox {
@@ -1543,6 +2144,13 @@ mod tests {
                     path: path.into(),
                     content_base64: String::new(),
                 })
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: FileChunkRequest,
+            ) -> Result<FileChunk, CoreError> {
+                Err(CoreError::Backend("unused".into()))
             }
             async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
                 Ok(Vec::new())
@@ -1677,6 +2285,13 @@ mod tests {
             async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
                 Err(CoreError::Backend("unexpected".into()))
             }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: FileChunkRequest,
+            ) -> Result<FileChunk, CoreError> {
+                Err(CoreError::Backend("unexpected".into()))
+            }
             async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
                 Err(CoreError::Backend("unexpected".into()))
             }
@@ -1730,6 +2345,7 @@ mod tests {
                     .body(axum::body::Body::from(
                         serde_json::to_string(&WorkerRequest {
                             request_id: Uuid::now_v7(),
+                            lease_id: stable_lease_id(),
                             lease_generation: 1,
                             operation: WorkerOperation::Stop {
                                 sandbox: sandbox(Some(Uuid::now_v7())),
@@ -1777,6 +2393,13 @@ mod tests {
                 Err(CoreError::Backend("unexpected".into()))
             }
             async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+                Err(CoreError::Backend("unexpected".into()))
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: FileChunkRequest,
+            ) -> Result<FileChunk, CoreError> {
                 Err(CoreError::Backend("unexpected".into()))
             }
             async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
@@ -1834,6 +2457,7 @@ mod tests {
                     .body(axum::body::Body::from(
                         serde_json::to_string(&WorkerRequest {
                             request_id: Uuid::now_v7(),
+                            lease_id: stable_lease_id(),
                             lease_generation: 1,
                             operation: WorkerOperation::Stop { sandbox },
                         })
@@ -1879,6 +2503,13 @@ mod tests {
             Err(CoreError::Backend("runtime must not run".into()))
         }
         async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("runtime must not run".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
             Err(CoreError::Backend("runtime must not run".into()))
         }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
@@ -1948,6 +2579,22 @@ mod tests {
                 content_base64: String::new(),
             })
         }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            request: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            self.execs.fetch_add(1, Ordering::Relaxed);
+            request.validate()?;
+            let chunk = FileChunk {
+                bytes: bytes::Bytes::from_static(b"chunk"),
+                size_bytes: 5,
+                version: "fixture".into(),
+                eof: true,
+            };
+            request.validate_chunk(&chunk)?;
+            Ok(chunk)
+        }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
             Ok(Vec::new())
         }
@@ -1975,8 +2622,18 @@ mod tests {
         }
     }
 
+    /// One lease id for every "same lease" case in these tests, so the
+    /// difference under test is the generation and not the lease.
+    fn stable_lease_id() -> Uuid {
+        Uuid::from_u128(0x5eed_5eed_5eed_5eed_5eed_5eed_5eed_5eed)
+    }
+
     enum FakeOwnership {
+        /// `Owned(generation)` uses a stable lease id, so two calls model the
+        /// same lease renewed. `Reassigned(generation)` models a different
+        /// lease issued for the same sandbox, which must be refused.
         Owned(i64),
+        Reassigned(i64),
         Rejected(&'static str),
         Unavailable,
     }
@@ -1989,7 +2646,14 @@ mod tests {
     impl OwnershipVerifier for FakeOwnershipVerifier {
         async fn verify(&self, _: Uuid) -> Result<OwnershipCheck, CoreError> {
             match self.answer {
-                FakeOwnership::Owned(generation) => Ok(OwnershipCheck::Owned { generation }),
+                FakeOwnership::Owned(generation) => Ok(OwnershipCheck::Owned {
+                    generation,
+                    lease_id: stable_lease_id(),
+                }),
+                FakeOwnership::Reassigned(generation) => Ok(OwnershipCheck::Owned {
+                    generation,
+                    lease_id: Uuid::now_v7(),
+                }),
                 FakeOwnership::Rejected(message) => Ok(OwnershipCheck::Rejected(message.into())),
                 FakeOwnership::Unavailable => {
                     Err(CoreError::Unavailable("control plane unreachable".into()))
@@ -2001,6 +2665,7 @@ mod tests {
     fn exec_request(generation: i64, target: &Sandbox) -> WorkerRequest {
         WorkerRequest {
             request_id: Uuid::now_v7(),
+            lease_id: stable_lease_id(),
             lease_generation: generation,
             operation: WorkerOperation::Exec {
                 sandbox: target.clone(),
@@ -2038,6 +2703,469 @@ mod tests {
         .unwrap()
     }
 
+    struct ChunkOwnership {
+        runtime_reads: Arc<AtomicUsize>,
+        revoke_after_read: bool,
+    }
+    #[async_trait]
+    impl OwnershipVerifier for ChunkOwnership {
+        async fn verify(&self, _: Uuid) -> Result<OwnershipCheck, CoreError> {
+            if self.revoke_after_read && self.runtime_reads.load(Ordering::SeqCst) > 0 {
+                Ok(OwnershipCheck::Rejected(
+                    "lease replaced during file read".into(),
+                ))
+            } else {
+                Ok(OwnershipCheck::Owned {
+                    generation: 2,
+                    lease_id: stable_lease_id(),
+                })
+            }
+        }
+    }
+    /// Revokes once the runtime has produced `revoke_after` reads, so the
+    /// revocation lands between two chunks of one group rather than at its
+    /// edges.
+    struct GroupOwnership {
+        runtime_reads: Arc<AtomicUsize>,
+        revoke_after: usize,
+    }
+    #[async_trait]
+    impl OwnershipVerifier for GroupOwnership {
+        async fn verify(&self, _: Uuid) -> Result<OwnershipCheck, CoreError> {
+            if self.runtime_reads.load(Ordering::SeqCst) >= self.revoke_after {
+                Ok(OwnershipCheck::Rejected(
+                    "lease replaced during file read".into(),
+                ))
+            } else {
+                Ok(OwnershipCheck::Owned {
+                    generation: 2,
+                    lease_id: stable_lease_id(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_chunks_are_refenced_after_read_without_caching_bytes() {
+        for revoke_after_read in [false, true] {
+            let owner = Uuid::now_v7();
+            let target = sandbox(Some(owner));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let service = WorkerService::new(
+                Arc::new(CountingRuntime {
+                    execs: reads.clone(),
+                }),
+                RuntimeKind::Firecracker,
+                RuntimeCapabilities::default(),
+                None,
+                "token",
+                owner,
+                1,
+            )
+            .with_ownership_verifier(Arc::new(ChunkOwnership {
+                runtime_reads: reads.clone(),
+                revoke_after_read,
+            }));
+            let request = WorkerChunkRequest {
+                authorization: WorkerRequest {
+                    request_id: Uuid::now_v7(),
+                    lease_id: stable_lease_id(),
+                    lease_generation: 1,
+                    operation: WorkerOperation::GetFile {
+                        sandbox: target,
+                        path: "/workspace/file".into(),
+                    },
+                },
+                request: FileChunkRequest {
+                    path: "/workspace/file".into(),
+                    offset: 0,
+                    length: FILE_CHUNK_BYTES,
+                    expected_version: None,
+                },
+                chunks: 1,
+            };
+            let response = service
+                .clone()
+                .router()
+                .oneshot(
+                    axum::http::Request::post("/v1/files/chunk")
+                        .header("authorization", "Bearer token")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::to_vec(&request).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+            assert_eq!(service.cache.lock().await.len(), 0);
+            if revoke_after_read {
+                let response: WorkerResponse = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(response.result.unwrap_err().code, "conflict");
+            } else {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/octet-stream"
+                );
+                assert_eq!(response.headers()["x-aiec-file-size"], "5");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 64)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    b"\x05\x00\x00\x00chunk"
+                );
+            }
+        }
+    }
+    /// A group is read between the two authorization checks, so the trailing
+    /// one is what publishes. This is the case a group makes possible that a
+    /// single chunk could not: a lease replaced *between* the chunks of one
+    /// request must still stop every byte of it.
+    #[tokio::test]
+    async fn a_chunk_group_is_published_only_if_the_lease_survived_the_whole_read() {
+        for revoke_mid_group in [false, true] {
+            let owner = Uuid::now_v7();
+            let target = sandbox(Some(owner));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let service = WorkerService::new(
+                Arc::new(GroupRuntime {
+                    reads: reads.clone(),
+                }),
+                RuntimeKind::Firecracker,
+                RuntimeCapabilities::default(),
+                None,
+                "token",
+                owner,
+                1,
+            )
+            .with_ownership_verifier(Arc::new(GroupOwnership {
+                runtime_reads: reads.clone(),
+                revoke_after: if revoke_mid_group { 1 } else { usize::MAX },
+            }));
+            let request = WorkerChunkRequest {
+                authorization: WorkerRequest {
+                    request_id: Uuid::now_v7(),
+                    lease_id: stable_lease_id(),
+                    lease_generation: 1,
+                    operation: WorkerOperation::GetFile {
+                        sandbox: target,
+                        path: "/workspace/file".into(),
+                    },
+                },
+                request: FileChunkRequest {
+                    path: "/workspace/file".into(),
+                    offset: 0,
+                    length: FILE_CHUNK_BYTES,
+                    expected_version: None,
+                },
+                chunks: 8,
+            };
+            let response = service
+                .router()
+                .oneshot(
+                    axum::http::Request::post("/v1/files/chunk")
+                        .header("authorization", "Bearer token")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::to_vec(&request).unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if revoke_mid_group {
+                let body: WorkerResponse = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body.result.unwrap_err().code, "conflict");
+            } else {
+                assert_eq!(response.headers()["x-aiec-chunk-count"], "3");
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                // three length-prefixed frames of 64 KiB each
+                assert_eq!(body.len(), 3 * (4 + FILE_CHUNK_BYTES));
+            }
+        }
+    }
+    /// Serves a file of exactly three chunks and counts its reads, so a group
+    /// request really does read more than once and a revocation can land
+    /// between two of them.
+    struct GroupRuntime {
+        reads: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl SandboxRuntime for GroupRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            request: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let size = (FILE_CHUNK_BYTES * 3) as u64;
+            let remaining = (size - request.offset).min(request.length as u64) as usize;
+            let chunk = FileChunk {
+                bytes: bytes::Bytes::from(vec![b'x'; remaining]),
+                size_bytes: size,
+                version: "group".into(),
+                eof: request.offset + remaining as u64 == size,
+            };
+            request.validate_chunk(&chunk)?;
+            Ok(chunk)
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_chunk_client_bounds_body_without_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/v1/files/chunk",
+            post(|Json(request): Json<WorkerChunkRequest>| async move {
+                // One frame of 6 bytes for a request that asked for 5: the
+                // client must bound the body, not trust the length in a frame.
+                let mut body = Vec::new();
+                body.extend_from_slice(&6u32.to_le_bytes());
+                body.extend_from_slice(b"123456");
+                let stream =
+                    futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(body))]);
+                (
+                    [
+                        ("content-type", "application/octet-stream".to_owned()),
+                        (
+                            "x-aiec-request-id",
+                            request.authorization.request_id.to_string(),
+                        ),
+                        ("x-aiec-file-size", "5".to_owned()),
+                        ("x-aiec-file-version", "fixture".to_owned()),
+                        ("x-aiec-file-eof", "true".to_owned()),
+                        ("x-aiec-chunk-count", "1".to_owned()),
+                    ],
+                    axum::body::Body::from_stream(stream),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let target = sandbox(Some(Uuid::now_v7()));
+        let authorization = WorkerRequest {
+            request_id: Uuid::now_v7(),
+            lease_id: stable_lease_id(),
+            lease_generation: 1,
+            operation: WorkerOperation::GetFile {
+                sandbox: target,
+                path: "/workspace/file".into(),
+            },
+        };
+        let result = HttpWorkerClient::new("token")
+            .unwrap()
+            .get_file_chunk(
+                &endpoint,
+                authorization,
+                FileChunkRequest {
+                    path: "/workspace/file".into(),
+                    offset: 0,
+                    length: 5,
+                    expected_version: None,
+                },
+            )
+            .await;
+        server.abort();
+        assert!(matches!(result, Err(CoreError::LimitExceeded(_))));
+    }
+    /// A full group of maximum-size chunks is the bound plus its frame headers.
+    /// Getting that wrong refuses the largest legitimate artifact, and it was
+    /// wrong once: the bound counted payload bytes only, so every 16 MiB
+    /// artifact failed collection with "limit exceeded".
+    #[tokio::test]
+    async fn a_full_group_of_maximum_chunks_is_not_refused_as_oversize() {
+        let count = aiec_core::runtime::FILE_CHUNK_BURST;
+        let size = (FILE_CHUNK_BYTES * count) as u64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let file_size = size.to_string();
+        let frame_count = count;
+        let app = Router::new().route(
+            "/v1/files/chunk",
+            post(move |Json(request): Json<WorkerChunkRequest>| async move {
+                let (count, size) = (frame_count, file_size.clone());
+                let mut body = Vec::with_capacity(count * (FILE_CHUNK_BYTES + 4));
+                for _ in 0..request.chunks {
+                    body.extend_from_slice(&(FILE_CHUNK_BYTES as u32).to_le_bytes());
+                    body.extend_from_slice(&[b'x'; FILE_CHUNK_BYTES]);
+                }
+                (
+                    [
+                        ("content-type", "application/octet-stream".to_owned()),
+                        (
+                            "x-aiec-request-id",
+                            request.authorization.request_id.to_string(),
+                        ),
+                        ("x-aiec-file-size", size),
+                        ("x-aiec-file-version", "fixture".to_owned()),
+                        ("x-aiec-file-eof", "true".to_owned()),
+                        ("x-aiec-chunk-count", count.to_string()),
+                    ],
+                    axum::body::Body::from(body),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let target = sandbox(Some(Uuid::now_v7()));
+        let authorization = WorkerRequest {
+            request_id: Uuid::now_v7(),
+            lease_id: stable_lease_id(),
+            lease_generation: 1,
+            operation: WorkerOperation::GetFile {
+                sandbox: target,
+                path: "/workspace/file".into(),
+            },
+        };
+        let result = HttpWorkerClient::new("token")
+            .unwrap()
+            .get_file_chunks(
+                &endpoint,
+                authorization,
+                FileChunkRequest {
+                    path: "/workspace/file".into(),
+                    offset: 0,
+                    length: FILE_CHUNK_BYTES,
+                    expected_version: None,
+                },
+                count,
+            )
+            .await;
+        server.abort();
+        let chunks = result.expect("a full group must not be refused for its size");
+        assert_eq!(chunks.len(), count);
+        assert_eq!(
+            chunks.iter().map(|c| c.bytes.len()).sum::<usize>(),
+            size as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_chunk_superseded_lease_never_reaches_runtime() {
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: reads.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Reassigned(2),
+        }));
+        let request = WorkerChunkRequest {
+            authorization: WorkerRequest {
+                request_id: Uuid::now_v7(),
+                lease_id: stable_lease_id(),
+                lease_generation: 1,
+                operation: WorkerOperation::GetFile {
+                    sandbox: target,
+                    path: "/workspace/file".into(),
+                },
+            },
+            request: FileChunkRequest {
+                path: "/workspace/file".into(),
+                offset: 0,
+                length: FILE_CHUNK_BYTES,
+                expected_version: None,
+            },
+            chunks: 1,
+        };
+        let response = service
+            .router()
+            .oneshot(
+                axum::http::Request::post("/v1/files/chunk")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&request).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response: WorkerResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.result.unwrap_err().code, "conflict");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn worker_service_rejects_unowned_sandbox_before_runtime_call() {
         let owner = Uuid::now_v7();
@@ -2054,6 +3182,7 @@ mod tests {
             service,
             WorkerRequest {
                 request_id: Uuid::now_v7(),
+                lease_id: stable_lease_id(),
                 lease_generation: 1,
                 operation: WorkerOperation::Stop {
                     sandbox: sandbox(None),
@@ -2158,6 +3287,46 @@ mod tests {
         assert_eq!(execs.load(Ordering::Relaxed), 0);
     }
 
+    /// A lease renewed between dispatch and authorization is still ours.
+    ///
+    /// `renew_worker_lease` increments the generation on every renewal, so the
+    /// control plane can read generation N, have a renewal commit, and then
+    /// answer an ownership check with N+1. The worker is not behind and the lease
+    /// was not reassigned - the fence simply compared two reads of a counter
+    /// that legitimately moves. Observed on a live artifact read as
+    /// `sent=1 verified=2`, then `sent=2 verified=3`, refusing work on a machine
+    /// the run still owned.
+    ///
+    /// Ownership is what makes this safe to accept: `verify_ownership` only
+    /// answers `Owned` once it has confirmed *this* worker holds the sandbox, so
+    /// a reassignment arrives as a rejection rather than as a higher number.
+    #[tokio::test]
+    async fn worker_service_accepts_a_lease_renewed_after_it_was_dispatched() {
+        let owner = Uuid::now_v7();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(2),
+        }));
+        // Dispatched against generation 1; the lease renewed to 2 in flight.
+        let value = post_operation(service, exec_request(1, &sandbox(Some(owner)))).await;
+        assert!(
+            value["result"]["Ok"].is_object(),
+            "a renewed lease must not be refused: {value}"
+        );
+        assert_eq!(execs.load(Ordering::Relaxed), 1, "the command must run");
+    }
+
     #[tokio::test]
     async fn worker_service_keeps_learned_generation_across_restart() {
         let state_dir = std::env::temp_dir().join(format!("aiec-worker-fence-{}", Uuid::now_v7()));
@@ -2200,8 +3369,13 @@ mod tests {
             1,
         )
         .with_state_dir(&state_dir)
+        // `Reassigned`, not `Owned`: the comment above says the sandbox moved to
+        // another worker, and that is a *different lease*, not the same lease at
+        // a higher generation. A renewal keeps its lease id and is legitimate;
+        // only a changed lease must be refused, and the distinction is the point
+        // of carrying the id at all.
         .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
-            answer: FakeOwnership::Owned(9),
+            answer: FakeOwnership::Reassigned(9),
         }));
         let stale = post_operation(restarted, exec_request(5, &target)).await;
         assert_eq!(stale["result"]["Err"]["code"], "conflict");
@@ -2211,6 +3385,127 @@ mod tests {
         );
         assert_eq!(execs.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(&state_dir).unwrap();
+    }
+
+    /// A floor written before this worker knew about lease ids must not be stuck.
+    ///
+    /// Those records load from `lease-generations.json` with no lease, so a
+    /// below-floor dispatch would find nothing to compare against and be refused
+    /// forever - the old behaviour, persisting across restarts. The renewal that
+    /// carries the lease arrives at exactly the generation already recorded, so
+    /// an unconditional "generation >= recorded, skip" would leave it stale
+    /// indefinitely.
+    #[test]
+    fn a_legacy_floor_entry_is_upgraded_when_its_lease_is_relearned() {
+        let dir = std::env::temp_dir().join(format!("aiec-legacy-floor-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("state dir");
+        let sandbox_id = Uuid::now_v7();
+        let node_id = Uuid::now_v7();
+        let lease_id = Uuid::now_v7();
+        // Exactly what an older worker wrote: no lease field at all.
+        std::fs::write(
+            dir.join(GenerationLedger::FILE_NAME),
+            serde_json::to_vec(&[serde_json::json!({
+                "sandbox_id": sandbox_id,
+                "node_id": node_id,
+                "generation": 4,
+            })])
+            .expect("encode"),
+        )
+        .expect("write legacy ledger");
+
+        let mut ledger = GenerationLedger::load(&dir, node_id);
+        assert_eq!(ledger.generation(sandbox_id), Some(4), "legacy entry loads");
+        assert_eq!(
+            ledger.lease(sandbox_id),
+            None,
+            "a legacy entry has no lease to compare"
+        );
+        // Re-learning at the same generation fills the lease in.
+        ledger
+            .record(sandbox_id, node_id, 4, lease_id)
+            .expect("record");
+        assert_eq!(
+            ledger.lease(sandbox_id),
+            Some(lease_id),
+            "the legacy entry must be upgraded, not skipped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the distinction: a dispatch behind this worker's floor
+    /// on the *same* lease is a renewal, and must be allowed.
+    ///
+    /// `renew_worker_lease` increments the generation on every renewal, so a
+    /// renewal that commits between the control plane reading the generation and
+    /// dispatching the operation leaves the dispatched value behind what the
+    /// worker already served. Refusing that - which the bare floor did - is what
+    /// made artifact reads fail on a machine the run still owned.
+    #[tokio::test]
+    async fn worker_service_accepts_a_dispatch_behind_its_floor_on_the_same_lease() {
+        let owner = Uuid::now_v7();
+        let execs = Arc::new(AtomicUsize::new(0));
+        // One service for both calls, so the second genuinely runs against a
+        // floor the first one installed. Two services would each start with an
+        // empty ledger and the test would pass whether or not the floor exists.
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(9),
+        }));
+        // The same sandbox both times: `sandbox()` mints a fresh id per call, so
+        // two calls would land on different sandboxes and never consult the floor
+        // this test exists to exercise.
+        let target = sandbox(Some(owner));
+        // A first call teaches this worker generation 9 on the stable lease...
+        let first = post_operation(service.clone(), exec_request(9, &target)).await;
+        assert!(first["result"]["Ok"].is_object(), "first call: {first}");
+        // ...and a later dispatch carrying 7, on that same lease, is a renewal.
+        let behind = post_operation(service, exec_request(7, &target)).await;
+        assert!(
+            behind["result"]["Ok"].is_object(),
+            "a renewal behind the floor must be accepted: {behind}"
+        );
+        assert_eq!(execs.load(Ordering::Relaxed), 2, "both commands must run");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_dispatch_is_refused_after_reassignment_to_the_same_worker() {
+        let owner = Uuid::now_v7();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            2,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(6),
+        }));
+        let target = sandbox(Some(owner));
+        let current = post_operation(service.clone(), exec_request(6, &target)).await;
+        assert!(current["result"]["Ok"].is_object());
+        // Recovery has already taught this worker the replacement lease. The
+        // delayed request belongs to a different lease, not a benign renewal.
+        let mut delayed = exec_request(5, &target);
+        delayed.lease_id = Uuid::now_v7();
+        let refused = post_operation(service, delayed).await;
+        assert_eq!(refused["result"]["Err"]["code"], "conflict");
+        assert_eq!(execs.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2240,6 +3535,13 @@ mod tests {
                 Ok(())
             }
             async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: FileChunkRequest,
+            ) -> Result<FileChunk, CoreError> {
                 Err(CoreError::Backend("unused".into()))
             }
             async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
@@ -2292,6 +3594,7 @@ mod tests {
             capabilities: vec!["git".into()],
             git_version: Some("2.47.0".into()),
             guest_agent_version: "0.1.0".into(),
+            guest_protocol_version: aiec_core::protocol::PROTOCOL_VERSION,
         });
         let response = service
             .router()
@@ -2323,6 +3626,7 @@ mod tests {
                 "http://worker.invalid",
                 WorkerRequest {
                     request_id: Uuid::now_v7(),
+                    lease_id: stable_lease_id(),
                     lease_generation: 1,
                     operation: WorkerOperation::Stop {
                         sandbox: sandbox(None),
@@ -2367,6 +3671,13 @@ mod tests {
         async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
             Err(CoreError::Backend("unused".into()))
         }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
             Ok(Vec::new())
         }
@@ -2399,35 +3710,6 @@ mod tests {
         }
     }
 
-    struct ArchiveSnapshots {
-        archive: Vec<u8>,
-    }
-
-    #[async_trait]
-    impl SnapshotProvider for ArchiveSnapshots {
-        fn capabilities(&self) -> SnapshotCapabilities {
-            SnapshotCapabilities {
-                workspace: true,
-                ..Default::default()
-            }
-        }
-        async fn capture(
-            &self,
-            _: &Sandbox,
-            request: &SnapshotRequest,
-        ) -> Result<aiec_core::snapshots::CapturedSnapshot, CoreError> {
-            Ok(aiec_core::snapshots::CapturedSnapshot::from_archive(
-                Uuid::now_v7(),
-                request.kind,
-                request.object_key.clone(),
-                self.archive.clone(),
-            ))
-        }
-        async fn restore(&self, _: &Sandbox, _: &SnapshotMetadata) -> Result<(), CoreError> {
-            Err(CoreError::Backend("unused".into()))
-        }
-    }
-
     async fn worker_post(service: WorkerService, request: WorkerRequest) -> serde_json::Value {
         let response = service
             .router()
@@ -2448,69 +3730,6 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
-    }
-
-    /// The whole production handoff over the worker wire: the control plane
-    /// captures a workspace, the bytes come back with the capture, and a later
-    /// import delivers those exact bytes to the adopting worker's runtime.
-    #[tokio::test]
-    async fn a_workspace_capture_crosses_the_wire_and_is_imported_back() {
-        use base64::Engine;
-        let archive = vec![7_u8; 4096];
-        let owner = Uuid::now_v7();
-        let sandbox = sandbox(Some(owner));
-        let imported = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let service = WorkerService::new(
-            Arc::new(ArchiveRuntime {
-                imported: imported.clone(),
-            }),
-            RuntimeKind::Docker,
-            RuntimeCapabilities::default(),
-            Some(Arc::new(ArchiveSnapshots {
-                archive: archive.clone(),
-            })),
-            "token",
-            owner,
-            1,
-        )
-        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
-            answer: FakeOwnership::Owned(4),
-        }));
-
-        let captured = worker_post(
-            service.clone(),
-            WorkerRequest {
-                request_id: Uuid::now_v7(),
-                lease_generation: 4,
-                operation: WorkerOperation::Snapshot {
-                    sandbox: sandbox.clone(),
-                    request: SnapshotRequest {
-                        kind: aiec_core::snapshots::SnapshotKind::Workspace,
-                        object_key: "wire-1".into(),
-                    },
-                },
-            },
-        )
-        .await;
-        let value: aiec_core::snapshots::CapturedSnapshot =
-            serde_json::from_value(captured["result"]["Ok"]["value"].clone()).unwrap();
-        assert_eq!(value.archive, archive);
-
-        let imported_response = worker_post(
-            service.clone(),
-            WorkerRequest {
-                request_id: Uuid::now_v7(),
-                lease_generation: 4,
-                operation: WorkerOperation::ImportWorkspaceArchive {
-                    sandbox,
-                    archive_base64: base64::engine::general_purpose::STANDARD
-                        .encode(&value.archive),
-                },
-            },
-        )
-        .await;
-        assert_eq!(imported_response["result"]["Ok"]["kind"], "unit");
-        assert_eq!(imported.lock().as_slice(), &[archive]);
     }
 
     /// An import rewrites a sandbox's whole workspace, so it is fenced like any
@@ -2544,6 +3763,7 @@ mod tests {
             service,
             WorkerRequest {
                 request_id: Uuid::now_v7(),
+                lease_id: Uuid::now_v7(),
                 lease_generation: 4,
                 operation: WorkerOperation::ImportWorkspaceArchive {
                     sandbox,
@@ -2564,5 +3784,741 @@ mod tests {
             Err(CoreError::LimitExceeded(_))
         ));
         assert!(decode_workspace_archive("not base64!").is_err());
+    }
+
+    /// Runtime double that holds a create open until the test releases it, and
+    /// records whether a second lifecycle operation reached it in the meantime.
+    ///
+    /// The overlap flag is the assertion, not the ordering: a destroy that ran
+    /// while the create was in flight is recorded from inside the destroy
+    /// itself, so the test cannot pass by the destroy never having been
+    /// scheduled.
+    struct LifecycleRuntime {
+        creating: AtomicBool,
+        overlapped: AtomicBool,
+        entered_create: tokio::sync::Notify,
+        release_create: tokio::sync::Semaphore,
+        order: parking_lot::Mutex<Vec<&'static str>>,
+        creates: Arc<AtomicUsize>,
+        destroys: Arc<AtomicUsize>,
+    }
+
+    impl LifecycleRuntime {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                creating: AtomicBool::new(false),
+                overlapped: AtomicBool::new(false),
+                entered_create: tokio::sync::Notify::new(),
+                release_create: tokio::sync::Semaphore::new(0),
+                order: parking_lot::Mutex::new(Vec::new()),
+                creates: Arc::new(AtomicUsize::new(0)),
+                destroys: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        /// Lets a held create finish.
+        fn release(&self) {
+            self.release_create.add_permits(1);
+        }
+    }
+
+    #[async_trait]
+    impl SandboxRuntime for LifecycleRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.creates.fetch_add(1, Ordering::Relaxed);
+            self.creating.store(true, Ordering::SeqCst);
+            self.entered_create.notify_one();
+            let _ = self.release_create.acquire().await;
+            self.creating.store(false, Ordering::SeqCst);
+            self.order.lock().push("create");
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.destroys.fetch_add(1, Ordering::SeqCst);
+            if self.creating.load(Ordering::SeqCst) {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            self.order.lock().push("destroy");
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Ok(ExecResult {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_ms: 0,
+                timed_out: false,
+            })
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Ok(FileContent {
+                path: "/workspace".into(),
+                content_base64: String::new(),
+            })
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    fn lifecycle_service(runtime: Arc<LifecycleRuntime>, owner: Uuid) -> WorkerService {
+        WorkerService::new(
+            runtime,
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(1),
+        }))
+    }
+
+    fn lifecycle_request(operation: WorkerOperation) -> WorkerRequest {
+        WorkerRequest {
+            request_id: Uuid::now_v7(),
+            lease_id: stable_lease_id(),
+            lease_generation: 1,
+            operation,
+        }
+    }
+
+    /// The race a completed destroy used to lose: it reported the sandbox gone
+    /// while a create for the same sandbox was still materializing into the
+    /// directory it had just removed, and the create's copy was what survived.
+    #[tokio::test]
+    async fn a_destroy_does_not_reach_the_runtime_while_a_create_of_that_sandbox_is_in_flight() {
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let runtime = LifecycleRuntime::new();
+        let service = lifecycle_service(runtime.clone(), owner);
+
+        let create = tokio::spawn(post_operation(
+            service.clone(),
+            lifecycle_request(WorkerOperation::Create {
+                sandbox: target.clone(),
+            }),
+        ));
+        // The create is inside the runtime now, holding the sandbox.
+        runtime.entered_create.notified().await;
+        let destroy = tokio::spawn(post_operation(
+            service.clone(),
+            lifecycle_request(WorkerOperation::Destroy {
+                sandbox: target.clone(),
+            }),
+        ));
+        // The create is still held, so anything the double records before it is
+        // released is an operation that ran inside a create it should have been
+        // behind. Yielding rather than sleeping: the destroy either makes
+        // progress on one of these turns or it is queued, and it is queued.
+        for _ in 0..256 {
+            if runtime.destroys.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            runtime.destroys.load(Ordering::SeqCst),
+            0,
+            "the destroy reached the runtime while a create was still in flight"
+        );
+
+        runtime.release();
+        let created = create.await.unwrap();
+        let destroyed = destroy.await.unwrap();
+        assert!(created["result"]["Ok"].is_object(), "{created}");
+        assert!(destroyed["result"]["Ok"].is_object(), "{destroyed}");
+        // Both ran, and in the only order that leaves nothing behind.
+        assert!(!runtime.overlapped.load(Ordering::SeqCst));
+        assert_eq!(*runtime.order.lock(), ["create", "destroy"]);
+        assert_eq!(runtime.creates.load(Ordering::Relaxed), 1);
+    }
+
+    /// Exec takes no lifecycle gate, so a destroy is never queued behind the
+    /// command it exists to interrupt. The gate is held here by the test itself
+    /// rather than by a concurrent request, so there is nothing to schedule.
+    #[tokio::test]
+    async fn exec_runs_while_a_lifecycle_operation_holds_the_same_sandbox() {
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let execs = Arc::new(AtomicUsize::new(0));
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(1),
+        }));
+        let held = service.lifecycle.clone().enter(target.id).await.unwrap();
+        let response = post_operation(service.clone(), exec_request(1, &target)).await;
+        assert!(response["result"]["Ok"].is_object(), "{response}");
+        assert_eq!(execs.load(Ordering::Relaxed), 1);
+        drop(held);
+    }
+
+    /// Ownership the worker verifier is the only authority, so an answer the
+    /// test can change.
+    struct SwappableOwnership {
+        answer: parking_lot::Mutex<FakeOwnership>,
+        verified: Arc<AtomicUsize>,
+        first: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl OwnershipVerifier for SwappableOwnership {
+        async fn verify(&self, _: Uuid) -> Result<OwnershipCheck, CoreError> {
+            let answer = self.answer.lock();
+            if self.verified.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first.notify_one();
+            }
+            match &*answer {
+                FakeOwnership::Owned(generation) => Ok(OwnershipCheck::Owned {
+                    generation: *generation,
+                    lease_id: Uuid::from_u128(0x5eed_5eed_5eed_5eed_5eed_5eed_5eed_5eed),
+                }),
+                FakeOwnership::Reassigned(generation) => Ok(OwnershipCheck::Owned {
+                    generation: *generation,
+                    lease_id: Uuid::now_v7(),
+                }),
+                FakeOwnership::Rejected(message) => Ok(OwnershipCheck::Rejected((*message).into())),
+                FakeOwnership::Unavailable => {
+                    Err(CoreError::Unavailable("control plane unreachable".into()))
+                }
+            }
+        }
+    }
+
+    /// A request that waited for the sandbox is authorized again, because the
+    /// wait is a window in which the control plane can hand the sandbox to
+    /// somebody else. The create that is queued here is refused on the strength
+    /// of the second answer, not the first.
+    #[tokio::test]
+    async fn a_queued_lifecycle_operation_is_authorized_again_before_it_runs() {
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let runtime = LifecycleRuntime::new();
+        let verified = Arc::new(AtomicUsize::new(0));
+        let first = Arc::new(tokio::sync::Notify::new());
+        let verifier = Arc::new(SwappableOwnership {
+            answer: parking_lot::Mutex::new(FakeOwnership::Owned(1)),
+            verified: verified.clone(),
+            first: first.clone(),
+        });
+        let service = WorkerService::new(
+            runtime.clone(),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(verifier.clone());
+        let held = service.lifecycle.clone().enter(target.id).await.unwrap();
+        let request = tokio::spawn(post_operation(
+            service,
+            lifecycle_request(WorkerOperation::Create {
+                sandbox: target.clone(),
+            }),
+        ));
+        // The request is authorized once and is now queued on the gate this
+        // test holds.
+        first.notified().await;
+        *verifier.answer.lock() = FakeOwnership::Rejected("sandbox is owned by another worker");
+        drop(held);
+
+        let response = request.await.unwrap();
+        assert_eq!(response["result"]["Err"]["code"], "conflict");
+        assert_eq!(
+            response["result"]["Err"]["message"],
+            "sandbox is owned by another worker"
+        );
+        assert_eq!(runtime.creates.load(Ordering::Relaxed), 0);
+        // Twice: once on arrival, once after the wait. Once would mean the
+        // answer it queued behind was the one it ran on.
+        assert_eq!(verified.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn boot_backpressure_releases_capacity_when_its_request_is_cancelled() {
+        let owner = Uuid::now_v7();
+        let runtime = LifecycleRuntime::new();
+        let service = lifecycle_service(runtime.clone(), owner);
+        let first = tokio::spawn(post_operation(
+            service.clone(),
+            lifecycle_request(WorkerOperation::Create {
+                sandbox: sandbox(Some(owner)),
+            }),
+        ));
+        runtime.entered_create.notified().await;
+        let refused = post_operation(
+            service.clone(),
+            lifecycle_request(WorkerOperation::Create {
+                sandbox: sandbox(Some(owner)),
+            }),
+        )
+        .await;
+        assert_eq!(refused["result"]["Err"]["code"], "runtime_unavailable");
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 1);
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(service.in_flight.load(Ordering::Relaxed), 0);
+
+        let replacement = tokio::spawn(post_operation(
+            service.clone(),
+            lifecycle_request(WorkerOperation::Create {
+                sandbox: sandbox(Some(owner)),
+            }),
+        ));
+        runtime.entered_create.notified().await;
+        runtime.release();
+        let result = replacement.await.unwrap();
+        assert!(result["result"]["Ok"].is_object());
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 2);
+        assert_eq!(service.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    /// A request whose client disconnected is dropped between claiming its
+    /// response slot and storing anything in it, so its entry holds an empty
+    /// slot forever. The entry and byte bounds are only real if the eviction
+    /// pass can give that entry back, and it can only be a candidate if it was
+    /// enrolled when it was claimed rather than when it was finished.
+    #[tokio::test]
+    async fn abandoned_response_entries_are_reclaimable_and_stay_within_the_bound() {
+        let mut cache = ResponseCache::default();
+        for _ in 0..MAX_WORKER_RESPONSE_CACHE_ENTRIES + 16 {
+            // Claimed, then abandoned: the slot exists and nothing ever fills
+            // it, which is exactly the state a dropped request leaves behind.
+            drop(cache.entry(Uuid::now_v7()));
+        }
+        // One completed response tips the cache over its entry bound, which is
+        // what starts the eviction pass over the abandoned entries.
+        cache
+            .complete(
+                Uuid::now_v7(),
+                WorkerResponse {
+                    request_id: Uuid::now_v7(),
+                    result: Ok(WorkerValue::Unit),
+                },
+            )
+            .await;
+        assert!(
+            cache.len() <= MAX_WORKER_RESPONSE_CACHE_ENTRIES,
+            "an abandoned entry is not reclaimable: {} entries against a bound of {}",
+            cache.len(),
+            MAX_WORKER_RESPONSE_CACHE_ENTRIES
+        );
+    }
+
+    /// Serves a worker chunk read out of a real workspace file, so the group a
+    /// worker publishes is made of the same bytes a backend would return and a
+    /// file that changes mid-group is a real change, not a reported one.
+    ///
+    /// `replacement`, when set, replaces the file's inode with same-length
+    /// different bytes before the first read that starts past offset zero:
+    /// the window a guest writer has between two completed chunk reads.
+    struct WorkspaceFileRuntime {
+        root: PathBuf,
+        replacement: Option<Vec<u8>>,
+        swapped: AtomicBool,
+    }
+    impl WorkspaceFileRuntime {
+        fn new(root: &std::path::Path, replacement: Option<Vec<u8>>) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                replacement,
+                swapped: AtomicBool::new(false),
+            }
+        }
+    }
+    #[async_trait]
+    impl SandboxRuntime for WorkspaceFileRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            request: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            if request.offset > 0
+                && !self.swapped.load(Ordering::SeqCst)
+                && let Some(replacement) = &self.replacement
+            {
+                self.swapped.store(true, Ordering::SeqCst);
+                let staged = self.root.join("staged");
+                std::fs::write(&staged, replacement).unwrap();
+                std::fs::rename(&staged, self.root.join("file")).unwrap();
+            }
+            request.read_workspace(&self.root)
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    /// A runtime that overrides the group read, which is exactly the case the
+    /// worker cannot delegate: it bypasses the default implementation's
+    /// pinning, so the worker's own check of the group's shared metadata is the
+    /// only thing between two files' worth of chunks and one published
+    /// artifact. Both groups below pass each chunk's own validation - the
+    /// caller's `expected_version` is `None` on a first burst - and disagree
+    /// with each other in the one field the worker publishes as group-wide.
+    #[derive(Clone, Copy)]
+    enum MixedGroup {
+        Versions,
+        Sizes,
+    }
+    struct MixedGroupRuntime {
+        mixed: MixedGroup,
+    }
+    #[async_trait]
+    impl SandboxRuntime for MixedGroupRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunks(
+            &self,
+            _: &Sandbox,
+            request: FileChunkRequest,
+            _: usize,
+        ) -> Result<Vec<FileChunk>, CoreError> {
+            let total = (FILE_CHUNK_BYTES * 2) as u64;
+            let first = FileChunk {
+                bytes: bytes::Bytes::from(vec![b'a'; FILE_CHUNK_BYTES]),
+                size_bytes: total,
+                version: "first".into(),
+                eof: false,
+            };
+            let second = match self.mixed {
+                MixedGroup::Versions => FileChunk {
+                    bytes: bytes::Bytes::from(vec![b'b'; FILE_CHUNK_BYTES]),
+                    size_bytes: total,
+                    version: "second".into(),
+                    eof: true,
+                },
+                MixedGroup::Sizes => FileChunk {
+                    bytes: bytes::Bytes::from(vec![b'b'; FILE_CHUNK_BYTES]),
+                    size_bytes: FILE_CHUNK_BYTES as u64,
+                    version: "first".into(),
+                    eof: true,
+                },
+            };
+            request.validate()?;
+            Ok(vec![first, second])
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    fn chunk_authorization(target: &Sandbox) -> WorkerRequest {
+        WorkerRequest {
+            request_id: Uuid::now_v7(),
+            lease_id: stable_lease_id(),
+            lease_generation: 2,
+            operation: WorkerOperation::GetFile {
+                sandbox: target.clone(),
+                path: "/workspace/file".into(),
+            },
+        }
+    }
+
+    fn chunk_request(expected_version: Option<String>) -> FileChunkRequest {
+        FileChunkRequest {
+            path: "/workspace/file".into(),
+            offset: 0,
+            length: FILE_CHUNK_BYTES,
+            expected_version,
+        }
+    }
+
+    /// Serves a worker over loopback and reads one group through the HTTP
+    /// client, so what the control plane would receive is what is asserted.
+    async fn group_over_http(
+        runtime: Arc<dyn SandboxRuntime>,
+        owner: Uuid,
+        target: &Sandbox,
+        request: FileChunkRequest,
+        count: usize,
+    ) -> Result<Vec<FileChunk>, CoreError> {
+        let service = WorkerService::new(
+            runtime,
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(2),
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, service.router()).await.unwrap();
+        });
+        let read = HttpWorkerClient::new("token")
+            .unwrap()
+            .get_file_chunks(&endpoint, chunk_authorization(target), request, count)
+            .await;
+        server.abort();
+        read
+    }
+
+    /// The first burst of an artifact read arrives with no version to check
+    /// against, so a worker that publishes a group it never checked can hand
+    /// the collector the first half of one file and the second half of another
+    /// under a checksum that authenticates the splice. A same-size replacement
+    /// between two completed chunks is enough.
+    #[tokio::test]
+    async fn a_worker_group_read_across_a_replacement_is_refused() {
+        let root = std::env::temp_dir().join(format!("aiec-worker-chunks-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let total = FILE_CHUNK_BYTES * 2;
+        std::fs::write(root.join("file"), vec![b'a'; total]).unwrap();
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let read = group_over_http(
+            Arc::new(WorkspaceFileRuntime::new(&root, Some(vec![b'b'; total]))),
+            owner,
+            &target,
+            chunk_request(None),
+            4,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(&read, Err(CoreError::Conflict(_))),
+            "a worker must not publish a group that spans a replacement: {read:?}"
+        );
+    }
+
+    /// A runtime that serves a group itself skips the default implementation
+    /// that pins the first chunk, so the worker has to reject a group whose
+    /// chunks disagree about which file they came from on its own.
+    #[tokio::test]
+    async fn a_worker_refuses_a_group_whose_chunks_disagree() {
+        for mixed in [MixedGroup::Versions, MixedGroup::Sizes] {
+            let owner = Uuid::now_v7();
+            let target = sandbox(Some(owner));
+            let response = WorkerService::new(
+                Arc::new(MixedGroupRuntime { mixed }),
+                RuntimeKind::Firecracker,
+                RuntimeCapabilities::default(),
+                None,
+                "token",
+                owner,
+                1,
+            )
+            .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+                answer: FakeOwnership::Owned(2),
+            }))
+            .router()
+            .oneshot(
+                axum::http::Request::post("/v1/files/chunk")
+                    .header("authorization", "Bearer token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&WorkerChunkRequest {
+                            authorization: chunk_authorization(&target),
+                            request: chunk_request(None),
+                            chunks: 2,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_ne!(
+                response.headers()["content-type"],
+                "application/octet-stream",
+                "a group that disagrees with itself must not be encoded"
+            );
+            let body: WorkerResponse = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body.result.unwrap_err().code, "conflict");
+        }
+    }
+
+    /// The refusals above must cost a real group nothing: an unchanged file of
+    /// several chunks is served whole, under one version, with the bytes the
+    /// file holds.
+    #[tokio::test]
+    async fn a_worker_group_read_of_an_unchanged_file_is_served_whole() {
+        let root = std::env::temp_dir().join(format!("aiec-worker-chunks-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let total = FILE_CHUNK_BYTES * 3;
+        std::fs::write(root.join("file"), vec![b'x'; total]).unwrap();
+        let owner = Uuid::now_v7();
+        let target = sandbox(Some(owner));
+        let read = group_over_http(
+            Arc::new(WorkspaceFileRuntime::new(&root, None)),
+            owner,
+            &target,
+            chunk_request(None),
+            8,
+        )
+        .await
+        .expect("an unchanged file must be served");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(read.len(), 3);
+        assert!(read.last().unwrap().eof);
+        assert!(read[..2].iter().all(|chunk| !chunk.eof));
+        assert!(
+            read.iter()
+                .all(|chunk| chunk.size_bytes == total as u64 && chunk.version == read[0].version)
+        );
+        let served: Vec<u8> = read.iter().flat_map(|chunk| chunk.bytes.to_vec()).collect();
+        assert_eq!(served, vec![b'x'; total]);
     }
 }

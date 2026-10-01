@@ -15,6 +15,187 @@ use std::sync::Arc;
 use crate::RuntimeKind;
 pub use crate::{SandboxId, TenantId};
 
+/// Maximum payload of one artifact range read.
+pub const FILE_CHUNK_BYTES: usize = 64 * 1024;
+/// How many consecutive chunks one authorized worker read may carry. The
+/// authorization pair brackets the whole group, so a lease replaced midway
+/// still stops the bytes before they are written; grouping only removes the
+/// per-chunk round trip, not the check. Bounded so a group is at most this
+/// times `FILE_CHUNK_BYTES` in memory.
+pub const FILE_CHUNK_BURST: usize = 32;
+
+/// The request for the `index`-th chunk of a burst starting at this request.
+pub fn burst_request(request: &FileChunkRequest, index: usize) -> FileChunkRequest {
+    FileChunkRequest {
+        path: request.path.clone(),
+        offset: request.offset + (index * request.length) as u64,
+        length: request.length,
+        expected_version: request.expected_version.clone(),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileChunkRequest {
+    pub path: String,
+    pub offset: u64,
+    pub length: usize,
+    pub expected_version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileChunk {
+    pub bytes: bytes::Bytes,
+    pub size_bytes: u64,
+    pub version: String,
+    pub eof: bool,
+}
+
+/// A JSON range reply must not allocate an oversized byte vector before validation.
+pub fn deserialize_file_chunk_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct ChunkVisitor;
+    impl<'de> serde::de::Visitor<'de> for ChunkVisitor {
+        type Value = Vec<u8>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded file chunk byte array")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Vec<u8>, A::Error> {
+            let mut bytes =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(FILE_CHUNK_BYTES));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if bytes.len() == FILE_CHUNK_BYTES {
+                    return Err(serde::de::Error::custom("file chunk exceeds 64 KiB"));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(ChunkVisitor)
+}
+
+impl FileChunkRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        crate::safe_path(&self.path)?;
+        if self.length == 0 || self.length > FILE_CHUNK_BYTES {
+            return Err(crate::CoreError::InvalidRequest(
+                "invalid file chunk length".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_chunk(&self, chunk: &FileChunk) -> Result<(), crate::CoreError> {
+        self.validate()?;
+        if chunk.size_bytes > crate::MAX_FILE as u64 {
+            return Err(crate::CoreError::LimitExceeded("file".into()));
+        }
+        if self.offset > chunk.size_bytes
+            || chunk.bytes.len()
+                != (chunk.size_bytes - self.offset).min(self.length as u64) as usize
+            || chunk.eof != (self.offset + chunk.bytes.len() as u64 == chunk.size_bytes)
+            || chunk.version.is_empty()
+            || self
+                .expected_version
+                .as_ref()
+                .is_some_and(|v| v != &chunk.version)
+        {
+            return Err(crate::CoreError::Conflict(
+                "file changed or invalid chunk response".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads relative to an opened workspace, never following a symlink.
+    /// Descriptor-relative traversal also prevents rename/symlink races.
+    #[cfg(unix)]
+    pub fn read_workspace(&self, root: &std::path::Path) -> Result<FileChunk, crate::CoreError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+        self.validate()?;
+        let path = crate::safe_path(&self.path)?;
+        let relative = path
+            .strip_prefix("/workspace")
+            .map_err(|_| crate::CoreError::Forbidden("outside workspace".into()))?;
+        let open = || -> Result<std::fs::File, crate::CoreError> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root)?;
+            let mut parts = relative.components().peekable();
+            while let Some(part) = parts.next() {
+                let name = std::ffi::CString::new(part.as_os_str().as_bytes())
+                    .map_err(|_| crate::CoreError::InvalidRequest("invalid path".into()))?;
+                let flags = libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK
+                    | if parts.peek().is_some() {
+                        libc::O_DIRECTORY
+                    } else {
+                        0
+                    };
+                let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                file = unsafe { std::fs::File::from_raw_fd(fd) };
+            }
+            Ok(file)
+        };
+        let version = |m: &std::fs::Metadata| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec()
+            )
+        };
+        let file = open()?;
+        let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(crate::CoreError::InvalidRequest(
+                "not a regular file".into(),
+            ));
+        }
+        if before.len() > crate::MAX_FILE as u64 {
+            return Err(crate::CoreError::LimitExceeded("file".into()));
+        }
+        let stamp = version(&before);
+        if self.offset > before.len() || self.expected_version.as_ref().is_some_and(|v| v != &stamp)
+        {
+            return Err(crate::CoreError::Conflict(
+                "file changed or invalid offset".into(),
+            ));
+        }
+        let mut bytes = vec![0; (before.len() - self.offset).min(self.length as u64) as usize];
+        file.read_exact_at(&mut bytes, self.offset)?;
+        if stamp != version(&file.metadata()?) || stamp != version(&open()?.metadata()?) {
+            return Err(crate::CoreError::Conflict(
+                "file changed while reading".into(),
+            ));
+        }
+        let chunk = FileChunk {
+            eof: self.offset + bytes.len() as u64 == before.len(),
+            bytes: bytes.into(),
+            size_bytes: before.len(),
+            version: stamp,
+        };
+        self.validate_chunk(&chunk)?;
+        Ok(chunk)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeIsolation {
@@ -76,6 +257,24 @@ pub struct RuntimeCapabilities {
     pub vsock: bool,
     /// Whether the guest image is a verified coding-capable artifact.
     pub coding_guest: bool,
+    /// Minimum writable disk reservation for this runtime's base image, in MiB.
+    /// Zero means no floor.
+    ///
+    /// Excluded from the stored capability document on both sides. It is a
+    /// capacity floor, not a capability: a worker advertises the floor of the
+    /// image it holds, while a sandbox requires only what it asked for, and
+    /// making the two comparable by JSON containment would compare `4096` to
+    /// `0` and refuse every placement on a microVM host. The scheduler applies
+    /// the floor arithmetically instead - see `RuntimeCapabilities::disk_floor_mb`.
+    #[serde(skip)]
+    pub minimum_disk_mb: u64,
+}
+
+impl RuntimeCapabilities {
+    /// The writable disk a sandbox on this runtime must be given, in MiB.
+    pub fn disk_floor_mb(&self) -> u64 {
+        self.minimum_disk_mb
+    }
 }
 
 /// Current operational health of a runtime.
@@ -137,6 +336,54 @@ pub trait SandboxRuntime: Send + Sync {
         sandbox: &Sandbox,
         path: &str,
     ) -> Result<FileContent, crate::CoreError>;
+    /// Reads one bounded, version-consistent range without buffering the file.
+    async fn get_file_chunk(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, crate::CoreError>;
+    /// Reads up to `count` consecutive chunks. The default is the obvious one
+    /// — repeated single reads — and a runtime that can serve a whole group
+    /// under one authorization overrides it.
+    ///
+    /// The first chunk read establishes the file the group is of, and every
+    /// later read is made against that identity: same version, same size.
+    /// A caller's own `expected_version`, when it has one, is what the first
+    /// read is checked against and the group then continues under the version
+    /// it reported. Without this, a caller's first burst - which arrives with
+    /// no version to check, by construction - authorizes each chunk
+    /// independently, and a same-size replacement between two completed
+    /// chunks produces a group that validates per chunk and carries the first
+    /// half of one file and the second half of another.
+    async fn get_file_chunks(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+        count: usize,
+    ) -> Result<Vec<FileChunk>, crate::CoreError> {
+        let mut chunks: Vec<FileChunk> = Vec::with_capacity(count.min(FILE_CHUNK_BURST));
+        for index in 0..count.min(FILE_CHUNK_BURST) {
+            let mut step = burst_request(&request, index);
+            if let Some(first) = chunks.first() {
+                step.expected_version = Some(first.version.clone());
+            }
+            let chunk = self.get_file_chunk(sandbox, step.clone()).await?;
+            step.validate_chunk(&chunk)?;
+            if let Some(first) = chunks.first()
+                && chunk.size_bytes != first.size_bytes
+            {
+                return Err(crate::CoreError::Conflict(
+                    "file changed within chunk group".into(),
+                ));
+            }
+            let eof = chunk.eof;
+            chunks.push(chunk);
+            if eof {
+                break;
+            }
+        }
+        Ok(chunks)
+    }
     /// Lists a directory in a sandbox.
     async fn list_files(
         &self,
@@ -296,7 +543,8 @@ impl RuntimeRegistry {
     }
 }
 
-fn capabilities_satisfy(
+/// Checks every requested capability and the minimum isolation boundary.
+pub fn capabilities_satisfy(
     actual: &RuntimeCapabilities,
     required: &RuntimeCapabilities,
     minimum: Option<RuntimeIsolation>,
@@ -307,6 +555,7 @@ fn capabilities_satisfy(
         && (!required.pty || actual.pty)
         && (!required.docker_image || actual.docker_image)
         && (!required.guest_agent || actual.guest_agent)
+        && (!required.coding_guest || actual.coding_guest)
         && (!required.full_kernel_isolation || actual.full_kernel_isolation)
         && (!required.portable_workspace || actual.portable_workspace)
         && (!required.vm_snapshot || actual.vm_snapshot)
@@ -370,6 +619,13 @@ mod registry_tests {
                 path: path.into(),
                 content_base64: String::new(),
             })
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
         }
         async fn list_files(
             &self,
@@ -605,5 +861,335 @@ mod registry_tests {
             .await
             .expect("docker satisfies a plain exec/files requirement");
         assert_eq!(container_first.runtime, RuntimeKind::Docker);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod file_chunk_tests {
+    use super::*;
+
+    struct Workspace(std::path::PathBuf);
+    impl Workspace {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("aiec-chunks-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn request(&self, offset: u64) -> FileChunkRequest {
+            FileChunkRequest {
+                path: "/workspace/file".into(),
+                offset,
+                length: FILE_CHUNK_BYTES,
+                expected_version: None,
+            }
+        }
+    }
+    fn sandbox() -> Sandbox {
+        let now = chrono::Utc::now();
+        Sandbox {
+            id: uuid::Uuid::now_v7(),
+            tenant_id: uuid::Uuid::now_v7(),
+            node_id: None,
+            image_id: "test".into(),
+            state: crate::SandboxState::Running,
+            runtime: crate::RuntimeKind::Firecracker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: crate::NetworkPolicy::Disabled,
+            environment: crate::EnvironmentSpec::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        }
+    }
+
+    /// A runtime that answers every chunk read with the descriptor-relative
+    /// read of a real workspace file, so a group read here is the same read a
+    /// backend performs rather than a fixture the default loop cannot fail on.
+    ///
+    /// `replacement`, when set, is written over the file before the first read
+    /// that starts past offset zero. That is the window a guest writer has
+    /// between two completed chunk reads: the first chunk is already returned
+    /// under one version, and the remaining ones are read from whatever the
+    /// path resolves to by then.
+    struct WorkspaceRuntime {
+        root: std::path::PathBuf,
+        replacement: Option<Vec<u8>>,
+        swapped: std::sync::atomic::AtomicBool,
+    }
+    impl WorkspaceRuntime {
+        fn new(root: &std::path::Path, replacement: Option<Vec<u8>>) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                replacement,
+                swapped: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        /// Replaces the file's inode with same-length different bytes, the way
+        /// an atomic rewrite looks to a reader that holds no descriptor.
+        fn swap(&self, bytes: &[u8]) {
+            let staged = self.root.join("staged");
+            std::fs::write(&staged, bytes).unwrap();
+            std::fs::rename(&staged, self.root.join("file")).unwrap();
+        }
+    }
+    #[async_trait]
+    impl SandboxRuntime for WorkspaceRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            request: FileChunkRequest,
+        ) -> Result<FileChunk, crate::CoreError> {
+            if request.offset > 0
+                && !self.swapped.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(replacement) = &self.replacement
+            {
+                self.swapped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.swap(replacement);
+            }
+            request.read_workspace(&self.root)
+        }
+        async fn list_files(
+            &self,
+            _: &Sandbox,
+            _: &str,
+        ) -> Result<Vec<FileEntry>, crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn delete_file(
+            &self,
+            _: &Sandbox,
+            _: DeleteFileRequest,
+        ) -> Result<(), crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn import_workspace_archive(
+            &self,
+            _: &Sandbox,
+            _: &[u8],
+        ) -> Result<(), crate::CoreError> {
+            Err(crate::CoreError::Backend("unused".into()))
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    /// The first burst of an artifact read carries no version to check
+    /// against, so the file's identity has to be established by the first
+    /// chunk and held for the rest of the group. Without that, a same-size
+    /// replacement between two completed chunks passes every per-chunk check
+    /// and the group returns the first half of one file joined to the second
+    /// half of another.
+    #[tokio::test]
+    async fn a_group_read_refuses_a_file_replaced_between_its_chunks() {
+        let workspace = Workspace::new();
+        let total = FILE_CHUNK_BYTES * 2;
+        std::fs::write(workspace.0.join("file"), vec![b'a'; total]).unwrap();
+        let runtime = WorkspaceRuntime::new(&workspace.0, Some(vec![b'b'; total]));
+        let read = runtime
+            .get_file_chunks(&sandbox(), workspace.request(0), 2)
+            .await;
+        assert!(
+            matches!(&read, Err(crate::CoreError::Conflict(_))),
+            "a group read across a replacement must be refused, got {read:?}"
+        );
+    }
+
+    /// A group read that sees no change serves every chunk of the file, and
+    /// the version it reports is what the next burst of the same artifact has
+    /// to present. A file swapped after the group, or after a single pinned
+    /// read, is refused rather than continued.
+    #[tokio::test]
+    async fn a_group_read_serves_a_stable_file_and_pins_the_next_burst() {
+        let workspace = Workspace::new();
+        let total = FILE_CHUNK_BYTES * 3;
+        std::fs::write(workspace.0.join("file"), vec![b'x'; total]).unwrap();
+        let runtime = WorkspaceRuntime::new(&workspace.0, None);
+        let first = runtime
+            .get_file_chunks(&sandbox(), workspace.request(0), 2)
+            .await
+            .expect("an unchanged file must be served");
+        assert_eq!(first.len(), 2);
+        assert!(!first.iter().any(|chunk| chunk.eof));
+        assert!(
+            first
+                .iter()
+                .all(|chunk| chunk.bytes.len() == FILE_CHUNK_BYTES
+                    && chunk.bytes.iter().all(|byte| *byte == b'x')
+                    && chunk.size_bytes == total as u64
+                    && chunk.version == first[0].version)
+        );
+
+        // Between bursts: the caller presents the version the group reported
+        // and the file is no longer the file it was read from.
+        let mut next = workspace.request((FILE_CHUNK_BYTES * 2) as u64);
+        next.expected_version = Some(first[0].version.clone());
+        runtime.swap(&vec![b'y'; total]);
+        assert!(matches!(
+            runtime.get_file_chunks(&sandbox(), next, 2).await,
+            Err(crate::CoreError::Conflict(_))
+        ));
+
+        // Pre-pinned: the same refusal after a single pinned read rather than
+        // after a group, which is how a multi-burst artifact resumes.
+        runtime.swap(&vec![b'z'; total]);
+        let mut pinned = workspace.request(0);
+        pinned.expected_version = Some(first[0].version.clone());
+        assert!(matches!(
+            runtime.get_file_chunks(&sandbox(), pinned, 3).await,
+            Err(crate::CoreError::Conflict(_))
+        ));
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn chunks_accept_inclusive_file_limit_and_eof_offsets() {
+        use std::os::unix::fs::FileExt;
+        let workspace = Workspace::new();
+        let file = std::fs::File::create(workspace.0.join("file")).unwrap();
+        let empty = workspace.request(0).read_workspace(&workspace.0).unwrap();
+        assert_eq!(empty.size_bytes, 0);
+        assert!(empty.bytes.is_empty());
+        assert!(empty.eof);
+        file.set_len(crate::MAX_FILE as u64).unwrap();
+        file.write_all_at(b"last", crate::MAX_FILE as u64 - 4)
+            .unwrap();
+        let first = workspace.request(0).read_workspace(&workspace.0).unwrap();
+        assert_eq!(first.bytes, vec![0; FILE_CHUNK_BYTES]);
+        assert_eq!(first.size_bytes, crate::MAX_FILE as u64);
+        assert!(!first.eof);
+        let mut request = workspace.request(crate::MAX_FILE as u64 - 4);
+        request.expected_version = Some(first.version);
+        let last = request.read_workspace(&workspace.0).unwrap();
+        assert_eq!(last.bytes.as_ref(), b"last");
+        assert!(last.eof);
+        request.offset = crate::MAX_FILE as u64;
+        let end = request.read_workspace(&workspace.0).unwrap();
+        assert!(end.bytes.is_empty());
+        assert!(end.eof);
+        request.offset += 1;
+        assert!(matches!(
+            request.read_workspace(&workspace.0),
+            Err(crate::CoreError::Conflict(_))
+        ));
+        file.set_len(crate::MAX_FILE as u64 + 1).unwrap();
+        assert!(matches!(
+            workspace.request(0).read_workspace(&workspace.0),
+            Err(crate::CoreError::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn chunks_reject_replacement_and_mutation_between_reads() {
+        let workspace = Workspace::new();
+        std::fs::write(workspace.0.join("file"), b"before").unwrap();
+        let first = workspace.request(0).read_workspace(&workspace.0).unwrap();
+        std::fs::write(workspace.0.join("replacement"), b"after!").unwrap();
+        std::fs::rename(workspace.0.join("replacement"), workspace.0.join("file")).unwrap();
+        let mut request = workspace.request(3);
+        request.expected_version = Some(first.version);
+        assert!(matches!(
+            request.read_workspace(&workspace.0),
+            Err(crate::CoreError::Conflict(_))
+        ));
+        request.expected_version = None;
+        let current = request.read_workspace(&workspace.0).unwrap();
+        std::fs::write(workspace.0.join("file"), b"x").unwrap();
+        request.expected_version = Some(current.version);
+        assert!(matches!(
+            request.read_workspace(&workspace.0),
+            Err(crate::CoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn chunks_reject_links_traversal_and_invalid_lengths() {
+        let workspace = Workspace::new();
+        std::os::unix::fs::symlink("/etc/passwd", workspace.0.join("file")).unwrap();
+        assert!(workspace.request(0).read_workspace(&workspace.0).is_err());
+        for path in [
+            "/workspace/../etc/passwd",
+            "/workspace-other/file",
+            "/etc/passwd",
+        ] {
+            let mut request = workspace.request(0);
+            request.path = path.into();
+            assert!(request.validate().is_err());
+        }
+        for length in [0, FILE_CHUNK_BYTES + 1, usize::MAX] {
+            let mut request = workspace.request(0);
+            request.length = length;
+            assert!(request.validate().is_err());
+        }
+        let mut request = workspace.request(0);
+        request.path = "/workspace/dir/file".into();
+        std::os::unix::fs::symlink("/etc", workspace.0.join("dir")).unwrap();
+        assert!(request.read_workspace(&workspace.0).is_err());
+    }
+
+    #[test]
+    fn guest_chunk_arrays_reject_oversize_and_invalid_byte_values() {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(deserialize_with = "deserialize_file_chunk_bytes")]
+            content: Vec<u8>,
+        }
+        let maximum = serde_json::json!({ "content": vec![255u8; FILE_CHUNK_BYTES] });
+        let reply: Wire = serde_json::from_value(maximum).unwrap();
+        assert_eq!(reply.content, vec![255u8; FILE_CHUNK_BYTES]);
+        assert!(
+            serde_json::from_value::<Wire>(
+                serde_json::json!({ "content": vec![0u8; FILE_CHUNK_BYTES + 1] })
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<Wire>(r#"{"content":[256]}"#).is_err());
+        assert!(serde_json::from_str::<Wire>(r#"{"content":"AA=="}"#).is_err());
     }
 }

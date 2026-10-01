@@ -234,3 +234,110 @@ async fn real_docker_portable_workspace_snapshot_restore() {
     assert!(!root.join(restored.id.to_string()).exists());
     let _ = tokio::time::timeout(Duration::from_secs(5), tokio::fs::remove_dir_all(root)).await;
 }
+
+/// A listing answers a question about metadata, so its size must be a function
+/// of what is directly inside the directory, never of what those descendants
+/// weigh. Three 12 MiB files are three entries, and a directory holding a
+/// 12 MiB file is one entry.
+#[tokio::test]
+async fn real_docker_listing_is_independent_of_descendant_contents() {
+    if std::env::var("AIEC_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let image = std::env::var("AIEC_DOCKER_TEST_IMAGE").unwrap_or_else(|_| "alpine:3.21".into());
+    let root = std::env::temp_dir().join(format!("aiec-docker-listing-{}", Uuid::new_v4()));
+    let runtime = DockerRuntime::new(&root).expect("Docker daemon and client");
+    let sandbox = docker_sandbox(&image);
+    let mut created = false;
+    let operation = async {
+        runtime.create(&sandbox).await?;
+        created = true;
+        runtime.start(&sandbox).await?;
+        // Written the way a guest would write them, through ordinary
+        // execution: 36 MiB of descendants under a directory with four
+        // entries in it.
+        let mut script = String::from("mkdir -p /workspace/data/sub &&");
+        let names = ["a.bin", "b.bin", "c.bin", "sub/deep.bin"];
+        for name in names {
+            // A trailing `&&` with nothing after it is a syntax error in sh,
+            // not a no-op, so the separator belongs between commands rather
+            // than after the last one.
+            script.push_str(&format!(
+                "dd if=/dev/zero of=/workspace/data/{name} bs=1M count=12 2>/dev/null"
+            ));
+            if name != names[names.len() - 1] {
+                script.push_str(" &&");
+            }
+        }
+        runtime
+            .exec(
+                &sandbox,
+                ExecRequest {
+                    command: vec!["/bin/sh".into(), "-c".into(), script],
+                    working_directory: Some("/workspace".into()),
+                    environment: Default::default(),
+                    timeout_seconds: 120,
+                    stdin: None,
+                },
+            )
+            .await?;
+
+        let entries = runtime.list_files(&sandbox, "/workspace/data").await?;
+        let listed: std::collections::BTreeMap<&str, (String, u64)> = entries
+            .iter()
+            .map(|entry| (entry.name.as_str(), (entry.kind.clone(), entry.size)))
+            .collect();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            assert_eq!(
+                listed.get(name),
+                Some(&("file".to_owned(), 12 * 1024 * 1024)),
+                "{listed:?}"
+            );
+        }
+        assert_eq!(
+            listed.get("sub").map(|(kind, _)| kind.as_str()),
+            Some("directory"),
+            "{listed:?}"
+        );
+        assert_eq!(entries.len(), 4, "{listed:?}");
+
+        // The parent whose listing is one entry, whatever its child weighs.
+        let parent = runtime.list_files(&sandbox, "/workspace").await?;
+        assert!(
+            parent
+                .iter()
+                .any(|entry| entry.name == "data" && entry.kind == "directory"),
+            "{parent:?}"
+        );
+        Ok::<(), CoreError>(())
+    }
+    .await;
+    // The container is removed first and waited for: on a tmpfs-backed root the
+    // bind mount's files are still open inside it, so deleting the tree while
+    // the container is going away is a permission error rather than a leak.
+    let cleanup = if created {
+        runtime.destroy(&sandbox).await
+    } else {
+        Ok(())
+    };
+    if let Err(operation_error) = operation {
+        if let Err(cleanup_error) = cleanup {
+            panic!(
+                "Docker listing failed: {operation_error}; cleanup also failed: {cleanup_error}"
+            );
+        }
+        panic!("Docker listing failed: {operation_error}");
+    }
+    cleanup.expect("Docker cleanup");
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await;
+    assert!(!root.exists(), "the test left its state directory behind");
+}
