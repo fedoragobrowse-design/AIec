@@ -137,17 +137,31 @@ pub fn allowlist_guard(hosts: Vec<String>) -> Result<aiec_guard::policy::GuardCo
             "a Guard allowlist may name at most 16 hosts",
         ));
     }
-    // Zones and rules come from one list, so a name can never resolve without a
-    // route behind it or a route exist that never resolves.
-    // Two repositories on one host - a fork and its upstream - must not become
-    // two identical zones, which the policy refuses as a duplicate.
-    let mut zones: Vec<String> = Vec::new();
-    for host in &hosts {
-        if !zones.contains(host) {
-            zones.push(host.clone());
+    // Deduplicated once, and the same vector feeds both the zones and the rules.
+    // Two names that resolve to one host - a caller naming it twice, or a fork
+    // and its upstream - are one destination, and Guard refuses a policy that
+    // names the same destination or zone twice. Deriving the two from
+    // different lists is how one of them ends up duplicated and the other not.
+    let mut unique: Vec<String> = Vec::new();
+    for host in hosts {
+        if !unique.contains(&host) {
+            unique.push(host);
         }
     }
-    // The egress rules keep the original order; only the zones are deduplicated.
+    let egress = unique
+        .iter()
+        .cloned()
+        .map(|host| EgressRule {
+            host,
+            port: 443,
+            protocol: "tcp".to_string(),
+            // POST because a clone is a read that uses POST as its transport
+            // verb; read-only is carried by the host and the path, not by the
+            // verb.
+            allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
+            allowed_paths: Vec::new(),
+        })
+        .collect();
     Ok(GuardConfig {
         topology: Topology::Inside,
         policy_template: PolicyTemplate::NoNetwork,
@@ -155,22 +169,10 @@ pub fn allowlist_guard(hosts: Vec<String>) -> Result<aiec_guard::policy::GuardCo
             version: 1,
             network: NetworkPolicy {
                 dns: DnsPolicy {
-                    allowed_zones: zones,
+                    allowed_zones: unique,
                     allowed_record_types: vec!["A".into(), "AAAA".into()],
                 },
-                egress: hosts
-                    .into_iter()
-                    .map(|host| EgressRule {
-                        host,
-                        port: 443,
-                        protocol: "tcp".to_string(),
-                        // POST because a clone is a read that uses POST as its
-                        // transport verb; read-only is carried by the host and
-                        // the path, not by the verb.
-                        allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
-                        allowed_paths: Vec::new(),
-                    })
-                    .collect(),
+                egress,
             },
             model: None,
             credentials: Vec::new(),
@@ -846,6 +848,47 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
+
+    /// `network_hosts` is caller input that flows straight into DNS zones and
+    /// egress rules, and nothing else checks that what comes out is a policy
+    /// Guard will accept. The compiler is the same check the API performs at
+    /// admission, so running it here is the same check.
+    #[test]
+    fn the_allowlist_the_tool_builds_is_a_policy_guard_accepts() {
+        let config = allowlist_guard(vec!["github.com".into()]).expect("an allowlist builds");
+        let effective = config
+            .effective_policy()
+            .expect("the derived policy compiles");
+        assert_eq!(effective.network.dns.allowed_zones, vec!["github.com"]);
+        assert_eq!(effective.network.egress.len(), 1);
+        // A governed clone fetches its pack with POST, so a rule without it
+        // would compile and then break the clone it exists to permit.
+        assert!(
+            effective.network.egress[0]
+                .allowed_methods
+                .iter()
+                .any(|method| method == "POST")
+        );
+    }
+
+    /// The same host named twice is one destination, and Guard refuses a
+    /// document that names a destination or a zone twice. Zones and rules are
+    /// derived from one deduplicated vector so they cannot disagree about it.
+    #[test]
+    fn a_repeated_host_is_one_destination() {
+        let config = allowlist_guard(vec!["github.com".into(), "github.com".into()])
+            .expect("a repeated host is not an error by itself");
+        let effective = config
+            .effective_policy()
+            .expect("the derived policy still compiles");
+        assert_eq!(effective.network.dns.allowed_zones.len(), 1);
+        assert_eq!(effective.network.egress.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_allowlist_is_refused_rather_than_denying_everything_silently() {
+        assert!(allowlist_guard(Vec::new()).is_err());
+    }
 
     /// A server pointed at a stub control plane, with no token file involved.
     fn server_for(url: &str, max_parallel: usize) -> AiecMcp {

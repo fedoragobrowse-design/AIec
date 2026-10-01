@@ -64,6 +64,12 @@ pub struct OmpRunSpec {
     /// repository URL says. Deriving only the clone hosts would produce a
     /// policy that compiles and then fails at the first model call, which is
     /// worse than being asked to name the destinations.
+    ///
+    /// This is a convenience for the *derived* policy, not a second way to
+    /// state one. `resources` wins: if it carries a `guard`, that policy is
+    /// used as-is and this list is ignored. Reach for `resources.guard` when
+    /// you need to say something a host list cannot - a credentialed model
+    /// binding, a non-https destination, a method or path restriction.
     #[serde(default)]
     pub network_hosts: Vec<String>,
     #[serde(default)]
