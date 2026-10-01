@@ -132,6 +132,20 @@ hosted endpoint to default to.</p>
   </div>
 </div>
 
+<h2 id="guard">Governing what a run can reach</h2>
+<p>A run that reaches the internet is governed from outside the machine. Pick a
+policy template and the worker enforces it, substituting model credentials the
+guest never holds and recording every decision where the guest cannot rewrite
+it. No policy selected means no network.</p>
+<pre><code># Only the model endpoint, through the Guard broker
+run = af.runs.create(command=["pytest", "-q"], guard="model-only")</code></pre>
+<p>A Guard selection replaces <code>network</code> rather than sitting beside it:
+two descriptions of one egress would be two paths to the internet, and the
+wider one would be the one that applied. Encrypted tunnels are not inspected,
+so a rule that needs method or path visibility is refused rather than quietly
+unenforced. <code>GUARD_POLICY.md</code> in the repository has the templates,
+the operator boundary, and how to verify a policy without deploying it.</p>
+
 <h2 id="mcp">Driving it from an agent</h2>
 <p>The <a href="/mcp">local MCP server</a> exposes the same lifecycle as tools:
 create a sandbox, run commands, read and write files, clone a repository,

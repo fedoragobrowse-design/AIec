@@ -94,6 +94,18 @@ link-local and cloud metadata addresses, the control plane, and other tenants.
 The guest control channel is a vsock socket that never touches the network, and
 guest paths are confined to the sandbox workspace.
 
+**Guard** adds out-of-guest governance on top of that. Policy, the network
+gateway, credentials and the evidence journal all live outside the machine, so a
+compromised guest cannot widen its own permissions or rewrite its own record. A
+guarded sandbox reaches exactly one path - its own gateway - and model traffic
+carries a `placeholder://<binding>` that the gateway swaps for a real credential
+the guest never holds. No policy selected means no network.
+
+Guard's relationship to OpenShell's policy schema, and the fields it refuses
+rather than approximates, is in
+[`docs/openshell-compatibility.md`](docs/openshell-compatibility.md). How to run
+and verify it: [`GUARD_POLICY.md`](GUARD_POLICY.md).
+
 Details, including the limits we have not solved: [`SECURITY.md`](SECURITY.md).
 
 ---
@@ -121,8 +133,158 @@ Available images: `aiec-coding:latest` (the default, with `git`, Python and a
 build toolchain), `python:3.13`, `node:24`, `rust:stable`, `ubuntu:24.04` and
 `alpine:3.21`.
 
+For work that is a self-contained task rather than an interactive session, ask
+for a **run**: the control plane places a machine, runs the command, collects
+the artifacts and reclaims the machine, and hands back the settled record.
+
+```python
+run = af.runs.create(
+    repo="https://github.com/me/fixture",
+    command="pytest -q",
+    validations=[["pytest", "-q"]],
+    artifacts=["report.txt"],
+    requirements={"full_kernel_isolation": True},
+)
+print(run["state"], run["results"]["task"]["exit_code"])
+```
+
+`af.runs.list()`, `.get()`, `.events()`, `.artifacts()` and `.cancel()` read and
+stop runs; `run_batch`, `run_repetitions` and `run_matrix` fan a workload out
+with bounded concurrency (`max_parallel`, default 2).
+
+`af.evals` is the same machinery in bulk, and it runs in the control plane
+rather than in your process: `af.evals.batch(...)`, `.repetitions(...)` and
+`.matrix(...)` post one bounded request and answer with the runs.
+`af.evals.run_suite(...)` and `.compare(...)` take a suite — the same reviewable
+document `aiec eval suite --suite` takes, described below — and expand it into
+that matrix, one cell per task, revision and repetition, each cell checked out
+at the revision it is standing for and labelled so it can be argued with
+afterwards.
+
+```python
+comparison = af.evals.compare(
+    baseline="main",
+    candidate="feature-x",
+    suite="evals/nightly.json",
+    repetitions=3,
+    max_parallel=4,
+)
+
+# Measurements for both sides. No verdict: what "better" means is yours to say.
+print(comparison.by_revision["main"]["succeeded"])
+print(comparison.by_revision["feature-x"]["succeeded"])
+print(comparison.by_revision["feature-x"]["task_exit_codes"])
+print(len(comparison.cells), "runs, each kept whole")
+```
+
+`repetitions`, `max_parallel`, `retention`, `max_attempts`, `retained_seconds`
+and `idempotency_key` all reach every cell: with an `idempotency_key`, each
+cell's scope is derivable, so a retried request returns the runs that already
+exist instead of quietly starting a second set of machines. Without one, each
+cell is named by the control plane, so running the same comparison again runs
+it again.
+
 A complete agent workflow — clone, inspect, edit, validate, diff, destroy — is in
 [`examples/coding_agent.py`](examples/coding_agent.py).
+
+---
+
+## Runs and evaluations from the CLI
+
+`aiec` talks to your own control plane with `--url` (`AIEC_URL`) and `--api-key`
+(`AIEC_API_KEY`), and prints JSON, so anything below pipes into `jq`.
+
+A run is described by a document, because a workload somebody else has to
+review is a workload that belongs in a pull request:
+
+```json
+{
+  "workload": {
+    "image": "aiec-coding:latest",
+    "repo": { "url": "https://github.com/me/fixture", "reference": "main" },
+    "command": ["pytest", "-q"],
+    "validations": [["pytest", "-q"]],
+    "artifacts": ["report.txt"],
+    "timeout_seconds": 900
+  },
+  "requirements": { "full_kernel_isolation": true },
+  "retention": "keep_on_failure"
+}
+```
+
+```bash
+aiec run submit run.json            # submit it, print the settled run
+aiec run submit run.json --dry-run  # print what would be sent, send nothing
+aiec run submit --repo https://github.com/me/fixture --dry-run -- pytest -q
+```
+
+The flags are a shorthand for the same request and override whatever the
+document said; `--setup` and `--validate` take a JSON argument vector each
+(`--setup '["pip","install","-e","."]'`), so a command stays a vector and is
+never re-split into a shell line. `--timeout-seconds`, `--cpu`,
+`--memory-mb`, `--disk-mb`, `--network`, `--full-kernel-isolation`,
+`--retention`, `--artifact`, `--env KEY=VALUE`, `--secret`,
+`--requested-runtime` and `--idempotency-key` cover the rest.
+
+Everything a run left behind is readable, and a run that is still holding a
+machine can be stopped:
+
+```bash
+aiec run list --state failed --limit 20
+aiec run show <run-id>
+aiec run results <run-id>      # command outcomes, the diff, per-phase timings
+aiec run events <run-id>       # the history, in the order it happened
+aiec run artifacts <run-id>    # what was collected, with a URL per artifact
+aiec run cancel <run-id>
+```
+
+Evaluations are the same runs, in bulk, at a bound the caller sets. They all
+need `sandboxes:write`, because they start machines:
+
+```bash
+aiec eval batch --request task-a.json --request task-b.json --max-parallel 2
+aiec eval repetitions --request task-a.json --repetitions 5
+aiec eval matrix --spec matrix.json
+aiec eval suite --suite suite.json --image aiec-coding:latest
+```
+
+Each takes `--dry-run` to print the request it would send. A batch or
+repetitions answer is the runs themselves, one per cell; a matrix answer
+carries each cell's axis *and* the run it produced, so a cell can be argued
+with rather than believed:
+
+```json
+{
+  "options": { "max_parallel": 4 },
+  "cells": [
+    { "axis": { "model": "opus" },   "request": { "workload": { "command": ["pytest", "-q"] } } },
+    { "axis": { "model": "sonnet" }, "request": { "workload": { "command": ["pytest", "-q"] } } }
+  ]
+}
+```
+
+A suite is the same thing written as tasks rather than cells, and is expanded
+into that matrix by the control plane:
+
+```json
+{
+  "name": "nightly",
+  "tasks": [
+    {
+      "name": "unit",
+      "repo_url": "https://github.com/me/fixture",
+      "reference": "main",
+      "command": ["pytest", "-q"],
+      "validations": [["pytest", "-q"]],
+      "timeout_seconds": 900
+    }
+  ]
+}
+```
+
+The same three routes are `POST /v1/eval/batch`, `/v1/eval/repetitions` and
+`/v1/eval/matrix`; the typed helpers live in `aiec-client` as `eval_batch`,
+`eval_repetitions` and `eval_matrix`.
 
 ---
 
@@ -190,7 +352,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation boundaries, reporting a vulnerability |
 | [`docs/MCP.md`](docs/MCP.md) | The local-only MCP server: giving an agent a disposable machine |
-| [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) | Defects found by running the server against a live cluster |
+| [`docs/known-defects.md`](docs/known-defects.md) | Open defects, resolved findings, and the cluster notes that cost time |
 | [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
 
 ---
@@ -204,8 +366,10 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | `crates/aiec-api` | The control plane, worker service and HTTP API |
 | `crates/aiec-storage` | PostgreSQL and S3-compatible persistence |
 | `crates/aiec-network-linux` | TAP and nftables isolation |
+| `crates/aiec-guard` | Out-of-guest policy, gateway, enforcement and evidence journal |
 | `crates/aiec-client` | Rust SDK |
 | `sdk/python` | Python SDK (`pip install agentforge-sdk`) |
+| `policies/guard` | Shipped Guard policy templates, selection examples and boundaries |
 | `guest/aiec-guest` | The in-guest agent serving the control channel |
 | `web` | Website and Cloud console |
 

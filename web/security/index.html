@@ -90,6 +90,16 @@ tenant B sandbox  ─┘
        allowing traffic.</p>
   </div>
   <div class="block">
+    <h3>Governance outside the guest</h3>
+    <p>Guard keeps policy, the network gateway, credentials and the evidence
+       journal on the worker rather than in the machine. A guarded sandbox
+       reaches exactly one path, its own gateway; model traffic carries a
+       placeholder that the gateway swaps for a real credential the guest never
+       holds, and no policy selected means no network. Encrypted tunnels are not
+       inspected, so a rule needing method or path visibility is refused rather
+       than quietly unenforced.</p>
+  </div>
+  <div class="block">
     <h3>Tenancy is enforced server-side</h3>
     <p>Every tenant-scoped query is filtered by the authenticated tenant.
        Possession of a sandbox ID does not grant access to it; guessing another

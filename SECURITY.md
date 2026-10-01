@@ -98,11 +98,128 @@ Public internet egress is permitted according to policy. The
 `NetworkPolicy::Restricted` mode **fails closed**: a non-empty host allowlist
 without a DNS/IP policy plugin is rejected rather than silently ignored.
 
+### Guard: governance outside the guest
+
+Guard moves the decisions out of the machine. Policy, the network gateway, the
+credentials and the evidence journal all live on the worker, so a fully
+compromised guest cannot widen its own permissions or rewrite its own record.
+This is a different boundary from microVM isolation, and it is additive: the
+same sandbox, lease and lifecycle paths serve guarded and unguarded workloads.
+
+For a guarded sandbox the worker installs per-attachment nftables rules that
+permit exactly one path, from the assigned guest source to the gateway's DNS
+and broker ports, and drop everything else on that interface - including
+forwarding in both directions, any other source, and all IPv6. No accept is
+made on connection state, so a cut takes effect against a flow that was already
+established. Guard owns only the two tables it created for one attachment and
+never references a host table.
+
+Model credentials never enter the guest. The guest holds a
+`placeholder://<binding>`, the gateway substitutes the real secret outside the
+machine, and DNS for the model name resolves to the gateway so the guest cannot
+open a direct connection to the provider. Secrets are not arguments, not part of
+a sandbox or run document, and not written into an image, environment or
+snapshot.
+
+Guard's honest limits:
+
+- **Opaque TLS is not inspected.** A `CONNECT` tunnel is permitted only for
+  destination-only rules, with a validated visible SNI, and refuses ECH, early
+  data, and a missing or duplicated server name. A rule that needs method, path
+  or tool visibility is refused on that path rather than quietly unenforced.
+- **Prompts are not a data-loss boundary.** Model prompts remain an information
+  channel, and Guard does not perform complete DLP.
+- **Host or gateway compromise defeats it.** Enforcement here is
+  software-only.
+- **The journal proves integrity, not completeness.** A hash chain detects
+  mutation, reordering and interior deletion; it cannot by itself detect a
+  removed tail, so the remote sink's acknowledged head is the anchor to check.
+- **Per-VM control identity and durable budgets are later phases.** Until then
+  the gateway's byte and rate budgets are process-scoped and lost on restart.
+
+An unreadable, truncated or unreplayable journal is refused rather than
+repaired, and a journal that cannot be written cuts the gateway: recovering a
+sink is not recovering a gateway. See [`GUARD_POLICY.md`](GUARD_POLICY.md).
+
 ### Secrets
 
 Tenant and sandbox secrets are never returned in public metadata, never written
 to snapshots, and never included in error messages or audit records. Transient
 in-sandbox secret material is destroyed with the sandbox.
+
+**Run secrets are names, not values.** `POST /v1/runs` accepts
+`workload.secrets` as a list of secret *names*. The workload document is
+durable — it is stored with the run, copied into attempts and the event log,
+and returned by `GET /v1/runs/{id}` — so a value written there is a value in a
+backup, a replica and an audit trail. The control plane resolves the names into
+values immediately before a command is executed inside the machine, injects
+them through the same `environment` map as any other setting, and stores them
+nowhere.
+
+#### Deployment format
+
+Values come from a directory named by `AIEC_RUN_SECRETS_DIR`, one file per
+tenant, named after the tenant UUID:
+
+```text
+$AIEC_RUN_SECRETS_DIR/
+├── <tenant-uuid>.json
+└── <another-tenant-uuid>.json
+```
+
+```json
+{
+  "tenant_id": "0f6c1d2e-6f3a-7c1b-9a55-2f0f1d3b4c5a",
+  "secrets": {
+    "GITHUB_TOKEN": "ghp_..."
+  }
+}
+```
+
+`tenant_id` inside the file must match the tenant that is asking, so a file
+copied into the wrong tenant's slot is refused instead of handing one tenant
+another's credentials.
+
+```bash
+install -d -m 0700 -o aiec -g aiec /var/lib/aiec/run-secrets
+install -m 0600 -o aiec -g aiec /root/tenant.json \
+  /var/lib/aiec/run-secrets/0f6c1d2e-6f3a-7c1b-9a55-2f0f1d3b4c5a.json
+export AIEC_RUN_SECRETS_DIR=/var/lib/aiec/run-secrets
+```
+
+The directory and every file in it must be owned by the user running the API
+and must not be group- or world-accessible: mode `0700` for the directory,
+`0600` for the file. A file or directory with any group or other bit set is
+refused, a symlink is refused, and a file larger than 64 KiB, declaring more than
+32 names, or holding an empty or NUL-bearing value is refused. The API refuses
+to start if the directory is configured but unusable.
+
+There is no network call, no vault client and no shared guest path involved: a
+secret reaches the guest only as a process environment variable, and a value
+rotated on disk is used by the next run without restarting anything.
+
+#### What is refused, and when
+
+- A run requesting no secrets works with no store configured at all.
+- A run requesting a secret with no store configured is rejected before a
+  machine is placed. It is never given a placeholder or an empty value.
+- A name that is not a valid environment variable (uppercase ASCII, digits and
+  underscores, up to 64 characters) is rejected before any machine is placed.
+- A name the tenant has no value for is rejected before any machine is placed,
+  naming the reference so the request can be corrected. A name is not itself a
+  secret.
+- A name already present in the command's environment — the workload's own
+  `environment`, or a per-sandbox secret — is rejected. Neither is allowed to
+  win silently, because a literal in the run document is exactly what must not
+  be stored.
+
+#### No read API
+
+There is no endpoint that returns a run secret's value, to any caller, in any
+role. `GET /v1/runs/{id}` and the event stream return names only. Captured
+command output is scrubbed of resolved values before it is stored, bounded to
+8 KiB per stream; error messages are scrubbed while keeping their error type,
+so a caller can still branch on *why* a run failed.
 
 **Known limitation:** the guest control secret is a single build-time shared
 secret in the current image. Per-sandbox workload secrets are stored in the
@@ -158,6 +275,9 @@ These are real and are not hidden:
   not need to expose the API at all.
 - Give PostgreSQL and object storage their own credentials, rotated, and never
   reuse them anywhere else.
+- Keep `$AIEC_RUN_SECRETS_DIR` (`0700`, one `0600` file per tenant) readable
+  only by the service account, excluded from backups you do not control, and
+  rotated by rewriting the file — the next run picks it up without a restart.
 - Do not run the Docker runtime for untrusted workloads.
 - Keep `nftables`/`ip_forward` enabled if you want sandbox egress, and re-check
   the isolation rules after any kernel or firewall change.

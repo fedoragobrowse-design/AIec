@@ -52,6 +52,44 @@ These are choices, not omissions of the paper.
 - **No multi-host validation yet.** Recovery and fencing are proven with two
   workers on one host. Genuinely distributed operation is not yet demonstrated.
 
+
+## Guard: what the paper does not name
+
+The paper's isolation story ends at the guest boundary. That is the right scope
+for training a model, where the model is the thing you are producing. For
+deploying an agent that acts on a developer's machine, the interesting failure
+is one step further in: a sandbox whose *guest* has been persuaded to want
+something the operator never agreed to.
+
+Guard answers that by moving the decisions out of the machine. A sandbox is
+still a microVM with its own kernel; what changes is that the answer to "what
+may this reach, with whose credentials, and recorded where" is computed on the
+worker, from a policy the guest cannot read, using secrets the guest never
+holds, into a journal the guest cannot rewrite. The consequence worth stating
+is the failure mode: compromising the guest does not grant new capability,
+because capability was never expressed in terms the guest could influence.
+
+Three design choices follow from that, and each one is a refusal rather than a
+capability:
+
+- **A policy is verified before it is applied.** A finite rule model is checked
+  against the operator boundary at compile time, and a rule naming a blocked
+  destination is a configuration error, not a runtime surprise.
+- **Evidence is written before an action, not after.** A cut that cannot be
+  recorded is not taken, and a journal that cannot be written cuts the gateway
+  permanently rather than continuing unobserved.
+- **What cannot be enforced is refused.** Encrypted tunnels are not inspected,
+  so a rule needing method or tool visibility is rejected on that path instead
+  of being recorded as satisfied. The same reasoning is why an OpenShell policy
+  carrying binary-scoped rules is refused rather than translated: an
+  out-of-guest gateway cannot verify which executable opened a connection, and
+  pretending otherwise would be a weaker policy wearing a familiar name.
+
+The full contract, the operator settings and the phase-by-phase status are in
+[`GUARD_POLICY.md`](../GUARD_POLICY.md),
+[`docs/guard-plan.md`](guard-plan.md) and
+[`docs/openshell-compatibility.md`](openshell-compatibility.md).
+
 ## Fencing, in detail
 
 A sandbox is owned through a lease carrying a generation that only ever
@@ -70,11 +108,18 @@ worker A owns generation N
 This is why the lease lives in the database rather than in a worker's memory: a
 restarted worker that still believes it owns a sandbox must be told otherwise.
 
+
 ## What AIec does not do
 
 - No GPU, QEMU or browser runtime.
 - No multi-region scheduler, enterprise SSO, or organisation hierarchy.
 - No marketplace, and no admin dashboard — the product is API and SDK driven.
+- No complete data-loss prevention. Model prompts remain an information channel,
+  and Guard governs egress, credentials and evidence rather than inspecting what
+  an agent says.
+- No production claim for Guard yet. The live Firecracker acceptance run is not
+  executed; [`docs/guard-plan.md`](guard-plan.md) records exactly what has and
+  has not been observed.
 
 ## Reference
 
