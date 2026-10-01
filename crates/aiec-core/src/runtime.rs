@@ -318,6 +318,30 @@ pub trait SandboxRuntime: Send + Sync {
     async fn pause(&self, sandbox: &Sandbox) -> Result<(), crate::CoreError>;
     /// Resumes a paused sandbox.
     async fn resume(&self, sandbox: &Sandbox) -> Result<(), crate::CoreError>;
+    /// Configures the durable outside-guest Guard admission authority.
+    fn configure_guard_budget_authority(
+        &self,
+        _authority: Arc<dyn aiec_guard::control::BudgetAuthority>,
+    ) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard budgets".into()))
+    }
+    /// Binds guarded startup to the worker operation's proven current lease.
+    async fn guard_set_fence(
+        &self,
+        _sandbox: &Sandbox,
+        _fence: aiec_guard::control::GuardFence,
+    ) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard ownership".into()))
+    }
+    /// Performs an ownership-pinned Guard action; capture must remain paused.
+    async fn guard_control(
+        &self,
+        _sandbox: &Sandbox,
+        _fence: aiec_guard::control::GuardFence,
+        _command: aiec_guard::control::GuardControlCommand,
+    ) -> Result<aiec_guard::control::GuardControlResponse, crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard control".into()))
+    }
     /// Executes a command inside a sandbox.
     async fn exec(
         &self,

@@ -112,6 +112,9 @@ fn scope_wire_name(scope: Scope) -> String {
         Scope::SandboxesWrite => "sandboxes:write",
         Scope::SnapshotsRead => "snapshots:read",
         Scope::SnapshotsWrite => "snapshots:write",
+        Scope::GuardRead => "guard:read",
+        Scope::GuardHeartbeat => "guard:heartbeat",
+        Scope::GuardQuarantine => "guard:quarantine",
         Scope::Admin => "admin",
     }
     .to_string()

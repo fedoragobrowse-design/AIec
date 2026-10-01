@@ -1261,3 +1261,42 @@ async fn remote_statistics_track_transport_failures() {
     );
     assert!(stats.last_acknowledged_hash.is_none());
 }
+
+#[test]
+fn a_verified_snapshot_anchors_a_bounded_continuation_and_refuses_to_skip_evidence() {
+    let journal = TempJournal::new("snapshot");
+    let sink = sink_for(&journal);
+    let (cold, head) = sink.verified_snapshot(0).expect("cold snapshot");
+    assert_eq!(head.count, 0);
+    assert_eq!(head.head_hash, GENESIS_HASH);
+    assert!(cold.events.is_empty());
+
+    let appended = append_many(&sink, 5);
+    let (page, head) = sink.verified_snapshot(2).expect("continuation");
+    assert_eq!(head.count, 5);
+    assert_eq!(head.head_hash, appended[4].current_hash);
+    assert_eq!(page.offset, 2);
+    assert_eq!(
+        page.first_previous_hash.as_deref(),
+        Some(appended[1].current_hash.as_str()),
+        "the caller can verify continuity from its own anchor"
+    );
+    assert_eq!(page.events.len(), 3);
+    assert_eq!(
+        page.last_hash.as_deref(),
+        Some(appended[4].current_hash.as_str())
+    );
+    assert!(
+        sink.verified_snapshot(9).is_err(),
+        "a future cursor has no evidence"
+    );
+
+    // A hostile on-disk edit outside the owning writer is detected.
+    let mut text = fs::read_to_string(journal.path()).unwrap();
+    text.push_str(&format!("{}\n", serde_json::json!({"timestamp": chrono::Utc::now(),"event_id": Uuid::new_v4(),"sandbox_id": Uuid::new_v4(),"tenant_id": Uuid::new_v4(),"policy_hash":"b","category":"model","decision":"allow","reason":"injected","destination":null,"request_bytes":0,"response_bytes":0,"duration_ms":0,"previous_hash":GENESIS_HASH,"current_hash":"0".repeat(64)})));
+    fs::write(journal.path(), text).unwrap();
+    assert!(
+        sink.verified_snapshot(0).is_err(),
+        "an edited journal is never reported as verified"
+    );
+}

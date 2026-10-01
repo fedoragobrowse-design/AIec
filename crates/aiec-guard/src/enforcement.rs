@@ -147,7 +147,8 @@ impl CounterKind {
 /// snapshot is only meaningful together with the table it came from, which is
 /// named by [`CounterSnapshot::table`], and a missing table is an error rather
 /// than a silent zero.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CounterSnapshot {
     pub table: String,
     pub blocked_range: u64,

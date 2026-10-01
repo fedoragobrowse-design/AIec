@@ -157,4 +157,28 @@ pub trait NetworkBackend: Send + Sync {
         sandbox: &Sandbox,
         attachment: &NetworkAttachment,
     ) -> Result<(), crate::CoreError>;
+    /// Supplies the outside-guest reservation authority before guarded startup.
+    fn configure_guard_budget_authority(
+        &self,
+        _authority: std::sync::Arc<dyn aiec_guard::control::BudgetAuthority>,
+    ) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard budgets".into()))
+    }
+    /// Binds the attachment to the ownership proven by worker dispatch.
+    async fn guard_set_fence(
+        &self,
+        _sandbox: &Sandbox,
+        _fence: aiec_guard::control::GuardFence,
+    ) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard ownership".into()))
+    }
+    /// Controls only an existing identity-bound attachment.
+    async fn guard_control(
+        &self,
+        _sandbox: &Sandbox,
+        _fence: aiec_guard::control::GuardFence,
+        _command: aiec_guard::control::GuardControlCommand,
+    ) -> Result<aiec_guard::control::GuardControlResponse, crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard control".into()))
+    }
 }

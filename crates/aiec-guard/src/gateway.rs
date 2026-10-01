@@ -3,7 +3,8 @@ mod connect;
 use crate::{
     GuardError, Result,
     compiler::CompiledPolicy,
-    events::{Category, Decision, EventInput, EventSink},
+    control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
+    events::{Category, Decision, EventInput, EventSink, GuardEvent},
 };
 use axum::body::Body;
 use bytes::Bytes;
@@ -26,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::{JoinHandle, JoinSet},
@@ -141,6 +143,7 @@ impl CredentialStore {
 pub struct GatewayConfig {
     pub sandbox_id: Uuid,
     pub tenant_id: Uuid,
+    pub fence: GuardFence,
     pub compiled: CompiledPolicy,
     pub bind_ip: Ipv4Addr,
     pub guest_ip: Ipv4Addr,
@@ -148,12 +151,22 @@ pub struct GatewayConfig {
     pub dns_port: u16,
     pub credentials: Arc<CredentialStore>,
     pub events: Arc<dyn EventSink>,
+    pub budget_authority: Arc<dyn BudgetAuthority>,
+    pub watchdog_timeout: Duration,
 }
 
 struct Budget {
     minute: Instant,
     requests: u32,
     dns: u32,
+    /// Bytes this process has admitted, against the policy ceilings.
+    ///
+    /// The durable reservation is the lifetime authority - it survives a
+    /// restart - but it is not a substitute for the policy's own ceiling: an
+    /// authority that permitted everything must not be able to widen what the
+    /// operator wrote. Both are enforced, and each is reset only by its own
+    /// scope (this one by the process, the durable one by nothing short of an
+    /// operator).
     out: u64,
     incoming: u64,
 }
@@ -178,12 +191,38 @@ enum AuditCommand {
     Restore {
         event: EventInput,
         generation: u64,
+        /// True only for the authorized path, which may reopen a latched cut.
+        /// An ordinary release is refused outright rather than applied and then
+        /// reported as a failure.
+        authorized: bool,
         complete: Option<tokio::sync::oneshot::Sender<RestoreAck>>,
     },
+}
+
+/// Host-only attachment cut. It runs independently of the event journal.
+#[async_trait::async_trait]
+pub trait GatewayNetworkCut: Send + Sync {
+    async fn cut_network(&self) -> Result<()>;
+}
+
+struct WatchdogState {
+    deadline: tokio::time::Instant,
+    activated: bool,
+    /// A cut is in force whose delivery to the kernel and the journal is still
+    /// owed. Every cut sets this, whoever asked for it.
+    pending: bool,
+    /// The watchdog is silent past its deadline, or the gateway has a terminal
+    /// fault. This is the latch an ordinary release cannot clear, and it is
+    /// distinct from an operator's own cut: holding a machine is a decision an
+    /// operator can undo, while losing sight of the watcher is not something the
+    /// operator's release answers.
+    deadman: bool,
 }
 pub(crate) struct Runtime {
     pub(crate) config: GatewayConfig,
     pub(crate) broker: SocketAddr,
+    identity: GuardIdentity,
+    fence: std::sync::RwLock<GuardFence>,
     cut: AtomicBool,
     terminal_failure: AtomicBool,
     pub(crate) stop: watch::Sender<u64>,
@@ -193,6 +232,9 @@ pub(crate) struct Runtime {
     pub(crate) connections: Arc<Semaphore>,
     audit_tx: mpsc::Sender<AuditCommand>,
     tunnels: Mutex<Vec<JoinHandle<()>>>,
+    watchdog: AuditMutex<WatchdogState>,
+    watchdog_changed: tokio::sync::Notify,
+    network_cut: AuditMutex<Option<Arc<dyn GatewayNetworkCut>>>,
 }
 impl Runtime {
     pub(crate) fn active(&self) -> bool {
@@ -276,6 +318,7 @@ impl Runtime {
             AuditCommand::Restore {
                 event,
                 generation,
+                authorized,
                 complete,
             } => {
                 let result = async {
@@ -294,7 +337,18 @@ impl Runtime {
                     {
                         return Err(GuardError::Denied("gateway release fenced out".into()));
                     }
+                    let mut watchdog = self.watchdog.lock();
+                    if watchdog.deadman && !authorized {
+                        return Err(GuardError::Denied(
+                            "watchdog is not reporting; authorized release required".into(),
+                        ));
+                    }
+                    watchdog.deadline = tokio::time::Instant::now() + self.config.watchdog_timeout;
+                    watchdog.activated = true;
+                    watchdog.deadman = false;
+                    watchdog.pending = false;
                     self.cut.store(false, Ordering::Release);
+                    self.watchdog_changed.notify_one();
                     Ok(())
                 }
                 .await;
@@ -361,28 +415,79 @@ impl Runtime {
         *value += 1;
         Ok(())
     }
-    pub(crate) fn debit(&self, outgoing: bool, amount: u64) -> Result<()> {
-        let mut b = self
-            .budget
-            .lock()
-            .map_err(|_| GuardError::Unavailable("budget unavailable".into()))?;
+    pub(crate) async fn reserve(&self, debit: BudgetDebit) -> Result<()> {
+        if !self.active() {
+            return Err(GuardError::Denied("gateway cut".into()));
+        }
+        let mut cancel = self.stop.subscribe();
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => Err(GuardError::Denied("gateway cut".into())),
+            result = self.config.budget_authority.reserve(&self.identity, *self.fence.read().map_err(|_| GuardError::Unavailable("gateway ownership fence is poisoned".into()))?, debit) => {
+                result?;
+                if !self.active() {
+                    return Err(GuardError::Denied("gateway cut".into()));
+                }
+                Ok(())
+            }
+        }
+    }
+    pub(crate) async fn debit(&self, outgoing: bool, amount: u64) -> Result<()> {
         let cap = if outgoing {
             self.config.compiled.policy().limits.bytes_out
         } else {
             self.config.compiled.policy().limits.bytes_in
         };
-        let value = if outgoing {
-            &mut b.out
-        } else {
-            &mut b.incoming
-        };
-        *value = value
-            .checked_add(amount)
-            .ok_or_else(|| GuardError::Denied("byte budget exhausted".into()))?;
-        if *value > cap {
-            return Err(GuardError::Denied("byte budget exhausted".into()));
+        {
+            let mut b = self
+                .budget
+                .lock()
+                .map_err(|_| GuardError::Unavailable("budget unavailable".into()))?;
+            let value = if outgoing {
+                &mut b.out
+            } else {
+                &mut b.incoming
+            };
+            *value = value
+                .checked_add(amount)
+                .ok_or_else(|| GuardError::Denied("byte budget exhausted".into()))?;
+            if *value > cap {
+                return Err(GuardError::Denied("byte budget exhausted".into()));
+            }
         }
-        Ok(())
+        self.reserve(BudgetDebit {
+            bytes_out: u64::from(outgoing) * amount,
+            bytes_in: u64::from(!outgoing) * amount,
+            ..Default::default()
+        })
+        .await
+    }
+
+    fn latch_cut(&self, deadman: bool) -> Result<bool> {
+        // Even a poisoned transition lock may not prevent the immediate cut.
+        let fence = self.transitions.lock();
+        let mut watchdog = self.watchdog.lock();
+        let first = !watchdog.pending;
+        watchdog.pending = true;
+        watchdog.deadman |= deadman;
+        self.cut.store(true, Ordering::Release);
+        if first {
+            self.stop.send_modify(|n| {
+                if *n != u64::MAX {
+                    *n = n.wrapping_add(1);
+                }
+            });
+        }
+        if first {
+            self.watchdog_changed.notify_one();
+        }
+        if fence.is_err() {
+            self.terminal_failure.store(true, Ordering::Release);
+            return Err(GuardError::Unavailable(
+                "gateway transition state is poisoned".into(),
+            ));
+        }
+        Ok(first)
     }
     pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         let test_addresses = self.config.compiled.boundary().test_addresses(host, port);
@@ -419,6 +524,50 @@ pub struct GuardGateway {
     audit_stop: watch::Sender<bool>,
     dns: SocketAddr,
 }
+
+/// Read-only attachment state for host cut callbacks; does not own listener tasks.
+#[derive(Clone)]
+pub struct GatewayControl {
+    state: Arc<Runtime>,
+}
+
+impl GatewayControl {
+    pub fn network_cut(&self) -> bool {
+        !self.state.active()
+    }
+    pub fn cut(&self) -> Result<()> {
+        self.state.latch_cut(false).map(|_| ())
+    }
+    pub fn identity(&self) -> &GuardIdentity {
+        &self.state.identity
+    }
+    pub fn policy_hash(&self) -> &str {
+        &self.state.identity.policy_hash
+    }
+    /// Appends one authoritative lifecycle record through the shared journal.
+    pub async fn append(&self, event: EventInput) -> Result<GuardEvent> {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.state.config.events.append(event),
+        )
+        .await
+        {
+            Ok(Ok(record)) => Ok(record),
+            _ => {
+                self.state.terminal_failure.store(true, Ordering::Release);
+                self.state.cut.store(true, Ordering::Release);
+                self.state.stop.send_modify(|n| {
+                    if *n != u64::MAX {
+                        *n = n.wrapping_add(1);
+                    }
+                });
+                Err(GuardError::Unavailable(
+                    "guard event sink unavailable".into(),
+                ))
+            }
+        }
+    }
+}
 /// Binds a TCP listener, naming which one refused.
 async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener, GuardError> {
     TcpListener::bind(bind).await.map_err(|error| {
@@ -432,6 +581,11 @@ async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener,
 impl GuardGateway {
     pub async fn start(config: GatewayConfig) -> Result<Self> {
         config.compiled.verify()?;
+        if !(Duration::from_secs(1)..=Duration::from_secs(60)).contains(&config.watchdog_timeout) {
+            return Err(GuardError::Policy(
+                "watchdog timeout must be between 1 and 60 seconds".into(),
+            ));
+        }
         if let Some(model) = &config.compiled.policy().model
             && !config.credentials.secrets.contains_key(&model.credential)
         {
@@ -465,9 +619,23 @@ impl GuardGateway {
         let (audit_stop, mut audit_shutdown) = watch::channel(false);
         let request_limit = config.compiled.policy().limits.max_concurrent_requests as usize;
         let state = Arc::new(Runtime {
+            identity: GuardIdentity {
+                sandbox_id: config.sandbox_id,
+                tenant_id: config.tenant_id,
+                policy_hash: config.compiled.policy_hash().to_owned(),
+            },
+            fence: std::sync::RwLock::new(config.fence),
+            watchdog: AuditMutex::new(WatchdogState {
+                deadline: tokio::time::Instant::now() + config.watchdog_timeout,
+                activated: false,
+                pending: false,
+                deadman: false,
+            }),
+            watchdog_changed: tokio::sync::Notify::new(),
+            network_cut: AuditMutex::new(None),
             config,
             broker: broker_addr,
-            cut: AtomicBool::new(false),
+            cut: AtomicBool::new(true),
             terminal_failure: AtomicBool::new(false),
             stop,
             budget: Mutex::new(Budget {
@@ -515,6 +683,7 @@ impl GuardGateway {
             Ok(())
         });
         let tasks = vec![
+            tokio::spawn(run_watchdog(state.clone())),
             spawn_service(state.clone(), serve_broker(broker, state.clone())),
             spawn_service(state.clone(), crate::dns::serve_udp(dns_udp, state.clone())),
             spawn_service(state.clone(), crate::dns::serve_tcp(dns_tcp, state.clone())),
@@ -533,17 +702,82 @@ impl GuardGateway {
     pub fn dns_addr(&self) -> SocketAddr {
         self.dns
     }
+    pub fn identity(&self) -> &GuardIdentity {
+        &self.state.identity
+    }
+
+    pub fn control(&self) -> GatewayControl {
+        GatewayControl {
+            state: self.state.clone(),
+        }
+    }
+
+    /// Registers the host attachment before bringing its link up.
+    pub fn set_network_cut_handler(&self, handler: Arc<dyn GatewayNetworkCut>) {
+        *self.state.network_cut.lock() = Some(handler);
+        self.state.watchdog_changed.notify_one();
+    }
+
+    pub fn network_cut(&self) -> bool {
+        !self.state.active()
+    }
+
+    /// Host-authenticated first activation is not a release of a latched cut.
+    /// Returns true only for the first activation, when the manager must install filters.
+    pub fn heartbeat(&self, identity: &GuardIdentity) -> Result<bool> {
+        if identity != &self.state.identity {
+            return Err(GuardError::Denied("watchdog identity mismatch".into()));
+        }
+        self.health()?;
+        let fence =
+            self.state.transitions.lock().map_err(|_| {
+                GuardError::Unavailable("gateway transition state is poisoned".into())
+            })?;
+        let mut watchdog = self.state.watchdog.lock();
+        if watchdog.deadman {
+            return Err(GuardError::Denied(
+                "watchdog is not reporting; authorized release required".into(),
+            ));
+        }
+        if tokio::time::Instant::now() >= watchdog.deadline {
+            drop(watchdog);
+            drop(fence);
+            let _ = self.state.latch_cut(true);
+            return Err(GuardError::Denied("watchdog deadline expired".into()));
+        }
+        let first = !watchdog.activated;
+        watchdog.activated = true;
+        watchdog.deadline = tokio::time::Instant::now() + self.state.config.watchdog_timeout;
+        self.state.cut.store(false, Ordering::Release);
+        drop(watchdog);
+        drop(fence);
+        self.state.watchdog_changed.notify_one();
+        if first {
+            self.queue_transition(
+                Decision::Allow,
+                "gateway activated by authenticated watchdog",
+            )?;
+        }
+        Ok(first)
+    }
+
+    /// Advances the reservation fence after an authorized lease renewal.
+    pub fn set_fence(&self, fence: GuardFence) -> Result<()> {
+        let mut bound =
+            self.state.fence.write().map_err(|_| {
+                GuardError::Unavailable("gateway ownership fence is poisoned".into())
+            })?;
+        if bound.lease_id == fence.lease_id && fence.generation < bound.generation {
+            return Ok(());
+        }
+        *bound = fence;
+        Ok(())
+    }
     pub fn cut(&self) -> Result<()> {
-        let _fence = self.state.transitions.lock().map_err(|_| {
-            self.state.terminal_failure.store(true, Ordering::Release);
-            GuardError::Unavailable("gateway transition state is poisoned".into())
-        })?;
-        self.state.cut.store(true, Ordering::Release);
-        self.state.stop.send_modify(|n| {
-            if *n != u64::MAX {
-                *n = n.wrapping_add(1);
-            }
-        });
+        let first = self.state.latch_cut(false)?;
+        if !first {
+            return Ok(());
+        }
         self.queue_transition(Decision::Cut, "gateway network cut")
     }
     /// A service/audit fault is terminal. Recovery requires a fresh gateway
@@ -572,9 +806,25 @@ impl GuardGateway {
     /// function cannot wait on a durable write without blocking a runtime
     /// thread. The wait is bounded, and a release that is not confirmed leaves
     /// the gateway cut rather than assuming the best.
+    /// The ordinary release. It cannot reopen a cut the dead-man switch
+    /// latched: the refusal is written to the journal rather than answered in
+    /// silence, because an operator who sees a denied release should find out
+    /// afterwards that the machine is still held.
     pub async fn restore(&self) -> Result<()> {
+        self.release(false).await
+    }
+
+    /// The authorized release, reserved for a caller that has already proved
+    /// the human decision behind it. It clears the latch, but traffic still
+    /// waits for the watchdog's next authenticated heartbeat: an operator
+    /// releasing a machine is not a substitute for the thing that watches it.
+    pub async fn authorized_release(&self) -> Result<()> {
+        self.release(true).await
+    }
+
+    async fn release(&self, authorized: bool) -> Result<()> {
         let (complete, receipt) = tokio::sync::oneshot::channel();
-        self.enqueue_restore(Some(complete))?;
+        self.enqueue_restore(Some(complete), authorized)?;
         match tokio::time::timeout(RESTORE_CONFIRMATION, receipt).await {
             Ok(Ok(RestoreAck::Applied)) => Ok(()),
             Ok(Ok(RestoreAck::Fenced)) => Err(GuardError::Denied(
@@ -598,6 +848,7 @@ impl GuardGateway {
     fn enqueue_restore(
         &self,
         complete: Option<tokio::sync::oneshot::Sender<RestoreAck>>,
+        authorized: bool,
     ) -> Result<()> {
         self.health()?;
         let _fence = self.state.transitions.lock().map_err(|_| {
@@ -619,6 +870,7 @@ impl GuardGateway {
             .try_send(AuditCommand::Restore {
                 event,
                 generation,
+                authorized,
                 complete,
             })
             .map_err(|_| {
@@ -728,11 +980,18 @@ async fn serve_broker(listener: TcpListener, state: Arc<Runtime>) -> Result<()> 
                 let (socket, peer) = accepted?;
                 let Ok(permit) = state.connections.clone().try_acquire_owned() else { drop(socket); continue; };
                 if peer.ip() != IpAddr::V4(state.config.guest_ip) { state.record(state.measured_event(Category::Network, Decision::Deny, "guest source mismatch", None, 0, 0, Duration::ZERO)).await?; continue; }
-                if !state.active() { drop(socket); continue; }
+                if !state.active() {
+                    // A reset connection is a refusal a client cannot read. The
+                    // gateway that is cut, or that has never seen a watchdog,
+                    // still answers: 503 says why, and it is the only answer a
+                    // guest's proxy can act on.
+                    refuse(socket).await;
+                    continue;
+                }
                 let state = state.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let mut cancel = state.stop.subscribe();
+                    let cancel = state.stop.subscribe();
                     let service_state = state.clone();
                     let service = service_fn(move |request: Request<Incoming>| {
                         let state = service_state.clone();
@@ -741,7 +1000,12 @@ async fn serve_broker(listener: TcpListener, state: Arc<Runtime>) -> Result<()> 
                     let mut http = hyper::server::conn::http1::Builder::new();
                     http.max_buf_size(HEADER_LIMIT).keep_alive(false);
                     let connection = http.serve_connection(TokioIo::new(socket), service).with_upgrades();
-                    tokio::select! { _ = cancel.changed() => {}, _ = tokio::time::sleep(LIFETIME) => {}, _ = connection => {} }
+                    // A cut cancels the request, not the connection: the
+                    // handler's own select answers 503, or fails the body it
+                    // was streaming. Killing the connection here instead would
+                    // turn both into a reset the client cannot interpret.
+                    tokio::select! { _ = tokio::time::sleep(LIFETIME) => {}, _ = connection => {} }
+                    drop(cancel);
                 });
             }
         }
@@ -749,6 +1013,21 @@ async fn serve_broker(listener: TcpListener, state: Arc<Runtime>) -> Result<()> 
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     Ok(())
+}
+
+/// Answers one refused connection with a complete, minimal HTTP response.
+async fn refuse(mut socket: tokio::net::TcpStream) {
+    let body = b"gateway cut";
+    let head = format!(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(body).await;
+        let _ = socket.flush().await;
+    })
+    .await;
 }
 
 fn response(status: StatusCode, text: &'static str) -> Response<Body> {
@@ -1089,6 +1368,25 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
         )
         .await;
     }
+    if state
+        .reserve(BudgetDebit {
+            model_requests: if matches!(category, Category::Model) {
+                1
+            } else {
+                0
+            },
+            ..Default::default()
+        })
+        .await
+        .is_err()
+    {
+        return deny(
+            &state,
+            "durable admission budget unavailable or exhausted",
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+    }
     let client = match reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -1141,10 +1439,14 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
         let chunk = item.map_err(|_| std::io::Error::other("request body failed"))?;
         upload.count = upload.count.saturating_add(chunk.len() as u64);
         upload.audit.lock().out = upload.count;
-        upload.state.debit(true, chunk.len() as u64).map_err(|_| {
-            upload.audit.lock().reason = "outbound byte budget exhausted";
-            std::io::Error::other("request budget exceeded")
-        })?;
+        upload
+            .state
+            .debit(true, chunk.len() as u64)
+            .await
+            .map_err(|_| {
+                upload.audit.lock().reason = "outbound byte budget exhausted";
+                std::io::Error::other("request budget exceeded")
+            })?;
         if upload.count
             > upload
                 .state
@@ -1218,13 +1520,6 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 item.map_err(|_| std::io::Error::other("upstream response failed"))?;
             download.count = download.count.saturating_add(download.pending.len() as u64);
             download.audit.lock().incoming = download.count;
-            download
-                .state
-                .debit(false, download.pending.len() as u64)
-                .map_err(|_| {
-                    download.audit.lock().reason = "inbound byte budget exhausted";
-                    std::io::Error::other("response budget exceeded")
-                })?;
             if download.count
                 > download
                     .state
@@ -1240,6 +1535,14 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
             }
         }
         let size = CHUNK.min(download.pending.len());
+        download
+            .state
+            .debit(false, size as u64)
+            .await
+            .map_err(|_| {
+                download.audit.lock().reason = "inbound byte budget exhausted";
+                std::io::Error::other("response budget exceeded")
+            })?;
         let chunk = download.pending.split_to(size);
         Ok(Some((chunk, download)))
     });
@@ -1311,6 +1614,64 @@ struct Download {
     pending: Bytes,
     cancel: watch::Receiver<u64>,
     deadline: tokio::time::Instant,
+}
+
+async fn run_watchdog(state: Arc<Runtime>) -> Result<()> {
+    let mut stop = state.stop.subscribe();
+    let mut delivered = None;
+    let mut audited = None;
+    loop {
+        if *stop.borrow() == u64::MAX {
+            break;
+        }
+        let (deadline, pending) = {
+            let watchdog = state.watchdog.lock();
+            (watchdog.deadline, watchdog.pending)
+        };
+        if state.terminal_failure.load(Ordering::Acquire)
+            || (!pending && tokio::time::Instant::now() >= deadline)
+        {
+            // Cancellation happens synchronously, before any attachment I/O or audit.
+            let _ = state.latch_cut(true);
+        }
+        let pending = state.watchdog.lock().pending;
+        let generation = *state.stop.borrow();
+        if pending && delivered != Some(generation) {
+            let handler = state.network_cut.lock().clone();
+            if let Some(handler) = handler {
+                if let Err(error) = handler.cut_network().await {
+                    state.terminal_failure.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                delivered = Some(generation);
+            }
+        }
+        if pending && audited != Some(generation) {
+            audited = Some(generation);
+            // A failed/full journal cannot gate the network cut.
+            if state
+                .audit_tx
+                .try_send(AuditCommand::Record(state.measured_event(
+                    Category::Lifecycle,
+                    Decision::Cut,
+                    "watchdog or host fault latched network cut",
+                    None,
+                    0,
+                    0,
+                    Duration::ZERO,
+                )))
+                .is_err()
+            {
+                state.terminal_failure.store(true, Ordering::Release);
+            }
+        }
+        tokio::select! {
+            _ = stop.changed() => {},
+            _ = state.watchdog_changed.notified() => {},
+            _ = tokio::time::sleep_until(deadline), if !pending => {},
+        }
+    }
+    Ok(())
 }
 
 fn spawn_service<F>(state: Arc<Runtime>, future: F) -> JoinHandle<Result<()>>

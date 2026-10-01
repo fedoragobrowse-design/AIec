@@ -8,7 +8,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -112,6 +112,97 @@ impl FileEventSink {
             count: journal.count,
             head_hash: journal.head.clone(),
         })
+    }
+
+    /// Verifies the whole live file against its acknowledged writer head.
+    /// Memory is bounded to a single record plus the requested suffix. A cold
+    /// observer receives the latest page; established observers must catch up
+    /// through the current head without silently skipping evidence.
+    pub fn verified_snapshot(&self, after: u64) -> Result<(EventPage, JournalHead)> {
+        let journal = lock(&self.journal)?;
+        refuse_if_broken(&journal)?;
+        if after > journal.count || (after > 0 && journal.count - after > MAX_PAGE_EVENTS as u64) {
+            return Err(GuardError::Integrity(
+                "journal continuation exceeds the bounded verified page".into(),
+            ));
+        }
+        reject_unusable_path(&self.path)?;
+        let file = File::open(&self.path)?;
+        let metadata = file.metadata()?;
+        let owned = journal.file.metadata()?;
+        if !metadata.is_file()
+            || metadata.dev() != owned.dev()
+            || metadata.ino() != owned.ino()
+            || metadata.len() > MAX_JOURNAL_BYTES
+        {
+            return Err(GuardError::Integrity(
+                "journal no longer matches its acknowledged writer".into(),
+            ));
+        }
+        let offset = if after == 0 {
+            journal.count.saturating_sub(MAX_PAGE_EVENTS as u64)
+        } else {
+            after
+        };
+        let mut reader = BufReader::new(file);
+        let mut record = Vec::with_capacity(MAX_LINE_BYTES + 1);
+        let mut events = Vec::with_capacity((journal.count - offset) as usize);
+        let mut expected = GENESIS_HASH.to_owned();
+        let mut count = 0u64;
+        let mut total = 0u64;
+        loop {
+            record.clear();
+            let size = std::io::Read::take(&mut reader, (MAX_LINE_BYTES + 2) as u64)
+                .read_until(b'\n', &mut record)?;
+            if size == 0 {
+                break;
+            }
+            total = total.saturating_add(size as u64);
+            count += 1;
+            if record.last() != Some(&b'\n')
+                || size > MAX_LINE_BYTES + 1
+                || count > MAX_EVENTS as u64
+                || total > MAX_JOURNAL_BYTES
+            {
+                return Err(GuardError::Integrity(
+                    "journal contains a torn or oversized record".into(),
+                ));
+            }
+            record.pop();
+            let event = parse_record(count as usize, &record)?;
+            if event.previous_hash != expected {
+                return Err(GuardError::Integrity(
+                    "journal chain continuity mismatch".into(),
+                ));
+            }
+            expected.clone_from(&event.current_hash);
+            if count > offset {
+                if events.len() == MAX_PAGE_EVENTS {
+                    return Err(GuardError::Integrity(
+                        "journal exceeds its acknowledged page".into(),
+                    ));
+                }
+                events.push(event);
+            }
+        }
+        if count != journal.count || expected != journal.head {
+            return Err(GuardError::Integrity(
+                "journal head differs from the durable acknowledged head".into(),
+            ));
+        }
+        Ok((
+            EventPage {
+                offset: offset as usize,
+                first_previous_hash: events.first().map(|event| event.previous_hash.clone()),
+                last_hash: events.last().map(|event| event.current_hash.clone()),
+                events,
+                has_more: false,
+            },
+            JournalHead {
+                count,
+                head_hash: expected,
+            },
+        ))
     }
 
     /// Routes committed records to a remote sink, in chain order.

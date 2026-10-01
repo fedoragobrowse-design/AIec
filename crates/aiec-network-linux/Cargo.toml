@@ -14,6 +14,6 @@ uuid.workspace = true
 ipnet.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true

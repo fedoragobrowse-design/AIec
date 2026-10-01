@@ -148,6 +148,7 @@ pub enum SandboxState {
     Starting,
     Running,
     Paused,
+    Quarantined,
     Stopping,
     Stopped,
     Snapshotting,
@@ -164,6 +165,7 @@ impl SandboxState {
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Paused => "paused",
+            Self::Quarantined => "quarantined",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::Snapshotting => "snapshotting",
@@ -179,6 +181,18 @@ impl SandboxState {
             (self, next),
             (Creating, Starting | Failed | Destroying)
                 | (Starting, Running | Failed | Destroying)
+                | (
+                    Creating
+                        | Starting
+                        | Running
+                        | Paused
+                        | Stopping
+                        | Stopped
+                        | Snapshotting
+                        | Restoring
+                        | Failed,
+                    Quarantined
+                )
                 | (Running, Stopping | Snapshotting | Failed | Destroying)
                 | (Running, Paused)
                 | (Paused, Running)
@@ -623,6 +637,9 @@ pub enum Scope {
     SandboxesWrite,
     SnapshotsRead,
     SnapshotsWrite,
+    GuardRead,
+    GuardHeartbeat,
+    GuardQuarantine,
     Admin,
 }
 impl Scope {
@@ -632,6 +649,9 @@ impl Scope {
             "sandboxes:write" => Ok(Self::SandboxesWrite),
             "snapshots:read" => Ok(Self::SnapshotsRead),
             "snapshots:write" => Ok(Self::SnapshotsWrite),
+            "guard:read" => Ok(Self::GuardRead),
+            "guard:heartbeat" => Ok(Self::GuardHeartbeat),
+            "guard:quarantine" => Ok(Self::GuardQuarantine),
             "admin" => Ok(Self::Admin),
             _ => Err(CoreError::InvalidRequest("unknown scope".into())),
         }

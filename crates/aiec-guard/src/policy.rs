@@ -1183,7 +1183,7 @@ pub fn zone_matches(zone: &str, host: &str) -> bool {
 /// Exactly one source of permissions may be present: an explicit
 /// [`GuardPolicy`] or a template plus its inputs. Anything else is ambiguous
 /// and refused, and no combination ever widens to open internet.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardConfig {
     /// Whether the agent loop runs inside or outside the sandbox.
@@ -1201,6 +1201,34 @@ pub struct GuardConfig {
     /// Allowlist rules for the selected template.
     #[serde(default)]
     pub allowlist: Vec<EgressRule>,
+    /// Outside-guest watchdog deadline; cannot disable the dead-man switch.
+    #[serde(default = "default_watchdog_timeout_ms")]
+    pub watchdog_timeout_ms: u64,
+    /// Immutable durable model-admission ceiling for this sandbox.
+    #[serde(default = "default_max_model_requests")]
+    pub max_model_requests: u64,
+}
+
+fn default_watchdog_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_max_model_requests() -> u64 {
+    10_000
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            topology: Topology::default(),
+            policy_template: PolicyTemplate::default(),
+            policy: None,
+            model_endpoint: None,
+            allowlist: Vec::new(),
+            watchdog_timeout_ms: default_watchdog_timeout_ms(),
+            max_model_requests: default_max_model_requests(),
+        }
+    }
 }
 
 impl GuardConfig {
@@ -1224,6 +1252,16 @@ impl GuardConfig {
 
     /// The validated policy this selection compiles to.
     pub fn effective_policy(&self) -> Result<GuardPolicy> {
+        if !(1_000..=60_000).contains(&self.watchdog_timeout_ms) {
+            return Err(policy_error(
+                "watchdog_timeout_ms must be between 1000 and 60000",
+            ));
+        }
+        if self.max_model_requests == 0 || self.max_model_requests > i64::MAX as u64 {
+            return Err(policy_error(
+                "max_model_requests must be between 1 and 9223372036854775807",
+            ));
+        }
         let template_inputs_present = self.policy_template != PolicyTemplate::NoNetwork
             || self.model_endpoint.is_some()
             || !self.allowlist.is_empty();

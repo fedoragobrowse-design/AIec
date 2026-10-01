@@ -1,6 +1,7 @@
 use crate::{
     NODE_HEARTBEAT_TTL_SECONDS, PostgresRepository, StoreError, core_error, database_error,
 };
+mod guard;
 use aiec_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
     Snapshot, UsageEvent, UsageSummary, new_id,
@@ -12,9 +13,10 @@ use aiec_core::{
     runtime::RuntimeCapabilities,
     scheduler::{ScheduleRequest, ScheduledSandbox, Scheduler, WorkerDispatch},
     storage::{
-        AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
-        SandboxOperation, SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment,
-        WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
+        AuditEvent, BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
+        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
+        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
+        WorkerLease, WorkerRegistration, WorkerStatus,
     },
 };
 use async_trait::async_trait;
@@ -51,6 +53,7 @@ fn state_from_str(value: &str) -> Result<SandboxState, StoreError> {
         "starting" => Ok(SandboxState::Starting),
         "running" => Ok(SandboxState::Running),
         "paused" => Ok(SandboxState::Paused),
+        "quarantined" => Ok(SandboxState::Quarantined),
         "stopping" => Ok(SandboxState::Stopping),
         "stopped" => Ok(SandboxState::Stopped),
         "snapshotting" => Ok(SandboxState::Snapshotting),
@@ -697,6 +700,11 @@ async fn apply_state_transition(
     reason: &str,
 ) -> Result<Sandbox, StoreError> {
     let mut value = sandbox_from_row(&row)?;
+    if next == SandboxState::Quarantined && value.state != SandboxState::Quarantined {
+        return Err(StoreError::Conflict(
+            "use the atomic Guard quarantine operation".into(),
+        ));
+    }
     if value.state == next {
         return Ok(value);
     }
@@ -1641,6 +1649,11 @@ impl PostgresRepository {
                 .map_err(database_error)?
                 .ok_or(StoreError::NotFound)?;
         let sandbox = sandbox_from_row(&row)?;
+        if sandbox.state == SandboxState::Quarantined {
+            return Err(StoreError::Conflict(
+                "quarantined sandbox requires explicit human release".into(),
+            ));
+        }
         if let Some(row) = lease_row {
             let lease = lease_from_row(&row)?;
             release_capacity(&mut tx, &lease, "released", "sandbox deleted").await?;
@@ -2566,8 +2579,9 @@ impl PostgresRepository {
         let rows = sqlx::query(
             "SELECT a.* FROM sandbox_assignments a \
              JOIN sandbox_leases l ON l.id = a.lease_id \
+             JOIN sandboxes s ON s.id=a.sandbox_id AND s.tenant_id=a.tenant_id \
              WHERE a.node_id=$1 AND a.status='reserved' AND l.status='active' \
-               AND l.expires_at > now() \
+               AND l.expires_at > now() AND s.state <> 'quarantined' \
              ORDER BY a.created_at LIMIT $2 FOR UPDATE OF a SKIP LOCKED",
         )
         .bind(node_id)
@@ -2890,8 +2904,9 @@ impl PostgresRepository {
         let limit = i64::from(limit.clamp(1, 10_000));
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         let rows = sqlx::query(
-            "SELECT * FROM sandbox_leases WHERE status='active' AND expires_at <= now() \
-             ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED",
+            "SELECT l.* FROM sandbox_leases l JOIN sandboxes s ON s.id=l.sandbox_id \
+             WHERE l.status='active' AND l.expires_at <= now() AND s.state <> 'quarantined' \
+             ORDER BY l.expires_at LIMIT $1 FOR UPDATE OF l SKIP LOCKED",
         )
         .bind(limit)
         .fetch_all(&mut *tx)
@@ -3447,7 +3462,7 @@ impl PostgresRepository {
         // this machine.
         let rows = sqlx::query(
             "SELECT s.* FROM sandboxes s \
-             WHERE s.state NOT IN ('destroyed', 'failed') \
+             WHERE s.state NOT IN ('destroyed', 'failed', 'quarantined') \
                AND s.updated_at < $1 \
                AND NOT EXISTS (\
                  SELECT 1 FROM sandbox_leases l \
@@ -3809,6 +3824,64 @@ impl PostgresRepository {
 
 #[async_trait]
 impl MetadataStore for PostgresRepository {
+    async fn put_guard_budget(
+        &self,
+        state: GuardBudgetState,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::put_guard_budget(self, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_guard_budget(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::get_guard_budget(self, tenant, id)
+            .await
+            .map_err(core_error)
+    }
+    async fn reserve_guard_budget(
+        &self,
+        identity: GuardIdentity,
+        fence: GuardFence,
+        debit: BudgetDebit,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::reserve_guard_budget(self, identity, fence, debit)
+            .await
+            .map_err(core_error)
+    }
+    async fn put_guard_incident(
+        &self,
+        incident: GuardIncident,
+    ) -> Result<GuardIncident, CoreError> {
+        Self::put_guard_incident(self, incident)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_guard_incident(&self, tenant: Uuid, id: Uuid) -> Result<GuardIncident, CoreError> {
+        Self::get_guard_incident(self, tenant, id)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_expired_guard_budgets(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<GuardBudgetState>, CoreError> {
+        Self::list_expired_guard_budgets(self, now)
+            .await
+            .map_err(core_error)
+    }
+    async fn mark_guard_quarantined(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        fence: GuardFence,
+    ) -> Result<Sandbox, CoreError> {
+        Self::mark_guard_quarantined(self, tenant, id, fence)
+            .await
+            .map_err(core_error)
+    }
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError> {
         Self::create_sandbox(self, value).await.map_err(core_error)
     }
@@ -4604,6 +4677,7 @@ async fn release_capacity(
 
 #[cfg(test)]
 mod tests {
+    mod guard_durable;
     use sqlx::postgres::PgPoolOptions;
 
     use super::*;

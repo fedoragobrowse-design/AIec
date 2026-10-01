@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 pub use crate::{LeaseId, RequestId, SandboxId, SnapshotId, TenantId, WorkerId};
+pub use aiec_guard::control::{
+    BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
+};
 
 /// Metadata returned after writing an artifact.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,6 +473,59 @@ pub struct OrphanedLeaseRelease {
 /// Persists AIec domain metadata with tenant-scoped access semantics.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    /// Initializes immutable Guard identity, expiration and caps without resetting usage.
+    async fn put_guard_budget(
+        &self,
+        _state: GuardBudgetState,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Err(CoreError::Unsupported("put_guard_budget".into()))
+    }
+    async fn get_guard_budget(
+        &self,
+        _tenant: TenantId,
+        _id: SandboxId,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Err(CoreError::Unsupported("get_guard_budget".into()))
+    }
+    /// Commits the debit before traffic forwards, under the current lease fence.
+    async fn reserve_guard_budget(
+        &self,
+        _identity: GuardIdentity,
+        _fence: GuardFence,
+        _debit: BudgetDebit,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Err(CoreError::Unsupported("reserve_guard_budget".into()))
+    }
+    /// Persists monotone quarantine progress; pending incidents survive restart.
+    async fn put_guard_incident(
+        &self,
+        _incident: GuardIncident,
+    ) -> Result<GuardIncident, CoreError> {
+        Err(CoreError::Unsupported("put_guard_incident".into()))
+    }
+    async fn get_guard_incident(
+        &self,
+        _tenant: TenantId,
+        _id: SandboxId,
+    ) -> Result<GuardIncident, CoreError> {
+        Err(CoreError::Unsupported("get_guard_incident".into()))
+    }
+    /// Includes expired or exhausted rows, even when quarantine still needs completion.
+    async fn list_expired_guard_budgets(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<GuardBudgetState>, CoreError> {
+        Err(CoreError::Unsupported("list_expired_guard_budgets".into()))
+    }
+    /// Atomically latches sandbox and budget quarantine; ordinary transitions cannot release it.
+    async fn mark_guard_quarantined(
+        &self,
+        _tenant: TenantId,
+        _id: SandboxId,
+        _fence: GuardFence,
+    ) -> Result<Sandbox, CoreError> {
+        Err(CoreError::Unsupported("mark_guard_quarantined".into()))
+    }
     /// Creates a sandbox.
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError>;
     /// Gets a tenant-owned sandbox.

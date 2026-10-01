@@ -221,12 +221,97 @@ it would be worse than leaving history alone, so the record is corrected here
 instead: the probe now reports `{"configured": false, "reason": "no ip binary
 on the guest"}`, and the image prerequisite is unchanged.
 
+## Phase 2: watchdog, dead-man switch and quarantine
+
+### Implemented, and exercised by the gate
+
+`fmt`, clippy with `-D warnings`, the full workspace test suite, the SDK import
+contract and 44 Python SDK tests pass. The implementation covers:
+
+- **Durable control-plane state.** `SandboxState::Quarantined` has no outgoing
+  transition. Seven `MetadataStore` methods with concrete Memory and Postgres
+  implementations and migration `0017_guard_durable_control.sql`. Ceilings and
+  expiry are immutable after initialisation, usage only grows, and a SQL latch
+  trigger refuses any update or delete that would release a quarantine.
+  Reconcile, reassignment, stranded cleanup, claim and delete all exclude
+  quarantined sandboxes. The scopes `guard:read`, `guard:heartbeat` and
+  `guard:quarantine` exist, and a key cannot grant what its holder lacks.
+- **Gateway dead-man switch.** A guarded attachment starts deny-all; the first
+  identity-matched heartbeat installs the packet rules. The deadline is
+  independent of the journal, so an audit failure cannot delay a cut. A
+  dead-man cut latches and only the authorized release path clears it; an
+  ordinary release is refused and the refusal is journaled.
+- **Durable budget admission.** Every model request and every byte is reserved
+  against the control plane through a fence-carrying HTTP client before it is
+  forwarded. An unreachable authority refuses traffic rather than falling back
+  to RAM. The policy's per-session ceilings are still enforced locally, so a
+  permissive authority cannot widen what the operator wrote.
+- **Watchdog.** A separate `aiec-guard-watchdog` process: deterministic rules
+  over authoritative counters and the hash-verified journal, guest advisory data
+  excluded, bounded configuration, private-CA support, retries that withhold the
+  heartbeat rather than exiting, a webhook notifier with an explicit `Disabled`
+  outcome, and an escaped Markdown incident report.
+- **Control-plane orchestration.** Telemetry, heartbeat, quarantine and incident
+  endpoints; a quarantine that cuts, captures without resuming, marks durably,
+  appends the authoritative event, generates the report and notifies, with each
+  stage retried until it succeeds and evidence extended rather than replaced.
+
+### Proven by running code
+
+- Phase 1 acceptance re-run against the phase 2 code: **41 of 41** on real
+  Firecracker microVMs with real nftables, including a new case proving that an
+  attachment carries traffic only after a watchdog heartbeat activates it.
+  `benchmarks/guard-core-acceptance.json`.
+- Phase 2 live acceptance (`scripts/guard-phase2-acceptance.sh`: a real control
+  plane, worker, guest, watchdog process, database and kernel tables inside a
+  disposable namespace). Observed passing: the watchdog key is narrowly scoped
+  and cannot create sandboxes; a guarded sandbox starts; telemetry is anchored
+  and authoritative; the watchdog heartbeats and the attachment stays live;
+  killing the watchdog cuts egress while the VM survives for forensics; a
+  triggered rule reaches the control plane; the durable quarantine mark lands and
+  a resume is refused before and after a worker restart.
+  `benchmarks/guard-phase2-acceptance.json` records the run in full, including
+  the cases that failed.
+
+### Defects the acceptance work found
+
+1. The watchdog declined to heartbeat a cut attachment, and an attachment only
+   leaves the cut *by* that heartbeat: a self-sustaining deadlock in which no
+   guest ever had egress. Found by counting zero heartbeats across 382
+   successful observations.
+2. A quarantine fence compared for equality refused every request after a lease
+   renewal, because a renewal legitimately advances the generation.
+3. The first incident write was refused by the store's evidence validator,
+   because the control plane created it with an empty anchor instead of seeding
+   it from the authoritative journal.
+4. The evidence refresh rewrote the incident's anchors with a continuation
+   page's anchors, so every stage update was silently dropped.
+5. The capture stage was gated on the pause, so a capture that failed after the
+   pause could never be retried.
+6. The quarantine endpoint held an HTTP request open across a multi-minute
+   capture, which every client with a one-second budget abandoned.
+7. A refused connection produced a TCP reset rather than a legible 503, and
+   killing the connection hid the handler's own refusal.
+8. An operator `cut()` was indistinguishable from a dead-man latch: an ordinary
+   release could not reopen one, and a dead-man latch could be cleared by one.
+
 ## What is still not proven
 
-Phase 1's real-sandbox acceptance gate is now clear. Phase 2 onward remains
-unimplemented and unproven; the core result does not stand in for watchdog,
-quarantine, L7, image-identity, harness or production acceptance evidence.
-The next active phase is watchdog and quarantine.
+- **A quarantine has not been observed reaching `completed_at` in a live run.**
+  The pause-and-capture stage has not yet been seen to finish end to end on the
+  deployed stack. Its behaviour is exercised by tests, and the durable mark, the
+  resume refusal and the dead-man cut are observed live, but "the incident
+  completes" is not yet observed evidence.
+- **The phase 2 acceptance namespace is intermittently unable to move a packet
+  from the guest to the attachment** - the guest reports ENETUNREACH with a
+  default route present - which is why its blocked-range case passes in some runs
+  and not others. The same counter path passes deterministically in the phase 1
+  acceptance, so the mechanism is sound and the fault is in the harness's
+  network setup, not in enforcement.
+- **Phases 3 to 5 are not started**: L7 governance and human-only policy
+  proposals, the optional watcher, canaries, image identity, per-VM credentials
+  and the adversarial red-team harness. None of the phase 2 evidence stands in
+  for any of them.
 
 ## Phases 2 to 6, and what gates each
 

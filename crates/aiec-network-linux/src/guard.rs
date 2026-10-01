@@ -6,10 +6,14 @@ use aiec_core::{
     network::{NetworkAttachment, NetworkBackend, NetworkCapabilities, NetworkPolicy},
 };
 use aiec_guard::{
-    compiler::{OperatorBoundary, compile},
-    enforcement::{EnforcementBackend, GuardAttachment, NftablesBackend},
-    events::{Category, Decision, EventInput, EventSink, FileEventSink},
-    gateway::{CredentialStore, GatewayConfig, GuardGateway},
+    compiler::{CompiledPolicy, OperatorBoundary, compile},
+    control::{
+        BudgetAuthority, GuardControlCommand, GuardControlResponse, GuardFence, GuardIdentity,
+        GuardRuntimeObservation,
+    },
+    enforcement::{CounterSource, EnforcementBackend, GuardAttachment, NftablesBackend},
+    events::{Category, Decision, EventInput, EventSink, FileEventSink, GuardEvent},
+    gateway::{CredentialStore, GatewayConfig, GatewayControl, GatewayNetworkCut, GuardGateway},
 };
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -18,7 +22,10 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -34,7 +41,55 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 struct RunningGuard {
     attachment: GuardAttachment,
-    gateway: GuardGateway,
+    node_id: Option<Uuid>,
+    compiled: CompiledPolicy,
+    gateway: Mutex<Option<GuardGateway>>,
+    control: GatewayControl,
+    fence: std::sync::RwLock<GuardFence>,
+    events: Arc<FileEventSink>,
+    kernel: Mutex<()>,
+    released: AtomicBool,
+    kernel_cut: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct LeaseContext {
+    tenant_id: Uuid,
+    node_id: Option<Uuid>,
+    fence: GuardFence,
+}
+
+struct AttachmentCut {
+    guard: Weak<RunningGuard>,
+    enforcement: Arc<NftablesBackend>,
+}
+
+#[async_trait]
+impl GatewayNetworkCut for AttachmentCut {
+    async fn cut_network(&self) -> aiec_guard::Result<()> {
+        let Some(guard) = self.guard.upgrade() else {
+            return Ok(());
+        };
+        let _kernel = guard.kernel.lock().await;
+        if guard.released.load(Ordering::Acquire)
+            || !guard.control.network_cut()
+            || guard.kernel_cut.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.enforcement.cut_network(&guard.attachment).await {
+            // If nft is unavailable, the attachment itself must still stop passing packets.
+            ip(&["link", "set", "dev", &guard.attachment.interface, "down"])
+                .await
+                .map_err(|fallback| {
+                    aiec_guard::GuardError::Unavailable(format!(
+                        "{error}; attachment cut: {fallback}"
+                    ))
+                })?;
+        }
+        guard.kernel_cut.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 /// Worker-side owner of out-of-guest gateways and their network attachments.
@@ -54,7 +109,10 @@ pub struct GuardNetworkManager {
     /// use it.
     can_enforce: bool,
     enforcement: Arc<NftablesBackend>,
-    running: Arc<Mutex<BTreeMap<Uuid, RunningGuard>>>,
+    running: Arc<Mutex<BTreeMap<Uuid, Arc<RunningGuard>>>>,
+    preparing: Arc<Mutex<()>>,
+    budget_authority: Arc<RwLock<Option<Arc<dyn BudgetAuthority>>>>,
+    fences: Arc<RwLock<BTreeMap<Uuid, LeaseContext>>>,
 }
 
 /// Whether this host can install and read nftables rules.
@@ -85,6 +143,9 @@ impl GuardNetworkManager {
             can_enforce: probe_enforcement(),
             enforcement: Arc::new(NftablesBackend::new()),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            preparing: Arc::new(Mutex::new(())),
+            budget_authority: Arc::new(RwLock::new(None)),
+            fences: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -105,6 +166,409 @@ impl GuardNetworkManager {
         self
     }
 
+    /// Installs the durable control-plane authority, shared by all runtime clones.
+    /// Reconfiguration cannot replace an authority underneath running workloads.
+    pub fn configure_budget_authority(
+        &self,
+        authority: Arc<dyn BudgetAuthority>,
+    ) -> Result<(), CoreError> {
+        let mut configured = self.budget_authority.write().map_err(|_| {
+            CoreError::Unavailable("Guard budget authority configuration poisoned".into())
+        })?;
+        if configured.is_some() {
+            return Err(CoreError::InvalidRequest(
+                "Guard budget authority already configured".into(),
+            ));
+        }
+        *configured = Some(authority);
+        Ok(())
+    }
+
+    /// Parent dispatch authenticates current ownership before issuing this fence.
+    pub async fn guard_set_fence(
+        &self,
+        sandbox: &Sandbox,
+        fence: GuardFence,
+    ) -> Result<(), CoreError> {
+        if fence.generation < 0 {
+            return Err(CoreError::InvalidRequest(
+                "invalid Guard ownership generation".into(),
+            ));
+        }
+        let running = self.running.lock().await.get(&sandbox.id).cloned();
+        if let Some(guard) = running.as_ref()
+            && (guard.fence.read().map(|bound| bound.lease_id).ok() != Some(fence.lease_id)
+                || guard.attachment.tenant_id != sandbox.tenant_id
+                || guard.node_id != sandbox.node_id)
+        {
+            return Err(CoreError::InvalidRequest(
+                "cannot change lease of a live Guard attachment".into(),
+            ));
+        }
+        // A lease renewal advances the authorized generation for the same lease,
+        // so reservations commit against the generation the worker owns now.
+        if let Some(guard) = running {
+            {
+                let mut bound = guard.fence.write().map_err(|_| {
+                    CoreError::Unavailable("Guard ownership fence is poisoned".into())
+                })?;
+                if bound.lease_id == fence.lease_id && fence.generation < bound.generation {
+                    return Ok(());
+                }
+                *bound = fence;
+            }
+            if let Some(gateway) = guard.gateway.lock().await.as_ref() {
+                let _ = gateway.set_fence(fence);
+            }
+        }
+        let mut fences = self
+            .fences
+            .write()
+            .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?;
+        if let Some(previous) = fences.get(&sandbox.id) {
+            if previous.tenant_id != sandbox.tenant_id || previous.node_id != sandbox.node_id {
+                return Err(CoreError::InvalidRequest(
+                    "Guard lease ownership mismatch".into(),
+                ));
+            }
+            if previous.fence.lease_id == fence.lease_id
+                && previous.fence.generation > fence.generation
+            {
+                return Ok(());
+            }
+        }
+        fences.insert(
+            sandbox.id,
+            LeaseContext {
+                tenant_id: sandbox.tenant_id,
+                node_id: sandbox.node_id,
+                fence,
+            },
+        );
+        Ok(())
+    }
+
+    async fn bound_guard(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+    ) -> Result<Arc<RunningGuard>, CoreError> {
+        let guard = self
+            .running
+            .lock()
+            .await
+            .get(&sandbox.id)
+            .cloned()
+            .ok_or_else(|| CoreError::Unavailable("Guard attachment is not running".into()))?;
+        let (context_tenant, context_node, context_fence) = {
+            let contexts = self
+                .fences
+                .read()
+                .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?;
+            let context = contexts
+                .get(&sandbox.id)
+                .ok_or_else(|| CoreError::Unavailable("Guard lease context missing".into()))?;
+            (context.tenant_id, context.node_id, context.fence)
+        };
+        if context_tenant != sandbox.tenant_id
+            || context_node != sandbox.node_id
+            || context_fence.lease_id != fence.lease_id
+            || guard.fence.read().map(|bound| bound.lease_id).ok() != Some(fence.lease_id)
+            || fence.generation < 0
+            || fence.generation < context_fence.generation
+        {
+            return Err(CoreError::InvalidRequest(
+                "Guard action ownership fence mismatch".into(),
+            ));
+        }
+        // A renewal advances the generation of the same lease, so a worker whose
+        // ownership was re-checked moments ago legitimately presents a newer one
+        // than the context recorded at startup. Refusing that would leave a
+        // healthy attachment unusable for the life of the lease; what must not be
+        // accepted is a *different* lease, and that is refused above.
+        if fence.generation > context_fence.generation {
+            {
+                let mut bound = guard.fence.write().map_err(|_| {
+                    CoreError::Unavailable("Guard ownership fence is poisoned".into())
+                })?;
+                if bound.lease_id != fence.lease_id || fence.generation < bound.generation {
+                    return Err(CoreError::InvalidRequest(
+                        "Guard action ownership fence mismatch".into(),
+                    ));
+                }
+                *bound = fence;
+            }
+            if let Some(gateway) = guard.gateway.lock().await.as_ref() {
+                let _ = gateway.set_fence(fence);
+            }
+            let mut contexts = self
+                .fences
+                .write()
+                .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?;
+            if let Some(entry) = contexts.get_mut(&sandbox.id)
+                && entry.fence.lease_id == fence.lease_id
+            {
+                entry.fence = fence;
+            }
+        }
+        if guard.attachment.sandbox_id != sandbox.id
+            || guard.attachment.tenant_id != sandbox.tenant_id
+            || guard.node_id != sandbox.node_id
+            || guard.compiled.policy_hash() != policy_hash
+            || guard.released.load(Ordering::Acquire)
+        {
+            return Err(CoreError::InvalidRequest(
+                "Guard attachment identity mismatch".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
+    /// Reports liveness for every live attachment this manager owns.
+    ///
+    /// This is the manager's own heartbeat, not the gateway's: the first one
+    /// also installs the attachment's packet rules, and a gateway that merely
+    /// stops refusing would leave the kernel denying everything.
+    pub async fn heartbeat_every_attachment(&self) {
+        let entries: Vec<(Uuid, Arc<RunningGuard>)> = {
+            let running = self.running.lock().await;
+            running
+                .iter()
+                .map(|(id, guard)| (*id, guard.clone()))
+                .collect()
+        };
+        let contexts = match self.fences.read() {
+            Ok(contexts) => contexts.clone(),
+            Err(_) => return,
+        };
+        for (sandbox_id, guard) in entries {
+            let Some(context) = contexts.get(&sandbox_id) else {
+                continue;
+            };
+            let sandbox = Sandbox {
+                id: sandbox_id,
+                tenant_id: context.tenant_id,
+                node_id: context.node_id,
+                image_id: String::new(),
+                state: aiec_core::SandboxState::Running,
+                runtime: aiec_core::RuntimeKind::Firecracker,
+                cpu: 0,
+                memory_mb: 0,
+                disk_mb: 0,
+                timeout_seconds: 0,
+                network: Default::default(),
+                environment: Default::default(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                runtime_path: None,
+            };
+            let policy_hash = guard.compiled.policy_hash().to_owned();
+            let fence = context.fence;
+            if let Err(error) = self.guard_heartbeat(&sandbox, &policy_hash, fence).await {
+                eprintln!("guard heartbeat refused for {sandbox_id}: {error}");
+            }
+        }
+    }
+
+    /// Whether every live attachment has been activated by a heartbeat.
+    pub async fn attachments_active(&self) -> bool {
+        let guards: Vec<Arc<RunningGuard>> = self.running.lock().await.values().cloned().collect();
+        let total = guards.len();
+        if total == 0 {
+            return true;
+        }
+        let mut active = 0usize;
+        for guard in &guards {
+            if let Some(gateway) = guard.gateway.lock().await.as_ref()
+                && !gateway.network_cut()
+                && !guard.kernel_cut.load(Ordering::Acquire)
+            {
+                active += 1;
+            }
+        }
+        active == total
+    }
+
+    /// How many attachments this manager currently owns.
+    pub async fn attachment_count(&self) -> usize {
+        self.running.lock().await.len()
+    }
+
+    pub async fn guard_heartbeat(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+    ) -> Result<(), CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        let gateway = guard.gateway.lock().await;
+        let gateway = gateway
+            .as_ref()
+            .ok_or_else(|| CoreError::Unavailable("Guard gateway stopped".into()))?;
+        let _kernel = guard.kernel.lock().await;
+        if guard.released.load(Ordering::Acquire) {
+            return Err(CoreError::Unavailable("Guard attachment released".into()));
+        }
+        let first = gateway
+            .heartbeat(&GuardIdentity {
+                sandbox_id: sandbox.id,
+                tenant_id: sandbox.tenant_id,
+                policy_hash: policy_hash.to_owned(),
+            })
+            .map_err(guard_error)?;
+        if first {
+            if let Err(error) = self
+                .enforcement
+                .restore_network(&guard.compiled, &guard.attachment)
+                .await
+            {
+                let _ = gateway.cut();
+                let _ = self.enforcement.cut_network(&guard.attachment).await;
+                return Err(guard_error(error));
+            }
+            guard.kernel_cut.store(false, Ordering::Release);
+            if gateway.network_cut() {
+                self.enforcement
+                    .cut_network(&guard.attachment)
+                    .await
+                    .map_err(guard_error)?;
+                return Err(CoreError::Unavailable("Guard activation expired".into()));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn guard_cut(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+    ) -> Result<(), CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        // Cut the gateway before any kernel I/O. Audit failure never skips nft.
+        let gateway_result = guard.control.cut().map_err(guard_error);
+        let kernel_result = AttachmentCut {
+            guard: Arc::downgrade(&guard),
+            enforcement: self.enforcement.clone(),
+        }
+        .cut_network()
+        .await
+        .map_err(guard_error);
+        kernel_result?;
+        gateway_result
+    }
+
+    /// Caller must authenticate and fence an explicit operator release.
+    pub async fn guard_restore(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+    ) -> Result<(), CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        let gateway = guard.gateway.lock().await;
+        let gateway = gateway
+            .as_ref()
+            .ok_or_else(|| CoreError::Unavailable("Guard gateway stopped".into()))?;
+        // No kernel mutex while waiting for the durable release event:
+        // the watchdog must be able to cut nft even if that journal hangs.
+        // This is the authorized path, reserved for a caller that has already
+        // proved the operator decision; an ordinary release cannot reopen a
+        // cut the dead-man switch latched.
+        gateway.authorized_release().await.map_err(guard_error)?;
+        let _kernel = guard.kernel.lock().await;
+        if guard.released.load(Ordering::Acquire) || gateway.network_cut() {
+            return Err(CoreError::Unavailable(
+                "Guard release fenced by attachment cut".into(),
+            ));
+        }
+        if let Err(error) = self
+            .enforcement
+            .restore_network(&guard.compiled, &guard.attachment)
+            .await
+        {
+            let _ = gateway.cut();
+            let _ = self.enforcement.cut_network(&guard.attachment).await;
+            return Err(guard_error(error));
+        }
+        guard.kernel_cut.store(false, Ordering::Release);
+        ip(&["link", "set", "dev", &guard.attachment.interface, "up"]).await?;
+        if gateway.network_cut() {
+            self.enforcement
+                .cut_network(&guard.attachment)
+                .await
+                .map_err(guard_error)?;
+            return Err(CoreError::Unavailable("Guard release expired".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn guard_observation(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+        after: u64,
+    ) -> Result<GuardRuntimeObservation, CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        let counters = self
+            .enforcement
+            .counters(&guard.attachment)
+            .await
+            .map_err(guard_error)?;
+        let sink = guard.events.clone();
+        let (page, head) = tokio::task::spawn_blocking(move || sink.verified_snapshot(after))
+            .await
+            .map_err(|_| CoreError::Unavailable("Guard journal verification task failed".into()))?
+            .map_err(guard_error)?;
+        if page.events.iter().any(|event| {
+            event.sandbox_id != sandbox.id
+                || event.tenant_id != sandbox.tenant_id
+                || event.policy_hash != policy_hash
+        }) {
+            return Err(CoreError::Unavailable(
+                "Guard journal identity mismatch".into(),
+            ));
+        }
+        Ok(GuardRuntimeObservation {
+            identity: GuardIdentity {
+                sandbox_id: sandbox.id,
+                tenant_id: sandbox.tenant_id,
+                policy_hash: policy_hash.to_owned(),
+            },
+            counters,
+            events: page.events,
+            observed_at: chrono::Utc::now(),
+            event_start_sequence: page.offset as u64 + 1,
+            event_previous_hash: page
+                .first_previous_hash
+                .unwrap_or_else(|| head.head_hash.clone()),
+            event_sequence: head.count,
+            event_head: head.head_hash,
+            network_cut: guard.control.network_cut(),
+        })
+    }
+
+    pub async fn guard_append_event(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+        event: EventInput,
+    ) -> Result<GuardEvent, CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        if event.sandbox_id != sandbox.id
+            || event.tenant_id != sandbox.tenant_id
+            || event.policy_hash != policy_hash
+        {
+            return Err(CoreError::InvalidRequest(
+                "Guard event identity mismatch".into(),
+            ));
+        }
+        // Reuse the gateway's file owner; never acquire a second writer lock.
+        guard.events.append(event).await.map_err(guard_error)
+    }
     fn directory(&self, id: Uuid) -> PathBuf {
         self.state_dir.join(id.to_string())
     }
@@ -121,7 +585,35 @@ impl GuardNetworkManager {
         }
     }
 
-    async fn create_guard(&self, sandbox: &Sandbox) -> Result<RunningGuard, CoreError> {
+    async fn create_guard(&self, sandbox: &Sandbox) -> Result<Arc<RunningGuard>, CoreError> {
+        let authority = self
+            .budget_authority
+            .read()
+            .map_err(|_| {
+                CoreError::Unavailable("Guard budget authority configuration poisoned".into())
+            })?
+            .clone()
+            .ok_or_else(|| {
+                CoreError::Unavailable(
+                    "guarded workloads require an external durable budget authority".into(),
+                )
+            })?;
+        let context = self
+            .fences
+            .read()
+            .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?
+            .get(&sandbox.id)
+            .copied()
+            .ok_or_else(|| {
+                CoreError::Unavailable(
+                    "Guard requires an authorized ownership fence before attachment".into(),
+                )
+            })?;
+        if context.tenant_id != sandbox.tenant_id || context.node_id != sandbox.node_id {
+            return Err(CoreError::InvalidRequest(
+                "Guard lease ownership mismatch".into(),
+            ));
+        }
         let config = sandbox
             .environment
             .guard
@@ -219,12 +711,13 @@ impl GuardNetworkManager {
             ])
             .await?;
             self.enforcement
-                .apply_policy(&compiled, &attachment)
+                .cut_network(&attachment)
                 .await
                 .map_err(|e| CoreError::Unavailable(format!("guard nftables apply: {e}")))?;
             let gateway = GuardGateway::start(GatewayConfig {
                 sandbox_id: sandbox.id,
                 tenant_id: sandbox.tenant_id,
+                fence: context.fence,
                 compiled: compiled.clone(),
                 bind_ip: gateway_ip,
                 guest_ip,
@@ -232,6 +725,8 @@ impl GuardNetworkManager {
                 dns_port: DNS_PORT,
                 credentials: Arc::new(credentials),
                 events: events.clone(),
+                budget_authority: authority,
+                watchdog_timeout: Duration::from_millis(config.watchdog_timeout_ms),
             })
             .await
             .map_err(|e| CoreError::Unavailable(format!("guard gateway start: {e}")))?;
@@ -260,10 +755,23 @@ impl GuardNetworkManager {
                 .await
                 .map_err(|e| CoreError::Unavailable(format!("guard journal append: {e}")))?;
             ip(&["link", "set", "dev", &attachment.interface, "up"]).await?;
-            Ok::<_, CoreError>(RunningGuard {
+            let control = gateway.control();
+            let guard = Arc::new(RunningGuard {
                 attachment: attachment.clone(),
-                gateway,
-            })
+                node_id: sandbox.node_id,
+                compiled: compiled.clone(),
+                fence: std::sync::RwLock::new(context.fence),
+                control,
+                gateway: Mutex::new(Some(gateway)),
+                events: events.clone(),
+                kernel: Mutex::new(()),
+                released: AtomicBool::new(false),
+                kernel_cut: AtomicBool::new(true),
+            });
+            guard.gateway.lock().await.as_ref().expect("new gateway").set_network_cut_handler(Arc::new(AttachmentCut {
+                guard: Arc::downgrade(&guard), enforcement: self.enforcement.clone(),
+            }));
+            Ok::<_, CoreError>(guard)
         }
         .await;
         if result.is_err() {
@@ -294,6 +802,54 @@ impl NetworkBackend for GuardNetworkManager {
         }
     }
 
+    fn configure_guard_budget_authority(
+        &self,
+        authority: Arc<dyn BudgetAuthority>,
+    ) -> Result<(), CoreError> {
+        self.configure_budget_authority(authority)
+    }
+
+    async fn guard_set_fence(&self, sandbox: &Sandbox, fence: GuardFence) -> Result<(), CoreError> {
+        GuardNetworkManager::guard_set_fence(self, sandbox, fence).await
+    }
+
+    async fn guard_control(
+        &self,
+        sandbox: &Sandbox,
+        fence: GuardFence,
+        command: GuardControlCommand,
+    ) -> Result<GuardControlResponse, CoreError> {
+        match command {
+            GuardControlCommand::SetFence { fence } => {
+                self.guard_set_fence(sandbox, fence).await?;
+                Ok(GuardControlResponse::Unit)
+            }
+            GuardControlCommand::Heartbeat { policy_hash } => {
+                self.guard_heartbeat(sandbox, &policy_hash, fence).await?;
+                Ok(GuardControlResponse::Unit)
+            }
+            GuardControlCommand::Cut { policy_hash } => {
+                self.guard_cut(sandbox, &policy_hash, fence).await?;
+                Ok(GuardControlResponse::Unit)
+            }
+            GuardControlCommand::Observe { policy_hash, after } => {
+                Ok(GuardControlResponse::Observation(
+                    self.guard_observation(sandbox, &policy_hash, fence, after)
+                        .await?,
+                ))
+            }
+            GuardControlCommand::AppendEvent { policy_hash, event } => {
+                Ok(GuardControlResponse::Event(
+                    self.guard_append_event(sandbox, &policy_hash, fence, event)
+                        .await?,
+                ))
+            }
+            GuardControlCommand::CapturePaused { .. } => Err(CoreError::Unsupported(
+                "paused Guard capture belongs to the runtime".into(),
+            )),
+        }
+    }
+
     async fn prepare(
         &self,
         sandbox: &Sandbox,
@@ -305,8 +861,8 @@ impl NetworkBackend for GuardNetworkManager {
             }
             return LinuxNetworkManager::new().prepare(sandbox, policy).await;
         }
-        let mut running = self.running.lock().await;
-        if running.contains_key(&sandbox.id) {
+        let _preparing = self.preparing.lock().await;
+        if self.running.lock().await.contains_key(&sandbox.id) {
             return Err(CoreError::InvalidRequest(
                 "Guard attachment already running".into(),
             ));
@@ -317,7 +873,7 @@ impl NetworkBackend for GuardNetworkManager {
             addresses: vec![guard.attachment.gateway_ip.to_string()],
             guest_addresses: vec![guard.attachment.guest_ip.to_string()],
         };
-        running.insert(sandbox.id, guard);
+        self.running.lock().await.insert(sandbox.id, guard);
         Ok(result)
     }
 
@@ -331,7 +887,6 @@ impl NetworkBackend for GuardNetworkManager {
                 .release(sandbox, attachment)
                 .await;
         }
-        let mut running = self.running.lock().await;
         let stored = bounded_read(
             &self.directory(sandbox.id).join("attachment.json"),
             MAX_CONFIG_BYTES,
@@ -361,9 +916,15 @@ impl NetworkBackend for GuardNetworkManager {
             .map_err(guard_error)?;
         // Do not delete filtering while a guest still has a live interface.
         ip(&["link", "set", "dev", &guard.interface, "down"]).await?;
-        if let Some(guard) = running.remove(&sandbox.id) {
-            guard.gateway.cut().map_err(guard_error)?;
-            guard.gateway.shutdown().await.map_err(guard_error)?;
+        let running = self.running.lock().await.remove(&sandbox.id);
+        if let Some(running) = running {
+            running.released.store(true, Ordering::Release);
+            let _ = running.control.cut();
+            let gateway = running.gateway.lock().await.take();
+            if let Some(gateway) = gateway {
+                let _ = gateway.cut();
+                gateway.shutdown().await.map_err(guard_error)?;
+            }
         }
         ip(&["link", "del", "dev", &guard.interface]).await?;
         self.enforcement
@@ -375,6 +936,10 @@ impl NetworkBackend for GuardNetworkManager {
             &serde_json::json!({"attachment":guard,"node_id":node,"released":true}),
         )
         .await?;
+        self.fences
+            .write()
+            .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?
+            .remove(&sandbox.id);
         Ok(())
     }
 }

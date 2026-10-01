@@ -23,7 +23,7 @@
 mod file;
 mod remote;
 
-pub use file::{FileEventSink, read_events, read_events_page, verify_file};
+pub use file::{EventPage, FileEventSink, read_events, read_events_page, verify_file};
 pub use remote::{
     HttpEventSink, HttpEventSinkConfig, RemoteAck, RemoteEventSink, RemoteQueue, RemoteQueueConfig,
     RemoteStatsSnapshot,

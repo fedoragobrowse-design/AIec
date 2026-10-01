@@ -15,6 +15,7 @@ use aiec_core::{
     snapshots::SnapshotProvider,
     storage::{MetadataStore, WorkerAssignment},
 };
+use aiec_guard::budget_client::HttpBudgetAuthority;
 use aiec_guard::policy::PolicyTemplate;
 use aiec_runtime::DockerRuntime;
 use aiec_runtime::{BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime};
@@ -32,6 +33,7 @@ use std::{
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "aiec", version, about = "AIec sandbox cloud CLI")]
@@ -932,8 +934,9 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     let capabilities = runtime.capabilities();
     let mut client_builder =
         reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
-    if let Ok(path) = std::env::var("AIEC_TLS_CA_CERT") {
-        let pem = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+    let ca_cert = std::env::var("AIEC_TLS_CA_CERT").ok();
+    if let Some(path) = ca_cert.as_deref() {
+        let pem = std::fs::read(path).with_context(|| format!("read {path}"))?;
         let certificate =
             reqwest::Certificate::from_pem(&pem).with_context(|| format!("parse {path}"))?;
         client_builder = client_builder.add_root_certificate(certificate);
@@ -1059,6 +1062,18 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // does not use.
     let verifier = HttpOwnershipVerifier::new(control.clone(), token.clone(), node_id)
         .map_err(|error| anyhow::anyhow!("build worker ownership verifier: {error}"))?;
+    // Guard reservations are committed by the control plane before any byte is
+    // admitted, so the worker needs a real authority before it may serve a
+    // guarded sandbox. A worker that cannot reach the authority still starts,
+    // because an unguarded deployment has nothing to reserve.
+    let guard_budget_authority = HttpBudgetAuthority::new(
+        &control,
+        Zeroizing::new(token.clone()),
+        node_id,
+        ca_cert.as_deref().map(std::path::Path::new),
+        std::env::var("AIEC_ALLOW_LOOPBACK_HTTP").as_deref() == Ok("1"),
+    );
+    let budget_target = runtime.clone();
     let mut service = WorkerService::new(
         runtime,
         runtime_kind,
@@ -1070,6 +1085,22 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     )
     .with_state_dir(&args.state_dir)
     .with_ownership_verifier(Arc::new(verifier));
+    match &guard_budget_authority {
+        Ok(authority) => {
+            // A guarded attachment refuses to prepare without this, so a
+            // failure here is reported rather than left to a sandbox's own
+            // refusal much later.
+            if let Err(error) =
+                budget_target.configure_guard_budget_authority(Arc::new(authority.clone()))
+            {
+                tracing::warn!(%error, "this worker's runtime does not accept a Guard budget authority");
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "no Guard budget authority is configured; guarded sandboxes will refuse to start"
+        ),
+    }
     if let Some(profile) = guest_profile {
         service = service.with_guest_profile(profile);
     }
@@ -1877,6 +1908,7 @@ fn run_request_from(args: &RunSubmitArgs) -> Result<CreateRunRequest> {
             policy: None,
             model_endpoint: None,
             allowlist: Vec::new(),
+            ..Default::default()
         });
         request.resources.network = NetworkPolicy::Disabled;
     }

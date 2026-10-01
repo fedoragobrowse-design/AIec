@@ -104,7 +104,10 @@ pub(super) async fn connect(
             if sni != host {
                 return Err(());
             }
-            task_state.debit(true, hello.len() as u64).map_err(|_| ())?;
+            task_state
+                .debit(true, hello.len() as u64)
+                .await
+                .map_err(|_| ())?;
             audit.lock().out = hello.len() as u64;
             if hello.len() as u64 > task_state.config.compiled.policy().limits.max_request_bytes {
                 return Err(());
@@ -203,7 +206,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
                 a.incoming = count;
             }
         }
-        state.debit(outgoing, size as u64).map_err(|_| ())?;
+        state.debit(outgoing, size as u64).await.map_err(|_| ())?;
         let cap = if outgoing {
             state.config.compiled.policy().limits.max_request_bytes
         } else {

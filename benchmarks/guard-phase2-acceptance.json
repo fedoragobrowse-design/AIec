@@ -1,0 +1,364 @@
+{
+  "schema": "aiec.guard.phase2-acceptance.v1",
+  "status": "FAIL",
+  "passed": 15,
+  "cases": 28,
+  "cases_detail": [
+    {
+      "case": "worker-registers-and-stays-healthy",
+      "status": "PASS",
+      "evidence": {
+        "registered": true,
+        "health": {
+          "node_id": "01a0f90a-e918-7637-9082-a9533163002a",
+          "healthy": true,
+          "runtime": "firecracker",
+          "capabilities": {
+            "isolation": "micro_vm",
+            "exec": true,
+            "files": true,
+            "streaming": false,
+            "pty": false,
+            "docker_image": false,
+            "guest_agent": true,
+            "full_kernel_isolation": true,
+            "portable_workspace": false,
+            "vm_snapshot": true,
+            "memory_resume": true,
+            "network_policy": true,
+            "gpu": false,
+            "pause": true,
+            "pause_reclaims_resources": false,
+            "workspace_snapshot": false,
+            "vsock": true,
+            "coding_guest": true
+          },
+          "in_flight": 0,
+          "capacity": 4,
+          "sandbox_count": 0,
+          "guest_profile": {
+            "artifact_version": "1.0.0",
+            "base": "debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "profile": "coding",
+            "capabilities": [
+              "sh",
+              "coreutils",
+              "git",
+              "ca-certificates",
+              "dns",
+              "https",
+              "tar",
+              "gzip",
+              "curl",
+              "python3"
+            ],
+            "git_version": "git version 2.39.5",
+            "guest_agent_version": "0.1.0",
+            "guest_protocol_version": 2
+          }
+        }
+      }
+    },
+    {
+      "case": "watchdog-key-is-narrowly-scoped",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "scopes": [
+          "guard:read",
+          "guard:heartbeat",
+          "guard:quarantine"
+        ]
+      }
+    },
+    {
+      "case": "watchdog-key-cannot-create-sandboxes",
+      "status": "PASS",
+      "evidence": {
+        "status": 403,
+        "error": "forbidden"
+      }
+    },
+    {
+      "case": "guarded-sandbox-starts",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "state": "running",
+        "error": null
+      }
+    },
+    {
+      "case": "policy-hash-is-recorded",
+      "status": "PASS",
+      "evidence": {
+        "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+      }
+    },
+    {
+      "case": "watchdog-process-starts-outside-the-guest",
+      "status": "PASS",
+      "evidence": {
+        "pid": 2264869,
+        "exit": null,
+        "reason": null
+      }
+    },
+    {
+      "case": "telemetry-is-authoritative-and-anchored",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "body": null,
+        "event_head": "d5f896dae1d1d19efd213609a688f484db23465890796905ef51e3aaeafbf4e5",
+        "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
+        "budget_max_model_requests": 10000
+      }
+    },
+    {
+      "case": "attachment-stays-live-under-a-real-watchdog",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "network_cut": false
+      }
+    },
+    {
+      "case": "guest-still-runs-while-guarded",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "stdout": "guarded-alive\n"
+      }
+    },
+    {
+      "case": "attachment-is-not-cut-while-a-watchdog-reports",
+      "status": "PASS",
+      "evidence": {
+        "network_cut": false,
+        "status": 200
+      }
+    },
+    {
+      "case": "guest-probe-is-installed",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "error": null
+      }
+    },
+    {
+      "case": "guest-route-is-configured-by-the-runtime",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "gateway": "172.30.11.53",
+        "tap": "agde42f1380e0a9",
+        "kernel_view": "{\"default\": [[\"eth0\", \"00000000\", \"350B1EAC\", \"0003\", \"0\", \"0\", \"0\", \"00000000\", \"0\", \"0\", \"0\"]], \"links\": {\"lo\": \"unknown\", \"eth0\": \"up\"}}\n",
+        "response": null
+      }
+    },
+    {
+      "case": "blocked-range-attempt-increments-the-authoritative-counter",
+      "status": "FAIL",
+      "evidence": {
+        "blocked_range_before": 0,
+        "counters_before": {
+          "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
+          "blocked_range": 0,
+          "other_denied": 0,
+          "ipv6": 0,
+          "dns_permitted": 0,
+          "broker_permitted": 0
+        },
+        "counters_after": {
+          "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
+          "blocked_range": 0,
+          "other_denied": 0,
+          "ipv6": 0,
+          "dns_permitted": 0,
+          "broker_permitted": 0
+        },
+        "blocked_range_after": 0,
+        "delta": 0,
+        "attempts": [
+          {
+            "errno": 101,
+            "guest_cpu_seconds": 0.062806,
+            "guest_peak_rss_kib": 19000,
+            "reachable": false,
+            "timeout": false
+          },
+          {
+            "errno": 101,
+            "guest_cpu_seconds": 0.047516,
+            "guest_peak_rss_kib": 18988,
+            "reachable": false,
+            "timeout": false
+          },
+          {
+            "errno": null,
+            "guest_cpu_seconds": 0.047897999999999996,
+            "guest_peak_rss_kib": 19076,
+            "reachable": false,
+            "timeout": true
+          },
+          {
+            "errno": null,
+            "guest_cpu_seconds": 0.048866999999999994,
+            "guest_peak_rss_kib": 19056,
+            "reachable": false,
+            "timeout": true
+          }
+        ]
+      }
+    },
+    {
+      "case": "repeated-deny-behavior-triggers-a-quarantine",
+      "status": "FAIL",
+      "evidence": {
+        "rules": []
+      }
+    },
+    {
+      "case": "killed-watchdog-cuts-egress",
+      "status": "PASS",
+      "evidence": {
+        "network_cut": true
+      }
+    },
+    {
+      "case": "guest-is-still-alive-for-forensics-while-cut",
+      "status": "PASS",
+      "evidence": {
+        "state": "running"
+      }
+    },
+    {
+      "case": "quarantine-cuts-the-network",
+      "status": "FAIL",
+      "evidence": {
+        "network_cut_at": null
+      }
+    },
+    {
+      "case": "quarantine-pauses-the-vm",
+      "status": "FAIL",
+      "evidence": {
+        "paused_at": null
+      }
+    },
+    {
+      "case": "quarantine-captures-forensics",
+      "status": "FAIL",
+      "evidence": {
+        "snapshot_id": null
+      }
+    },
+    {
+      "case": "quarantine-writes-an-incident-report",
+      "status": "FAIL",
+      "evidence": {
+        "report_head": ""
+      }
+    },
+    {
+      "case": "quarantine-completes",
+      "status": "FAIL",
+      "evidence": {
+        "completed_at": null
+      }
+    },
+    {
+      "case": "durable-state-marks-the-sandbox-quarantined",
+      "status": "FAIL",
+      "evidence": {
+        "state": null
+      }
+    },
+    {
+      "case": "quarantined-sandbox-cannot-be-resumed",
+      "status": "FAIL",
+      "evidence": {
+        "status": 401,
+        "error": "unauthorized"
+      }
+    },
+    {
+      "case": "quarantine-twice-is-idempotent",
+      "status": "FAIL",
+      "evidence": {
+        "status": 401,
+        "same_incident": false,
+        "response": {
+          "error": {
+            "code": "unauthorized",
+            "message": "invalid API key",
+            "request_id": "01a0f98a-7674-75c4-b0ea-c81ab0c5b55b"
+          }
+        },
+        "completed_at_unchanged": true
+      }
+    },
+    {
+      "case": "worker-restarts-cleanly",
+      "status": "PASS",
+      "evidence": {
+        "exit": -15
+      }
+    },
+    {
+      "case": "budget-and-quarantine-survive-a-worker-restart",
+      "status": "FAIL",
+      "evidence": {
+        "quarantined": null,
+        "model_requests": null,
+        "max_model_requests": null,
+        "expires_at": null
+      }
+    },
+    {
+      "case": "quarantine-is-not-forgotten-after-restart",
+      "status": "FAIL",
+      "evidence": {
+        "status": 401,
+        "error": "unauthorized"
+      }
+    },
+    {
+      "case": "sandbox-is-released-at-cleanup",
+      "status": "FAIL",
+      "evidence": {
+        "remaining": [
+          [
+            null,
+            null
+          ]
+        ]
+      }
+    }
+  ],
+  "failing": [
+    "blocked-range-attempt-increments-the-authoritative-counter",
+    "repeated-deny-behavior-triggers-a-quarantine",
+    "quarantine-cuts-the-network",
+    "quarantine-pauses-the-vm",
+    "quarantine-captures-forensics",
+    "quarantine-writes-an-incident-report",
+    "quarantine-completes",
+    "durable-state-marks-the-sandbox-quarantined",
+    "quarantined-sandbox-cannot-be-resumed",
+    "quarantine-twice-is-idempotent",
+    "budget-and-quarantine-survive-a-worker-restart",
+    "quarantine-is-not-forgotten-after-restart",
+    "sandbox-is-released-at-cleanup"
+  ],
+  "cleanup_errors": [
+    "watchdog exited -9"
+  ],
+  "watchdog_timeout_ms": 3000,
+  "incident_id": null,
+  "incident_errors": null,
+  "elapsed_seconds": 654.164,
+  "finished_at": "2026-10-01T22:16:44.431506+00:00"
+}

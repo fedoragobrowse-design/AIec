@@ -1,13 +1,16 @@
 //! Out-of-guest policy, network enforcement and credential governance for AIec.
 //! This crate deliberately has no dependency on the sandbox control plane.
 
+pub mod budget_client;
 pub mod compiler;
+pub mod control;
 pub mod deployment;
 pub mod dns;
 pub mod enforcement;
 pub mod events;
 pub mod gateway;
 pub mod policy;
+pub mod watchdog;
 
 pub type Result<T, E = GuardError> = std::result::Result<T, E>;
 

@@ -110,6 +110,7 @@ fn guard_config(name: &str) -> Result<aiec_guard::policy::GuardConfig, McpError>
         policy: None,
         model_endpoint: None,
         allowlist: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -180,6 +181,7 @@ pub fn allowlist_guard(hosts: Vec<String>) -> Result<aiec_guard::policy::GuardCo
         }),
         model_endpoint: None,
         allowlist: Vec::new(),
+        ..Default::default()
     })
 }
 

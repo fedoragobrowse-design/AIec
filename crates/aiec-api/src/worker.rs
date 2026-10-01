@@ -226,8 +226,13 @@ pub enum WorkerOperation {
     ImportWorkspaceArchive {
         sandbox: Sandbox,
         /// Base64 portable workspace archive, bounded by
-        /// `MAX_WORKSPACE_ARCHIVE_BYTES` once decoded.
+        /// `MAX_WORKER_TRANSFER_BYTES` once decoded.
         archive_base64: String,
+    },
+    /// One outside-guest Guard action, fenced by this worker's current lease.
+    Guard {
+        sandbox: Sandbox,
+        command: aiec_guard::control::GuardControlCommand,
     },
 }
 
@@ -239,6 +244,7 @@ pub enum WorkerValue {
     File(FileContent),
     Files(Vec<FileEntry>),
     Snapshot(aiec_core::snapshots::CapturedSnapshot),
+    Guard(aiec_guard::control::GuardControlResponse),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -666,6 +672,23 @@ impl WorkerRuntime {
             .map_err(runtime_client_error)?;
         response.result.map_err(runtime_worker_error)
     }
+
+    /// Every Guard action reaches the owning worker under the lease the
+    /// scheduler just resolved, so the fence is the same identity everywhere.
+    async fn guard_call(
+        &self,
+        sandbox: &Sandbox,
+        command: aiec_guard::control::GuardControlCommand,
+    ) -> Result<WorkerValue, CoreError> {
+        self.call(
+            sandbox,
+            WorkerOperation::Guard {
+                sandbox: sandbox.clone(),
+                command,
+            },
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -908,6 +931,45 @@ impl SandboxRuntime for WorkerRuntime {
         .map(|_| ())
     }
 
+    /// The control plane is not the packet or VM owner, so it holds no
+    /// reservation client of its own; that authority lives on the worker.
+    fn configure_guard_budget_authority(
+        &self,
+        _authority: Arc<dyn aiec_guard::control::BudgetAuthority>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "Guard budgets are enforced on the worker".into(),
+        ))
+    }
+
+    async fn guard_set_fence(
+        &self,
+        sandbox: &Sandbox,
+        fence: aiec_guard::control::GuardFence,
+    ) -> Result<(), CoreError> {
+        self.guard_call(
+            sandbox,
+            aiec_guard::control::GuardControlCommand::SetFence { fence },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn guard_control(
+        &self,
+        sandbox: &Sandbox,
+        fence: aiec_guard::control::GuardFence,
+        command: aiec_guard::control::GuardControlCommand,
+    ) -> Result<aiec_guard::control::GuardControlResponse, CoreError> {
+        let _ = fence;
+        match self.guard_call(sandbox, command).await? {
+            WorkerValue::Guard(response) => Ok(response),
+            _ => Err(CoreError::Backend(
+                "worker returned no Guard response".into(),
+            )),
+        }
+    }
+
     async fn health(&self) -> RuntimeHealth {
         RuntimeHealth::healthy()
     }
@@ -1004,6 +1066,31 @@ pub enum WorkerClientError {
     Unavailable(String),
 }
 
+impl WorkerOperation {
+    /// The sandbox this operation acts on, for the calls that need one before
+    /// the operation itself runs.
+    fn guard_sandbox(&self) -> Option<&Sandbox> {
+        match self {
+            WorkerOperation::Create { sandbox }
+            | WorkerOperation::Start { sandbox }
+            | WorkerOperation::Stop { sandbox }
+            | WorkerOperation::Pause { sandbox }
+            | WorkerOperation::Resume { sandbox }
+            | WorkerOperation::Destroy { sandbox }
+            | WorkerOperation::Exec { sandbox, .. }
+            | WorkerOperation::PutFile { sandbox, .. }
+            | WorkerOperation::GetFile { sandbox, .. }
+            | WorkerOperation::ListFiles { sandbox, .. }
+            | WorkerOperation::DeleteFile { sandbox, .. }
+            | WorkerOperation::MakeDirectory { sandbox, .. }
+            | WorkerOperation::Snapshot { sandbox, .. }
+            | WorkerOperation::Restore { sandbox, .. }
+            | WorkerOperation::ImportWorkspaceArchive { sandbox, .. }
+            | WorkerOperation::Guard { sandbox, .. } => Some(sandbox),
+        }
+    }
+}
+
 fn operation_belongs_to_worker(operation: &WorkerOperation, node_id: Uuid) -> bool {
     let sandbox = match operation {
         WorkerOperation::Create { sandbox }
@@ -1020,7 +1107,8 @@ fn operation_belongs_to_worker(operation: &WorkerOperation, node_id: Uuid) -> bo
         | WorkerOperation::MakeDirectory { sandbox, .. }
         | WorkerOperation::Snapshot { sandbox, .. }
         | WorkerOperation::Restore { sandbox, .. }
-        | WorkerOperation::ImportWorkspaceArchive { sandbox, .. } => sandbox,
+        | WorkerOperation::ImportWorkspaceArchive { sandbox, .. }
+        | WorkerOperation::Guard { sandbox, .. } => sandbox,
     };
     // An unowned sandbox is never acceptable: without a durable owner there is
     // nothing to fence against, so any worker could act on it.
@@ -1042,7 +1130,8 @@ fn operation_sandbox_id(operation: &WorkerOperation) -> Uuid {
         | WorkerOperation::MakeDirectory { sandbox, .. }
         | WorkerOperation::Snapshot { sandbox, .. }
         | WorkerOperation::Restore { sandbox, .. }
-        | WorkerOperation::ImportWorkspaceArchive { sandbox, .. } => sandbox.id,
+        | WorkerOperation::ImportWorkspaceArchive { sandbox, .. }
+        | WorkerOperation::Guard { sandbox, .. } => sandbox.id,
     }
 }
 
@@ -1469,7 +1558,35 @@ impl WorkerService {
         }
     }
 
-    async fn execute(&self, operation: WorkerOperation) -> Result<WorkerValue, WorkerError> {
+    async fn execute(
+        &self,
+        operation: WorkerOperation,
+        lease_id: Uuid,
+        lease_generation: i64,
+    ) -> Result<WorkerValue, WorkerError> {
+        // A guarded machine is bound to the ownership this worker just proved
+        // before anything is built for it. Without this the attachment would
+        // refuse to prepare, which is the intended failure rather than a hole.
+        if let Some(sandbox) = operation.guard_sandbox()
+            && sandbox.environment.guard.is_some()
+            && matches!(
+                operation,
+                WorkerOperation::Create { .. }
+                    | WorkerOperation::Start { .. }
+                    | WorkerOperation::Restore { .. }
+            )
+        {
+            self.runtime
+                .guard_set_fence(
+                    sandbox,
+                    aiec_guard::control::GuardFence {
+                        lease_id,
+                        generation: lease_generation,
+                    },
+                )
+                .await
+                .map_err(WorkerError::from_runtime)?;
+        }
         let result = match operation {
             WorkerOperation::Create { sandbox } => self
                 .runtime
@@ -1556,6 +1673,19 @@ impl WorkerService {
                     .import_workspace_archive(&sandbox, &archive)
                     .await
                     .map(|_| WorkerValue::Unit)
+            }
+            WorkerOperation::Guard { sandbox, command } => {
+                // The fence is this request's own lease identity, which the
+                // dispatch handler has just proved current. No Guard action may
+                // touch an attachment whose ownership the worker cannot show.
+                let fence = aiec_guard::control::GuardFence {
+                    lease_id,
+                    generation: lease_generation,
+                };
+                self.runtime
+                    .guard_control(&sandbox, fence, command)
+                    .await
+                    .map(WorkerValue::Guard)
             }
         };
         result.map_err(WorkerError::from_runtime)
@@ -1791,6 +1921,9 @@ fn lifecycle_sandbox(operation: &WorkerOperation) -> Option<Uuid> {
         | WorkerOperation::Destroy { sandbox }
         | WorkerOperation::Snapshot { sandbox, .. }
         | WorkerOperation::Restore { sandbox, .. } => Some(sandbox.id),
+        // A Guard action changes what the machine can do, so it takes the same
+        // per-sandbox gate: a capture must not interleave with a destroy.
+        WorkerOperation::Guard { sandbox, .. } => Some(sandbox.id),
         WorkerOperation::Exec { .. }
         | WorkerOperation::PutFile { .. }
         | WorkerOperation::GetFile { .. }
@@ -2004,7 +2137,13 @@ async fn operation(
         WorkerOperation::Destroy { sandbox } => Some((sandbox.id, false)),
         _ => None,
     };
-    let result = state.execute(request.operation).await;
+    let result = state
+        .execute(
+            request.operation,
+            request.lease_id,
+            request.lease_generation,
+        )
+        .await;
     if result.is_ok()
         && let Some((sandbox_id, create)) = sandbox_event
     {

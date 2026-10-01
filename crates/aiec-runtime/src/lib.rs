@@ -2499,6 +2499,97 @@ impl FirecrackerRuntime {
         )
         .await
     }
+    /// Captures a guarded sandbox for forensics and leaves it paused.
+    ///
+    /// Unlike [`Self::snapshot`], this never resumes the guest: the operator is
+    /// holding a machine they believe misbehaved, and a resume inside the
+    /// capture would hand it a slice of execution back. The guest is asked to
+    /// prepare while it still runs - `PrepareSnapshot` fsyncs the workspace
+    /// inside the guest and cannot answer from a paused VM - and the network
+    /// cut belongs to the attachment, not to the VM, so it stays in force.
+    async fn capture_forensics(
+        &self,
+        sandbox: &Sandbox,
+        snapshot_id: &str,
+    ) -> Result<u64, RuntimeError> {
+        if snapshot_id.is_empty()
+            || snapshot_id.len() > 128
+            || !snapshot_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(RuntimeError::Unavailable(
+                "forensic snapshot id is not a bounded plain identifier".into(),
+            ));
+        }
+        // One gate per sandbox: a destroy issued now would kill the VM halfway
+        // through the capture and leave a snapshot object that is not one.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        let (socket, source_disk) = {
+            let vms = self.vms.lock().await;
+            let vm = vms
+                .get(&sandbox.id)
+                .ok_or_else(|| RuntimeError::Unavailable("sandbox VM is not running".into()))?;
+            (vm.api_socket.clone(), vm.rootfs.clone())
+        };
+        self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
+            .await?;
+        // Final pause and capture are one fenced step: after this returns the
+        // only remaining transitions are an operator's, or destruction.
+        self.api(
+            &socket,
+            "PATCH",
+            "/vm",
+            Some(serde_json::json!({"state":"Paused"})),
+        )
+        .await?;
+        let destination = self
+            .config
+            .state_dir
+            .join("guard-forensics")
+            .join(sandbox.id.to_string())
+            .join(snapshot_id);
+        // A repeated capture of the same incident id replaces nothing: it
+        // refuses rather than overwriting evidence an operator may be reading.
+        if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
+            return Err(RuntimeError::Core(CoreError::Conflict(
+                "forensic capture already exists".into(),
+            )));
+        }
+        tokio::fs::create_dir_all(&destination).await?;
+        let state = destination.join("vmstate");
+        let memory = destination.join("memory");
+        self.api(
+            &socket,
+            "PUT",
+            "/snapshot/create",
+            Some(serde_json::json!({"snapshot_type":"Full", "snapshot_path":&state, "mem_file_path":&memory, "sync_snapshot_files":true})),
+        )
+        .await
+        .inspect_err(|_| {
+            let destination = destination.clone();
+            tokio::spawn(async move { let _ = tokio::fs::remove_dir_all(destination).await; });
+        })?;
+        let disk = destination.join("rootfs.ext4");
+        tokio::fs::copy(&source_disk, &disk).await?;
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "sandbox_id": sandbox.id,
+            "snapshot_id": snapshot_id,
+            "captured_paused": true,
+            "source_disk": source_disk,
+        });
+        tokio::fs::write(
+            destination.join("manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )
+        .await?;
+        let mut size = 0;
+        for file in [state, memory, disk] {
+            size += tokio::fs::metadata(file).await?.len();
+        }
+        Ok(size)
+    }
     async fn resume(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         let socket = self
             .vms
@@ -3148,6 +3239,38 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
     async fn resume(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::resume(self, sandbox).await.map_err(into_core)
+    }
+    fn configure_guard_budget_authority(
+        &self,
+        authority: Arc<dyn aiec_guard::control::BudgetAuthority>,
+    ) -> Result<(), CoreError> {
+        self.network.configure_guard_budget_authority(authority)
+    }
+    async fn guard_set_fence(
+        &self,
+        sandbox: &Sandbox,
+        fence: aiec_guard::control::GuardFence,
+    ) -> Result<(), CoreError> {
+        self.network.guard_set_fence(sandbox, fence).await
+    }
+    async fn guard_control(
+        &self,
+        sandbox: &Sandbox,
+        fence: aiec_guard::control::GuardFence,
+        command: aiec_guard::control::GuardControlCommand,
+    ) -> Result<aiec_guard::control::GuardControlResponse, CoreError> {
+        match command {
+            aiec_guard::control::GuardControlCommand::CapturePaused { snapshot_id } => {
+                let size = Self::capture_forensics(self, sandbox, &snapshot_id)
+                    .await
+                    .map_err(into_core)?;
+                Ok(aiec_guard::control::GuardControlResponse::Forensics {
+                    snapshot_id,
+                    size_bytes: size,
+                })
+            }
+            other => self.network.guard_control(sandbox, fence, other).await,
+        }
     }
     async fn exec(&self, sandbox: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
         Self::exec(self, sandbox, request).await.map_err(into_core)

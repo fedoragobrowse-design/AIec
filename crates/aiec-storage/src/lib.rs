@@ -1,4 +1,5 @@
 mod artifact_gc;
+mod guard;
 mod images;
 mod matrix;
 mod memory_artifact_gc;
@@ -11,9 +12,10 @@ use aiec_core::{
     ApiKeyRecord, CoreError, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
     UsageSummary,
     storage::{
-        AuditEvent, MetadataStore, Reassignment, ReconciliationAction, SandboxEvent,
-        SandboxOperation, SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment,
-        WorkerHeartbeat, WorkerLease, WorkerRegistration, WorkerStatus,
+        AuditEvent, BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
+        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
+        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
+        WorkerLease, WorkerRegistration, WorkerStatus,
     },
 };
 use async_trait::async_trait;
@@ -123,6 +125,9 @@ struct MemoryData {
     tenants: HashMap<Uuid, TenantRecord>,
     artifact_objects: BTreeMap<String, memory_artifact_gc::MemoryArtifact>,
     artifact_scan: Option<String>,
+    guard_budgets: HashMap<Uuid, GuardBudgetState>,
+    guard_incidents: HashMap<Uuid, GuardIncident>,
+    leases: HashMap<Uuid, WorkerLease>,
 }
 
 #[derive(Default)]
@@ -181,6 +186,11 @@ impl MemoryRepository {
     ) -> Result<Sandbox, StoreError> {
         let mut data = self.data.write().await;
         let mut value = owned(&data, tenant, id)?;
+        if next == SandboxState::Quarantined && value.state != SandboxState::Quarantined {
+            return Err(StoreError::Conflict(
+                "use the atomic Guard quarantine operation".into(),
+            ));
+        }
         if value.state == next {
             return Ok(value);
         }
@@ -199,6 +209,11 @@ impl MemoryRepository {
     async fn delete_sandbox(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
         let mut data = self.data.write().await;
         let mut value = owned(&data, tenant, id)?;
+        if value.state == SandboxState::Quarantined {
+            return Err(StoreError::Conflict(
+                "quarantined sandbox requires explicit human release".into(),
+            ));
+        }
         value.state = SandboxState::Destroyed;
         value.updated_at = Utc::now();
         data.sandboxes.insert(id, value);
@@ -452,6 +467,64 @@ impl MemoryRepository {
 
 #[async_trait]
 impl MetadataStore for MemoryRepository {
+    async fn put_guard_budget(
+        &self,
+        state: GuardBudgetState,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::put_guard_budget(self, state)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_guard_budget(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::get_guard_budget(self, tenant, id)
+            .await
+            .map_err(core_error)
+    }
+    async fn reserve_guard_budget(
+        &self,
+        identity: GuardIdentity,
+        fence: GuardFence,
+        debit: BudgetDebit,
+    ) -> Result<GuardBudgetState, CoreError> {
+        Self::reserve_guard_budget(self, identity, fence, debit)
+            .await
+            .map_err(core_error)
+    }
+    async fn put_guard_incident(
+        &self,
+        incident: GuardIncident,
+    ) -> Result<GuardIncident, CoreError> {
+        Self::put_guard_incident(self, incident)
+            .await
+            .map_err(core_error)
+    }
+    async fn get_guard_incident(&self, tenant: Uuid, id: Uuid) -> Result<GuardIncident, CoreError> {
+        Self::get_guard_incident(self, tenant, id)
+            .await
+            .map_err(core_error)
+    }
+    async fn list_expired_guard_budgets(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<GuardBudgetState>, CoreError> {
+        Self::list_expired_guard_budgets(self, now)
+            .await
+            .map_err(core_error)
+    }
+    async fn mark_guard_quarantined(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        fence: GuardFence,
+    ) -> Result<Sandbox, CoreError> {
+        Self::mark_guard_quarantined(self, tenant, id, fence)
+            .await
+            .map_err(core_error)
+    }
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError> {
         Self::create_sandbox(self, value).await.map_err(core_error)
     }
@@ -665,26 +738,68 @@ impl MetadataStore for MemoryRepository {
     }
     async fn get_worker_lease(
         &self,
-        _tenant: Uuid,
-        _lease_id: Uuid,
+        tenant: Uuid,
+        lease_id: Uuid,
     ) -> Result<WorkerLease, CoreError> {
-        Err(CoreError::Unsupported("memory metadata store".into()))
+        self.data
+            .read()
+            .await
+            .leases
+            .get(&lease_id)
+            .filter(|lease| lease.tenant_id == tenant)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("lease not found".into()))
     }
     async fn get_active_worker_lease(
         &self,
-        _tenant: Uuid,
-        _sandbox: Uuid,
+        tenant: Uuid,
+        sandbox: Uuid,
     ) -> Result<WorkerLease, CoreError> {
-        Err(CoreError::Unsupported("memory metadata store".into()))
+        self.data
+            .read()
+            .await
+            .leases
+            .values()
+            .find(|lease| {
+                lease.tenant_id == tenant
+                    && lease.sandbox_id == sandbox
+                    && lease.status == "active"
+                    && lease.expires_at > Utc::now()
+            })
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("active lease not found".into()))
     }
     async fn renew_worker_lease(
         &self,
-        _tenant: Uuid,
-        _lease_id: Uuid,
-        _generation: i64,
-        _ttl_seconds: u64,
+        tenant: Uuid,
+        lease_id: Uuid,
+        generation: i64,
+        ttl_seconds: u64,
     ) -> Result<WorkerLease, CoreError> {
-        Err(CoreError::Unsupported("memory metadata store".into()))
+        if !(1..=3600).contains(&ttl_seconds) {
+            return Err(CoreError::InvalidRequest(
+                "lease TTL must be between 1 and 3600 seconds".into(),
+            ));
+        }
+        let mut data = self.data.write().await;
+        let lease = data
+            .leases
+            .get_mut(&lease_id)
+            .filter(|lease| lease.tenant_id == tenant)
+            .ok_or_else(|| CoreError::NotFound("lease not found".into()))?;
+        if lease.generation != generation
+            || lease.status != "active"
+            || lease.expires_at <= Utc::now()
+        {
+            return Err(CoreError::Conflict("lease is no longer current".into()));
+        }
+        lease.generation = lease
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Conflict("lease generation overflow".into()))?;
+        lease.updated_at = Utc::now();
+        lease.expires_at = lease.updated_at + chrono::Duration::seconds(ttl_seconds as i64);
+        Ok(lease.clone())
     }
     async fn complete_worker_lease(
         &self,

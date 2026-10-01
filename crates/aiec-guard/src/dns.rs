@@ -37,8 +37,13 @@ pub(crate) async fn serve_udp(socket: UdpSocket, state: Arc<Runtime>) -> Result<
                     state.record(state.measured_event(Category::Dns, Decision::Deny, "DNS guest source mismatch", None, size as u64, 0, Duration::ZERO)).await?;
                     continue;
                 }
-                let reply = answer(&bytes[..size], &state, false).await?;
-                if let Some(reply) = reply { socket.send_to(&reply, peer).await?; }
+                let reply = tokio::select! {
+                    biased;
+                    _ = stop.changed() => None,
+                    result = answer(&bytes[..size], &state, false) => result?,
+                };
+                if state.active()
+                    && let Some(reply) = reply { socket.send_to(&reply, peer).await?; }
             }
         }
     }
@@ -67,7 +72,7 @@ pub(crate) async fn serve_tcp(listener: TcpListener, state: Arc<Runtime>) -> Res
                         let size = socket.read_u16().await? as usize;
                         if size == 0 || size > DNS_FRAME {
                             let _ = state.rate(true);
-                            let _ = state.debit(true, 2);
+                            let _ = state.debit(true, 2).await;
                             state.record(state.measured_event(Category::Dns, Decision::Deny, "DNS TCP frame too large or empty", None, 2, 0, Duration::ZERO)).await?;
                             return Ok::<(), crate::GuardError>(());
                         }
@@ -103,7 +108,7 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
     let mut decision = Decision::Deny;
     let mut reason = "malformed DNS query";
     let mut destination = None;
-    if state.debit(true, bytes.len() as u64).is_err() {
+    if state.debit(true, bytes.len() as u64).await.is_err() {
         state
             .record(state.measured_event(
                 Category::Dns,
@@ -169,7 +174,10 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
             if valid_name {
                 destination = Some(name.clone());
             }
-            if !valid_name || q.query_class() != DNSClass::IN {
+            if !valid_name {
+                reply.set_response_code(ResponseCode::FormErr);
+                reason = "DNS name too long or malformed";
+            } else if q.query_class() != DNSClass::IN {
                 reply.set_response_code(ResponseCode::FormErr);
             } else if !matches!(kind, RecordType::A | RecordType::AAAA)
                 || !state
@@ -181,11 +189,12 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
                     .allowed_record_types
                     .iter()
                     .any(|t| t == &kind.to_string())
-                || port.is_none()
-                || !state.config.compiled.allows_dns(&name, u16::from(kind))
             {
                 reply.set_response_code(ResponseCode::Refused);
-                reason = "DNS name or record type denied";
+                reason = "DNS record type denied";
+            } else if port.is_none() || !state.config.compiled.allows_dns(&name, u16::from(kind)) {
+                reply.set_response_code(ResponseCode::Refused);
+                reason = "DNS name denied";
             } else {
                 let model = state
                     .config
@@ -215,13 +224,27 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
                                 reply.add_answer(Record::from_rdata(q.name().clone(), 30, data));
                             }
                         }
-                        reply.set_response_code(ResponseCode::NoError);
-                        decision = Decision::Allow;
-                        reason = if model.is_some() {
-                            "DNS model points to gateway"
+                        if reply.answers().is_empty() {
+                            // The destination exists but holds no record of this
+                            // type: an authoritative negative answer, not a refusal.
+                            reply.set_response_code(ResponseCode::NXDomain);
+                            reason = "DNS NXDOMAIN";
                         } else {
-                            "DNS validated destination"
-                        };
+                            reply.set_response_code(ResponseCode::NoError);
+                            decision = Decision::Allow;
+                            reason = if model.is_some() {
+                                "DNS model points to gateway"
+                            } else {
+                                "DNS validated destination"
+                            };
+                        }
+                    }
+                    Err(crate::GuardError::Denied(message))
+                        if message == "destination resolution failed" =>
+                    {
+                        // The name itself does not exist upstream.
+                        reply.set_response_code(ResponseCode::NXDomain);
+                        reason = "DNS NXDOMAIN";
                     }
                     Err(_) => {
                         reply.set_response_code(ResponseCode::Refused);
@@ -243,7 +266,7 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
             .to_vec()
             .map_err(|_| crate::GuardError::Unavailable("DNS encoding failed".into()))?;
     }
-    if state.debit(false, wire.len() as u64).is_err() {
+    if state.debit(false, wire.len() as u64).await.is_err() {
         state
             .record(state.measured_event(
                 Category::Dns,

@@ -209,6 +209,10 @@ fn evaluation_guard(allowlist: Vec<String>) -> aiec_guard::policy::GuardConfig {
         }),
         model_endpoint: None,
         allowlist: Vec::new(),
+        // An evaluation is a short, governed read: the ceilings are its own
+        // defaults rather than an opening an operator chose.
+        watchdog_timeout_ms: 10_000,
+        max_model_requests: 10_000,
     }
 }
 
@@ -686,6 +690,7 @@ mod tests {
                     allowed_methods: vec!["GET".into()],
                     allowed_paths: Vec::new(),
                 }],
+                ..Default::default()
             }),
         });
         let built = to_run_request(&request).expect("a valid spec builds");

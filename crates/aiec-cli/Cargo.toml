@@ -26,4 +26,5 @@ serde_json.workspace = true
 tokio.workspace = true
 rustls.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 libc.workspace = true

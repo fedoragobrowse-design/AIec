@@ -293,6 +293,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(limit) = execution_budget_units() {
         state = state.with_execution_budget(limit);
     }
+    // Incident notifications are opt-in and secret-free: without a webhook the
+    // notifier is explicitly absent, and a quarantine reports that as disabled
+    // rather than as delivered.
+    if let Some(url) = std::env::var("AIEC_GUARD_WEBHOOK_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+    {
+        let config = aiec_api::guard::GuardNotifierConfig {
+            webhook_url: Some(url),
+            webhook_timeout_ms: std::env::var("AIEC_GUARD_WEBHOOK_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5_000),
+            local_loopback_http: std::env::var("AIEC_GUARD_ALLOW_LOOPBACK_HTTP").as_deref()
+                == Ok("1"),
+        };
+        state = state.with_guard_notifier(config.notifier());
+    }
+    // Lifetime and budget enforcement reads durable rows rather than in-process
+    // timers, so this task is a reader: restarting it resets nothing.
+    let reaper_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            aiec_api::guard::reap_guard_budgets(&reaper_state, chrono::Utc::now()).await;
+        }
+    });
     bootstrap_api_key(
         metadata_store.as_ref(),
         &api_key,

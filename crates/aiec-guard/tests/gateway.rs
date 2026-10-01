@@ -1,5 +1,6 @@
 use aiec_guard::{
     compiler::{OperatorBoundary, compile},
+    control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
     events::{EventInput, EventSink, FileEventSink, GuardEvent, read_events},
     gateway::{CredentialStore, GatewayConfig, GuardGateway},
     policy::{EgressRule, GuardPolicy, ModelEndpoint, PolicyTemplate},
@@ -107,19 +108,103 @@ async fn upstream(State(mock): State<Mock>, request: Request<Body>) -> Response<
 }
 struct Fixture {
     gateway: Option<GuardGateway>,
+    identity: GuardIdentity,
+    control: aiec_guard::gateway::GatewayControl,
     mock: Mock,
     server: JoinHandle<()>,
     port: u16,
     directory: std::path::PathBuf,
 }
+
+struct AllowAllAuthority;
+
+#[async_trait::async_trait]
+impl BudgetAuthority for AllowAllAuthority {
+    async fn reserve(
+        &self,
+        _: &GuardIdentity,
+        _: GuardFence,
+        _: BudgetDebit,
+    ) -> aiec_guard::Result<()> {
+        Ok(())
+    }
+}
+
+/// Records every reservation so a test can prove what was committed before bytes moved.
+struct RecordingAuthority {
+    admitted: Mutex<Vec<BudgetDebit>>,
+    reachable: bool,
+}
+
+impl RecordingAuthority {
+    fn debits(&self) -> Vec<BudgetDebit> {
+        self.admitted.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BudgetAuthority for RecordingAuthority {
+    async fn reserve(
+        &self,
+        _: &GuardIdentity,
+        _: GuardFence,
+        debit: BudgetDebit,
+    ) -> aiec_guard::Result<()> {
+        if !self.reachable {
+            return Err(aiec_guard::GuardError::Unavailable(
+                "durable authority unreachable".into(),
+            ));
+        }
+        self.admitted.lock().push(debit);
+        Ok(())
+    }
+}
+
+struct DeadAuthority {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl BudgetAuthority for DeadAuthority {
+    async fn reserve(
+        &self,
+        _: &GuardIdentity,
+        _: GuardFence,
+        _: BudgetDebit,
+    ) -> aiec_guard::Result<()> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Err(aiec_guard::GuardError::Unavailable(
+            "durable authority unreachable".into(),
+        ))
+    }
+}
 impl Fixture {
     async fn new(adjust: impl FnOnce(&mut GuardPolicy)) -> Self {
-        Self::with_sink(adjust, |sink| sink).await
+        let fixture = Self::configured(adjust, |sink| sink, None, 60_000).await;
+        // Every fixture activates only through the authenticated dead-man path.
+        assert!(
+            fixture
+                .gateway()
+                .heartbeat(&fixture.identity)
+                .expect("first heartbeat")
+        );
+        fixture
     }
 
-    async fn with_sink(
+    async fn with_authority(
+        adjust: impl FnOnce(&mut GuardPolicy),
+        authority: Arc<dyn BudgetAuthority>,
+    ) -> Self {
+        Self::configured(adjust, |sink| sink, Some(authority), 60_000).await
+    }
+
+    async fn configured(
         adjust: impl FnOnce(&mut GuardPolicy),
         map_sink: impl FnOnce(Arc<FileEventSink>) -> Arc<dyn EventSink>,
+        authority: Option<Arc<dyn BudgetAuthority>>,
+        watchdog_timeout_ms: u64,
     ) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -166,23 +251,39 @@ impl Fixture {
         let gateway = GuardGateway::start(GatewayConfig {
             sandbox_id: Uuid::new_v4(),
             tenant_id: Uuid::new_v4(),
+            fence: GuardFence {
+                lease_id: Uuid::new_v4(),
+                generation: 1,
+            },
             compiled,
             bind_ip: Ipv4Addr::LOCALHOST,
             guest_ip: Ipv4Addr::LOCALHOST,
             broker_port: 0,
             dns_port: 0,
             credentials: Arc::new(credentials),
-            events: map_sink(events),
+            events: map_sink(events.clone()),
+            budget_authority: authority.unwrap_or_else(|| Arc::new(AllowAllAuthority)),
+            watchdog_timeout: Duration::from_millis(watchdog_timeout_ms),
         })
         .await
         .unwrap();
+        let control = gateway.control();
         Self {
             gateway: Some(gateway),
+            identity: control.identity().clone(),
+            control,
             mock,
             server,
             port,
             directory,
         }
+    }
+
+    async fn with_sink(
+        adjust: impl FnOnce(&mut GuardPolicy),
+        map_sink: impl FnOnce(Arc<FileEventSink>) -> Arc<dyn EventSink>,
+    ) -> Self {
+        Self::configured(adjust, map_sink, None, 60_000).await
     }
     fn gateway(&self) -> &GuardGateway {
         self.gateway.as_ref().unwrap()
@@ -778,6 +879,12 @@ async fn audit_failure_cannot_be_released_by_restore_after_the_sink_recovers() {
         },
     )
     .await;
+    assert!(
+        fixture
+            .gateway()
+            .heartbeat(&fixture.identity)
+            .expect("first heartbeat")
+    );
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -814,4 +921,189 @@ async fn audit_failure_cannot_be_released_by_restore_after_the_sink_recovers() {
         stopped.is_err(),
         "shutdown must retain the terminal audit fault"
     );
+}
+
+#[tokio::test]
+async fn a_gateway_denies_until_the_first_authenticated_heartbeat_and_then_latches_closed() {
+    let f = Fixture::configured(|_| {}, |sink| sink, None, 1_000).await;
+    let client = f.client();
+    let denied = client
+        .post(f.url("/v1/echo"))
+        .bearer_auth("placeholder://model-main")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 503);
+    assert!(f.mock.seen.lock().is_empty(), "no watchdog means no egress");
+
+    let foreign = GuardIdentity {
+        sandbox_id: Uuid::new_v4(),
+        tenant_id: f.identity.tenant_id,
+        policy_hash: f.identity.policy_hash.clone(),
+    };
+    assert!(f.gateway().heartbeat(&foreign).is_err());
+    assert!(f.mock.seen.lock().is_empty());
+
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    let allowed = client
+        .post(f.url("/v1/echo"))
+        .bearer_auth("placeholder://model-main")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.text().await.unwrap(), "ok");
+
+    // A silently killed watchdog cuts every path and latches.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    assert!(f.control.network_cut());
+    let refused = client
+        .post(f.url("/v1/echo"))
+        .bearer_auth("placeholder://model-main")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    assert_eq!(f.mock.seen.lock().len(), 1);
+
+    // No heartbeat, and no ordinary release, can reopen it.
+    assert!(f.gateway().heartbeat(&f.identity).is_err());
+    assert!(f.gateway().restore().await.is_err());
+    assert!(f.control.network_cut());
+    assert_eq!(f.mock.seen.lock().len(), 1);
+    let _ = f.finish().await;
+}
+
+#[tokio::test]
+async fn a_model_request_reserves_durably_before_any_byte_reaches_upstream() {
+    let authority = Arc::new(RecordingAuthority {
+        admitted: Mutex::new(Vec::new()),
+        reachable: true,
+    });
+    let f = Fixture::with_authority(|_| {}, authority.clone()).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    let response = f
+        .client()
+        .post(f.url("/v1/stream"))
+        .bearer_auth("placeholder://model-main")
+        .body("prompt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut stream = response.bytes_stream();
+    use futures_util::StreamExt as _;
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&first[..], b"data: first\n\n");
+    let debits = authority.debits();
+    assert_eq!(
+        debits[0].model_requests, 1,
+        "one durable model reservation per request"
+    );
+    assert!(
+        debits.iter().any(|debit| debit.bytes_out > 0),
+        "request bytes are debited before forwarding"
+    );
+    assert!(
+        debits.iter().any(|debit| debit.bytes_in > 0),
+        "response bytes are debited before delivery"
+    );
+    let _ = f.finish().await;
+}
+
+#[tokio::test]
+async fn an_unreachable_budget_authority_refuses_the_request_without_reaching_upstream() {
+    let authority = Arc::new(RecordingAuthority {
+        admitted: Mutex::new(Vec::new()),
+        reachable: false,
+    });
+    let f = Fixture::with_authority(|_| {}, authority.clone()).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    let refused = f
+        .client()
+        .post(f.url("/v1/echo"))
+        .bearer_auth("placeholder://model-main")
+        .body("prompt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 503);
+    assert!(f.mock.seen.lock().is_empty());
+    assert!(authority.debits().is_empty());
+    let _ = f.finish().await;
+}
+
+#[tokio::test]
+async fn a_reservation_uncertain_at_cut_is_cancelled_rather_than_waited_out() {
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let f = Fixture::with_authority(
+        |_| {},
+        Arc::new(DeadAuthority {
+            started: started.clone(),
+            release: release.clone(),
+        }),
+    )
+    .await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    let pending = tokio::spawn({
+        let client = f.client();
+        let url = f.url("/v1/echo");
+        async move {
+            client
+                .post(url)
+                .bearer_auth("placeholder://model-main")
+                .body("prompt")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    f.gateway().cut().expect("cut");
+    let status = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 503);
+    assert!(f.mock.seen.lock().is_empty());
+    release.notify_one();
+    let _ = f.finish().await;
+}
+
+#[tokio::test]
+async fn an_in_flight_tunnel_is_cancelled_by_the_watchdog_without_closing_the_gateway() {
+    let f = Fixture::new(|_| {}).await;
+    let mut socket = TcpStream::connect(f.gateway().broker_addr()).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "CONNECT web.guard.test:{} HTTP/1.1\r\nHost: web.guard.test:{}\r\n\r\n",
+                f.port, f.port
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(socket.read_u8().await.unwrap());
+    }
+    assert!(header.starts_with(b"HTTP/1.1 200"));
+    // The tunnel holds a connection permit until the latched cut cancels it.
+    f.gateway().cut().expect("cut");
+    let mut byte = [0];
+    let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte)).await;
+    assert!(closed.is_ok(), "an in-flight tunnel is cancelled at cut");
+    assert!(f.control.network_cut());
+    let _ = f.finish().await;
 }

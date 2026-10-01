@@ -12,6 +12,7 @@ pub mod artifact_gc;
 mod composition;
 pub mod eval_matrix;
 pub mod evaluations;
+pub mod guard;
 pub mod omp;
 pub mod ratelimit;
 pub(crate) mod repo_cache;
@@ -72,6 +73,9 @@ pub struct AppState {
     hosted_only: bool,
     /// Invite codes accepted by public signup. Empty means signup is closed.
     invites: Arc<Vec<String>>,
+    /// Incident notifier for Guard quarantines. Absent means notifications are
+    /// explicitly disabled, which is reported as such rather than as success.
+    guard_notifier: Option<Arc<dyn aiec_guard::watchdog::Notifier>>,
 }
 
 /// A global ceiling on hosted execution spend.
@@ -221,6 +225,7 @@ impl AppState {
             secrets: Arc::new(Mutex::new(HashMap::new())),
             run_secrets: run_secrets::RunSecretResolver::disabled(),
             repo_cache: Arc::new(repo_cache::RepositoryCache::from_env()),
+            guard_notifier: None,
             run_queue_limits: Default::default(),
             upload_slots: Arc::new(Semaphore::new(2)),
             snapshot_slots: Arc::new(Semaphore::new(2)),
@@ -309,6 +314,18 @@ impl AppState {
     pub fn with_hosted_only(mut self, hosted_only: bool) -> Self {
         self.hosted_only = hosted_only;
         self
+    }
+    /// Attaches the incident notifier quarantines publish through.
+    pub fn with_guard_notifier(
+        mut self,
+        notifier: Option<Arc<dyn aiec_guard::watchdog::Notifier>>,
+    ) -> Self {
+        self.guard_notifier = notifier;
+        self
+    }
+    /// The configured incident notifier, or none when notifications are off.
+    pub fn guard_notifier(&self) -> Option<Arc<dyn aiec_guard::watchdog::Notifier>> {
+        self.guard_notifier.clone()
     }
     pub fn with_worker_token(mut self, token: impl Into<String>) -> Self {
         self.worker_token = Some(Arc::from(token.into().as_str()));
@@ -850,6 +867,7 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         // object key, so a wider capture cannot widen what is readable.
         .route("/runs/{id}/artifacts/{*name}", get(download_run_artifact))
         .route("/runs/{id}/cancel", post(cancel_run))
+        .merge(guard::routes())
 }
 pub fn app(state: AppState) -> Router {
     router(state)
@@ -868,6 +886,7 @@ fn worker_routes() -> Router<AppState> {
             post(complete_worker_lease),
         )
         .route("/{node}/ownership/{sandbox_id}", get(sandbox_ownership))
+        .route("/{node}/guard/reserve", post(guard::reserve_guard_budget))
         .route("/{id}/drain", post(drain_worker))
 }
 #[derive(Deserialize)]
@@ -1662,6 +1681,13 @@ pub(crate) async fn provision_sandbox(
             timings,
         });
     }
+
+    // A guarded sandbox's lifetime and model ceilings are durable before the
+    // machine is built, not when its gateway first needs one: a budget created
+    // at first use is a budget a worker restart can reset.
+    guard::initialize_guard_budget(s.repository().as_ref(), &x)
+        .await
+        .map_err(ApiFailure::from)?;
 
     // From here the sandbox holds capacity and a lease, so every exit has to
     // give both back. Before this, only the environment-preparation failure did:
@@ -2551,6 +2577,22 @@ async fn resume_sandbox(
         return Err(ApiFailure::from(CoreError::Conflict(
             "sandbox is not paused".into(),
         )));
+    }
+    // A quarantine in progress freezes the machine for an operator. Resuming it
+    // here would hand a guest execution back between the watchdog's pause and
+    // its durable mark, and the incident would then describe a paused capture
+    // of a machine that is running.
+    if x.environment.guard.is_some()
+        && s.repository()
+            .get_guard_incident(p.tenant_id, id)
+            .await
+            .is_ok()
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "sandbox is held under a Guard incident",
+        ));
     }
     s.runtime_for(&x)?
         .resume(&x)

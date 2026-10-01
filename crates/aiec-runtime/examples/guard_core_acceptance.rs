@@ -3,6 +3,7 @@
 use aiec_core::{ExecRequest, PutFileRequest, RuntimeKind, Sandbox, SandboxState};
 use aiec_guard::{
     compiler::{OperatorBoundary, compile},
+    control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
     enforcement::{
         CounterSnapshot, CounterSource, EnforcementBackend, GuardAttachment, NftablesBackend,
     },
@@ -33,6 +34,89 @@ use tokio::{
 use uuid::Uuid;
 
 type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+/// A durable budget authority for this acceptance run.
+///
+/// The gateway refuses guarded traffic without one, which is the point: the
+/// acceptance must exercise the real admission path rather than disabling it.
+/// This is file-backed and synced, so a reservation is committed before the
+/// bytes are forwarded and survives the driver's own restart - which is the
+/// property the control plane's store provides in a deployment.
+struct FileBudgetAuthority {
+    path: PathBuf,
+    lock: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct FileBudgetState {
+    model_requests: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    max_model_requests: u64,
+    max_bytes_in: u64,
+    max_bytes_out: u64,
+}
+
+impl FileBudgetAuthority {
+    fn open(path: PathBuf) -> Result<Self> {
+        std::fs::create_dir_all(path.parent().unwrap_or(&path))?;
+        Ok(Self {
+            path,
+            lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    async fn commit(&self, debit: BudgetDebit) -> aiec_guard::Result<()> {
+        let _held = self.lock.lock().await;
+        let mut state: FileBudgetState = std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        if state.max_model_requests == 0 {
+            return Err(aiec_guard::GuardError::Unavailable(
+                "acceptance budget has no ceilings".into(),
+            ));
+        }
+        if state.model_requests + 1 > state.max_model_requests
+            || state.bytes_in.saturating_add(debit.bytes_in) > state.max_bytes_in
+            || state.bytes_out.saturating_add(debit.bytes_out) > state.max_bytes_out
+        {
+            return Err(aiec_guard::GuardError::Denied(
+                "acceptance budget exhausted".into(),
+            ));
+        }
+        state.model_requests += 1;
+        state.bytes_in = state.bytes_in.saturating_add(debit.bytes_in);
+        state.bytes_out = state.bytes_out.saturating_add(debit.bytes_out);
+        let temporary = self.path.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(&serde_json::to_vec(&state)?)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temporary, &self.path).map_err(aiec_guard::GuardError::Io)?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl BudgetAuthority for FileBudgetAuthority {
+    async fn reserve(
+        &self,
+        _identity: &GuardIdentity,
+        fence: GuardFence,
+        debit: BudgetDebit,
+    ) -> aiec_guard::Result<()> {
+        if fence.generation < 0 {
+            return Err(aiec_guard::GuardError::Denied(
+                "invalid acceptance fence".into(),
+            ));
+        }
+        self.commit(debit).await
+    }
+}
+
 const PROBE: &str = include_str!("../../../scripts/guard_core_guest_probe.py");
 const MODEL_HOST: &str = "model.guard.test";
 const MODEL_ADDR: &str = "198.18.0.10:18080";
@@ -312,6 +396,11 @@ impl Drop for Mocks {
 
 struct Driver {
     runtime: FirecrackerRuntime,
+    /// The manager this driver owns, so the run can keep reporting liveness and
+    /// can prove what the gateway did on its own when it stops.
+    network: Arc<GuardNetworkManager>,
+    /// The liveness task, so the run can stop reporting and prove the cut.
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
     sandboxes: Vec<Sandbox>,
     state: PathBuf,
     boundary: OperatorBoundary,
@@ -573,6 +662,18 @@ async fn model_baseline(secret: &str, expected_hash: &str, expected_bytes: usize
 }
 
 async fn run(driver: &mut Driver) -> Result<()> {
+    // The watchdog heartbeat, reported from outside the guest for the length of
+    // the run. Its absence is what the dead-man switch is for; this harness is
+    // exercising enforcement, and a case below proves the switch by stopping it.
+    let liveness = driver.network.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            liveness.heartbeat_every_attachment().await;
+        }
+    });
+    driver.heartbeat = Some(heartbeat);
     driver.current = "local-mock-addresses".into();
     // Every local listener binds to an address that must already exist in this
     // namespace; without this the run dies at startup rather than testing.
@@ -645,6 +746,21 @@ async fn run(driver: &mut Driver) -> Result<()> {
         sandbox.environment.guard = Some(config.clone());
         sandbox.environment.guard_policy_hash = Some(driver.policy_hash.clone());
         driver.sandboxes.push(sandbox.clone());
+        // The attachment is bound to the ownership this worker proved before
+        // anything is built for it, exactly as WorkerService does for a guarded
+        // create. Without the fence the attachment refuses to exist, which is
+        // the intended failure rather than a hole.
+        driver
+            .network
+            .guard_set_fence(
+                &sandbox,
+                GuardFence {
+                    lease_id: Uuid::now_v7(),
+                    generation: 1,
+                },
+            )
+            .await
+            .map_err(|e| failure(format!("guard fence: {e}")))?;
         // Each lifecycle step names itself: an acceptance failure that says only
         // "create failed" costs an operator a whole debugging round.
         driver
@@ -710,6 +826,26 @@ async fn run(driver: &mut Driver) -> Result<()> {
     driver.case("secret-absent-actual-guest-environment", environment_safe,
         json!({"method":"host scans complete actual guest env output; key never sent to guest probe",
             "environment_entries":actual_environment.stdout.lines().count(),"synthetic_secret_matches":secret_matches,"exec_exit_code":actual_environment.exit_code,"values_suppressed":true}))?;
+    // No packet leaves until the attachment is activated by a heartbeat, and a
+    // case that runs before that would be reading a dead gateway's answer
+    // rather than the policy's.
+    driver.current = "wait-for-guard-activation".into();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        driver.network.heartbeat_every_attachment().await;
+        if driver.network.attachments_active().await || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    driver.case(
+        "guard-attachment-activates-on-watchdog-heartbeat",
+        driver.network.attachments_active().await
+            && driver.network.attachment_count().await == driver.sandboxes.len(),
+        json!({"attachments": driver.network.attachment_count().await,
+               "sandboxes": driver.sandboxes.len()}),
+    )?;
+
     driver.current = "runtime-placeholder-and-resolver".into();
     let environment = driver.probe(&first, json!({"kind":"environment"})).await?;
     driver.case(
@@ -764,9 +900,16 @@ async fn run(driver: &mut Driver) -> Result<()> {
             result["matching_id"] == true
                 && result["answers"] == 0
                 && matches!(result["rcode"].as_u64(), Some(3 | 5))
-                && denials
-                    .iter()
-                    .any(|event| event.reason == "DNS name or record type denied"),
+                && denials.iter().any(|event| {
+                    // The gateway reports why it refused, and the reasons are
+                    // distinct on purpose: a watcher rules on "denied", "NXDOMAIN"
+                    // and "record type denied" separately, so one merged string
+                    // would hide which of them happened.
+                    matches!(
+                        event.reason.as_str(),
+                        "DNS name denied" | "DNS record type denied" | "DNS NXDOMAIN"
+                    )
+                }),
             json!({"guest":result,"authoritative_denials":denials}),
         )?;
     }
@@ -1208,8 +1351,25 @@ async fn main() {
         let network = GuardNetworkManager::new(state.join("guard"))
             .with_operator_files(Some(boundary_path), Some(credentials))
             .with_local_test_mode();
+        // Guarded traffic is admitted only against a durable authority and only
+        // while an outside-guest watchdog reports. Both are real here: the
+        // authority commits to a synced file before any byte is forwarded, and
+        // the heartbeat below is this process, which is not the guest.
+        let authority = Arc::new(FileBudgetAuthority::open(state.join("guard-budget.json"))?);
+        std::fs::write(
+            state.join("guard-budget.json"),
+            serde_json::to_vec(&FileBudgetState {
+                max_model_requests: 4096,
+                max_bytes_in: 64 * 1024 * 1024,
+                max_bytes_out: 64 * 1024 * 1024,
+                ..Default::default()
+            })?,
+        )?;
+        let network = Arc::new(network);
+        network.configure_budget_authority(authority)?;
         Ok(Driver {
-            runtime: FirecrackerRuntime::with_network_backend(config, Arc::new(network)),
+            runtime: FirecrackerRuntime::with_network_backend(config, network.clone()),
+            network,
             sandboxes: Vec::new(),
             state,
             boundary,
@@ -1219,6 +1379,7 @@ async fn main() {
             cases: Vec::new(),
             current: "initialization".into(),
             started: Instant::now(),
+            heartbeat: None,
         })
     };
     let initialized = initialized.await;
@@ -1248,6 +1409,9 @@ async fn main() {
         _=tokio::signal::ctrl_c()=>Err(failure("interrupted (SIGINT)")),
         _=terminate.recv()=>Err(failure("interrupted (SIGTERM)")),
     };
+    if let Some(task) = driver.heartbeat.take() {
+        task.abort();
+    }
     let failing = driver.current.clone();
     let errors = driver.cleanup().await;
     let pass = result.is_ok() && errors.is_empty();
