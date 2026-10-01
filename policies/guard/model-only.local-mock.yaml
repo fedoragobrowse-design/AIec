@@ -1,0 +1,49 @@
+# AIec Guard policy template: model-only against a LOCAL MOCK model service.
+#
+# OPERATOR TEST USE ONLY. This policy pairs with
+# policies/guard/boundary.local-test.yaml, which maps mock.model.test:8080 to a
+# loopback address. Plain HTTP upstreams exist only behind that explicit
+# operator mapping; the guest can never obtain it, so a policy that uses
+# scheme http without the mapping is refused at compile time.
+version: 1
+
+network:
+  dns:
+    allowed_zones:
+      - mock.model.test
+    allowed_record_types:
+      - A
+      - AAAA
+  egress:
+    - host: mock.model.test
+      port: 8080
+      protocol: tcp
+      allowed_methods:
+        - POST
+      allowed_paths:
+        - /v1/
+
+model:
+  host: mock.model.test
+  port: 8080
+  scheme: http
+  allowed_methods:
+    - POST
+  allowed_paths:
+    - /v1/
+  credential: model-main
+
+credentials:
+  - name: model-main
+    host: mock.model.test
+    port: 8080
+    header: authorization
+
+limits:
+  requests_per_minute: 60
+  dns_queries_per_minute: 120
+  bytes_out: 67108864
+  bytes_in: 268435456
+  max_request_bytes: 1048576
+  max_response_bytes: 67108864
+  max_concurrent_requests: 4

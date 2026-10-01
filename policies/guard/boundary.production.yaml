@@ -1,0 +1,24 @@
+# AIec Guard operator boundary: production.
+#
+# Guard's default non-public ranges (RFC1918, loopback, link-local and the
+# 169.254.169.254 metadata endpoint, CGNAT, multicast, documentation and
+# reserved space, plus the IPv6 equivalents) always apply and are not repeated
+# here. blocked_cidrs ADDS to them; protected_cidrs can never be authorized by
+# any policy or test mapping, so runtime adds the gateway, guest, peer-sandbox
+# and management /32s here.
+blocked_cidrs:
+  - 10.244.0.0/16   # sandbox TAP and management segment
+  - 192.0.0.0/20
+
+protected_cidrs:
+  - 169.254.169.254/32  # cloud metadata, never overridable
+  - 169.254.170.2/32   # container credential endpoint
+
+blocked_hosts:
+  - metadata.google.internal
+  - instance-data.ec2.internal
+  - kubernetes.default.svc
+
+# No operator test mappings in production: a private, loopback or otherwise
+# reserved destination is refused.
+test_destinations: {}

@@ -1,0 +1,29 @@
+# AIec Guard policy template: no-network.
+#
+# Topology B default: the trusted agent loop runs outside the sandbox and the
+# guest executes tools only. Nothing inside the guest may reach the network.
+# Selecting no policy at all produces exactly this policy - Guard never falls
+# back to open internet.
+version: 1
+
+network:
+  dns:
+    # Empty scope: Guard refuses every query instead of forwarding it.
+    allowed_zones: []
+    allowed_record_types:
+      - A
+      - AAAA
+  egress: []
+
+# No model endpoint: this sandbox must not hold a model credential.
+model: null
+credentials: []
+
+limits:
+  requests_per_minute: 60
+  dns_queries_per_minute: 120
+  bytes_out: 67108864
+  bytes_in: 268435456
+  max_request_bytes: 1048576
+  max_response_bytes: 67108864
+  max_concurrent_requests: 4

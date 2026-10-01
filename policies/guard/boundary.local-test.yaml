@@ -1,0 +1,23 @@
+# AIec Guard operator boundary: local acceptance testing.
+#
+# OPERATOR TEST USE ONLY. Pair with policies/guard/model-only.local-mock.yaml.
+# Each entry maps exactly one "host:port" to local mock addresses; nothing else
+# is authorized. Mappings can never override protected_cidrs, blocked_hosts or
+# operator blocked_cidrs, and they never create an egress permission on their
+# own - the policy must still permit the host and port.
+#
+# Never ship this file to a production worker.
+blocked_cidrs: []
+
+# The gateway, guest, peer sandbox and management addresses runtime knows about
+# are added here at startup; even these test mappings can never authorize them.
+protected_cidrs: []
+
+blocked_hosts:
+  - metadata.google.internal
+
+test_destinations:
+  mock.model.test:8080:
+    - 127.0.0.1
+  mock.web.test:443:
+    - 127.0.0.1

@@ -1,0 +1,6 @@
+# AIec Guard sandbox selection: external agent loop, no egress.
+#
+# Topology B default. The guest executes tools only; an empty selection is
+# identical to this file and never widens to open internet.
+topology: outside
+policy_template: no-network

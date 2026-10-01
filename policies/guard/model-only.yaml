@@ -1,0 +1,55 @@
+# AIec Guard policy template: model-only.
+#
+# Recommended template for in-VM agent loops (topology A). The guest may reach
+# exactly one destination, the configured model endpoint, and only through the
+# Guard broker, which substitutes the real credential for the guest placeholder
+# AIEC_MODEL_API_KEY=placeholder://model-main.
+#
+# The sandbox never receives the real secret: it is stored in the operator
+# credential store keyed by the binding name below.
+version: 1
+
+network:
+  dns:
+    # Exact name only. Guard resolves this to the gateway address so the guest
+    # cannot open a direct connection to the provider.
+    allowed_zones:
+      - api.example-model.com
+    allowed_record_types:
+      - A
+      - AAAA
+  egress:
+    - host: api.example-model.com
+      port: 443
+      protocol: tcp
+      allowed_methods:
+        - POST
+      allowed_paths:
+        # Segment-prefix match: /v1/chat/completions is inside, /v1x is not.
+        - /v1/
+
+model:
+  host: api.example-model.com
+  port: 443
+  scheme: https
+  allowed_methods:
+    - POST
+  allowed_paths:
+    - /v1/
+  # Binding name, never a secret value.
+  credential: model-main
+
+credentials:
+  - name: model-main
+    host: api.example-model.com
+    port: 443
+    header: authorization
+
+limits:
+  requests_per_minute: 60
+  dns_queries_per_minute: 120
+  bytes_out: 67108864
+  bytes_in: 268435456
+  max_request_bytes: 1048576
+  max_response_bytes: 67108864
+  max_concurrent_requests: 4

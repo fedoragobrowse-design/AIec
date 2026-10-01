@@ -1,0 +1,15 @@
+# AIec Guard sandbox selection: in-VM agent loop, model-only.
+#
+# This is the compact operator selection form. `effective_policy()` expands it
+# into exactly the same policy as policies/guard/model-only.yaml.
+topology: inside
+policy_template: model-only
+model_endpoint:
+  host: api.example-model.com
+  port: 443
+  scheme: https
+  allowed_methods:
+    - POST
+  allowed_paths:
+    - /v1/
+  credential: model-main

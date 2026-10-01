@@ -1,0 +1,41 @@
+# AIec Guard policy template: read-only-api.
+#
+# For guests that may read an operator allowlist and nothing more. This template
+# accepts no model endpoint, and every rule must declare read-only methods
+# (GET/HEAD/OPTIONS); a mutating method is refused rather than dropped.
+version: 1
+
+network:
+  dns:
+    allowed_zones:
+      - api.docs.example.com
+      - status.example.com
+    allowed_record_types:
+      - A
+      - AAAA
+  egress:
+    - host: api.docs.example.com
+      port: 443
+      protocol: tcp
+      allowed_methods:
+        - GET
+        - HEAD
+      allowed_paths:
+        - /v1/docs/
+    - host: status.example.com
+      port: 443
+      protocol: tcp
+      allowed_methods:
+        - GET
+
+model: null
+credentials: []
+
+limits:
+  requests_per_minute: 240
+  dns_queries_per_minute: 240
+  bytes_out: 134217728
+  bytes_in: 268435456
+  max_request_bytes: 1048576
+  max_response_bytes: 16777216
+  max_concurrent_requests: 8

@@ -1,0 +1,57 @@
+# AIec Guard policy template: model-plus-allowlist.
+#
+# The model endpoint plus an explicit operator allowlist. Every listed
+# destination is proxied by Guard; nothing else is reachable, and no list entry
+# ever receives the model credential. Entries with empty allowed_methods and
+# allowed_paths are opaque destination-only permissions: Guard cannot see inside
+# them, so never bind a credential to such a host.
+version: 1
+
+network:
+  dns:
+    allowed_zones:
+      - api.example-model.com
+      - api.docs.example.com
+    allowed_record_types:
+      - A
+      - AAAA
+  egress:
+    - host: api.example-model.com
+      port: 443
+      protocol: tcp
+      allowed_methods:
+        - POST
+      allowed_paths:
+        - /v1/
+    - host: api.docs.example.com
+      port: 443
+      protocol: tcp
+      allowed_methods:
+        - GET
+      allowed_paths:
+        - /v1/docs/
+
+model:
+  host: api.example-model.com
+  port: 443
+  scheme: https
+  allowed_methods:
+    - POST
+  allowed_paths:
+    - /v1/
+  credential: model-main
+
+credentials:
+  - name: model-main
+    host: api.example-model.com
+    port: 443
+    header: authorization
+
+limits:
+  requests_per_minute: 120
+  dns_queries_per_minute: 240
+  bytes_out: 134217728
+  bytes_in: 536870912
+  max_request_bytes: 2097152
+  max_response_bytes: 67108864
+  max_concurrent_requests: 8
