@@ -6,6 +6,19 @@
 # operator blocked_cidrs, and they never create an egress permission on their
 # own - the policy must still permit the host and port.
 #
+# The addresses are from 198.18.0.0/15, the benchmarking range, and not from
+# loopback. That is a deliberate constraint rather than a stylistic choice:
+# loopback is where a worker's own management services live, so a boundary that
+# could authorize it would make every mock mapping a candidate for reaching
+# something real. The benchmark range has no such meaning, and Guard refuses
+# any test address outside it.
+#
+# The mock listeners must be bound to these exact addresses INSIDE the
+# acceptance namespace - `ip addr add 198.18.0.10/32 dev lo` and
+# `198.18.0.11/32` - because bind() on an address the namespace does not hold
+# fails with EADDRNOTAVAIL. scripts/guard-core-acceptance.sh assigns the model
+# mock's address; assign the web mock's if you enable that rule.
+#
 # Never ship this file to a production worker.
 blocked_cidrs: []
 
@@ -18,6 +31,6 @@ blocked_hosts:
 
 test_destinations:
   mock.model.test:8080:
-    - 127.0.0.1
+    - 198.18.0.10
   mock.web.test:443:
-    - 127.0.0.1
+    - 198.18.0.11

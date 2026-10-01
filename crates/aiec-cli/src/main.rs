@@ -1861,6 +1861,16 @@ fn run_request_from(args: &RunSubmitArgs) -> Result<CreateRunRequest> {
         request.resources.network = NetworkPolicy::Internet;
     }
     if let Some(template) = args.guard {
+        // Silently dropping `--network` would let a script believe it asked
+        // for open egress and silently get a governed policy instead, which is
+        // the opposite of what the flag said. Two descriptions of one egress
+        // are refused, not resolved in favour of the narrower one.
+        if args.network {
+            anyhow::bail!(
+                "--guard and --network ask for two different egress policies; \
+                 pass --guard with a template that names the destinations you want"
+            );
+        }
         request.resources.guard = Some(aiec_guard::policy::GuardConfig {
             topology: aiec_guard::policy::Topology::default(),
             policy_template: PolicyTemplate::from(template),
@@ -1868,8 +1878,6 @@ fn run_request_from(args: &RunSubmitArgs) -> Result<CreateRunRequest> {
             model_endpoint: None,
             allowlist: Vec::new(),
         });
-        // Guard owns the egress, so the ordinary network policy beside it would
-        // be a second and wider path to the internet.
         request.resources.network = NetworkPolicy::Disabled;
     }
     if args.full_kernel_isolation {

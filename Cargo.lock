@@ -35,6 +35,7 @@ name = "aiec-api"
 version = "0.1.0"
 dependencies = [
  "aiec-core",
+ "aiec-guard",
  "aiec-network-linux",
  "aiec-runtime",
  "aiec-storage",

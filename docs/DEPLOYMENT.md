@@ -11,6 +11,8 @@ Use dedicated Linux worker hosts with:
 - a cgroup-v2-enabled kernel for predictable Firecracker snapshot performance;
 - private connectivity among API, PostgreSQL, S3, and workers.
 
+Docker workers are explicit runtime backends, not a production fallback. Start one with `aiec worker --runtime docker`; the worker uses the Docker Engine API, advertises `container`, `exec`, and `files` capabilities (`streaming: false`), and registers those capabilities for capability-aware scheduling. Docker containers use a managed workspace bind mount under the configured state root, drop all capabilities, disable privilege escalation, use a read-only root filesystem, and run a long-lived `sh -c 'sleep 3600'` process so exec operations have a stable container process. The default seccomp profile is left to Docker's daemon defaults; restricted network policies fail closed until an egress allowlist backend exists. Docker snapshot capture/restore is currently `UNSUPPORTED`.
+
 ## Guard on a worker
 
 Guard is additive: a Firecracker worker enforces it by default, and a sandbox
@@ -24,10 +26,14 @@ AIEC_GUARD_CREDENTIALS_FILE=/etc/aiec/guard/credentials.json
 AIEC_GUARD_BOUNDARY_FILE=/etc/aiec/guard/boundary.json
 ```
 
-The worker also needs the privileges the existing network backend already
-required — `CAP_NET_ADMIN` and `CAP_NET_RAW` — because Guard installs
-nftables tables and TAP devices of its own. A worker without them refuses a
-guarded sandbox at placement rather than booting one it cannot govern.
+The worker needs the privileges the existing network backend already required
+— `CAP_NET_ADMIN` and `CAP_NET_RAW` — because Guard installs nftables tables
+and TAP devices of its own. A worker without them is still *admitted* a guarded
+sandbox: the placement path does not probe the privilege, so the sandbox fails
+to start, at boot, with the enforcement backend reporting that it could not
+install its rules. That is fail-closed but late. If you need the refusal to
+happen at placement instead, run the capability probe in
+`firecracker_capabilities()` rather than leaving `network_policy` hardcoded.
 
 The pre-Guard network backend is available only when the operator asks for it
 explicitly:

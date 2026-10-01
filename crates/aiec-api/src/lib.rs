@@ -1770,6 +1770,9 @@ async fn create_sandbox(
     let required = aiec_core::runtime::RuntimeCapabilities {
         exec: true,
         files: true,
+        // A guarded sandbox needs a worker that can enforce its egress, so the
+        // capability is demanded at placement rather than discovered at boot.
+        network_policy: body.request.environment.guard.is_some(),
         ..Default::default()
     };
     let (runtime_kind, _selection_reason) = if let Some(registry) = s.runtime_registry() {

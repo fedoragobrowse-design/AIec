@@ -2163,8 +2163,9 @@ mod tests {
             Transport::Tcp,
             two.broker_port
         ));
-        // Both attachments share the gateway address, so neither guest can
-        // borrow the other's permit or count against the other's counters.
+        // Each attachment has its own /30, and the invariant is that one
+        // attachment's guest address is never a permit for the other's
+        // listener, whatever the addresses happen to be.
         assert!(!backend.permits(
             &one,
             two.guest_ip,

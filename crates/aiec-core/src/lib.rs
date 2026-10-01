@@ -460,6 +460,43 @@ fn validate_git_repo(repo: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// The host a repository URL names, for a policy that has to permit it.
+///
+/// Only the transports [`EnvironmentSpec::validate`] accepts are read, and a
+/// shape it cannot parse yields `None` rather than a guess. That asymmetry is
+/// deliberate: a host derived wrongly here would authorize a destination the
+/// caller never named, and a missing one fails loudly at policy compile time
+/// instead.
+pub fn repository_host(repo: &str) -> Option<String> {
+    let authority = if let Some(rest) = repo
+        .strip_prefix("https://")
+        .or_else(|| repo.strip_prefix("git://"))
+        .or_else(|| repo.strip_prefix("ssh://"))
+    {
+        rest.split('/').next().filter(|a| !a.is_empty())?
+    } else {
+        // `git@host:path` carries no scheme, and its separator is `:`.
+        repo.strip_prefix("git@")?
+            .split(':')
+            .next()
+            .filter(|a| !a.is_empty())?
+    };
+    let host = match authority.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => host,
+        _ => authority,
+    };
+    // A port is not part of the name, and policies carry the port separately.
+    let host = match host.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host,
+    };
+    (!host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)))
+    .then(|| host.to_ascii_lowercase())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecRequest {
     pub command: Vec<String>,

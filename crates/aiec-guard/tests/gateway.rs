@@ -405,9 +405,10 @@ async fn concurrency_cut_restore_and_nonrefundable_session_budgets_hold() {
             .is_none_or(|r| r.is_err())
     );
     drop(stream);
-    // A release takes effect only after its audit record is durable, so the
-    // caller waits for confirmation rather than assuming the flag flipped.
-    f.gateway().restore_and_wait().await.unwrap();
+    // A release takes effect only after its audit record is durable, and
+    // `restore` returns only once that has happened, so the next request here
+    // is not racing the audit worker.
+    f.gateway().restore().await.unwrap();
     // The first stream debited 13 bytes; disconnect leaves only three bytes available.
     let response = c
         .post(f.url("/v1/echo"))
@@ -791,15 +792,14 @@ async fn audit_failure_cannot_be_released_by_restore_after_the_sink_recovers() {
     tokio::time::timeout(Duration::from_secs(2), failed.notified())
         .await
         .unwrap();
-    let restored = fixture.gateway().restore();
+    let restored = fixture.gateway().restore().await;
     let _ = client
         .post(fixture.url("/v1/echo"))
         .bearer_auth("placeholder://model-main")
         .body("{}")
         .send()
         .await;
-    let _ =
-        tokio::time::timeout(Duration::from_secs(1), fixture.gateway().restore_and_wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), fixture.gateway().restore()).await;
     let stopped = fixture.gateway.take().unwrap().shutdown().await;
     assert_eq!(
         fixture.mock.seen.lock().len(),

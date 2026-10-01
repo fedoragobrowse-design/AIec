@@ -102,6 +102,53 @@ about code rather than observations.
 **No later phase may start before that run passes.** Phase 2's design is settled
 in `local://guard-phase2-contract.md` and is deliberately not implemented.
 
+## Phases 2 to 6, and what gates each
+
+The gates are not formality. Each phase's acceptance is what makes the next one
+safe to start, and a phase that has not been exercised on real hardware is
+code, not evidence.
+
+**Phase 2 - watchdog and quarantine.** A separate deterministic observer, not a
+second policy engine. It fails closed on lost liveness: if the watchdog cannot
+observe what it is watching within its deadline, the sandbox is cut, because
+silence is not health. Actions are idempotent and fenced to a sandbox and a
+policy generation, so a cut already applied is not a second cut and an action
+computed against a stale generation is refused. Escalation is ordered - cut,
+then pause for forensics, then quarantine - and evidence is written *before*
+each action, because an unrecorded cut is indistinguishable from a bug later.
+This phase also carries the durable budgets phase 1 left process-scoped.
+*Gate:* a cut, pause and quarantine each shown effective against a real sandbox;
+a duplicate action shown to be a no-op; a stale-generation action refused; a
+restart shown to preserve the budget; a watchdog whose own death leaves the
+sandbox cut.
+
+**Phase 3 - L7 governance.** Bounded inspection of visible HTTP, MCP and
+GraphQL, with default-deny method and tool policies, plus human-only proposals
+that a person decides and that are verified and applied atomically. This is
+also where an OpenShell import reports what it cannot preserve. *Gate:* a
+denied method, tool and GraphQL field shown actually refused; a proposal shown
+requiring a human; an import shown reporting its unsupported fields rather than
+converting silently.
+
+**Phase 4 - optional watcher.** Disabled by default, with no tools, a rigid
+validated output vocabulary, untrusted evidence kept separate from
+authoritative facts, and sampled batched budgets. Deterministic restrictions
+always win over anything the watcher says. *Gate:* a watcher output outside the
+vocabulary refused; an unavailable watcher shown producing the recorded
+continue-with-rules or pause-if-unavailable behaviour rather than silence.
+
+**Phase 5 - additional safeguards.** Synthetic canaries for files, hostnames
+and credentials; signed manifests and verified kernel/rootfs digests for
+guarded workloads; a unique short-lived rotatable per-VM control identity held
+outside portable snapshots; and a local-only adversarial red-team harness. *Gate:*
+a canary reached is detected; a rotated identity is refused; a tampered manifest
+is refused before boot.
+
+**Phase 6 - integration and production acceptance.** The real tool-using
+harness under model-only with a local streaming mock, topology B with zero guest
+egress, the motivating DNS bypass reproduced and shown blocked, the escape
+matrix, measured overhead, and deployment recovery. *Gate:* the full report,
+with every claim tied to a command that was run.
 
 ## Why the live run has not happened here
 

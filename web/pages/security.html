@@ -30,11 +30,14 @@ tenant B sandbox  ─┘
        exposed to the workload at all.</p>
   </div>
   <div class="block">
-    <h3>Filtered egress</h3>
-    <p>A sandbox cannot reach the host LAN, RFC1918 ranges, link-local and cloud
-       metadata addresses, the control plane, worker management endpoints, or
-       another tenant. Restricted network mode fails closed rather than silently
-       allowing traffic.</p>
+    <h3>Deny-all by default</h3>
+    <p>A sandbox reaches exactly one path, its own gateway. The host LAN,
+       RFC1918 ranges, link-local and cloud metadata addresses, the control
+       plane, worker management endpoints, other tenants, all IPv6 and all
+       forwarding are dropped, with no NAT and no accept on connection state.
+       A sandbox that asks for a network without selecting a policy is refused
+       rather than quietly filtered or quietly granted; the unguarded backend
+       exists only if the operator names it.</p>
   </div>
   <div class="block">
     <h3>Governance outside the guest</h3>

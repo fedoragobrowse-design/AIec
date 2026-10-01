@@ -35,6 +35,12 @@ use zeroize::Zeroizing;
 
 const IDLE: Duration = Duration::from_secs(30);
 const LIFETIME: Duration = Duration::from_secs(900);
+/// How long a release waits for its audit record to become durable before the
+/// gateway latches a fault and stays cut.
+///
+/// Long enough for an fsync on a slow disk, short enough that a caller is not
+/// left waiting on a worker that has stopped answering.
+const RESTORE_CONFIRMATION: Duration = Duration::from_secs(10);
 const HEADER_LIMIT: usize = 16 * 1024;
 const CHUNK: usize = 16 * 1024;
 
@@ -516,20 +522,39 @@ impl GuardGateway {
         Ok(())
     }
 
-    /// Accepts a release request; traffic remains cut until its audit record is
-    /// durable. A later cut fences out a pending release. Use restore_and_wait
-    /// when the caller requires confirmation that release has been applied.
-    pub fn restore(&self) -> Result<()> {
-        self.enqueue_restore(None)
-    }
-
-    pub async fn restore_and_wait(&self) -> Result<()> {
+    /// Releases the network, and returns only once the release is real.
+    ///
+    /// A release is not a flag write: the audit record has to be durable before
+    /// traffic is permitted again, so this awaits the audit worker's
+    /// confirmation rather than returning once the request is merely queued.
+    /// Returning early would let a caller proceed while the guest was still cut,
+    /// and the next request would fail for reasons that look like a policy
+    /// problem rather than a release that had not landed yet.
+    ///
+    /// It is `async` for that reason, not for convenience: a synchronous
+    /// function cannot wait on a durable write without blocking a runtime
+    /// thread. The wait is bounded, and a release that is not confirmed leaves
+    /// the gateway cut rather than assuming the best.
+    pub async fn restore(&self) -> Result<()> {
         let (complete, receipt) = tokio::sync::oneshot::channel();
         self.enqueue_restore(Some(complete))?;
-        match receipt.await {
-            Ok(RestoreAck::Applied) => Ok(()),
-            Ok(RestoreAck::Fenced) => Err(GuardError::Denied("gateway release fenced out".into())),
-            _ => Err(GuardError::Unavailable("gateway release failed".into())),
+        match tokio::time::timeout(RESTORE_CONFIRMATION, receipt).await {
+            Ok(Ok(RestoreAck::Applied)) => Ok(()),
+            Ok(Ok(RestoreAck::Fenced)) => Err(GuardError::Denied(
+                "gateway release fenced out by a later cut".into(),
+            )),
+            Ok(Ok(RestoreAck::Failed)) | Ok(Err(_)) => Err(GuardError::Unavailable(
+                "gateway release was not applied".into(),
+            )),
+            Err(_) => {
+                // The worker never answered, so the release is not knowable. The
+                // gateway stays cut: a release whose evidence cannot be
+                // confirmed is precisely the case the latched fault exists for.
+                self.state.terminal_failure.store(true, Ordering::Release);
+                Err(GuardError::Unavailable(
+                    "gateway release was not confirmed; the gateway remains cut".into(),
+                ))
+            }
         }
     }
 

@@ -46,8 +46,32 @@ pub struct GuardNetworkManager {
     boundary_file: Option<PathBuf>,
     allow_legacy: bool,
     local_test_mode: bool,
+    /// Whether this host can actually install the rules Guard promises.
+    ///
+    /// Probed once, because a capability the scheduler places governed work on
+    /// has to mean something. `NetworkCapabilities` describes the backend type;
+    /// only the host can say whether `nft` exists and whether the process may
+    /// use it.
+    can_enforce: bool,
     enforcement: Arc<NftablesBackend>,
     running: Arc<Mutex<BTreeMap<Uuid, RunningGuard>>>,
+}
+
+/// Whether this host can install and read nftables rules.
+///
+/// A read is enough to know the binary exists and the caller has the privilege,
+/// and it changes nothing: listing the ruleset does not modify the firewall. The
+/// answer is the reason a worker should or should not advertise network policy
+/// enforcement, so it is taken once at startup rather than discovered by a
+/// sandbox that believed it was governed.
+fn probe_enforcement() -> bool {
+    std::process::Command::new("nft")
+        .args(["list", "ruleset"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl GuardNetworkManager {
@@ -58,6 +82,7 @@ impl GuardNetworkManager {
             boundary_file: std::env::var_os("AIEC_GUARD_BOUNDARY_FILE").map(PathBuf::from),
             allow_legacy: std::env::var("AIEC_ALLOW_LEGACY_NETWORK").as_deref() == Ok("1"),
             local_test_mode: std::env::var("AIEC_GUARD_TEST_MODE").as_deref() == Ok("1"),
+            can_enforce: probe_enforcement(),
             enforcement: Arc::new(NftablesBackend::new()),
             running: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -236,8 +261,12 @@ impl GuardNetworkManager {
 impl NetworkBackend for GuardNetworkManager {
     fn capabilities(&self) -> NetworkCapabilities {
         NetworkCapabilities {
-            restricted_allowlists: true,
-            dns_controls: true,
+            // Reported from the probe, not from the backend type. A worker that
+            // claims this is a promise the scheduler places governed work on, so
+            // a host without `nft` or the privilege to use it must say so here
+            // rather than at the first boot that trusted the claim.
+            restricted_allowlists: self.can_enforce,
+            dns_controls: self.can_enforce,
             bandwidth_limits: false,
         }
     }

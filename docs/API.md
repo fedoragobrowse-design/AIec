@@ -6,6 +6,7 @@ Base path `/v1`. Except health/metrics, send `Authorization: Bearer af_live_...`
 
 - `POST /v1/sandboxes` — create. Body: `image`, `cpu`, `memory_mb`, `disk_mb`, `timeout_seconds`, `network.enabled`.
   `environment.workspace` accepts `{"type":"empty"}` or `{"type":"git","repo":"https://...","reference":"main","shallow":true}`. Repository credentials in URLs are rejected. `environment.toolkits` is a bounded list of named `setup_commands` argv arrays.
+  `environment.guard` selects an out-of-guest policy, with the same shape as `resources.guard` below. It replaces `network.enabled` rather than accompanying it. A Firecracker request with no `environment.guard` gets the default no-network policy; a request that asks for `network.enabled` without selecting a policy is refused unless the operator has set `AIEC_ALLOW_LEGACY_NETWORK=1`. Model credentials are configured on the worker and never travel in this document; the guest receives `placeholder://<binding>` instead.
 - `GET /v1/sandboxes` — tenant list.
 - `GET /v1/sandboxes/{id}` — tenant-scoped detail.
 - `DELETE /v1/sandboxes/{id}` — destroy.
@@ -42,6 +43,7 @@ The Python SDK exposes the same size-guarded partial path as `Sandbox.upload_art
   fallback. Model credentials are configured on the worker and never travel in
   this document; the guest receives a `placeholder://<binding>` instead. See
   `GUARD_POLICY.md`.
+
 - `GET /v1/runs`, `GET /v1/runs/{id}` — tenant-scoped list (filterable by `state`, paginated by `limit`) and detail.
 - `GET /v1/runs/{id}/events`, `GET /v1/runs/{id}/attempts` — the run's history and its attempts.
 - `POST /v1/runs/{id}/cancel` — stop a run and reclaim its machine. Cancelling a finished run returns it unchanged.

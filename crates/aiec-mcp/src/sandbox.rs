@@ -154,6 +154,7 @@ impl LocalAiec {
         disk_mb: u32,
         timeout_seconds: u64,
         network_enabled: bool,
+        guard_allowlist: Option<Vec<String>>,
     ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
         self.create_sandbox_inner(
             image,
@@ -163,6 +164,7 @@ impl LocalAiec {
             disk_mb,
             timeout_seconds,
             network_enabled,
+            guard_allowlist,
             Some(workspace),
         )
         .await
@@ -179,6 +181,7 @@ impl LocalAiec {
         disk_mb: u32,
         timeout_seconds: u64,
         network_enabled: bool,
+        guard_allowlist: Option<Vec<String>>,
     ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
         self.create_sandbox_inner(
             image,
@@ -188,6 +191,7 @@ impl LocalAiec {
             disk_mb,
             timeout_seconds,
             network_enabled,
+            guard_allowlist,
             None,
         )
         .await
@@ -203,29 +207,44 @@ impl LocalAiec {
         disk_mb: u32,
         timeout_seconds: u64,
         network_enabled: bool,
+        guard_allowlist: Option<Vec<String>>,
         workspace: Option<WorkspaceSpec>,
     ) -> Result<(SandboxView, Uuid, Uuid), McpError> {
         LocalEndpoint::require_local_runtime(runtime)?;
 
         let ttl = timeout_seconds.clamp(60, 86_400);
         let run_id = Uuid::now_v7();
+        // A Firecracker worker governs its own egress, so asking it for
+        // ungoverned internet access is refused rather than quietly downgraded
+        // to no-network. The caller is told what to do instead, because a
+        // failure that arrives as a backend error sends people looking in the
+        // wrong place.
+        let firecracker = runtime.eq_ignore_ascii_case("firecracker");
+        if network_enabled && firecracker && guard_allowlist.is_none() {
+            return Err(McpError::invalid(
+                "a Firecracker sandbox governs its own egress: pass guard_allowlist with the \
+                 hosts it may reach instead of network_enabled, or leave the network off",
+            ));
+        }
         let request = CreateSandboxRequest {
             image: image.to_owned(),
             cpu,
             memory_mb,
             disk_mb,
             timeout_seconds: ttl,
-            network: if network_enabled {
+            network: if network_enabled && !firecracker {
                 NetworkPolicy::Internet
             } else {
                 NetworkPolicy::Disabled
             },
             environment: EnvironmentSpec {
                 workspace: workspace.unwrap_or_default(),
+                guard: guard_allowlist
+                    .map(crate::runs::allowlist_guard)
+                    .transpose()?,
                 ..Default::default()
             },
         };
-
         let sandbox = self.create_with_runtime(&request, runtime).await?;
 
         // A caller that asked for a specific runtime must not silently get a

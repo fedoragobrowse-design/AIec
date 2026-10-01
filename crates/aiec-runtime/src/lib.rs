@@ -263,7 +263,7 @@ fn bwrap_capabilities() -> RuntimeCapabilities {
 }
 
 fn firecracker_capabilities(
-    _network: &dyn NetworkBackend,
+    network: &dyn NetworkBackend,
     artifact: Option<&guest_artifact::GuestArtifact>,
     minimum_disk_mb: u64,
 ) -> RuntimeCapabilities {
@@ -276,7 +276,13 @@ fn firecracker_capabilities(
         full_kernel_isolation: true,
         vm_snapshot: true,
         memory_resume: true,
-        network_policy: true,
+        // Asked of the backend rather than assumed. A worker that advertises
+        // `network_policy` is a promise the scheduler will place governed work
+        // on, and a hardcoded `true` makes that promise empty: the sandbox
+        // would then be admitted and would fail at boot instead of being placed
+        // somewhere that can actually govern it.
+        network_policy: network.capabilities().dns_controls
+            && network.capabilities().restricted_allowlists,
         pause: true,
         pause_reclaims_resources: false,
         vsock: true,
@@ -2515,18 +2521,16 @@ impl FirecrackerRuntime {
             let effective = guard
                 .effective_policy()
                 .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            let gateway = self
+                .vms
+                .lock()
+                .await
+                .get(&sandbox.id)
+                .and_then(|vm| vm.network.as_ref())
+                .and_then(|network| network.addresses.first())
+                .cloned()
+                .ok_or_else(|| RuntimeError::Unavailable("Guard gateway missing".into()))?;
             if let Some(model) = effective.model {
-                let gateway = self
-                    .vms
-                    .lock()
-                    .await
-                    .get(&sandbox.id)
-                    .and_then(|vm| vm.network.as_ref())
-                    .and_then(|network| network.addresses.first())
-                    .cloned()
-                    .ok_or_else(|| {
-                        RuntimeError::Unavailable("Guard model gateway missing".into())
-                    })?;
                 let base = format!("http://{gateway}:8443/model/{}/v1", model.credential);
                 let placeholder = format!("placeholder://{}", model.credential);
                 for key in ["AIEC_MODEL_API_KEY", "AIEC_AGENT_API_KEY", "OPENAI_API_KEY"] {
@@ -2539,6 +2543,32 @@ impl FirecrackerRuntime {
                 ] {
                     request.environment.insert(key.into(), base.clone());
                 }
+            }
+            // A governed policy with non-model destinations is unusable without
+            // this: nft denies all forwarding, so an allowlisted `git clone` or
+            // `curl` has no route unless the client is told to send its request
+            // to the gateway, which decides whether the destination is
+            // permitted. Both spellings are set because the tools disagree -
+            // curl reads the lower-case names, git and most of the ecosystem
+            // read the upper-case ones.
+            //
+            // `NO_PROXY` is deliberately empty. Anything listed there would be
+            // reached by a direct socket, which the kernel drops; a guest that
+            // reads an empty value and bypasses the proxy gets a refused
+            // connection rather than an ungoverned one.
+            let proxy = format!("http://{gateway}:8443");
+            for key in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                request.environment.insert(key.into(), proxy.clone());
+            }
+            for key in ["NO_PROXY", "no_proxy"] {
+                request.environment.insert(key.into(), String::new());
             }
         }
         validate_exec(&request)?;

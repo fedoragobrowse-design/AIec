@@ -1,9 +1,13 @@
 # OpenShell policy compatibility
 
-Source: NVIDIA OpenShell, Apache-2.0, policy schema reference
-<https://github.com/NVIDIA/OpenShell/blob/main/docs/how-it-works/policies/schema.mdx>
-(read 2026-10-01). Earlier paths such as `docs/reference/policy-schema.mdx` and
-non-`latest` URLs return 404 and were not treated as the current schema.
+Source: NVIDIA OpenShell, Apache-2.0, policy schema reference, read at commit
+`71440b28f48d5fefc569d779f70d6e63893aa80a` (2026-10-01):
+<https://github.com/NVIDIA/OpenShell/blob/71440b28f48d5fefc569d779f70d6e63893aa80a/docs/how-it-works/policies/schema.mdx>
+
+Pinned deliberately. A `main` URL moves under this document, and a branch moving
+is how a compatibility claim quietly stops describing the thing it describes.
+The path `docs/reference/policy-schema.mdx` is 404 at this commit and was not
+used; earlier drafts of this file that cited it were wrong.
 
 No OpenShell code is copied into AIec. This document records what its schema
 means for a Guard policy, field by field, because "we support OpenShell

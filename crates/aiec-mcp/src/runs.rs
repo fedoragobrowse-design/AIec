@@ -113,6 +113,35 @@ fn guard_config(name: &str) -> Result<aiec_guard::policy::GuardConfig, McpError>
     })
 }
 
+/// A read-only Guard policy permitting exactly the named hosts.
+///
+/// Shared by the run and sandbox tools: both need "these hosts, and nothing
+/// else", and two spellings of that is how a client and a control plane drift.
+pub fn allowlist_guard(hosts: Vec<String>) -> Result<aiec_guard::policy::GuardConfig, McpError> {
+    use aiec_guard::policy::{EgressRule, GuardConfig, PolicyTemplate, Topology};
+    if hosts.len() > 16 {
+        return Err(McpError::invalid(
+            "a Guard allowlist may name at most 16 hosts",
+        ));
+    }
+    Ok(GuardConfig {
+        topology: Topology::Inside,
+        policy_template: PolicyTemplate::ReadOnlyApi,
+        policy: None,
+        model_endpoint: None,
+        allowlist: hosts
+            .into_iter()
+            .map(|host| EgressRule {
+                host,
+                port: 443,
+                protocol: "tcp".to_string(),
+                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
+                allowed_paths: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
 /// One workload, as a calling agent states it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunArgs {

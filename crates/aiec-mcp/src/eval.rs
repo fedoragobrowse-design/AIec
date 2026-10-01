@@ -996,6 +996,11 @@ async fn create_sandbox_with_repo(
         timeout_seconds,
         // The clone runs inside the guest, so it needs egress to the remote.
         true,
+        // A Firecracker worker has no ungoverned egress to grant, so the
+        // destination is named rather than left open. A repository host the
+        // platform cannot read yields `None`, and the sandbox call then
+        // refuses with a message saying which flag to use.
+        aiec_core::repository_host(repo_url).map(|host| vec![host]),
     )
     .await
 }

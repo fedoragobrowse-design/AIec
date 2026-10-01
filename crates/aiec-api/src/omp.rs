@@ -106,10 +106,54 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Resources for an evaluation run, governed by the repositories it clones.
+///
+/// An evaluation needs the network: it clones two repositories and runs a
+/// build. Asking for bare `NetworkPolicy::Internet` used to work, and no longer
+/// does on a Guard worker, which refuses an ungoverned attachment - so the
+/// default silently broke the very deployments Guard targets. The destinations
+/// are known here: the harness repository and the target repository, and
+/// nothing else. Naming them is a read-only allowlist, which is the honest
+/// version of what the run actually does.
+fn evaluation_resources(spec: &OmpRunSpec) -> ResourceRequirements {
+    let allowlist = [spec.omp_repo.as_str(), spec.target_repo.as_str()]
+        .into_iter()
+        .filter_map(aiec_core::repository_host)
+        .collect::<Vec<_>>();
+    ResourceRequirements {
+        cpu: 2,
+        memory_mb: 2048,
+        disk_mb: 2048,
+        network: NetworkPolicy::Disabled,
+        guard: Some(evaluation_guard(allowlist)),
+    }
+}
+
+/// A read-only Guard policy permitting exactly the named hosts.
+fn evaluation_guard(allowlist: Vec<String>) -> aiec_guard::policy::GuardConfig {
+    use aiec_guard::policy::{EgressRule, GuardConfig, PolicyTemplate, Topology};
+    GuardConfig {
+        topology: Topology::Inside,
+        policy_template: PolicyTemplate::ReadOnlyApi,
+        policy: None,
+        model_endpoint: None,
+        allowlist: allowlist
+            .into_iter()
+            .map(|host| EgressRule {
+                host,
+                port: 443,
+                protocol: "tcp".to_string(),
+                allowed_methods: vec!["GET".to_string(), "HEAD".to_string()],
+                allowed_paths: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 /// Turns an OMP run into an ordinary workload.
 ///
 /// The agent is cloned and built as *setup*, the task is the *command*, and the
-/// checks are *validations* — three things the platform already schedules. The
+/// checks are *validations* - three things the platform already schedules. The
 /// only OMP-specific part left is the command itself.
 pub fn to_run_request(spec: &OmpRunSpec) -> Result<RunRequest, CoreError> {
     let agent = RepoSpec {
@@ -241,13 +285,10 @@ pub fn to_run_request(spec: &OmpRunSpec) -> Result<RunRequest, CoreError> {
             timeout_seconds: spec.timeout_seconds.or(Some(1800)),
             ..Default::default()
         },
-        resources: spec.resources.clone().unwrap_or(ResourceRequirements {
-            cpu: 2,
-            memory_mb: 2048,
-            disk_mb: 2048,
-            network: NetworkPolicy::Internet,
-            guard: None,
-        }),
+        resources: spec
+            .resources
+            .clone()
+            .unwrap_or_else(|| evaluation_resources(spec)),
         requirements: spec.requirements.clone(),
         requested_runtime: spec.runtime.clone(),
         retention: spec.retention.unwrap_or(RetentionPolicy::KeepOnFailure),

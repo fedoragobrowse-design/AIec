@@ -929,7 +929,13 @@ async fn acquire_sandbox(
     attempt_id: Uuid,
 ) -> Result<(Sandbox, Placement, crate::ProvisionTimings), (CoreError, Vec<String>)> {
     let reasons = run.requirements.reasons();
-    let required = required_capabilities(&run.requirements);
+    // A Guard selection additionally demands a worker that advertises network
+    // policy enforcement, so a governed run is placed on a machine that can
+    // actually govern it rather than being admitted and failing at boot.
+    let mut required = required_capabilities(&run.requirements);
+    if run.resources.guard.is_some() {
+        required.network_policy = true;
+    }
     // A Guard selection is enforced by the runtime that owns the guest's
     // network attachment, and there is no weaker fallback: asking for Guard and
     // landing on a runtime that cannot install the rules would be a sandbox

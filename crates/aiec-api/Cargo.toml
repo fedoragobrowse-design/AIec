@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 aiec-core.workspace = true
+aiec-guard.workspace = true
 aiec-runtime.workspace = true
 aiec-storage.workspace = true
 aiec-network-linux.workspace = true

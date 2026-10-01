@@ -198,7 +198,11 @@ fn is_non_public(ip: &IpAddr) -> bool {
                 || v4.octets()[0] == 0
                 || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
                 || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 2)
-                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 0x18)
+                // 198.18.0.0/15: the mask must be 0x12, because 18 and 19 are
+                // 0x12 and 0x13. Written as 0x18 it matched nothing, which made
+                // the benchmarking range look like public space and rejected
+                // the one range a local mock is allowed to use.
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 0x12)
                 || (v4.octets()[0] == 198 && v4.octets()[1] == 51 && v4.octets()[2] == 100)
                 || (v4.octets()[0] == 203 && v4.octets()[1] == 0 && v4.octets()[2] == 113)
                 || (v4.octets()[0] >= 240)
@@ -1292,18 +1296,28 @@ mod tests {
         ))
         .expect("local mock policy");
         let mock = compile(&mock_policy, &local).expect("local mock compiles");
+        // The shipped local boundary maps to the benchmarking range, not to
+        // loopback: loopback is where a worker's own services live, and a
+        // boundary able to authorize it could reach something real.
         assert!(mock.allows_plain_http_upstream(
             "mock.model.test",
             8080,
-            "127.0.0.1".parse().unwrap()
+            "198.18.0.10".parse().unwrap()
         ));
+        // The right address on the wrong port is still refused.
         assert!(!mock.allows_plain_http_upstream(
             "mock.web.test",
             8080,
-            "127.0.0.1".parse().unwrap()
+            "198.18.0.11".parse().unwrap()
         ));
-        // The same mapping does not leak into production, where it is absent.
+        // And the same mapping does not exist in production, where it is absent.
         assert!(!compiled.allows_plain_http_upstream(
+            "mock.model.test",
+            8080,
+            "198.18.0.10".parse().unwrap()
+        ));
+        // Loopback is refused outright even in the local-test boundary.
+        assert!(!mock.allows_plain_http_upstream(
             "mock.model.test",
             8080,
             "127.0.0.1".parse().unwrap()
@@ -1316,10 +1330,13 @@ mod tests {
             "../../../policies/guard/boundary.local-test.yaml"
         ))
         .expect("local boundary");
-        local.protected_cidrs = vec!["127.0.0.1/32".parse().expect("cidr")];
+        // The protected range has to be one the boundary actually maps, or the
+        // test proves nothing: protecting an address no mapping mentions cannot
+        // conflict with anything.
+        local.protected_cidrs = vec!["198.18.0.10/32".parse().expect("cidr")];
         assert!(
             local.validate().is_err(),
-            "test mapping inside protected range"
+            "a test mapping inside a protected range is refused"
         );
         local.protected_cidrs.clear();
         local.validate().expect("valid boundary");

@@ -124,9 +124,14 @@ that the result is a single sample.
 
 ## Things that will bite you
 
-- **Network is opt-in.** `network_enabled` defaults to `false`. A clone needs it
-  on. On a Firecracker host without `CAP_NET_ADMIN`, `network_enabled: true`
-  fails at create; use the `docker` runtime instead.
+- **Network is opt-in, and how you get it depends on the runtime.**
+  `network_enabled` defaults to `false` and a clone needs it on. On a
+  **Docker** worker it still means ordinary internet access, exactly as before.
+  On a **Firecracker** worker the sandbox governs its own egress, so
+  `network_enabled: true` alone is refused with a message saying so — pass
+  `guard_allowlist` naming the hosts it may reach instead. A worker that cannot
+  install the rules says so when it starts, and a governed sandbox is placed
+  only on a worker that advertises the capability.
 - **Images.** `aiec-coding:latest` is the coding guest. `python:3.13`,
   `node:24`, `rust:stable`, `ubuntu:24.04` and `alpine:3.21` are the standard
   set. `aiec:latest` does not resolve.

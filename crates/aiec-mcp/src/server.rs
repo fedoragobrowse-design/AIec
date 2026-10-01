@@ -94,8 +94,18 @@ pub struct CreateSandboxArgs {
     pub disk_mb: Option<u32>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Allow the sandbox to reach the internet.
+    ///
+    /// Still the right flag on a Docker worker, which does not enforce Guard
+    /// and therefore still has the ordinary NAT path. On a Firecracker worker
+    /// it is refused without `guard_allowlist`, because a microVM there has no
+    /// ungoverned egress to grant.
     #[serde(default)]
     pub network_enabled: Option<bool>,
+    /// Govern egress with a Guard policy naming the hosts the sandbox may
+    /// reach. Required instead of `network_enabled` on a Firecracker worker.
+    #[serde(default)]
+    pub guard_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -293,6 +303,7 @@ third-party provider.",
                     args.disk_mb.unwrap_or(2048),
                     args.timeout_seconds.unwrap_or(self.default_ttl_seconds),
                     args.network_enabled.unwrap_or(false),
+                    args.guard_allowlist,
                 )
                 .await?;
             Ok(view)

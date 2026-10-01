@@ -85,18 +85,24 @@ traversal and symlink escapes.
 
 ### Network isolation
 
-A public sandbox is attached to its own TAP device with an nftables policy that
-blocks:
+**The default is no network at all.** A public sandbox is attached to its own
+TAP device, and on that interface nftables permits exactly one path: the
+Guard gateway on the guest's DNS and broker ports. Everything else is dropped -
+the host LAN, RFC1918 and other private ranges, link-local and cloud metadata
+addresses (`169.254.169.254`), the AIec control plane, the worker's management
+endpoints, every other tenant's sandbox, all IPv6, and all forwarding in either
+direction. No NAT is involved, and no rule accepts on connection state, so a cut
+takes effect against a flow that was already established.
 
-- the host LAN and RFC1918 ranges,
-- link-local and cloud metadata addresses (`169.254.169.254`),
-- the AIec control plane,
-- the worker's management endpoints,
-- other tenants' sandboxes.
+There is no implicit "internet" mode. A sandbox that asks for a network without
+selecting a Guard policy is **refused**, not quietly filtered and not quietly
+granted. The pre-Guard network backend exists only when the operator asks for it
+by name, with `AIEC_ALLOW_LEGACY_NETWORK=1`; that is the one supported way to get
+an ungoverned attachment, and it is off by default because a deployment that
+believes it is filtered and is not is worse than one that is openly unfiltered.
 
-Public internet egress is permitted according to policy. The
-`NetworkPolicy::Restricted` mode **fails closed**: a non-empty host allowlist
-without a DNS/IP policy plugin is rejected rather than silently ignored.
+`NetworkPolicy::Restricted` **fails closed**: a non-empty host allowlist without
+a DNS/IP policy plugin is rejected rather than silently ignored.
 
 ### Guard: governance outside the guest
 
