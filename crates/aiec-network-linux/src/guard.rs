@@ -127,8 +127,13 @@ impl GuardNetworkManager {
             .guard
             .as_ref()
             .ok_or_else(|| CoreError::InvalidRequest("Guard selection missing".into()))?;
-        let policy = config.effective_policy().map_err(guard_error)?;
-        self.enforcement.health().await.map_err(guard_error)?;
+        let policy = config
+            .effective_policy()
+            .map_err(|e| CoreError::Unavailable(format!("guard policy selection: {e}")))?;
+        self.enforcement
+            .health()
+            .await
+            .map_err(|e| CoreError::Unavailable(format!("guard enforcement probe: {e}")))?;
         let occupied = assigned_ipv4().await?;
         let start = (sandbox.id.as_u128() % u128::from(TAP_SLOTS)) as u32;
         let slot = (0..TAP_SLOTS)
@@ -150,7 +155,10 @@ impl GuardNetworkManager {
             dns_port: DNS_PORT,
             broker_port: BROKER_PORT,
         };
-        let mut boundary = self.boundary().await?;
+        let mut boundary = self
+            .boundary()
+            .await
+            .map_err(|e| CoreError::Unavailable(format!("guard operator boundary: {e}")))?;
         let mock_addresses: HashSet<_> = boundary
             .test_destinations
             .values()
@@ -160,13 +168,20 @@ impl GuardNetworkManager {
             .map_err(guard_error)?;
         // Test exceptions cannot authorize any guarded peer or gateway. Only
         // isolated benchmark-network mock listeners escape host-address checks.
+        // Deduplicated: `occupied` includes addresses the boundary already
+        // protects, and Guard refuses a boundary that names the same range
+        // twice. Without this the second sandbox on a host can never attach,
+        // because its mock's address is already protected by the operator file.
         for address in occupied
             .iter()
             .copied()
             .filter(|address| !mock_addresses.contains(&std::net::IpAddr::V4(*address)))
             .chain([gateway_ip, guest_ip])
         {
-            boundary.protected_cidrs.push(ipnet_from_v4(address));
+            let range = ipnet_from_v4(address);
+            if !boundary.protected_cidrs.contains(&range) {
+                boundary.protected_cidrs.push(range);
+            }
         }
         let compiled = compile(&policy, &boundary).map_err(guard_error)?;
         if sandbox
@@ -180,12 +195,29 @@ impl GuardNetworkManager {
             ));
         }
         let dir = self.directory(sandbox.id);
-        private_directory(&dir).await?;
+        // Each of these names itself. "Guard I/O: Permission denied" tells an
+        // operator nothing about which of the four filesystem steps refused,
+        // and this is the path a worker walks the first time it places a
+        // sandbox under Guard.
+        private_directory(&dir).await.map_err(|e| {
+            CoreError::Io(std::io::Error::new(
+                io_kind_of(&e),
+                format!("guard state directory: {e}"),
+            ))
+        })?;
         let credentials = match &self.credential_file {
-            Some(path) => CredentialStore::from_file(path).map_err(guard_error)?,
+            Some(path) => CredentialStore::from_file(path)
+                .map_err(|e| CoreError::Unavailable(format!("guard credential store: {e}")))?,
             None => CredentialStore::empty(),
         };
-        let events = Arc::new(FileEventSink::open(dir.join("events.jsonl")).map_err(guard_error)?);
+        // The journal is opened before anything else is installed, and it is
+        // the first thing that writes outside memory. Naming it here rather
+        // than letting `guard_error` flatten it is the difference between an
+        // operator reading "event journal" and reading a bare errno.
+        let events = Arc::new(
+            FileEventSink::open(dir.join("events.jsonl"))
+                .map_err(|e| CoreError::Unavailable(format!("guard event journal: {e}")))?,
+        );
         // Link remains DOWN until both filter and listeners are installed.
         ip(&["tuntap", "add", "dev", &attachment.interface, "mode", "tap"]).await?;
         let result = async {
@@ -200,7 +232,7 @@ impl GuardNetworkManager {
             self.enforcement
                 .apply_policy(&compiled, &attachment)
                 .await
-                .map_err(guard_error)?;
+                .map_err(|e| CoreError::Unavailable(format!("guard nftables apply: {e}")))?;
             let gateway = GuardGateway::start(GatewayConfig {
                 sandbox_id: sandbox.id,
                 tenant_id: sandbox.tenant_id,
@@ -213,17 +245,19 @@ impl GuardNetworkManager {
                 events: events.clone(),
             })
             .await
-            .map_err(guard_error)?;
+            .map_err(|e| CoreError::Unavailable(format!("guard gateway start: {e}")))?;
             private_json(
                 &dir.join("attachment.json"),
                 &serde_json::json!({ "attachment": attachment, "node_id": sandbox.node_id }),
             )
-            .await?;
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(io_kind_of(&e), format!("guard attachment record: {e}"))))?;
             private_json(
                 &dir.join("effective-policy.json"),
                 &serde_json::json!({"policy":compiled.policy(),"policy_hash":compiled.policy_hash()}),
             )
-            .await?;
+            .await
+            .map_err(|e| CoreError::Io(std::io::Error::new(io_kind_of(&e), format!("guard policy record: {e}"))))?;
             events
                 .append(EventInput {
                     sandbox_id: sandbox.id,
@@ -235,7 +269,7 @@ impl GuardNetworkManager {
                     ..Default::default()
                 })
                 .await
-                .map_err(guard_error)?;
+                .map_err(|e| CoreError::Unavailable(format!("guard journal append: {e}")))?;
             ip(&["link", "set", "dev", &attachment.interface, "up"]).await?;
             Ok::<_, CoreError>(RunningGuard {
                 attachment: attachment.clone(),
@@ -406,6 +440,15 @@ async fn private_json(path: &Path, value: &serde_json::Value) -> Result<(), Core
     Ok(())
 }
 
+/// The I/O kind behind a core error, so a labelled one keeps the kind a caller
+/// might be matching on.
+fn io_kind_of(error: &CoreError) -> std::io::ErrorKind {
+    match error {
+        CoreError::Io(inner) => inner.kind(),
+        _ => std::io::ErrorKind::Other,
+    }
+}
+
 async fn assigned_ipv4() -> Result<HashSet<Ipv4Addr>, CoreError> {
     let bytes = tool("ip", &["-j", "-4", "addr", "show"]).await?;
     let values: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
@@ -437,7 +480,13 @@ async fn tool(program: &str, args: &[&str]) -> Result<Vec<u8>, CoreError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            CoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("could not run `{program} {}`: {e}", args.join(" ")),
+            ))
+        })?;
     let stdout = child
         .stdout
         .take()

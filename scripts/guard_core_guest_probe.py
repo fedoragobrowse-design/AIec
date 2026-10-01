@@ -40,14 +40,30 @@ def main(c):
                 data = conn.recv(4096)
                 conn.sendall(data)
     if kind == 'ipv6_setup':
+        # Absolute paths: the guest agent execs with a fixed PATH of
+        # /usr/local/bin:/usr/bin:/bin, and on this image `ip` lives under
+        # /usr/sbin - so a bare `ip` is a FileNotFoundError, not a permission
+        # problem, and would read as an enforcement failure.
+        ip_binary = next(
+            (p for p in ('/usr/sbin/ip', '/sbin/ip', '/usr/bin/ip', '/bin/ip')
+             if os.path.exists(p)),
+            None,
+        )
+        if ip_binary is None:
+            return {'configured': False, 'reason': 'no ip binary on the guest'}
         commands = [
-            ['ip', '-6', 'addr', 'replace', 'fd00:beef::2/64', 'dev', 'eth0', 'nodad'],
-            ['ip', '-6', 'neigh', 'replace', 'fd00:beef::1', 'lladdr', c['mac'], 'nud', 'permanent', 'dev', 'eth0'],
-            ['ip', '-6', 'route', 'replace', 'default', 'via', 'fd00:beef::1', 'dev', 'eth0'],
+            [ip_binary, '-6', 'addr', 'replace', 'fd00:beef::2/64', 'dev', 'eth0', 'nodad'],
+            [ip_binary, '-6', 'neigh', 'replace', 'fd00:beef::1', 'lladdr', c['mac'], 'nud', 'permanent', 'dev', 'eth0'],
+            [ip_binary, '-6', 'route', 'replace', 'default', 'via', 'fd00:beef::1', 'dev', 'eth0'],
         ]
+        results = []
         for command in commands:
-            subprocess.run(command, check=True, capture_output=True, timeout=5)
-        return {'configured': True}
+            done = subprocess.run(command, capture_output=True, timeout=5)
+            results.append({'cmd': ' '.join(command), 'rc': done.returncode,
+                            'err': done.stderr.decode(errors='replace')[:120]})
+            if done.returncode != 0:
+                return {'configured': False, 'steps': results}
+        return {'configured': True, 'steps': results}
     if kind == 'environment':
         base = os.environ.get('AIEC_AGENT_BASE_URL', '')
         placeholder = 'placeholder://model-main'

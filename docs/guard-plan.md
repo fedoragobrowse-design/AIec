@@ -89,18 +89,85 @@ Run by the parent, on the integrated tree:
 
 `docs/bug-hunt-2026-10-01.md` records each with its reproduction.
 
-## What is not yet proven
+## The live Firecracker acceptance, as observed
 
-The live Firecracker acceptance run has not been executed. The driver
-(`crates/aiec-runtime/examples/guard_core_acceptance.rs`) and launcher
-(`scripts/guard-core-acceptance.sh`) exist, compile, and are designed to fail
-loudly rather than report a partial pass, but until the run is observed on real
-hardware with a real guest, the escape matrix, the guest-visible credential
-absence, the streaming and DNS measurements and the cleanup census are claims
-about code rather than observations.
+Run on 2026-10-01 against the deployment host (`Linux 7.2.7-200.fc44.x86_64`,
+x86_64, KVM available), with the driver built from this tree and run by
+`scripts/guard-core-acceptance.sh` inside a disposable user+network namespace.
+**18 of 19 cases pass; the 19th fails for a reason stated below.**
 
-**No later phase may start before that run passes.** Phase 2's design is settled
-in `local://guard-phase2-contract.md` and is deliberately not implemented.
+Observed passing, each on a real Firecracker microVM under a real Guard
+attachment:
+
+- two guarded sandboxes booted side by side, each with its own TAP, gateway,
+  policy hash and nftables table;
+- the synthetic model credential is absent from the actual guest environment,
+  scanned host-side from the real exec output;
+- the guest resolves the model hostname through the Guard resolver
+  (10 DNS samples), and unrelated hostnames, TCP-DNS, `NS`, `TXT`, `NULL` and
+  `ANY` queries are all refused;
+- streaming model traffic through the broker with the placeholder (3 samples);
+- wrong binding, wrong placeholder, wrong host, wrong method, wrong path, and a
+  placeholder aimed at another proxy destination are each refused;
+- direct public IPv4, RFC1918, link-local, cloud metadata, worker management,
+  the control plane, external TCP DNS and DoT/853 are all refused, each
+  verified against a host-side baseline that was reachable before the policy
+  was installed - so a denied packet is a denial, not a missing route;
+- `cleanup_errors: []`.
+
+### The failing case, and why it was not made to pass
+
+`ipv6-route-preparation` asserts that a guest *which has an IPv6 route* still
+cannot bypass the unconditional IPv6 drop. The deployed guest image ships no
+`ip` binary, so the guest cannot install that route and the case reports
+`{"configured": false, "reason": "no ip binary on the guest"}` - correctly, as a
+failure.
+
+The image fix is `iproute2` in the guest package list, which is now in
+`scripts/build-firecracker-guest.sh`. Rebuilding the image here is not possible:
+the guest agent is a static musl binary by design, the deployment host has no
+`musl-tools` and no root to install it, and the ext4 image cannot be mounted
+unprivileged. So this case is **not exercised**, and it is recorded as such
+rather than redefined into a pass - weakening the assertion to accept a guest
+that could not run it would have made the report say something the evidence
+does not support.
+
+### What the run found that the tests did not
+
+Four real defects, all fixed and covered:
+
+1. **A worker could never admit its first sandbox.** Host headroom is measured
+   with `statvfs` on the state directory, which does not exist until something
+   creates it; the reading came back empty, which reads as an unmeasurable host
+   and refuses every placement. The measurement now walks to the nearest
+   existing ancestor.
+2. **An unavailable backend was reported as an I/O error.** `into_core` collapsed
+   every non-`Core` runtime error into `CoreError::Io`, discarding the class a
+   caller branches on and burying "Guard refused" under a category that says
+   nothing about who refused.
+3. **A second sandbox could never attach.** The boundary accumulates the
+   host's occupied addresses as protected ranges without deduplicating, so the
+   second sandbox re-added a range the operator file already protected and Guard
+   refused the duplicate.
+4. **The local-mock validator could not pass in the namespace it exists for.** It
+   compared `/proc/self/ns/net` against `/proc/1/ns/net`, and PID 1's namespace
+   link is unreadable from inside a fresh user+network namespace - so it failed
+   with a permission error on exactly the configuration it was written to
+   permit. The launcher now records the host's namespace inode before unsharing
+   and the validator compares against that.
+
+Guard's own failure messages were also a bare errno at every layer that could
+refuse; those sites now name the operation, the address, and the reason.
+
+## What is still not proven
+
+`ipv6-route-preparation`, above, and everything phase 2 onward. The phase 2
+watchdog, phases 3 to 5, and the phase 6 production acceptance are unimplemented
+by design: the plan gates them on the phase 1 run, and the phase 1 run is not
+clean.
+
+**No later phase may start before that case passes.** Phase 2's design is
+settled in `local://guard-phase2-contract.md` and deliberately not implemented.
 
 ## Phases 2 to 6, and what gates each
 

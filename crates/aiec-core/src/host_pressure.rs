@@ -522,11 +522,25 @@ fn measure_memory(reserve: u64) -> (Option<u64>, Option<u64>) {
 }
 
 /// Bytes on the filesystem holding `path`, and what is left of them.
+///
+/// `path` need not exist. A worker is given a state directory that is created
+/// lazily, so the first admission of a worker's life measures a path with
+/// nothing under it yet - and a bare `statvfs` there answers "could not be
+/// measured", which reads as a broken host and refuses the first sandbox. The
+/// nearest existing ancestor shares the filesystem, so that is what is
+/// measured.
 fn measure_disk(path: &Path, reserve: u64) -> (Option<u64>, Option<u64>) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let Ok(c_path) = CString::new(path.as_os_str().as_bytes().to_vec()) else {
+    let mut existing = path;
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => return (None, None),
+        }
+    }
+    let Ok(c_path) = CString::new(existing.as_os_str().as_bytes().to_vec()) else {
         return (None, None);
     };
     // SAFETY: `stat` is zeroed before the call, `c_path` is a valid,
@@ -645,6 +659,47 @@ mod tests {
             },
             HostReserves::default(),
         )
+    }
+
+    /// A worker's state directory does not exist when it starts, and admission
+    /// measures it before anything has created it. A bare `statvfs` there
+    /// answers "could not be measured", which reads as a broken host and
+    /// refuses the first sandbox the worker ever takes - so the measurement
+    /// walks to the nearest existing ancestor, which shares the filesystem.
+    #[test]
+    fn a_path_that_does_not_exist_yet_still_yields_its_filesystem() {
+        let root = std::env::temp_dir().join(format!("aiec-pressure-{}", std::process::id()));
+        let absent = root.join("not").join("created").join("yet");
+        assert!(!absent.exists(), "the fixture must start absent");
+        let (total, available) = measure_disk(&absent, 0);
+        assert!(total.is_some(), "an absent path still has a filesystem");
+        assert!(available.is_some(), "and has free space to report");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The reading a lazily-created state directory produces has to satisfy the
+    /// same completeness check as any other, or admission refuses the sandbox.
+    #[test]
+    fn a_worker_can_admit_with_a_state_directory_it_has_not_created_yet() {
+        let root = std::env::temp_dir().join(format!("aiec-pressure-{}", std::process::id()));
+        let (total, available) = measure_disk(&root.join("never-created"), 0);
+        let pressure = HostPressure::from_measurements(
+            "host-under-test",
+            Utc::now(),
+            HostMeasurements {
+                total_vcpus: Some(HOST_VCPUS),
+                available_vcpus: Some(HOST_VCPUS),
+                total_memory_bytes: Some(GIB * 100),
+                memory_available_bytes: Some(GIB * 50),
+                total_disk_bytes: total,
+                disk_available_bytes: available,
+            },
+            HostReserves::default(),
+        );
+        assert!(
+            pressure.complete(),
+            "a lazily-created state directory must not read as an unmeasurable host"
+        );
     }
 
     /// A host that has less free than the reserve has not lost its reading, it

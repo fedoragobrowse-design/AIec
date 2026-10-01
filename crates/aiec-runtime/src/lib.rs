@@ -61,6 +61,11 @@ pub use e2b::{E2bConfig, E2bRuntime, RuntimePathProvider};
 fn into_core(error: RuntimeError) -> CoreError {
     match error {
         RuntimeError::Core(error) => error,
+        // An unavailable backend stays unavailable. Collapsing it into `Io`
+        // turned a Guard or Firecracker refusal into "io error: <text>", which
+        // loses the class a caller branches on and buries the reason under a
+        // category that says nothing about who refused.
+        RuntimeError::Unavailable(message) => CoreError::Unavailable(message),
         other => CoreError::Io(std::io::Error::other(other.to_string())),
     }
 }

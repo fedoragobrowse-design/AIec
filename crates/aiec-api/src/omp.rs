@@ -659,7 +659,51 @@ mod tests {
             .collect();
         assert!(hosts.contains(&"github.com"), "{hosts:?}");
     }
-
+    /// The field doc says `resources` is authoritative and this pins it: a spec
+    /// carrying both must use the resources' policy, with the host list
+    /// ignored. A doc claim nobody executes is how two spellings of one choice
+    /// become two behaviours.
+    #[test]
+    fn an_explicit_guard_wins_over_the_derived_host_list() {
+        use aiec_guard::policy::{EgressRule, GuardConfig, PolicyTemplate, Topology};
+        let chosen = "registry.example.com";
+        let mut request = spec();
+        request.network_hosts = vec!["ignored.example.com".into()];
+        request.resources = Some(ResourceRequirements {
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: 1024,
+            network: NetworkPolicy::Disabled,
+            guard: Some(GuardConfig {
+                topology: Topology::Inside,
+                policy_template: PolicyTemplate::ReadOnlyApi,
+                policy: None,
+                model_endpoint: None,
+                allowlist: vec![EgressRule {
+                    host: chosen.to_string(),
+                    port: 443,
+                    protocol: "tcp".into(),
+                    allowed_methods: vec!["GET".into()],
+                    allowed_paths: Vec::new(),
+                }],
+            }),
+        });
+        let built = to_run_request(&request).expect("a valid spec builds");
+        let effective = built
+            .resources
+            .guard
+            .as_ref()
+            .expect("the caller's policy survived")
+            .effective_policy()
+            .expect("it compiles");
+        let hosts: Vec<&str> = effective
+            .network
+            .egress
+            .iter()
+            .map(|rule| rule.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec![chosen], "resources.guard is authoritative");
+    }
     #[test]
     fn a_suite_loads_from_reviewable_json() {
         let comparison = OmpComparisonSpec {

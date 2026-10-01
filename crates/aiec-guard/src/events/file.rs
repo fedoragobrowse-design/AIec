@@ -291,9 +291,22 @@ fn append_locked(journal: &Arc<Mutex<Journal>>, input: EventInput) -> Result<Gua
     let mut record = Vec::with_capacity(line.len() + 1);
     record.extend_from_slice(&line);
     record.push(b'\n');
-    guard.file.write_all(&record)?;
+    // Labelled: this is the first write a guarded sandbox causes, and a bare
+    // "Permission denied" from an unnamed append tells an operator nothing about
+    // which filesystem refused.
+    guard.file.write_all(&record).map_err(|error| {
+        GuardError::Io(std::io::Error::new(
+            error.kind(),
+            format!("event journal write: {error}"),
+        ))
+    })?;
     // fsync before the record counts as durable or is offered to a remote sink.
-    guard.file.sync_all()?;
+    guard.file.sync_all().map_err(|error| {
+        GuardError::Io(std::io::Error::new(
+            error.kind(),
+            format!("event journal fsync: {error}"),
+        ))
+    })?;
     guard.head.clone_from(&event.current_hash);
     guard.count += 1;
     if let Some(remote) = &guard.remote {
@@ -564,7 +577,13 @@ fn open_journal(path: &Path) -> Result<File> {
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| {
+            GuardError::Io(std::io::Error::new(
+                error.kind(),
+                format!("event journal {}: {error}", path.display()),
+            ))
+        })?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }

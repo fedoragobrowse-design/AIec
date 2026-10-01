@@ -79,8 +79,19 @@ impl CredentialStore {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        let meta = file.metadata()?;
+            .open(path)
+            .map_err(|error| {
+                GuardError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("credential store {}: {error}", path.display()),
+                ))
+            })?;
+        let meta = file.metadata().map_err(|error| {
+            GuardError::Io(std::io::Error::new(
+                error.kind(),
+                format!("credential store {} metadata: {error}", path.display()),
+            ))
+        })?;
         // Opening first prevents symlink/metadata races; only owner-readable regular files are accepted.
         if !meta.is_file()
             || meta.mode() & 0o777 != 0o600
@@ -408,6 +419,16 @@ pub struct GuardGateway {
     audit_stop: watch::Sender<bool>,
     dns: SocketAddr,
 }
+/// Binds a TCP listener, naming which one refused.
+async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener, GuardError> {
+    TcpListener::bind(bind).await.map_err(|error| {
+        GuardError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{what} listener on {}:{}: {error}", bind.0, bind.1),
+        ))
+    })
+}
+
 impl GuardGateway {
     pub async fn start(config: GatewayConfig) -> Result<Self> {
         config.compiled.verify()?;
@@ -418,11 +439,27 @@ impl GuardGateway {
                 "bound model credential unavailable".into(),
             ));
         }
-        let broker = TcpListener::bind((config.bind_ip, config.broker_port)).await?;
-        let broker_addr = broker.local_addr()?;
-        let dns_tcp = TcpListener::bind((config.bind_ip, config.dns_port)).await?;
-        let dns_addr = dns_tcp.local_addr()?;
-        let dns_udp = UdpSocket::bind(dns_addr).await?;
+        // Each bind names itself. "Guard I/O: Permission denied" from a gateway
+        // that opens four sockets says nothing about which one, and the four
+        // have genuinely different causes: the broker is a high port, DNS is a
+        // privileged one, and all of them are bound to an address that exists
+        // only once the sandbox's TAP is up.
+        let broker = labelled_bind("broker", (config.bind_ip, config.broker_port)).await?;
+        let broker_addr = broker.local_addr().map_err(|e| {
+            GuardError::Io(std::io::Error::other(format!(
+                "broker listener address: {e}"
+            )))
+        })?;
+        let dns_tcp = labelled_bind("DNS over TCP", (config.bind_ip, config.dns_port)).await?;
+        let dns_addr = dns_tcp.local_addr().map_err(|e| {
+            GuardError::Io(std::io::Error::other(format!("DNS listener address: {e}")))
+        })?;
+        let dns_udp = UdpSocket::bind(dns_addr).await.map_err(|e| {
+            GuardError::Io(std::io::Error::new(
+                e.kind(),
+                format!("DNS over UDP listener on {dns_addr}: {e}"),
+            ))
+        })?;
         let (stop, _) = watch::channel(0);
         let (audit_tx, mut audit_rx) = mpsc::channel(128);
         let (audit_stop, mut audit_shutdown) = watch::channel(false);

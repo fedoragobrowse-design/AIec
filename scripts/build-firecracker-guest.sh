@@ -95,7 +95,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update
 apt-get install -y --no-install-recommends \
-  git ca-certificates curl python3 tar gzip coreutils util-linux hostname
+  git ca-certificates curl python3 tar gzip coreutils util-linux hostname iproute2
 apt-get clean
 rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/*
 rm -rf /tmp/* /var/tmp/* /root/.cache

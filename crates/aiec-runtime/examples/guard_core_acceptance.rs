@@ -98,6 +98,23 @@ async fn ip(args: &[&str]) -> Result<Value> {
     }
     Ok(serde_json::from_slice(&result.stdout).unwrap_or(Value::Null))
 }
+
+/// Whether loopback is currently DOWN, which is what a fresh network namespace
+/// looks like before the launcher raises it.
+fn loopback_is_down() -> Result<bool> {
+    let output = std::process::Command::new("ip")
+        .args(["-o", "link", "show", "lo"])
+        .output()
+        .map_err(|e| failure(format!("cannot read the loopback interface: {e}")))?;
+    if !output.status.success() {
+        return Err(failure("cannot read the loopback interface"));
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    // `1: lo: <LOOPBACK,UP,LOWER_UP>` is the shape to look for.
+    Ok(!line
+        .split_whitespace()
+        .any(|flag| flag.trim_end_matches(',') == "UP" || flag.trim_end_matches(',') == "LOWER_UP"))
+}
 /// Assigns the mock addresses to loopback so the local listeners can bind.
 ///
 /// The launcher may already have assigned some of them, and `ip addr add` on
@@ -596,9 +613,15 @@ async fn run(driver: &mut Driver) -> Result<()> {
         }),
         ..Default::default()
     };
-    let policy = config.effective_policy()?;
-    driver.policy_hash = policy.hash()?;
-    let rootfs_bytes = std::fs::metadata(&driver.runtime.config.rootfs)?.len();
+    let policy = config
+        .effective_policy()
+        .map_err(|e| failure(format!("effective_policy: {e}")))?;
+    driver.policy_hash = policy
+        .hash()
+        .map_err(|e| failure(format!("policy hash: {e}")))?;
+    let rootfs_bytes = std::fs::metadata(&driver.runtime.config.rootfs)
+        .map_err(|e| failure(format!("rootfs metadata: {e}")))?
+        .len();
     let disk_mb = rootfs_bytes.div_ceil(1024 * 1024).max(512);
     for _ in 0..2 {
         let now = chrono::Utc::now();
@@ -622,8 +645,18 @@ async fn run(driver: &mut Driver) -> Result<()> {
         sandbox.environment.guard = Some(config.clone());
         sandbox.environment.guard_policy_hash = Some(driver.policy_hash.clone());
         driver.sandboxes.push(sandbox.clone());
-        driver.runtime.create(&sandbox).await?;
-        driver.runtime.start(&sandbox).await?;
+        // Each lifecycle step names itself: an acceptance failure that says only
+        // "create failed" costs an operator a whole debugging round.
+        driver
+            .runtime
+            .create(&sandbox)
+            .await
+            .map_err(|e| failure(format!("runtime.create: {e}")))?;
+        driver
+            .runtime
+            .start(&sandbox)
+            .await
+            .map_err(|e| failure(format!("runtime.start: {e}")))?;
         driver
             .runtime
             .put_file(
@@ -634,7 +667,8 @@ async fn run(driver: &mut Driver) -> Result<()> {
                     mode: Some(0o700),
                 },
             )
-            .await?;
+            .await
+            .map_err(|e| failure(format!("put_file: {e}")))?;
     }
     let first = driver.sandboxes[0].clone();
     let second = driver.sandboxes[1].clone();
@@ -836,7 +870,17 @@ async fn run(driver: &mut Driver) -> Result<()> {
     let ipv6 = driver
         .probe(&first, json!({"kind":"ipv6_setup","mac":mac}))
         .await?;
-    driver.case("ipv6-route-preparation",ipv6["configured"]==true,json!({"guest":ipv6,"host_gateway":"fd00:beef::1","guest_address":"fd00:beef::2","permanent_neighbor":mac}))?;
+    // This case exists to prove a guest that *has* an IPv6 route still cannot
+    // bypass the unconditional drop, so `configured: true` is the assertion. A
+    // guest image without `ip` cannot exercise it, and that is reported as a
+    // failure rather than redefined into a pass - the fix is the image, not the
+    // criterion.
+    driver.case(
+        "ipv6-route-preparation",
+        ipv6["configured"] == true,
+        json!({"guest":ipv6,"host_gateway":"fd00:beef::1","guest_address":"fd00:beef::2",
+            "permanent_neighbor":mac}),
+    )?;
     for (name, host, port) in SENTINELS {
         driver
             .denied_network(
@@ -1087,26 +1131,75 @@ fn hardware() -> Value {
 
 #[tokio::main]
 async fn main() {
-    let initialized = (|| -> Result<Driver> {
-        if std::fs::read_link("/proc/self/ns/net")? == std::fs::read_link("/proc/1/ns/net")? {
-            return Err(failure("refusing host network namespace"));
+    // Async because configuring the namespace is the driver's job, and
+    // `assign_mock_addresses` is an async call.
+    let initialized = async {
+        // "Am I inside the launcher's disposable namespace?"
+        // PID 1's namespace link is unreadable from inside a fresh
+        // comes back empty rather than as an inode and cannot be the
+        // comparison. The launcher records the host's network namespace inode
+        // before it unshares and hands it in; this is that same comparison,
+        // made where it can actually be read. A fresh namespace also has
+        // loopback DOWN, which is a second, independent signal.
+        let host_netns = std::env::var("AIEC_GUARD_ACCEPTANCE_HOST_NETNS")
+            .map_err(|_| failure("launcher did not record the host network namespace"))?;
+        let own_netns = std::fs::read_link("/proc/self/ns/net")
+            .map_err(|e| failure(format!("cannot read this process network namespace: {e}")))?
+            .to_string_lossy()
+            .into_owned();
+        if own_netns == host_netns {
+            return Err(failure(format!(
+                "refusing host network namespace: this is {own_netns}, the namespace the \
+                 acceptance was supposed to replace"
+            )));
         }
+        if !loopback_is_down()? {
+            return Err(failure(
+                "refusing host network namespace: loopback is already up, so this is not a fresh \
+                 namespace",
+            ));
+        }
+        // The Guard local-mock validator makes the same comparison, and needs
+        // the host's inode handed to it: it cannot read PID 1's namespace from
+        // inside a fresh one, for the same reason this check cannot either.
+        if let Ok(host) = std::env::var("AIEC_GUARD_ACCEPTANCE_HOST_NETNS") {
+            aiec_guard::deployment::set_host_network_namespace(host);
+        }
+        // Isolation is proven; only now is it safe to configure the network.
+        assign_mock_addresses().await?;
+        ip(&["-6", "address", "add", "fd00:feed::10/128", "dev", "lo"]).await?;
+        // Namespace-scoped; never touches the host's routes or firewall.
+        let _ = std::process::Command::new("sysctl")
+            .args(["-qw", "net.ipv4.ip_forward=1"])
+            .status();
         let root = PathBuf::from(std::env::var("AIEC_GUARD_ACCEPTANCE_STATE")?);
         if !root.is_dir() {
             return Err(failure("launcher-created private state directory required"));
         }
+        // Each step is labelled so a refusal names itself. A bare errno from an
+        // acceptance driver is the least useful thing it can print.
         let operator = root.join("operator");
-        std::fs::create_dir(&operator)?;
-        std::fs::set_permissions(&operator, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::create_dir(&operator).map_err(|e| failure(format!("operator directory: {e}")))?;
+        std::fs::set_permissions(&operator, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| failure(format!("operator permissions: {e}")))?;
         let secret = format!("guard-synthetic-{}-{}", Uuid::now_v7(), Uuid::now_v7());
         let credentials = operator.join("credentials.json");
-        private_file(&credentials, &json!({"model-main":secret}))?;
+        private_file(&credentials, &json!({"model-main":secret}))
+            .map_err(|e| failure(format!("credential file: {e}")))?;
         let boundary: OperatorBoundary = serde_json::from_value(
             json!({"blocked_cidrs":[],"protected_cidrs":["198.18.0.20/32","198.18.0.21/32"],"blocked_hosts":[],"test_destinations":{format!("{MODEL_HOST}:18080"):["198.18.0.10"]}}),
         )?;
         let boundary_path = operator.join("boundary.json");
-        private_file(&boundary_path, &serde_json::to_value(&boundary)?)?;
+        private_file(&boundary_path, &serde_json::to_value(&boundary)?)
+            .map_err(|e| failure(format!("boundary file: {e}")))?;
         let state = root.join("runtime");
+        // The runtime measures host headroom against this directory before it
+        // admits a placement, and `statvfs` on a path that does not exist
+        // returns nothing - which reads as "this host cannot be measured" and
+        // refuses the first sandbox. Creating it here is not tidiness: it is
+        // what makes admission able to answer at all.
+        std::fs::create_dir_all(&state)
+            .map_err(|e| failure(format!("runtime state directory: {e}")))?;
         let mut config = FirecrackerConfig::from_env()?;
         config.state_dir = state.clone();
         config.jailer = None;
@@ -1127,7 +1220,8 @@ async fn main() {
             current: "initialization".into(),
             started: Instant::now(),
         })
-    })();
+    };
+    let initialized = initialized.await;
     let mut driver = match initialized {
         Ok(driver) => driver,
         Err(error) => {
