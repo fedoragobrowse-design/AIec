@@ -134,9 +134,7 @@ does not support.
 
 ### What the run found that the tests did not
 
-Four real defects, all fixed. Three now have regression tests and one is
-covered by the acceptance run itself - stated per item rather than as a blanket
-claim:
+Four real defects, all fixed, and each now carries a regression test:
 
 1. **A worker could never admit its first sandbox.** Host headroom is measured
    with `statvfs` on the state directory, which does not exist until something
@@ -147,9 +145,10 @@ claim:
 2. **An unavailable backend was reported as an I/O error.** `into_core` collapsed
    every non-`Core` runtime error into `CoreError::Io`, discarding the class a
    caller branches on and burying "Guard refused" under a category that says
-   nothing about who refused. *Covered:* the acceptance run, which is how the
-   message was read to the point of the four fixes; there is no unit test
-   asserting the variant survives the conversion.
+   nothing about who refused. *Covered:* `into_core_tests` in
+   `crates/aiec-runtime/src/lib.rs` - the unavailable variant survives, a core
+   error passes through unchanged, and everything else is still an I/O error with
+   its text intact.
 3. **A second sandbox could never attach.** The boundary accumulates the
    host's occupied addresses as protected ranges without deduplicating, so the
    second sandbox re-added a range the operator file already protected and Guard

@@ -3321,6 +3321,54 @@ impl SnapshotProvider for FirecrackerRuntime {
 }
 
 #[cfg(test)]
+mod into_core_tests {
+    use super::{RuntimeError, into_core};
+
+    /// An unavailable backend must stay unavailable.
+    ///
+    /// `into_core` used to collapse every non-`Core` error into `CoreError::Io`,
+    /// which lost the class a caller branches on and reported "Guard refused"
+    /// as a filesystem problem. The live acceptance run was what made that
+    /// legible: a permission error arrived wearing a category that had nothing to
+    /// do with who refused.
+    #[test]
+    fn an_unavailable_backend_survives_as_unavailable() {
+        let converted = into_core(RuntimeError::Unavailable("guard refused".into()));
+        match converted {
+            aiec_core::CoreError::Unavailable(message) => assert_eq!(message, "guard refused"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A core error is already the right type and passes through untouched.
+    #[test]
+    fn a_core_error_passes_through_unchanged() {
+        let converted = into_core(RuntimeError::Core(aiec_core::CoreError::Conflict(
+            "already started".into(),
+        )));
+        match converted {
+            aiec_core::CoreError::Conflict(message) => assert_eq!(message, "already started"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// Everything else is still an I/O error, and keeps its text. This is the
+    /// part that was correct before and must not regress while the unavailable
+    /// case is being fixed.
+    #[test]
+    fn other_errors_stay_io_errors_with_their_text() {
+        let converted = into_core(RuntimeError::FirecrackerApi("boot failed".into()));
+        let aiec_core::CoreError::Io(error) = converted else {
+            panic!("expected Io, got {converted:?}");
+        };
+        assert!(
+            error.to_string().contains("boot failed"),
+            "the reason must survive: {error}",
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aiec_core::host_pressure::{GIB, MIB};
