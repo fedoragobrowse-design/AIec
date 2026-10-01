@@ -361,39 +361,55 @@ egress, the motivating DNS bypass reproduced and shown blocked, the escape
 matrix, measured overhead, and deployment recovery. *Gate:* the full report,
 with every claim tied to a command that was run.
 
-## Why the live run has not happened here
+## How the live runs are done, and what the environment still withholds
 
-The acceptance needs three things, and this workstation has only the first:
-KVM, a built guest image, a control plane to place against, and — less
-obviously — the privilege to install nftables rules. It has KVM and Docker but
-no running control plane (`https://127.0.0.1:18443/health` does not answer),
-and the deployment host's Firecracker environment is reached over SSH rather
-than exercised in place.
-
-The privilege one is a property of the code, not of the host, and is worth
-stating plainly: a worker probes `nft list ruleset` at startup and advertises
-`network_policy: false` without `CAP_NET_ADMIN`. On this workstation that
-probe returns "Operation not permitted", so a worker started here would refuse
-every governed placement — correctly, and for a reason that has nothing to do
-with the acceptance driver. This is also why
-`scripts/guard-core-acceptance.sh` runs the whole thing under
-`unshare --user --map-root-user --net`: the namespace is what supplies the
-privilege. Treat a run that reports "cannot enforce" as a missing prerequisite,
-not as a Guard bug.
-
-So the driver and launcher are delivered, compile, and are written to fail
-loudly - a missing route, an unreachable sentinel, an absent counter, a wrong
-event reason, a secret found in the guest, or a leftover table all prevent a
-`PASS` - but their output has not been observed. Anyone with a Firecracker
-worker can run it directly:
+Both acceptances run the whole stack inside a disposable user+network namespace
+(`unshare --user --map-root-user --net`), which is what supplies the privilege to
+install nftables rules and keeps every table, TAP device and route out of the
+host. Phase 1 uses `scripts/guard-core-acceptance.sh` and
+`scripts/guard_core_guest_probe.py`; phase 2 uses
+`scripts/guard-phase2-acceptance.sh` with the same probe.
 
 ```bash
+# Phase 1: real microVMs, real nftables, local mocks only.
 cargo build -p aiec-runtime --example guard_core_acceptance --release
-# with the worker's Firecracker environment loaded:
-bash scripts/guard-core-acceptance.sh ./target/release/examples/guard_core_acceptance
+AIEC_ROOTFS=<acceptance rootfs with iproute2> TMPDIR=<short disk-backed path> \
+  bash scripts/guard-core-acceptance.sh ./target/release/examples/guard_core_acceptance
+
+# Phase 2: control plane, worker, guest, watchdog process and database, all disposable.
+cargo build --release -p aiec-api --bin aiec-server -p aiec-cli --bin aiec \
+  -p aiec-guard --bin aiec-guard-watchdog
+P2_DRIVER=$PWD/scripts/guard-phase2-acceptance.py \
+  bash scripts/guard-phase2-acceptance.sh
 ```
 
-The result is a single JSON document with one entry per acceptance case, the
-kernel counter deltas, the verified event chain, the observed stream and DNS
-latencies, the hardware it ran on, and any cleanup failure. A case that could
-not be exercised is reported as failed, not skipped.
+Both emit one JSON document with a per-case status, the evidence for that case,
+and any cleanup failure. A case that cannot be exercised is reported as failed,
+never skipped.
+
+### Two environment facts that are not Guard bugs
+
+- **The running deployment's Firecracker worker cannot install Guard rules at
+  all.** `aiec-worker.service` on 192.168.1.250 runs as `gobrowse` with no
+  `User=`, no `AmbientCapabilities` and no file capabilities on the binary
+  (`getcap` is empty and `sudo` needs a password), and its node row advertises
+  `network_policy: false`. Every governed placement on that host is therefore
+  refused with `nft could not read the host ruleset: Operation not permitted` -
+  which is Guard behaving correctly, but it means **the production worker there
+  has never enforced anything and is not enforcing anything now.** The fix is
+  operational: run the worker as root, or grant it `CAP_NET_ADMIN`. The phase 2
+  acceptance had to supply that privilege through a disposable user namespace
+  precisely because the host could not.
+- **The deployment's Neon `DATABASE_URL` password was printed into this working
+  session while the acceptance was being set up, and should be rotated.** It was
+  never written into this repository, but a credential that has been on a screen
+  is a credential to replace.
+
+### What the namespace still does not settle
+
+The phase 2 harness intermittently cannot move a packet from the guest to the
+attachment - the guest reports ENETUNREACH with a default route present - which
+is why its blocked-range case passes in some runs and not others. The phase 1
+acceptance exercises the same counter path deterministically, so the mechanism
+is sound and the fault is in the harness's network setup. That is recorded as
+an open harness defect, not as enforcement evidence in either direction.
