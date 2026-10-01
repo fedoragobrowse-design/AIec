@@ -27,10 +27,12 @@ class FakeTransport:
         self.in_flight = 0
         self.peak_in_flight = 0
         self.delay = 0.0
+        self.timeouts = []
 
-    def __call__(self, method, path, payload=None):
+    def __call__(self, method, path, payload=None, *, timeout=120):
         with self.lock:
             self.calls.append((method, path, payload))
+            self.timeouts.append(timeout)
             if path in self.fail_paths:
                 raise AIecError(400, {"error": {"code": "invalid_request", "message": "refused"}})
             self.in_flight += 1
@@ -138,6 +140,38 @@ class RunRequestTest(unittest.TestCase):
             "allowed_hosts": ["pypi.org", "registry.npmjs.org"],
         })
 
+    def test_a_guard_selection_replaces_the_network_policy(self):
+        self.runs.create(command=["true"], network=True, guard="model-only")
+        body = self.transport.calls[0][2]
+        self.assertEqual(body["resources"]["guard"], {"policy_template": "model-only"})
+        # A Guard policy governs the egress, so an ordinary network policy
+        # beside it would be a second, wider path to the internet.
+        self.assertEqual(body["resources"]["network"], {"enabled": False})
+
+    def test_a_full_guard_selection_is_sent_verbatim(self):
+        selection = {
+            "policy_template": "read-only-api",
+            "allowlist": [{"host": "pypi.org", "port": 443}],
+        }
+        self.runs.create(command=["true"], guard=selection)
+        body = self.transport.calls[0][2]
+        self.assertEqual(body["resources"]["guard"], selection)
+        self.assertEqual(body["resources"]["network"], {"enabled": False})
+
+    def test_no_guard_selection_leaves_the_network_policy_alone(self):
+        self.runs.create(command=["true"], network=["pypi.org"])
+        body = self.transport.calls[0][2]
+        self.assertNotIn("guard", body["resources"])
+        self.assertEqual(
+            body["resources"]["network"],
+            {"enabled": True, "allowed_hosts": ["pypi.org"]},
+        )
+
+    def test_a_guard_selection_that_is_neither_name_nor_dict_is_refused(self):
+        with self.assertRaises(TypeError):
+            self.runs.create(command=["true"], guard=7)
+        self.assertEqual(self.transport.calls, [])
+
     def test_a_retention_the_api_does_not_have_is_refused_before_sending(self):
         with self.assertRaises(ValueError):
             self.runs.create(command=["true"], retention="keep_forever")
@@ -147,6 +181,28 @@ class RunRequestTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.runs.create(command={"cmd": "true"})
         self.assertEqual(self.transport.calls, [])
+
+    def test_the_wait_outlasts_the_queue_the_server_can_hold_a_run_in(self):
+        # `POST /v1/runs` admits to the durable queue before it answers, so a
+        # run can sit queued until `now() + queue_timeout_seconds` and only
+        # then get its execution deadline of `timeout_seconds + 120`
+        # (crates/aiec-storage/src/run_queue.rs). A client that waits only the
+        # execution budget times out with no run id while the run keeps going.
+        self.runs.create(command=["true"], timeout_seconds=600)
+        # Mirrors the `1..=86_400` check on RunQueueLimits::queue_timeout_seconds
+        # and the server's PLACEMENT_GRACE_SECONDS.
+        server_holds_at_most = 86_400 + 600 + 120
+        self.assertGreaterEqual(self.transport.timeouts[0], server_holds_at_most)
+
+    def test_the_wait_covers_the_whole_server_window_for_the_stated_timeout(self):
+        # The client's own default goes through the same arithmetic, so a
+        # workload that states no timeout waits out the queue just as long.
+        self.runs.create(command=["true"])
+        self.runs.create(command=["true"], timeout_seconds=7200)
+        default, stated = self.transport.timeouts
+        self.assertGreaterEqual(default, 86_400 + 600 + 120)
+        self.assertGreaterEqual(stated, 86_400 + 7200 + 120)
+        self.assertEqual(stated - default, 7200 - 600)
 
 
 class RunReadTest(unittest.TestCase):
@@ -195,7 +251,7 @@ class RunWorkflowTest(unittest.TestCase):
         transport = FakeTransport()
         seen = {"n": 0}
 
-        def flaky(method, path, payload=None):
+        def flaky(method, path, payload=None, *, timeout=120):
             # The second submission is refused, the other two are not.
             with transport.lock:
                 seen["n"] += 1
@@ -204,7 +260,7 @@ class RunWorkflowTest(unittest.TestCase):
                 raise AIecError(
                     400, {"error": {"code": "invalid_request", "message": "refused"}}
                 )
-            return transport(method, path, payload)
+            return transport(method, path, payload, timeout=timeout)
 
         results = Runs(client_with(flaky)).run_batch(
             [{"command": ["one"]}, {"command": ["two"]}, {"command": ["three"]}], max_parallel=1

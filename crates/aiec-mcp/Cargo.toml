@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 aiec-core = { workspace = true }
 aiec-client = { workspace = true }
+aiec-api = { workspace = true }
+aiec-guard = { workspace = true }
 rmcp = { version = "3.4", features = [
     "server",
     "macros",

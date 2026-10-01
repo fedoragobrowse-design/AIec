@@ -8,10 +8,15 @@ use aiec_core::{
     storage::{ArtifactStore, GetObjectOptions, MetadataStore},
 };
 pub mod account;
+pub mod artifact_gc;
 mod composition;
 pub mod eval_matrix;
+pub mod evaluations;
 pub mod omp;
 pub mod ratelimit;
+pub(crate) mod repo_cache;
+mod run_queue;
+pub mod run_secrets;
 pub mod runs;
 mod worker;
 use axum::{
@@ -35,7 +40,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 pub use worker::{
     HttpOwnershipVerifier, HttpWorkerClient, OwnershipCheck, OwnershipRecord, OwnershipVerifier,
@@ -53,6 +58,11 @@ pub struct AppState {
     worker_token: Option<Arc<str>>,
     lease_ttl_seconds: u64,
     secrets: SecretStore,
+    run_secrets: run_secrets::RunSecretResolver,
+    repo_cache: Arc<repo_cache::RepositoryCache>,
+    run_queue_limits: aiec_core::run_queue::RunQueueLimits,
+    upload_slots: Arc<Semaphore>,
+    snapshot_slots: Arc<Semaphore>,
     /// Per-tenant / per-client admission control for the public API.
     limiter: Arc<ratelimit::RateLimiter>,
     /// Aggregate execution budget for hosted capacity. Reaching it stops new
@@ -152,6 +162,25 @@ fn artifact_key(tenant: TenantId, sandbox: Uuid, name: &str) -> Result<String, A
     ))
 }
 
+/// The URL a run artifact's bytes are served from.
+///
+/// The name is percent-encoded rather than pasted in. An artifact's name is the
+/// path it had inside the sandbox - `/workspace/report.txt` - so concatenating it
+/// produced a URL the route could not match, and a listing whose own links 404.
+/// Only the reserved characters are escaped, which leaves an ordinary name such as
+/// `report.txt` readable and still round-trips a nested one exactly.
+fn run_artifact_download_url(run: Uuid, name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("/v1/runs/{run}/artifacts/{encoded}")
+}
+
 fn validate_secret_name(name: &str) -> Result<(), ApiFailure> {
     if name.is_empty()
         || name.len() > 64
@@ -190,6 +219,11 @@ impl AppState {
             runtime_kind: RuntimeKind::Firecracker,
             worker_token: None,
             secrets: Arc::new(Mutex::new(HashMap::new())),
+            run_secrets: run_secrets::RunSecretResolver::disabled(),
+            repo_cache: Arc::new(repo_cache::RepositoryCache::from_env()),
+            run_queue_limits: Default::default(),
+            upload_slots: Arc::new(Semaphore::new(2)),
+            snapshot_slots: Arc::new(Semaphore::new(2)),
             limiter: Arc::new(ratelimit::RateLimiter::new(limit)),
             execution_budget,
             // Permissive by default: a self-hoster may run any runtime they
@@ -203,6 +237,24 @@ impl AppState {
         self.production = false;
         self.runtime_kind = kind;
         self
+    }
+    pub fn with_run_secrets(mut self, resolver: run_secrets::RunSecretResolver) -> Self {
+        self.run_secrets = resolver;
+        self
+    }
+    pub fn run_secrets(&self) -> &run_secrets::RunSecretResolver {
+        &self.run_secrets
+    }
+    pub fn with_run_queue_limits(mut self, limits: aiec_core::run_queue::RunQueueLimits) -> Self {
+        self.run_queue_limits = limits;
+        self
+    }
+    pub fn run_queue_limits(&self) -> aiec_core::run_queue::RunQueueLimits {
+        self.run_queue_limits
+    }
+    /// The node-local repository object cache, consulted before a clone.
+    pub(crate) fn repo_cache(&self) -> &Arc<repo_cache::RepositoryCache> {
+        &self.repo_cache
     }
     /// Applies an explicit rate limit, used by the composition root.
     pub fn with_rate_limit(mut self, limit: ratelimit::RateLimit) -> Self {
@@ -318,22 +370,28 @@ impl AppState {
         expected: SandboxState,
         next: SandboxState,
     ) -> Result<Sandbox, CoreError> {
-        let generation = match self.repository().sandbox_ownership(sandbox.id).await {
-            Ok(ownership) => ownership.map(|ownership| ownership.generation),
+        let ownership = match self.repository().sandbox_ownership(sandbox.id).await {
+            Ok(ownership) => ownership,
             Err(CoreError::Unsupported(_)) => None,
             Err(error) => return Err(error),
         };
-        match generation {
-            Some(generation) => {
+        match ownership {
+            Some(ownership) => {
                 self.repository()
-                    .update_state_with_generation(
+                    .update_state_with_lease(
                         sandbox.tenant_id,
                         sandbox.id,
                         expected,
                         next,
-                        generation,
+                        ownership.lease_id,
+                        ownership.generation,
                     )
                     .await?;
+            }
+            None if self.production && sandbox.runtime != RuntimeKind::Hosted => {
+                return Err(CoreError::Transient(
+                    "sandbox has no active unexpired lease".into(),
+                ));
             }
             None => {
                 self.repository()
@@ -485,7 +543,7 @@ pub fn router(state: AppState) -> Router {
     // obtains a credential in the first place. It is invite-gated, and rate
     // limited like everything else.
     let public = Router::new().route("/account", post(signup));
-    let protected = protected_routes().route("/account", get(current_account));
+    let protected = protected_routes(&state).route("/account", get(current_account));
     let workers = worker_routes().layer(middleware::from_fn_with_state(state.clone(), worker_auth));
     Router::new()
         .route("/health", get(health))
@@ -738,8 +796,9 @@ async fn revoke_key(
     Ok(Json(json!({ "revoked": id })))
 }
 
-fn protected_routes() -> Router<AppState> {
+fn protected_routes(state: &AppState) -> Router<AppState> {
     Router::new()
+        .merge(evaluations::routes())
         .route("/sandboxes", post(create_sandbox).get(list_sandboxes))
         .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/{id}/start", post(start_sandbox))
@@ -756,8 +815,14 @@ fn protected_routes() -> Router<AppState> {
         .route(
             "/sandboxes/{id}/artifacts/{name}",
             post(upload_artifact)
-                .get(download_artifact)
-                .delete(delete_artifact),
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    ARTIFACT_MAX_BYTES.div_ceil(3) * 4 + 1024,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    artifact_upload_admission,
+                ))
+                .merge(get(download_artifact).delete(delete_artifact)),
         )
         .route("/sandboxes/{id}/artifacts", get(list_artifacts))
         .route(
@@ -779,7 +844,11 @@ fn protected_routes() -> Router<AppState> {
         .route("/runs/{id}/events", get(list_run_events))
         .route("/runs/{id}/attempts", get(list_run_attempts))
         .route("/runs/{id}/artifacts", get(list_run_artifacts))
-        .route("/runs/{id}/artifacts/{name}", get(download_run_artifact))
+        // A wildcard, because an artifact's name is a path inside the sandbox:
+        // `/workspace/report.txt` has to be addressable as one artifact. The
+        // handler matches it against the run's recorded names, never against an
+        // object key, so a wider capture cannot widen what is readable.
+        .route("/runs/{id}/artifacts/{*name}", get(download_run_artifact))
         .route("/runs/{id}/cancel", post(cancel_run))
 }
 pub fn app(state: AppState) -> Router {
@@ -1255,6 +1324,19 @@ async fn restore_workspace(state: &AppState, sandbox: &Sandbox) -> Result<(), Co
         );
         return Ok(());
     };
+    import_stored_workspace(state, sandbox, &stored).await
+}
+
+async fn import_stored_workspace(
+    state: &AppState,
+    sandbox: &Sandbox,
+    stored: &aiec_core::storage::StoredSnapshot,
+) -> Result<(), CoreError> {
+    if !stored.complete || stored.kind != "workspace" || stored.tenant_id != sandbox.tenant_id {
+        return Err(CoreError::Conflict(
+            "a complete tenant-owned workspace snapshot is required".into(),
+        ));
+    }
     let object_key = stored
         .workspace_object_key
         .clone()
@@ -1273,8 +1355,13 @@ async fn restore_workspace(state: &AppState, sandbox: &Sandbox) -> Result<(), Co
             },
         )
         .await
+        // Not `Conflict`: nothing about the caller's request conflicts with
+        // anything. Bytes in shared storage that do not match the digest the
+        // snapshot was captured under are an integrity failure on our side,
+        // and a 409 would tell the caller to retry a request that cannot
+        // succeed until the stored archive is repaired.
         .map_err(|error| {
-            CoreError::Conflict(format!(
+            CoreError::Backend(format!(
                 "workspace archive {object_key} is unreadable: {error}"
             ))
         })?;
@@ -1452,6 +1539,22 @@ struct CreateSandboxBody {
     isolation: Option<String>,
 }
 
+/// The four measured steps of provisioning, in the order they happen. A timed
+/// step is measured on the shared path so a caller can tell a slow reservation
+/// from a slow boot; `results.phase_ms` reports these as `placement.*`.
+#[derive(Default)]
+pub(crate) struct ProvisionTimings {
+    pub scheduler_ms: u64,
+    pub allocation_ms: u64,
+    pub boot_ms: u64,
+    pub workspace_ms: u64,
+}
+
+pub(crate) struct ProvisionedSandbox {
+    pub sandbox: Sandbox,
+    pub timings: ProvisionTimings,
+}
+
 /// Brings a sandbox from a row to a running machine.
 ///
 /// One path for the sandbox API and for runs, deliberately. A run that
@@ -1466,11 +1569,54 @@ pub(crate) async fn provision_sandbox(
     tenant: TenantId,
     request_id: Uuid,
     x: Sandbox,
-) -> Result<Sandbox, ApiFailure> {
+    required_capabilities: aiec_core::runtime::RuntimeCapabilities,
+    run_id: Option<Uuid>,
+    authorization_present: bool,
+) -> Result<ProvisionedSandbox, ApiFailure> {
     let mut x = x;
+    let mut timings = ProvisionTimings::default();
+    let floor = s.runtime_for(&x)?.capabilities().minimum_disk_mb;
+    x.disk_mb = x.disk_mb.max(u32::try_from(floor).map_err(|_| {
+        ApiFailure::from(CoreError::LimitExceeded(
+            "runtime disk floor exceeds supported capacity".into(),
+        ))
+    })?);
+    let admission = CreateSandboxRequest {
+        image: x.image_id.clone(),
+        cpu: x.cpu,
+        memory_mb: x.memory_mb,
+        disk_mb: x.disk_mb,
+        timeout_seconds: x.timeout_seconds,
+        network: x.network.clone(),
+        environment: x.environment.clone(),
+    };
+    validate_create(&admission, MAX_LIFETIME_SECONDS).map_err(ApiFailure::from)?;
+    if let Some(policy) = s.platform.policy() {
+        let decision = policy.evaluate(PolicyOperation::CreateSandbox(&admission));
+        if !decision.allowed {
+            return Err(ApiFailure::new(
+                StatusCode::BAD_REQUEST,
+                "policy_denied",
+                decision
+                    .reason
+                    .unwrap_or_else(|| "request denied by policy".into()),
+            ));
+        }
+    }
+    if !s.allows_runtime(x.runtime) {
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "runtime_not_permitted",
+            format!(
+                "runtime {} is not available to this deployment",
+                x.runtime.as_str()
+            ),
+        ));
+    }
     // Hosted capacity is reached through the provider inside the runtime, not
     // through a leased worker node, so there is nothing for the worker
     // scheduler to place. Worker-backed runtimes are scheduled as before.
+    let scheduled_at = std::time::Instant::now();
     if s.is_production() && x.runtime != RuntimeKind::Hosted {
         x = s
             .scheduler()
@@ -1480,6 +1626,8 @@ pub(crate) async fn provision_sandbox(
                 sandbox: x,
                 preferred_worker: None,
                 lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
+                required_capabilities,
+                run_id,
             })
             .await
             .map_err(|error| match error {
@@ -1494,13 +1642,25 @@ pub(crate) async fn provision_sandbox(
             })?
             .sandbox;
     } else {
-        s.repository()
-            .create_sandbox(x.clone())
-            .await
-            .map_err(ApiFailure::from)?;
+        if let Some(run_id) = run_id {
+            x = s
+                .repository()
+                .create_attempt_sandbox(run_id, request_id, x, required_capabilities)
+                .await
+                .map_err(ApiFailure::from)?;
+        } else {
+            s.repository()
+                .create_sandbox(x.clone())
+                .await
+                .map_err(ApiFailure::from)?;
+        }
     }
+    timings.scheduler_ms = scheduled_at.elapsed().as_millis() as u64;
     if x.state != SandboxState::Creating {
-        return Ok(x);
+        return Ok(ProvisionedSandbox {
+            sandbox: x,
+            timings,
+        });
     }
 
     // From here the sandbox holds capacity and a lease, so every exit has to
@@ -1513,26 +1673,25 @@ pub(crate) async fn provision_sandbox(
     // and the tenant was refused on quota with seven sandboxes stuck in
     // `creating` and `starting`.
     let provision = async {
-        // If the runtime cannot bring the machine up, the row must not be left
-        // behind as Creating: it would count against the tenant's quota, appear
-        // in a console as running, and never be cleaned up. A provider that
-        // refuses capacity is a normal outcome, not a crash, so it is recorded
-        // as failed.
-        if let Err(error) = s.runtime_for(&x)?.create(&x).await {
-            let _ = s
-                .commit_state(&x, SandboxState::Creating, SandboxState::Failed)
-                .await;
-            return Err(ApiFailure::from(error));
-        }
+        let allocated_at = std::time::Instant::now();
+        s.runtime_for(&x)?
+            .create(&x)
+            .await
+            .map_err(ApiFailure::from)?;
+        timings.allocation_ms = allocated_at.elapsed().as_millis() as u64;
         s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
             .await
             .map_err(ApiFailure::from)?;
         x.state = SandboxState::Starting;
+        let booted_at = std::time::Instant::now();
         s.runtime_for(&x)?
             .start(&x)
             .await
             .map_err(ApiFailure::from)?;
-        prepare_environment(s, &x, &x.environment).await?;
+        timings.boot_ms = booted_at.elapsed().as_millis() as u64;
+        let workspace_at = std::time::Instant::now();
+        prepare_environment(s, &x, &x.environment, authorization_present).await?;
+        timings.workspace_ms = workspace_at.elapsed().as_millis() as u64;
         s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
             .await
             .map_err(ApiFailure::from)?;
@@ -1542,40 +1701,14 @@ pub(crate) async fn provision_sandbox(
     .await;
 
     if let Err(error) = provision {
-        // Best effort, and in this order: stop anything that started, mark the
-        // row so nothing treats it as live, then hand the lease back. A failure
-        // here is logged rather than propagated - the caller is already being
-        // told the provisioning failed, and replacing that with a cleanup
-        // error would hide the original cause.
-        match s.runtime_for(&x) {
-            Ok(runtime) => {
-                if let Err(destroy_error) = runtime.destroy(&x).await {
-                    tracing::warn!(
-                        sandbox_id = %x.id,
-                        error = %destroy_error,
-                        "could not stop a sandbox whose provisioning failed"
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(
-                sandbox_id = %x.id,
-                error = %error,
-                "could not reach the runtime to stop a sandbox whose provisioning failed"
-            ),
-        }
-        let from = if x.state == SandboxState::Running {
-            SandboxState::Running
-        } else if x.state == SandboxState::Starting {
-            SandboxState::Starting
-        } else {
-            SandboxState::Creating
-        };
-        let _ = s.commit_state(&x, from, SandboxState::Failed).await;
-        // Hosted capacity is not leased from a worker, so there is nothing to
-        // release; asking the scheduler would fail for a lease that never
-        // existed.
-        if s.is_production() && x.runtime != RuntimeKind::Hosted {
-            let _ = s.scheduler().release(tenant, x.id).await;
+        // Capacity is returned only after the runtime confirms it stopped.
+        // A failed stop remains owned and visible for retry; it is not a free slot.
+        if let Err(cleanup_error) = runs::destroy_with_retry(s, tenant, x.id).await {
+            return Err(ApiFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_unavailable",
+                format!("{}; cleanup failed: {cleanup_error}", error.message),
+            ));
         }
         return Err(error);
     }
@@ -1587,7 +1720,10 @@ pub(crate) async fn provision_sandbox(
         let units = i64::from(x.cpu) * ((seconds + 3599) / 3600);
         s.charge_execution(units.max(1));
     }
-    Ok(x)
+    Ok(ProvisionedSandbox {
+        sandbox: x,
+        timings,
+    })
 }
 
 fn create_response(sandbox: Sandbox, reason: &str) -> Response {
@@ -1690,7 +1826,24 @@ async fn create_sandbox(
             "the hosted execution budget is exhausted; no new sandboxes are being created right now",
         ));
     }
-    let r = body.request;
+    let mut r = body.request;
+    if runtime_kind == RuntimeKind::Firecracker && r.environment.guard.is_none() {
+        r.environment.guard = Some(Default::default());
+    }
+    if r.environment.guard.is_some() && runtime_kind != RuntimeKind::Firecracker {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "guard_runtime_unavailable",
+            "Guard requires the local Firecracker network enforcement backend; no weaker runtime fallback",
+        ));
+    }
+    r.environment.guard_policy_hash = r
+        .environment
+        .guard
+        .as_ref()
+        .map(|guard| guard.effective_policy().and_then(|policy| policy.hash()))
+        .transpose()
+        .map_err(|error| ApiFailure::from(CoreError::InvalidRequest(error.to_string())))?;
     validate_create(&r, MAX_LIFETIME_SECONDS).map_err(ApiFailure::from)?;
     if let Some(policy) = s.platform.policy() {
         let decision = policy.evaluate(PolicyOperation::CreateSandbox(&r));
@@ -1752,13 +1905,14 @@ async fn create_sandbox(
         updated_at: now,
         runtime_path: None,
     };
-    let x = provision_sandbox(&s, p.tenant_id, request_id, x).await?;
-    Ok(create_response(x, &_selection_reason))
+    let x = provision_sandbox(&s, p.tenant_id, request_id, x, required, None, false).await?;
+    Ok(create_response(x.sandbox, &_selection_reason))
 }
 async fn prepare_environment(
     state: &AppState,
     sandbox: &Sandbox,
     environment: &EnvironmentSpec,
+    authorization_present: bool,
 ) -> Result<(), ApiFailure> {
     let runtime = state.runtime_for(sandbox)?;
     match &environment.workspace {
@@ -1774,23 +1928,7 @@ async fn prepare_environment(
                     "snapshot-derived workspace requires a workspace snapshot".into(),
                 )));
             }
-            state
-                .platform
-                .snapshots()
-                .ok_or_else(|| {
-                    ApiFailure::from(CoreError::Conflict(
-                        "snapshot provider is not configured".into(),
-                    ))
-                })?
-                .restore(
-                    sandbox,
-                    &SnapshotMetadata {
-                        id: stored.id,
-                        kind: SnapshotKind::Workspace,
-                        object_key: stored.object_key,
-                        checksum_sha256: stored.checksum_sha256,
-                    },
-                )
+            import_stored_workspace(state, sandbox, &stored)
                 .await
                 .map_err(ApiFailure::from)?;
         }
@@ -1799,28 +1937,46 @@ async fn prepare_environment(
             reference,
             shallow,
         } => {
-            let mut clone = vec!["git".into(), "clone".into()];
-            if *shallow {
-                clone.push("--depth".into());
-                clone.push("1".into());
-            }
-            clone.push(repo.clone());
-            clone.push("/workspace/repository".into());
-            run_setup_command(runtime.as_ref(), sandbox, clone).await?;
-            if let Some(reference) = reference {
-                run_setup_command(
+            // Tenant isolation is not a credential identity: any Run carrying
+            // secret references or caller exec environment bypasses the cache,
+            // including before those values are installed in its fresh sandbox.
+            let secrets = state.secret_values(sandbox.tenant_id, sandbox.id).await;
+            let cached = state
+                .repo_cache()
+                .prepare(
                     runtime.as_ref(),
                     sandbox,
-                    vec![
-                        "git".into(),
-                        "-C".into(),
-                        "/workspace/repository".into(),
-                        "checkout".into(),
-                        "--detach".into(),
-                        reference.clone(),
-                    ],
+                    repo,
+                    reference.as_deref(),
+                    *shallow,
+                    authorization_present || !secrets.is_empty(),
                 )
-                .await?;
+                .await
+                .map_err(ApiFailure::from)?;
+            if !cached {
+                let mut clone = vec!["git".into(), "clone".into()];
+                if *shallow {
+                    clone.push("--depth".into());
+                    clone.push("1".into());
+                }
+                clone.push(repo.clone());
+                clone.push("/workspace/repository".into());
+                run_setup_command(runtime.as_ref(), sandbox, clone).await?;
+                if let Some(reference) = reference {
+                    run_setup_command(
+                        runtime.as_ref(),
+                        sandbox,
+                        vec![
+                            "git".into(),
+                            "-C".into(),
+                            "/workspace/repository".into(),
+                            "checkout".into(),
+                            "--detach".into(),
+                            reference.clone(),
+                        ],
+                    )
+                    .await?;
+                }
             }
         }
     }
@@ -1910,6 +2066,22 @@ async fn run_setup_command(
     Ok(())
 }
 
+async fn artifact_upload_admission(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = state.upload_slots.clone().try_acquire_owned() else {
+        return ApiFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_upload_busy",
+            "artifact upload capacity is occupied",
+        )
+        .into_response();
+    };
+    next.run(request).await
+}
+
 async fn upload_artifact(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -1929,6 +2101,13 @@ async fn upload_artifact(
             "artifact storage is not configured",
         )
     })?;
+    if body.content_base64.len() > ARTIFACT_MAX_BYTES.div_ceil(3) * 4 {
+        return Err(ApiFailure::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "limit_exceeded",
+            "artifact exceeds the 64 MiB limit",
+        ));
+    }
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(body.content_base64)
@@ -1942,10 +2121,16 @@ async fn upload_artifact(
             "artifact exceeds the 64 MiB limit",
         ));
     }
-    let metadata = store
-        .put(&artifact_key(p.tenant_id, id, &name)?, &bytes)
-        .await
-        .map_err(ApiFailure::from)?;
+    let metadata = tokio::time::timeout(
+        std::time::Duration::from_secs(artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS),
+        store.put(
+            &artifact_key(p.tenant_id, id, &name)?,
+            bytes::Bytes::from(bytes),
+        ),
+    )
+    .await
+    .map_err(|_| ApiFailure::from(CoreError::Unavailable("artifact upload timed out".into())))?
+    .map_err(ApiFailure::from)?;
     Ok(Json(ArtifactResponse {
         metadata: Some(metadata),
         content_base64: None,
@@ -1971,8 +2156,15 @@ async fn download_artifact(
         )
     })?;
     let key = artifact_key(p.tenant_id, id, &name)?;
-    let bytes = match store.get(&key).await {
-        Ok(bytes) => bytes,
+    let mut download = match store
+        .get_verified(
+            &key,
+            &GetObjectOptions::default(),
+            ARTIFACT_MAX_BYTES as u64,
+        )
+        .await
+    {
+        Ok(download) => download,
         Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiFailure::new(
                 StatusCode::NOT_FOUND,
@@ -1982,21 +2174,38 @@ async fn download_artifact(
         }
         Err(error) => return Err(ApiFailure::from(error)),
     };
-    if bytes.len() > ARTIFACT_MAX_BYTES {
-        return Err(ApiFailure::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "limit_exceeded",
-            "artifact exceeds the 64 MiB limit",
-        ));
-    }
+    // JSON compatibility requires an encoded string, but never a second
+    // whole decoded object beside it. Carry at most two bytes across chunks.
     use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let checksum_sha256 = hex::encode(Sha256::digest(&bytes));
+    let encoder = base64::engine::general_purpose::STANDARD;
+    let mut content_base64 =
+        String::with_capacity((download.metadata.size_bytes as usize).div_ceil(3) * 4);
+    let mut carry = [0_u8; 3];
+    let mut carry_len = 0;
+    while let Some(chunk) = download.body.next_chunk().await.map_err(ApiFailure::from)? {
+        let mut offset = 0;
+        if carry_len != 0 {
+            let take = (3 - carry_len).min(chunk.len());
+            carry[carry_len..carry_len + take].copy_from_slice(&chunk[..take]);
+            carry_len += take;
+            offset = take;
+            if carry_len == 3 {
+                encoder.encode_string(carry, &mut content_base64);
+                carry_len = 0;
+            }
+        }
+        let end = offset + (chunk.len() - offset) / 3 * 3;
+        encoder.encode_string(&chunk[offset..end], &mut content_base64);
+        let remainder = &chunk[end..];
+        carry[carry_len..carry_len + remainder.len()].copy_from_slice(remainder);
+        carry_len += remainder.len();
+    }
+    encoder.encode_string(&carry[..carry_len], &mut content_base64);
     Ok(Json(ArtifactDownload {
         key,
-        size_bytes: bytes.len() as u64,
-        checksum_sha256,
-        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        size_bytes: download.metadata.size_bytes,
+        checksum_sha256: download.metadata.checksum_sha256,
+        content_base64,
     }))
 }
 
@@ -2773,14 +2982,12 @@ async fn create_snapshot(
     let request = body.map(|Json(value)| value).unwrap_or_default();
     p.authorize(Scope::SnapshotsWrite)
         .map_err(ApiFailure::from)?;
+    let _permit = s.snapshot_slots.acquire().await.map_err(|_| {
+        ApiFailure::from(CoreError::Unavailable("snapshot operations closed".into()))
+    })?;
     let mut x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
-        .await
-        .map_err(ApiFailure::from)?;
-    let old = x.state;
-    x.state = SandboxState::Snapshotting;
-    s.commit_state(&x, old, SandboxState::Snapshotting)
         .await
         .map_err(ApiFailure::from)?;
     let provider = s.platform.snapshots().ok_or_else(|| {
@@ -2813,88 +3020,129 @@ async fn create_snapshot(
             ),
         ));
     }
-    let captured = provider
-        .capture(
-            &x,
-            &SnapshotRequest {
-                kind,
-                object_key: format!("{id}-{}", new_id()),
-            },
-        )
+    let old = x.state;
+    x.state = SandboxState::Snapshotting;
+    s.commit_state(&x, old, SandboxState::Snapshotting)
         .await
         .map_err(ApiFailure::from)?;
-    // A workspace capture only survives the worker that produced it if the
-    // archive is stored where every worker can read it. Persisting before the
-    // metadata row exists means a stored snapshot never points at bytes that
-    // nobody else can reach.
-    if captured.kind == SnapshotKind::Workspace {
-        if captured.archive.is_empty() {
-            return Err(ApiFailure::new(
-                StatusCode::CONFLICT,
-                "snapshot_not_portable",
-                "the runtime returned no workspace archive to store",
-            ));
-        }
-        let store = s.artifact_store().ok_or_else(|| {
-            ApiFailure::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "artifacts_unavailable",
-                "artifact storage is not configured",
+    let outcome: Result<Snapshot, ApiFailure> = async {
+        let mut captured = provider
+            .capture(
+                &x,
+                &SnapshotRequest {
+                    kind,
+                    // Tenant-prefixed like every other object key in the
+                    // system, so the bytes say whose they are to anyone reading
+                    // the bucket, and so the upload claim can check the prefix
+                    // rather than trusting the caller's tenancy.
+                    object_key: format!("tenants/{}/snapshots/{id}/{}", p.tenant_id, new_id()),
+                },
             )
-        })?;
-        let stored = store
-            .put(&captured.object_key, &captured.archive)
             .await
             .map_err(ApiFailure::from)?;
-        if stored.checksum_sha256 != captured.checksum_sha256 {
-            return Err(ApiFailure::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "snapshot_archive_corrupt",
-                "the stored workspace archive does not match the captured bytes",
-            ));
+        // A workspace capture only survives the worker that produced it if the
+        // archive is stored where every worker can read it. Persisting before the
+        // metadata row exists means a stored snapshot never points at bytes that
+        // nobody else can reach.
+        if captured.kind == SnapshotKind::Workspace {
+            if captured.archive.is_empty() {
+                return Err(ApiFailure::new(
+                    StatusCode::CONFLICT,
+                    "snapshot_not_portable",
+                    "the runtime returned no workspace archive to store",
+                ));
+            }
+            let store = s.artifact_store().ok_or_else(|| {
+                ApiFailure::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "artifacts_unavailable",
+                    "artifact storage is not configured",
+                )
+            })?;
+            let repository = s.repository();
+            repository
+                .reserve_artifact_upload(p.tenant_id, None, &captured.object_key)
+                .await
+                .map_err(ApiFailure::from)?;
+            let stored = tokio::time::timeout(
+                std::time::Duration::from_secs(artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS),
+                store.put(
+                    &captured.object_key,
+                    bytes::Bytes::from(std::mem::take(&mut captured.archive)),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ApiFailure::from(CoreError::Unavailable("snapshot upload timed out".into()))
+            })?
+            .map_err(ApiFailure::from)?;
+            repository
+                .complete_artifact_upload(p.tenant_id, None, &captured.object_key)
+                .await
+                .map_err(ApiFailure::from)?;
+            if stored.checksum_sha256 != captured.checksum_sha256 {
+                return Err(ApiFailure::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "snapshot_archive_corrupt",
+                    "the stored workspace archive does not match the captured bytes",
+                ));
+            }
         }
-    }
-    let snap = Snapshot {
-        id: captured.id,
-        tenant_id: p.tenant_id,
-        sandbox_id: id,
-        object_key: captured.object_key.clone(),
-        size_bytes: captured.size_bytes,
-        image_id: x.image_id.clone(),
-        created_at: Utc::now(),
-    };
-    // One write only: `put_stored_snapshot` records every column of the
-    // `snapshots` row, so the separate metadata insert was a second insert of
-    // the same primary key and failed the whole capture.
-    s.repository()
-        .put_stored_snapshot(aiec_core::storage::StoredSnapshot {
-            id: snap.id,
+        let snap = Snapshot {
+            id: captured.id,
             tenant_id: p.tenant_id,
             sandbox_id: id,
             object_key: captured.object_key.clone(),
-            manifest_object_key: format!("{}.manifest.json", snap.object_key),
-            memory_object_key: None,
-            disk_object_key: None,
-            // A workspace capture stores the workspace under the primary object
-            // key; a memory or VM capture stores it in a separate artifact. Only
-            // claim the object the provider actually produced, so "complete"
-            // means what it says and recovery can find the archive.
-            workspace_object_key: (captured.kind == aiec_core::snapshots::SnapshotKind::Workspace)
-                .then(|| captured.object_key.clone()),
             size_bytes: captured.size_bytes,
-            image_id: snap.image_id.clone(),
-            checksum_sha256: captured.checksum_sha256,
-            kind: snapshot_kind_name(captured.kind).into(),
-            complete: true,
-            manifest: json!({"kind": snapshot_kind_name(captured.kind)}),
-            created_at: snap.created_at,
-        })
-        .await
-        .map_err(ApiFailure::from)?;
-    s.commit_state(&x, SandboxState::Snapshotting, SandboxState::Running)
-        .await
-        .map_err(ApiFailure::from)?;
-    Ok(Json(snap))
+            image_id: x.image_id.clone(),
+            created_at: Utc::now(),
+        };
+        // One write only: `put_stored_snapshot` records every column of the
+        // `snapshots` row, so the separate metadata insert was a second insert of
+        // the same primary key and failed the whole capture.
+        s.repository()
+            .put_stored_snapshot(aiec_core::storage::StoredSnapshot {
+                id: snap.id,
+                tenant_id: p.tenant_id,
+                sandbox_id: id,
+                object_key: captured.object_key.clone(),
+                manifest_object_key: format!("{}.manifest.json", snap.object_key),
+                memory_object_key: None,
+                disk_object_key: None,
+                // A workspace capture stores the workspace under the primary object
+                // key; a memory or VM capture stores it in a separate artifact. Only
+                // claim the object the provider actually produced, so "complete"
+                // means what it says and recovery can find the archive.
+                workspace_object_key: (captured.kind
+                    == aiec_core::snapshots::SnapshotKind::Workspace)
+                    .then(|| captured.object_key.clone()),
+                size_bytes: captured.size_bytes,
+                image_id: snap.image_id.clone(),
+                checksum_sha256: captured.checksum_sha256,
+                kind: snapshot_kind_name(captured.kind).into(),
+                complete: true,
+                manifest: json!({"kind": snapshot_kind_name(captured.kind), "runtime": x.runtime}),
+                created_at: snap.created_at,
+            })
+            .await
+            .map_err(ApiFailure::from)?;
+        Ok(snap)
+    }
+    .await;
+    let resumed = s.commit_state(&x, SandboxState::Snapshotting, old).await;
+    match (outcome, resumed) {
+        (Ok(snapshot), Ok(_)) => Ok(Json(snapshot)),
+        (Err(error), Ok(_)) => Err(error),
+        (outcome, Err(error)) => {
+            tracing::error!(
+                sandbox_id = %id,
+                %error,
+                capture_error = ?outcome.err().map(|failure| failure.message),
+                "snapshot operation could not restore the sandbox state",
+            );
+            Err(ApiFailure::from(error))
+        }
+    }
 }
 async fn list_snapshots(
     State(s): State<AppState>,
@@ -2936,6 +3184,28 @@ async fn restore_snapshot(
         .await
         .map_err(ApiFailure::from)?;
     let kind = snapshot_kind(&stored.kind)?;
+    if !stored.complete {
+        return Err(ApiFailure::from(CoreError::Conflict(
+            "snapshot is incomplete".into(),
+        )));
+    }
+    let runtime = match r.runtime {
+        Some(runtime) => runtime,
+        None => match stored.manifest.get("runtime") {
+            Some(value) => RuntimeKind::deserialize(value).map_err(|error| {
+                ApiFailure::from(CoreError::Conflict(format!(
+                    "invalid snapshot runtime: {error}"
+                )))
+            })?,
+            None => {
+                s.repository()
+                    .get_sandbox(p.tenant_id, stored.sandbox_id)
+                    .await
+                    .map_err(ApiFailure::from)?
+                    .runtime
+            }
+        },
+    };
     let now = Utc::now();
     let mut x = Sandbox {
         id: new_id(),
@@ -2943,7 +3213,7 @@ async fn restore_snapshot(
         node_id: None,
         image_id: r.image.unwrap_or(stored.image_id.clone()),
         state: SandboxState::Restoring,
-        runtime: r.runtime.unwrap_or_else(|| s.runtime_kind()),
+        runtime,
         cpu: r.cpu.unwrap_or(1),
         memory_mb: r.memory_mb.unwrap_or(512),
         disk_mb: r.disk_mb.unwrap_or(2048),
@@ -2954,6 +3224,28 @@ async fn restore_snapshot(
         updated_at: now,
         runtime_path: None,
     };
+    if kind == SnapshotKind::Workspace {
+        // Use ordinary admission, readiness and rollback. Workspace bytes come
+        // from shared storage, never a provider's worker-local capture path.
+        x.state = SandboxState::Creating;
+        x.environment.workspace = WorkspaceSpec::Snapshot { snapshot_id: id };
+        let request_id = x.id;
+        let restored = provision_sandbox(
+            &s,
+            p.tenant_id,
+            request_id,
+            x,
+            aiec_core::runtime::RuntimeCapabilities {
+                portable_workspace: true,
+                workspace_snapshot: true,
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .await?;
+        return Ok(Json(restored.sandbox));
+    }
     if s.is_production() {
         x = s
             .scheduler()
@@ -2963,6 +3255,8 @@ async fn restore_snapshot(
                 sandbox: x,
                 preferred_worker: None,
                 lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
+                required_capabilities: Default::default(),
+                run_id: None,
             })
             .await
             .map_err(|error| match error {
@@ -3015,17 +3309,6 @@ async fn delete_snapshot(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SnapshotsWrite)
         .map_err(ApiFailure::from)?;
-    let snapshot = s
-        .repository()
-        .get_snapshot(p.tenant_id, id)
-        .await
-        .map_err(ApiFailure::from)?;
-    if let Some(artifact_store) = s.artifact_store() {
-        artifact_store
-            .delete(&snapshot.object_key)
-            .await
-            .map_err(ApiFailure::from)?;
-    }
     s.repository()
         .delete_snapshot(p.tenant_id, id)
         .await
@@ -3237,7 +3520,7 @@ async fn list_run_artifacts(
         artifacts
             .into_iter()
             .map(|artifact| RunArtifactResponse {
-                download_url: format!("/v1/runs/{id}/artifacts/{}", artifact.name),
+                download_url: run_artifact_download_url(id, &artifact.name),
                 artifact,
             })
             .collect(),
@@ -3245,6 +3528,11 @@ async fn list_run_artifacts(
 }
 
 /// Fetches one artifact's bytes.
+///
+/// The name arrives percent-decoded by the router, so a listing's own URL
+/// resolves back to the exact name that was recorded - `/workspace/report.txt`
+/// included - while a hand-written URL still has to name an artifact this run
+/// actually collected.
 async fn download_run_artifact(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -3274,8 +3562,26 @@ async fn download_run_artifact(
             "artifact storage is not configured",
         )
     })?;
-    let bytes = match store.get(&artifact.object_key).await {
-        Ok(bytes) => bytes,
+    // Read back under the checksum that was recorded at collection, when there is
+    // one. The alternative is serving whatever is at the key now, which is how a
+    // corrupted or overwritten object reaches a caller as if it were the file
+    // their task produced.
+    let expected = artifact
+        .checksum_sha256
+        .as_deref()
+        .map(|checksum| checksum.to_owned());
+    let download = match store
+        .get_verified(
+            &artifact.object_key,
+            &GetObjectOptions {
+                if_match: None,
+                expected_checksum_sha256: expected,
+            },
+            ARTIFACT_MAX_BYTES as u64,
+        )
+        .await
+    {
+        Ok(download) => download,
         Err(CoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiFailure::from(CoreError::NotFound(
                 "run artifact not found".into(),
@@ -3283,12 +3589,10 @@ async fn download_run_artifact(
         }
         Err(error) => return Err(ApiFailure::from(error)),
     };
-    if bytes.len() > ARTIFACT_MAX_BYTES {
-        return Err(ApiFailure::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "limit_exceeded",
-            "artifact exceeds the 64 MiB limit",
-        ));
+    if artifact.size_bytes < 0 || artifact.size_bytes as u64 != download.metadata.size_bytes {
+        return Err(ApiFailure::from(CoreError::Conflict(
+            "stored artifact size does not match its recorded size".into(),
+        )));
     }
     // The recorded content type is a stored string, so it is used only if it
     // is still a legal header value; otherwise the bytes are served as the
@@ -3298,7 +3602,19 @@ async fn download_run_artifact(
         .filter(|value| HeaderValue::from_str(value).is_ok())
         .and_then(|value| HeaderValue::from_str(&value).ok())
         .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"));
-    let mut response = bytes.into_response();
+    let size_bytes = download.metadata.size_bytes;
+    let stream = futures::stream::try_unfold(download.body, |mut body| async move {
+        match body.next_chunk().await? {
+            Some(bytes) => Ok(Some((bytes, body))),
+            None => Ok::<_, CoreError>(None),
+        }
+    });
+    let mut response = axum::body::Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&size_bytes.to_string())
+            .map_err(|error| ApiFailure::from(CoreError::Backend(error.to_string())))?,
+    );
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, content_type);
@@ -3463,7 +3779,50 @@ const ORPHANED_LEASE_LIMIT: u32 = 200;
 /// any single tick should spend.
 const STRANDED_MAX_PAGES: u32 = 4;
 
-fn spawn_lease_sweeper(state: AppState) {
+struct MaintenanceTasks([tokio::task::JoinHandle<()>; 2]);
+
+impl Drop for MaintenanceTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+fn spawn_maintenance(state: AppState) -> Result<MaintenanceTasks, std::io::Error> {
+    let config = artifact_gc::ArtifactGcConfig::from_env()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let artifact_state = state.clone();
+    let artifacts = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let Some(store) = artifact_state.artifact_store() else {
+                continue;
+            };
+            let repository = artifact_state.repository();
+            match artifact_gc::sweep_artifacts(repository.as_ref(), store.as_ref(), &config).await {
+                Ok(outcome) if outcome.claimed > 0 || outcome.temporary_files_deleted > 0 => {
+                    tracing::info!(
+                        claimed = outcome.claimed,
+                        deleted = outcome.deleted,
+                        retrying = outcome.retrying,
+                        stale_claims = outcome.stale_claims,
+                        temporary_files_deleted = outcome.temporary_files_deleted,
+                        "artifact reclamation completed",
+                    );
+                }
+                Ok(_) => {}
+                Err(CoreError::Unsupported(_)) if !artifact_state.is_production() => {}
+                Err(error) => tracing::warn!(%error, "artifact reclamation failed"),
+            }
+        }
+    });
+    Ok(MaintenanceTasks([spawn_lease_sweeper(state), artifacts]))
+}
+
+fn spawn_lease_sweeper(state: AppState) -> tokio::task::JoinHandle<()> {
     // Announced at startup and on every pass. A background task that panics is
     // silent - tokio drops it and nothing is ever reclaimed again - so its
     // presence has to be visible from outside or "the sweeper is not running"
@@ -3473,16 +3832,34 @@ fn spawn_lease_sweeper(state: AppState) {
         // Short enough that a dead machine does not hold capacity for long,
         // long enough to be uninteresting.
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             sweep_once(&state).await;
         }
-    });
+    })
 }
 
 /// One pass: return capacity held by dead leases, then release sandboxes that
 /// no lease and no unfinished run accounts for.
 async fn sweep_once(state: &AppState) {
+    match state.repository().retained_runs_due(Utc::now(), 50).await {
+        Ok(runs) => {
+            for run in runs {
+                if let Err(error) = runs::expire_retention(state, &run).await {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        error = %error,
+                        "could not reclaim expired retention; retrying on the next sweep"
+                    );
+                }
+            }
+        }
+        Err(CoreError::Unsupported(_)) if !state.is_production() => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "could not list expired run retention");
+        }
+    }
     let expired = match state
         .repository()
         .reconcile_expired_leases(RECONCILE_LIMIT)
@@ -3600,10 +3977,37 @@ async fn sweep_once(state: &AppState) {
     }
 }
 
+/// Starts the Run executor when the store can queue, and holds it for the
+/// lifetime of the listener.
+///
+/// The executor is service state, not listener state, so both entry points
+/// start it: an API that stops claiming runs on shutdown leaves admitted work
+/// waiting for lease recovery instead of finishing what it already owns.
+fn start_run_executor(
+    state: &AppState,
+) -> Result<Option<run_queue::RunQueueDispatcher>, std::io::Error> {
+    if !state.repository().supports_run_queue() {
+        return Ok(None);
+    }
+    run_queue::spawn(state.clone(), state.run_queue_limits())
+        .map(Some)
+        .map_err(|error| {
+            // Continuing here would admit runs that nothing can ever claim, and
+            // hold each response open until the queue deadline expires it.
+            tracing::error!(%error, "invalid Run queue limits; refusing to serve");
+            std::io::Error::other(error.to_string())
+        })
+}
+
 pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {
-    spawn_lease_sweeper(state.clone());
+    let _maintenance = spawn_maintenance(state.clone())?;
+    let executor = start_run_executor(&state)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(state)).await
+    let outcome = axum::serve(listener, app(state)).await;
+    if let Some(executor) = executor {
+        executor.shutdown().await;
+    }
+    outcome
 }
 
 pub async fn serve_tls(
@@ -3614,13 +4018,18 @@ pub async fn serve_tls(
 ) -> Result<(), std::io::Error> {
     // The sweeper is a property of the control plane, not of a listener, so it
     // starts here as well as on the plain listener.
-    spawn_lease_sweeper(state.clone());
+    let _maintenance = spawn_maintenance(state.clone())?;
+    let executor = start_run_executor(&state)?;
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
-    axum_server::bind_rustls(addr, config)
+    let outcome = axum_server::bind_rustls(addr, config)
         // Without ConnectInfo the limiter cannot see the peer address, so every
         // unauthenticated caller collapsed into one shared bucket.
         .serve(app(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .await
+        .await;
+    if let Some(executor) = executor {
+        executor.shutdown().await;
+    }
+    outcome
 }
 
 pub async fn serve_worker(
@@ -3652,12 +4061,12 @@ pub async fn serve_worker_tls(
 mod tests {
     use super::*;
     use aiec_core::run::{
-        RetentionPolicy, Run, RunArtifactRef, RunEvent, RunResults, RunSandbox, RunState,
-        WorkloadSpec,
+        Placement, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
+        RunSandbox, RunState, WorkloadSpec,
     };
     use aiec_core::storage::{
-        AuditEvent, MetadataStore, Reassignment, SandboxEvent, SandboxOwnership, StoredSnapshot,
-        TenantRecord, WorkerHeartbeat as HeartbeatRecord, WorkerLease,
+        AuditEvent, MetadataStore, ObjectMetadata, Reassignment, SandboxEvent, SandboxOwnership,
+        StoredSnapshot, TenantRecord, WorkerHeartbeat as HeartbeatRecord, WorkerLease,
         WorkerRegistration as RegistrationRecord, WorkerStatus as WorkerRecord,
     };
     use axum::{body::Body, http::Request};
@@ -3683,6 +4092,7 @@ mod tests {
         run_events: TestMutex<TestMap<Uuid, Vec<RunEvent>>>,
         run_sandboxes: TestMutex<TestMap<Uuid, Vec<RunSandbox>>>,
         run_artifacts: TestMutex<TestMap<Uuid, Vec<RunArtifactRef>>>,
+        run_attempts: TestMutex<TestMap<Uuid, Vec<RunAttempt>>>,
         /// Sandboxes created for a run, keyed by the request id that asked for
         /// them, so a retried request joins the machine it already has.
         sandbox_requests: TestMutex<TestMap<(Uuid, Uuid), SandboxId>>,
@@ -3698,6 +4108,7 @@ mod tests {
                 run_sandboxes: TestMutex::new(TestMap::new()),
                 run_artifacts: TestMutex::new(TestMap::new()),
                 sandbox_requests: TestMutex::new(TestMap::new()),
+                run_attempts: TestMutex::new(TestMap::new()),
             })
         }
 
@@ -3951,6 +4362,13 @@ mod tests {
         async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
             Err(CoreError::Backend("unused".into()))
         }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: aiec_core::runtime::FileChunkRequest,
+        ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
             Ok(Vec::new())
         }
@@ -4002,20 +4420,24 @@ mod tests {
                 .update_state(tenant, id, expected, next, runtime_path)
                 .await
         }
-        async fn update_state_with_generation(
+        async fn update_state_with_lease(
             &self,
             tenant: TenantId,
             id: SandboxId,
             expected: SandboxState,
             next: SandboxState,
+            lease_id: LeaseId,
             generation: i64,
         ) -> Result<(), CoreError> {
             match self.sandbox_ownership(id).await? {
-                Some(ownership) if ownership.generation == generation => self
-                    .inner
-                    .update_state(tenant, id, expected, next, None)
-                    .await
-                    .map(|_| ()),
+                Some(ownership)
+                    if ownership.lease_id == lease_id && ownership.generation >= generation =>
+                {
+                    self.inner
+                        .update_state(tenant, id, expected, next, None)
+                        .await
+                        .map(|_| ())
+                }
                 Some(_) => Err(CoreError::Transient(
                     "stale sandbox lease generation".into(),
                 )),
@@ -4503,6 +4925,29 @@ mod tests {
             self.run_artifacts.lock().await.insert(run, artifacts);
             Ok(())
         }
+        async fn reserve_artifact_upload(
+            &self,
+            tenant: TenantId,
+            run: Option<Uuid>,
+            key: &str,
+        ) -> Result<(), CoreError> {
+            if let Some(run) = run {
+                self.stored_run(tenant, run).await?;
+            }
+            self.inner.reserve_artifact_upload(tenant, None, key).await
+        }
+
+        async fn complete_artifact_upload(
+            &self,
+            tenant: TenantId,
+            run: Option<Uuid>,
+            key: &str,
+        ) -> Result<(), CoreError> {
+            if let Some(run) = run {
+                self.stored_run(tenant, run).await?;
+            }
+            self.inner.complete_artifact_upload(tenant, None, key).await
+        }
 
         async fn list_run_artifacts(
             &self,
@@ -4517,6 +4962,204 @@ mod tests {
                 .get(&run)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
+            self.stored_run_for_child(attempt.run_id).await?;
+            let mut attempts = self.run_attempts.lock().await;
+            let history = attempts.entry(attempt.run_id).or_default();
+            // An attempt number is recorded once. Re-recording it would rewrite
+            // the evidence of what a previous try actually did.
+            if history
+                .iter()
+                .any(|stored| stored.attempt_number == attempt.attempt_number)
+            {
+                return Err(CoreError::Conflict("attempt already recorded".into()));
+            }
+            // Only a try may be recorded as one, and only while unfinished.
+            if attempt.completed_at.is_some()
+                || !matches!(attempt.state, RunState::Running | RunState::Preparing)
+            {
+                return Err(CoreError::Conflict(
+                    "only an unfinished attempt may be started".into(),
+                ));
+            }
+            history.push(attempt);
+            Ok(())
+        }
+
+        async fn complete_run_attempt(
+            &self,
+            tenant: TenantId,
+            attempt: RunAttempt,
+        ) -> Result<(), CoreError> {
+            self.stored_run(tenant, attempt.run_id).await?;
+            let mut attempts = self.run_attempts.lock().await;
+            let history = attempts.entry(attempt.run_id).or_default();
+            let stored = history
+                .iter_mut()
+                .find(|candidate| candidate.attempt_number == attempt.attempt_number)
+                .ok_or_else(|| CoreError::NotFound("run attempt not found".into()))?;
+            *stored = attempt;
+            Ok(())
+        }
+
+        async fn create_attempt_sandbox(
+            &self,
+            run_id: Uuid,
+            attempt_id: Uuid,
+            sandbox: Sandbox,
+            _required: aiec_core::runtime::RuntimeCapabilities,
+        ) -> Result<Sandbox, CoreError> {
+            self.stored_run_for_child(run_id).await?;
+            // The machine exists as a row before it exists as a runtime, and the
+            // rest of the run - usage, destruction, the sweeper - reads that row.
+            self.inner.create_sandbox(sandbox.clone()).await?;
+            let mut attempts = self.run_attempts.lock().await;
+            let stored = attempts
+                .get_mut(&run_id)
+                .and_then(|history| history.iter_mut().find(|entry| entry.id == attempt_id))
+                .ok_or_else(|| CoreError::NotFound("run attempt not found".into()))?;
+            // Placement commits the link before the machine exists, so cleanup
+            // can always find what a run held even if creation then failed.
+            self.link_run_sandbox(RunSandbox {
+                run_id,
+                sandbox_id: sandbox.id,
+                role: "primary".into(),
+            })
+            .await?;
+            stored.sandbox_id = Some(sandbox.id);
+            Ok(sandbox)
+        }
+
+        async fn list_run_attempts(
+            &self,
+            tenant: TenantId,
+            run: Uuid,
+        ) -> Result<Vec<RunAttempt>, CoreError> {
+            self.stored_run(tenant, run).await?;
+            let mut attempts = self
+                .run_attempts
+                .lock()
+                .await
+                .get(&run)
+                .cloned()
+                .unwrap_or_default();
+            attempts.sort_by_key(|attempt| attempt.attempt_number);
+            Ok(attempts)
+        }
+
+        async fn set_run_placement(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            placement: Placement,
+        ) -> Result<Run, CoreError> {
+            // Placement is decided once. A later write may not move where the
+            // run went, or a results write could rewrite history.
+            let mut runs = self.runs.lock().await;
+            let stored = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            if stored.placement.runtime.is_some() {
+                return Ok(stored.clone());
+            }
+            stored.placement = placement;
+            Ok(stored.clone())
+        }
+
+        async fn set_run_failure(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            failure_reason: Option<String>,
+            state: RunState,
+        ) -> Result<Run, CoreError> {
+            let mut runs = self.runs.lock().await;
+            let stored = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            if stored.state.is_terminal() {
+                return Ok(stored.clone());
+            }
+            stored.failure_reason = failure_reason;
+            stored.state = state;
+            stored.completed_at = Some(chrono::Utc::now());
+            Ok(stored.clone())
+        }
+
+        async fn retain_run_sandbox(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            sandbox_id: Uuid,
+            until: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Run, CoreError> {
+            let mut runs = self.runs.lock().await;
+            let stored = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            stored.retained_sandbox_id = Some(sandbox_id);
+            stored.retained_until = Some(until);
+            Ok(stored.clone())
+        }
+
+        async fn clear_run_retention(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            sandbox_id: SandboxId,
+        ) -> Result<Run, CoreError> {
+            let mut runs = self.runs.lock().await;
+            let stored = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            // Only the machine that was actually retained may be released, so a
+            // late sweeper cannot clear a retention a later run recorded.
+            if stored.retained_sandbox_id == Some(sandbox_id) {
+                stored.retained_sandbox_id = None;
+                stored.retained_until = None;
+            }
+            Ok(stored.clone())
+        }
+
+        async fn retained_runs_due(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            limit: u32,
+        ) -> Result<Vec<Run>, CoreError> {
+            Ok(self
+                .runs
+                .lock()
+                .await
+                .values()
+                .filter(|run| run.retained_until.is_some_and(|until| until <= now))
+                .take(limit as usize)
+                .cloned()
+                .collect())
+        }
+
+        async fn delete_run(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError> {
+            let mut runs = self.runs.lock().await;
+            runs.get(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            // A run with recorded history is evidence, not scratch.
+            if self
+                .run_events
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|events| !events.is_empty())
+            {
+                return Err(CoreError::Conflict("run has recorded history".into()));
+            }
+            runs.remove(&id);
+            Ok(())
         }
     }
 
@@ -4550,6 +5193,13 @@ mod tests {
             Ok(())
         }
         async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: aiec_core::runtime::FileChunkRequest,
+        ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
             Err(CoreError::Backend("unused".into()))
         }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
@@ -4733,6 +5383,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn corrupt_workspace_restore_reclaims_the_new_computer() {
+        let archive = b"{\"version\":1,\"entries\":[]}".to_vec();
+        let fixture = RecoveryFixture::new(archive.clone());
+        let tenant = new_id();
+        let source = fixture.sandbox(tenant).await;
+        let key = format!("{}-workspace", source.id);
+        let stored = fixture.store_snapshot(&source, &key, &archive).await;
+        fixture
+            .store
+            .put(&key, bytes::Bytes::from_static(b"corrupt archive"))
+            .await
+            .unwrap();
+
+        let error = restore_snapshot(
+            State(fixture.state.clone()),
+            Extension(principal(tenant)),
+            Path(stored.id),
+            Json(RestoreSnapshotRequest {
+                image: None,
+                cpu: None,
+                memory_mb: None,
+                disk_mb: None,
+                runtime: Some(RuntimeKind::Docker),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let sandboxes = fixture.repository.list_sandboxes(tenant).await.unwrap();
+        assert_eq!(
+            sandboxes
+                .iter()
+                .filter(|value| value.state != SandboxState::Destroyed)
+                .map(|value| value.id)
+                .collect::<Vec<_>>(),
+            vec![source.id],
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .get_sandbox(tenant, source.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Running,
+        );
+    }
     /// A workspace captured on a worker is worthless if the bytes die with that
     /// worker, so the capture path must leave them in shared object storage.
     #[tokio::test]
@@ -4788,7 +5486,7 @@ mod tests {
         let object_key = format!("{}-workspace", sandbox.id);
         fixture
             .store
-            .put(&object_key, &archive)
+            .put(&object_key, bytes::Bytes::copy_from_slice(&archive))
             .await
             .expect("store archive");
         fixture
@@ -4810,7 +5508,7 @@ mod tests {
         let object_key = format!("{}-workspace", sandbox.id);
         fixture
             .store
-            .put(&object_key, b"tampered")
+            .put(&object_key, bytes::Bytes::from_static(b"tampered"))
             .await
             .expect("store archive");
         fixture
@@ -4819,7 +5517,7 @@ mod tests {
 
         assert!(matches!(
             restore_workspace(&fixture.state, &sandbox).await,
-            Err(CoreError::Conflict(_))
+            Err(CoreError::Backend(_))
         ));
         assert!(fixture.runtime.imported.lock().await.is_empty());
     }
@@ -4880,6 +5578,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct RunRuntime {
         recorder: Option<DestroyRecorder>,
+        /// Raw file bytes served by the chunk transfer and public JSON reader.
+        files: Option<std::sync::Arc<TestMap<String, bytes::Bytes>>>,
+        failing_command: Option<Vec<String>>,
     }
 
     impl RunRuntime {
@@ -4888,6 +5589,21 @@ mod tests {
         fn recording(recorder: DestroyRecorder) -> Self {
             Self {
                 recorder: Some(recorder),
+                ..Self::default()
+            }
+        }
+
+        fn serving(mut self, files: TestMap<String, bytes::Bytes>) -> Self {
+            self.files = Some(std::sync::Arc::new(files));
+            self
+        }
+        fn file_bytes(&self, path: &str) -> Result<bytes::Bytes, CoreError> {
+            match &self.files {
+                Some(files) => files
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| CoreError::NotFound(format!("no such file: {path}"))),
+                None => Ok(bytes::Bytes::from(format!("contents of {path}"))),
             }
         }
     }
@@ -4911,7 +5627,7 @@ mod tests {
         }
         async fn exec(&self, _: &Sandbox, request: ExecRequest) -> Result<ExecResult, CoreError> {
             Ok(ExecResult {
-                exit_code: 0,
+                exit_code: i32::from(self.failing_command.as_ref() == Some(&request.command)),
                 stdout: request.command.join(" "),
                 stderr: String::new(),
                 duration_ms: 1,
@@ -4922,10 +5638,36 @@ mod tests {
             Ok(())
         }
         async fn get_file(&self, _: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
+            use base64::Engine;
+            let bytes = self.file_bytes(path)?;
             Ok(FileContent {
                 path: path.to_owned(),
-                content_base64: format!("contents of {path}"),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
             })
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            request: aiec_core::runtime::FileChunkRequest,
+        ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+            let bytes = self.file_bytes(&request.path)?;
+            let size_bytes = bytes.len() as u64;
+            let version = hex::encode(sha2::Sha256::digest(&bytes));
+            request.validate()?;
+            let start = request.offset as usize;
+            let end = start.saturating_add(request.length).min(bytes.len());
+            let chunk = aiec_core::runtime::FileChunk {
+                bytes: if start <= end {
+                    bytes.slice(start..end)
+                } else {
+                    bytes::Bytes::new()
+                },
+                size_bytes,
+                version,
+                eof: end == bytes.len(),
+            };
+            request.validate_chunk(&chunk)?;
+            Ok(chunk)
         }
         async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
             Ok(Vec::new())
@@ -4996,6 +5738,7 @@ mod tests {
             idempotency_key: None,
             parent_run_id: None,
             matrix_id: None,
+            matrix_cell: None,
         }
     }
 
@@ -5030,6 +5773,121 @@ mod tests {
             "retention=destroy must release a failed machine too"
         );
         assert_eq!(RunState::Failed.as_str(), "failed");
+    }
+
+    /// A recovered Run must stop reporting a teardown that has since succeeded.
+    ///
+    /// The queue dispatcher finishes a Run only when its results carry no
+    /// `cleanup_failed`. Carrying a *previous* failure forward meant a Run
+    /// whose machines were all gone still answered "cleanup failed", so the
+    /// dispatcher re-leased it on every recovery tick and never finished the
+    /// queue row. Three such Runs - created minutes apart, their sandboxes
+    /// destroyed with all of them - wedged the queue and starved queued work.
+    /// Reclaiming has to clear the stale report before it retries, or the retry
+    /// can never succeed.
+    #[tokio::test]
+    async fn reclaiming_clears_a_cleanup_report_that_predates_the_retry() {
+        let fixture = RunFixture::new();
+        let sandbox_id = new_id();
+
+        // A run that finished minutes ago and whose machine has since been
+        // destroyed, still carrying the report of the teardown that failed
+        // before it. This is the exact shape three wedged queue rows had.
+        let mut run = settled_run(fixture.tenant, RunState::Succeeded);
+        run.results.cleanup_failed = Some(aiec_core::run::CleanupReport {
+            sandbox_id,
+            error: "conflict: worker lease generation or status changed".into(),
+        });
+        // The machine has to actually exist, and has to be running: without it
+        // the first reclaim tears nothing down, and comparing two counts of
+        // zero would pass whether or not the guard works.
+        let now = Utc::now();
+        fixture
+            .store
+            .create_sandbox(Sandbox {
+                id: sandbox_id,
+                tenant_id: fixture.tenant,
+                node_id: None,
+                image_id: "alpine:3.21".into(),
+                state: aiec_core::SandboxState::Running,
+                runtime: RuntimeKind::Docker,
+                cpu: 1,
+                memory_mb: 128,
+                disk_mb: 512,
+                timeout_seconds: 60,
+                network: NetworkPolicy::Disabled,
+                environment: Default::default(),
+                created_at: now,
+                updated_at: now,
+                runtime_path: None,
+            })
+            .await
+            .expect("the run's machine exists");
+        fixture.store.seed(run.clone()).await;
+        fixture
+            .store
+            .link_run_sandbox(RunSandbox {
+                run_id: run.id,
+                sandbox_id,
+                role: "primary".into(),
+            })
+            .await
+            .expect("the run owns a machine");
+
+        let reclaimed = crate::runs::reclaim_run(&fixture.state, &run)
+            .await
+            .expect("reclaim a run with nothing left to destroy");
+        assert!(
+            reclaimed.results.cleanup_failed.is_none(),
+            "a run whose machine is gone must stop reporting a failed teardown, \
+             or the dispatcher re-leases it forever and starves queued work"
+        );
+
+        // Persisted, not just returned: the queue row is finished from what is
+        // stored, so an in-memory clear would still wedge the dispatcher.
+        let stored = fixture
+            .store
+            .get_run(fixture.tenant, run.id)
+            .await
+            .expect("the reclaimed run is still readable");
+        assert!(
+            stored.results.cleanup_failed.is_none(),
+            "the cleared report must be persisted"
+        );
+
+        // A second pass over the same machine must not invent a teardown. The
+        // outer per-attempt cleanup re-enters after `execute` has already
+        // released the machine, and `destroy_with_retry` answers success for a
+        // sandbox that is already gone - so without a guard the run's history
+        // carried two `sandbox.destroyed` events for one machine, overstating
+        // what was released.
+        let events = || async {
+            fixture
+                .store
+                .list_run_events(fixture.tenant, run.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|event| event.event_type == "sandbox.destroyed")
+                .count()
+        };
+        let before = events().await;
+        // Meaningful only if the first pass really tore a machine down: a count
+        // of zero would let this test pass no matter what the second pass did.
+        assert!(
+            before >= 1,
+            "the fixture must produce a real teardown before the second pass, \
+             or this test cannot detect a duplicated one"
+        );
+        crate::runs::reclaim_run(&fixture.state, &stored)
+            .await
+            .expect("a second reclaim over the same machine");
+        assert_eq!(
+            events().await,
+            before,
+            "a machine that was already gone is not torn down again, and must not \
+             be recorded as if it were"
+        );
     }
 
     /// A finished run must stop its machine, not merely forget it.
@@ -5209,12 +6067,28 @@ mod tests {
         /// runtime which blocks or counts has not hand-rolled a second platform
         /// setup that can quietly stop placing sandboxes.
         fn with_runtime(runtime: Arc<dyn SandboxRuntime>) -> Self {
-            let store = LeasedRepository::new();
-            let tenant = new_id();
-            let key = run_api_key();
             let root = std::env::temp_dir().join(format!("af-runs-{}", new_id()));
             let objects: Arc<dyn ArtifactStore> =
                 Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
+            Self::with_parts(runtime, objects, root)
+        }
+
+        /// The same fixture over a caller-supplied object store, so a test can
+        /// make storage fail rather than only succeed. A collection failure that
+        /// cannot be produced is a failure nobody notices is handled.
+        fn with_object_store(objects: Arc<dyn ArtifactStore>) -> Self {
+            let root = std::env::temp_dir().join(format!("af-runs-{}", new_id()));
+            Self::with_parts(Arc::new(RunRuntime::default()), objects, root)
+        }
+
+        fn with_parts(
+            runtime: Arc<dyn SandboxRuntime>,
+            objects: Arc<dyn ArtifactStore>,
+            root: std::path::PathBuf,
+        ) -> Self {
+            let store = LeasedRepository::new();
+            let tenant = new_id();
+            let key = run_api_key();
             let metadata: Arc<dyn MetadataStore> = store.clone();
             let platform = Platform::builder()
                 .runtime(runtime.clone())
@@ -5542,17 +6416,322 @@ mod tests {
         assert!(events.iter().all(|event| event.run_id.to_string() == id));
     }
 
-    /// An artifact is listed with the URL its bytes are served from, and that
-    /// URL returns those bytes.
+    /// The bytes a run collects are the file's bytes, described by the file's
+    /// own size and digest, and the listing's URL serves exactly those bytes.
+    ///
+    /// Driven through a real run rather than by seeding the artifact table,
+    /// because every one of the defects this covers lived between the sandbox
+    /// and the table and left a hand-written row looking perfectly correct. The
+    /// payload is binary on purpose: NUL bytes and invalid UTF-8 are what a base64
+    /// text file mangles, and they are the reason the artifact is decoded rather
+    /// than stored as the transport encoding.
     #[tokio::test]
-    async fn a_runs_artifact_is_listed_with_a_url_and_served_from_it() {
+    async fn a_collected_artifact_is_the_file_its_bytes_not_their_base64() {
+        let mut files = TestMap::new();
+        files.insert(
+            "/workspace/report.bin".to_owned(),
+            bytes::Bytes::from_static(&[0x00, 0xff, 0xfe, b'h', b'i']),
+        );
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime::default().serving(files)));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "command": ["/bin/sh", "-lc", "printf hello > /workspace/report.bin"],
+                        "artifacts": ["/workspace/report.bin"],
+                    },
+                    "requested_runtime": "docker",
+                    "retention": "destroy",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "submit: {submitted}");
+        let run_id = submitted["id"].as_str().unwrap_or_default().to_owned();
+
+        // The absolute path is the ordinary way to ask, and it is what came back
+        // empty from a live cluster: the object key was built by pasting the path
+        // into `.../runs/{id}/`, producing an empty component the store rejects,
+        // and the rejection was skipped like any other.
+        let artifacts = submitted["results"]["artifacts"]
+            .as_array()
+            .expect("collected artifacts");
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "a run that asked for a file it wrote collected nothing: {submitted}"
+        );
+        assert_eq!(artifacts[0]["name"], "/workspace/report.bin");
+        assert_eq!(
+            artifacts[0]["size_bytes"], 5,
+            "the recorded size must be the file's, not the base64 text's"
+        );
+        assert_eq!(
+            artifacts[0]["checksum_sha256"],
+            hex::encode(sha2::Sha256::digest([0x00, 0xff, 0xfe, b'h', b'i']))
+        );
+
+        let (status, listed) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{run_id}/artifacts"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<Value> = serde_json::from_value(listed).expect("artifact list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["name"], "/workspace/report.bin");
+
+        let url = listed[0]["download_url"].as_str().unwrap_or_default();
+        assert!(
+            !url.ends_with("/artifacts//workspace/report.bin"),
+            "an absolute name must be escaped, not pasted into the path: {url}"
+        );
+        let (status, _, bytes) = fixture
+            .call(axum::http::Method::GET, url, &fixture.key, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK, "download {url}");
+        assert_eq!(
+            bytes,
+            vec![0x00, 0xff, 0xfe, b'h', b'i'],
+            "the downloaded bytes must be the file's"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_accepts_empty_and_limit_files_and_rejects_over_limit() {
+        for size in [0, aiec_core::MAX_FILE, aiec_core::MAX_FILE + 1] {
+            let name = "/workspace/boundary.bin";
+            let payload = bytes::Bytes::from(vec![0x9b; size]);
+            let mut files = TestMap::new();
+            files.insert(name.to_owned(), payload.clone());
+            let fixture = RunFixture::with_runtime(Arc::new(RunRuntime::default().serving(files)));
+            fixture.issue_key(fixture.tenant, &fixture.key).await;
+            let (status, submitted) = fixture
+                .call_json(
+                    axum::http::Method::POST,
+                    "/v1/runs",
+                    json!({
+                        "workload": {"command": ["true"], "artifacts": [name]},
+                        "requested_runtime": "docker",
+                    }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{submitted}");
+            if size > aiec_core::MAX_FILE {
+                assert_eq!(submitted["state"], "failed");
+                assert_eq!(submitted["results"]["artifacts"], json!([]));
+            } else {
+                assert_eq!(submitted["state"], "succeeded", "{submitted}");
+                let artifacts = &submitted["results"]["artifacts"];
+                assert_eq!(artifacts[0]["size_bytes"], size);
+                assert_eq!(
+                    artifacts[0]["checksum_sha256"],
+                    hex::encode(sha2::Sha256::digest(&payload))
+                );
+                let id = submitted["id"].as_str().expect("run id");
+                let (status, _, downloaded) = fixture
+                    .call(
+                        axum::http::Method::GET,
+                        &format!("/v1/runs/{id}/artifacts/%2Fworkspace%2Fboundary.bin"),
+                        &fixture.key,
+                        Value::Null,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(downloaded.as_slice(), payload.as_ref());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_corrupted_run_artifact_is_rejected_before_success_headers() {
         let fixture = RunFixture::new();
         fixture.issue_key(fixture.tenant, &fixture.key).await;
         let run = settled_run(fixture.tenant, RunState::Succeeded);
-        let object_key = format!("tenants/{}/runs/{}/report.txt", fixture.tenant, run.id);
+        fixture.store.seed(run.clone()).await;
+        let key = crate::runs::run_artifact_key(fixture.tenant, run.id, "report.bin");
+        let stored = fixture
+            .objects
+            .put(&key, bytes::Bytes::from_static(b"good"))
+            .await
+            .unwrap();
+        fixture
+            .store
+            .put_run_artifacts(
+                fixture.tenant,
+                run.id,
+                vec![RunArtifactRef {
+                    name: "report.bin".into(),
+                    object_key: key.clone(),
+                    size_bytes: stored.size_bytes as i64,
+                    checksum_sha256: Some(stored.checksum_sha256),
+                    content_type: Some("application/octet-stream".into()),
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::fs::write(fixture.root.join(&key), b"evil")
+            .await
+            .unwrap();
+        let (status, headers, _) = fixture
+            .call(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}/artifacts/report.bin", run.id),
+                &fixture.key,
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+    }
+
+    /// An artifact collected by a run outlives the machine that produced it.
+    ///
+    /// The whole point of collecting is that the caller gets the file back, and
+    /// a `retention: destroy` run is the normal case: the sandbox is gone before
+    /// the response is written, so anything that only existed inside it is gone
+    /// too. This asserts against the run's own recorded URL rather than a
+    /// hand-seeded row, so it fails if collection itself stops happening.
+    #[tokio::test]
+    async fn a_collected_artifact_outlives_the_machine_that_produced_it() {
+        let mut files = TestMap::new();
+        files.insert(
+            "/workspace/out/result.json".to_owned(),
+            bytes::Bytes::from_static(br#"{"ok":true}"#),
+        );
+        let recorder = DestroyRecorder::default();
+        let runtime = Arc::new(RunRuntime::recording(recorder.clone()).serving(files));
+        let fixture = RunFixture::with_runtime(runtime);
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "command": ["/bin/sh", "-lc", "true"],
+                        "artifacts": ["/workspace/out/result.json"],
+                    },
+                    "requested_runtime": "docker",
+                    "retention": "destroy",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "submit: {submitted}");
+        let run_id = submitted["id"].as_str().unwrap_or_default().to_owned();
+        assert_eq!(
+            recorder.destroyed().len(),
+            1,
+            "the machine must be gone for this to mean anything"
+        );
+
+        // A nested name is the shape that broke the old single-segment route: the
+        // listing produced `/artifacts//workspace/out/result.json`, which matched
+        // nothing, so a collected nested artifact could be listed but never read.
+        let (status, listed) = fixture
+            .call_json(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{run_id}/artifacts"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<Value> = serde_json::from_value(listed).expect("artifact list");
+        assert_eq!(listed.len(), 1);
+        let url = listed[0]["download_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let (status, _, bytes) = fixture
+            .call(axum::http::Method::GET, &url, &fixture.key, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK, "download {url}");
+        assert_eq!(bytes, br#"{"ok":true}"#);
+    }
+
+    /// A URL only serves the artifact it names. Widening the route to reach nested
+    /// names must not turn the rest of the key space into a readable one.
+    #[tokio::test]
+    async fn a_run_artifact_url_serves_only_a_name_the_run_collected() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let run = settled_run(fixture.tenant, RunState::Succeeded);
+        fixture.store.seed(run.clone()).await;
+        let key = crate::runs::run_artifact_key(fixture.tenant, run.id, "/workspace/report.txt");
+        fixture
+            .store
+            .put_run_artifacts(
+                fixture.tenant,
+                run.id,
+                vec![RunArtifactRef {
+                    name: "/workspace/report.txt".to_owned(),
+                    object_key: key.clone(),
+                    size_bytes: 4,
+                    checksum_sha256: None,
+                    content_type: Some("application/octet-stream".to_owned()),
+                }],
+            )
+            .await
+            .expect("record artifacts");
         fixture
             .objects
-            .put(&object_key, b"run output")
+            .put(&key, bytes::Bytes::from_static(b"data"))
+            .await
+            .expect("store artifact");
+
+        for name in [
+            "/workspace/other.txt",
+            "/workspace/report.txt/../../escape",
+            "/",
+            "/tenants/other-tenant/sandboxes/x/artifacts/y",
+        ] {
+            let encoded: String = name
+                .bytes()
+                .map(|byte| match byte {
+                    b'-' | b'.' | b'_' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => {
+                        char::from(byte).to_string()
+                    }
+                    other => format!("%{other:02X}"),
+                })
+                .collect();
+            let (status, _, _) = fixture
+                .call(
+                    axum::http::Method::GET,
+                    &format!("/v1/runs/{}/artifacts/{encoded}", run.id),
+                    &fixture.key,
+                    Value::Null,
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{name} is not an artifact this run collected"
+            );
+        }
+    }
+
+    /// One tenant's key cannot read another tenant's run artifact, and cannot
+    /// discover that it exists by listing.
+    #[tokio::test]
+    async fn another_tenant_cannot_read_a_runs_artifacts() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let run = settled_run(fixture.tenant, RunState::Succeeded);
+        let key = crate::runs::run_artifact_key(fixture.tenant, run.id, "/workspace/report.txt");
+        fixture
+            .objects
+            .put(&key, bytes::Bytes::from_static(b"private output"))
             .await
             .expect("store artifact");
         fixture.store.seed(run.clone()).await;
@@ -5562,43 +6741,256 @@ mod tests {
                 fixture.tenant,
                 run.id,
                 vec![RunArtifactRef {
-                    name: "report.txt".to_owned(),
-                    object_key,
-                    size_bytes: 10,
+                    name: "/workspace/report.txt".to_owned(),
+                    object_key: key,
+                    size_bytes: 14,
                     checksum_sha256: None,
-                    content_type: Some("text/plain".to_owned()),
+                    content_type: Some("application/octet-stream".to_owned()),
                 }],
             )
             .await
             .expect("record artifacts");
 
-        let (status, value) = fixture
-            .call_json(
+        let outsider = new_id();
+        let outsider_key = format!("af_live_{}", "cd".repeat(24));
+        fixture.issue_key(outsider, &outsider_key).await;
+
+        let (status, _, _) = fixture
+            .call(
                 axum::http::Method::GET,
                 &format!("/v1/runs/{}/artifacts", run.id),
+                &outsider_key,
                 Value::Null,
             )
             .await;
-        assert_eq!(status, StatusCode::OK);
-        let listed: Vec<Value> = serde_json::from_value(value).expect("artifact list");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0]["name"], "report.txt");
-        let url = listed[0]["download_url"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-
-        let (status, headers, bytes) = fixture
-            .call(axum::http::Method::GET, &url, &fixture.key, Value::Null)
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, bytes) = fixture
+            .call(
+                axum::http::Method::GET,
+                &format!("/v1/runs/{}/artifacts/%%2Fworkspace%%2Freport.txt", run.id),
+                &outsider_key,
+                Value::Null,
+            )
             .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(bytes, b"run output");
-        assert_eq!(
-            headers
-                .get(header::CONTENT_TYPE)
-                .map(|value| value.to_str().ok()),
-            Some(Some("text/plain"))
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            !bytes.windows(6).any(|window| window == b"private"),
+            "a cross-tenant read leaked the artifact"
         );
+    }
+
+    /// Storage failing mid-collection fails the run rather than quietly producing
+    /// a shorter list than the caller asked for.
+    #[tokio::test]
+    async fn a_run_fails_when_artifact_storage_rejects_the_write() {
+        let objects: Arc<dyn ArtifactStore> = Arc::new(UnwritableStore);
+        let fixture = RunFixture::with_object_store(objects);
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "command": ["/bin/sh", "-lc", "true"],
+                        "artifacts": ["/workspace/report.txt"],
+                    },
+                    "requested_runtime": "docker",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "submit: {submitted}");
+        assert_eq!(
+            submitted["state"], "failed",
+            "a run whose artifacts were never stored must not report success"
+        );
+    }
+
+    /// A machine asked to be kept must survive a failure that happens late.
+    ///
+    /// `execute` releases the attempt's machine before it returns, then reports
+    /// the outcome as an error so the caller can classify it. The caller used to
+    /// read that as "still held" and ran cleanup a second time - this time with
+    /// `retention_seconds = None`, which destroys. So a `keep_on_failure` run
+    /// that failed while *collecting artifacts* lost the machine the caller had
+    /// asked to keep, and nothing in the response said so.
+    #[tokio::test]
+    async fn a_machine_kept_on_failure_survives_a_collection_failure() {
+        let objects: Arc<dyn ArtifactStore> = Arc::new(UnwritableStore);
+        let fixture = RunFixture::with_object_store(objects);
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "command": ["/bin/sh", "-lc", "exit 3"],
+                        "artifacts": ["/workspace/report.txt"],
+                    },
+                    "requested_runtime": "docker",
+                    "retention": "keep_on_failure",
+                    "retained_seconds": 3600,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "submit: {submitted}");
+        let run = run_document(&submitted);
+        assert_eq!(run.state, RunState::Failed, "the run should have failed");
+
+        let Some(retained) = run.retained_sandbox_id else {
+            panic!("a keep_on_failure run must report a machine it kept: {submitted}");
+        };
+        let sandbox = fixture
+            .store
+            .get_sandbox(fixture.tenant, retained)
+            .await
+            .expect("the retained machine is still readable");
+        assert_ne!(
+            sandbox.state,
+            aiec_core::SandboxState::Destroyed,
+            "the machine the caller asked to keep was destroyed by a second cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_setup_failure_keeps_its_debugging_machine_without_retrying() {
+        let failed_setup = vec!["/bin/sh".into(), "-lc".into(), "exit 1".into()];
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            failing_command: Some(failed_setup.clone()),
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "setup": [failed_setup],
+                        "command": ["true"],
+                    },
+                    "requested_runtime": "docker",
+                    "max_attempts": 2,
+                    "retention": "keep_on_failure",
+                    "retained_seconds": 3600,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let run = run_document(&submitted);
+        assert_eq!(run.state, RunState::Failed);
+        assert!(
+            run.results.task.is_none(),
+            "the task must not run after setup failed"
+        );
+        let sandboxes = fixture.store.list_sandboxes(fixture.tenant).await.unwrap();
+        assert_eq!(
+            sandboxes.len(),
+            1,
+            "a failed setup is permanent, not a fresh-machine retry"
+        );
+        assert_eq!(run.retained_sandbox_id, Some(sandboxes[0].id));
+        assert_eq!(sandboxes[0].state, SandboxState::Running);
+    }
+
+    /// A storage refusal must cost one machine, not one per remaining attempt.
+    ///
+    /// The test above cannot tell the two behaviours apart: it runs at the
+    /// default `max_attempts: 1`, where "retry on a fresh machine" has nowhere
+    /// to go. With a higher bound the old classification spent a whole sandbox
+    /// re-running a task that had already exited 0, and re-collecting the same
+    /// bytes to reach the same refusal - once per remaining attempt. The run
+    /// still fails either way; what must not change is the number of machines.
+    #[tokio::test]
+    async fn a_rejected_artifact_is_retried_on_no_further_machine() {
+        let objects: Arc<dyn ArtifactStore> = Arc::new(UnwritableStore);
+        let fixture = RunFixture::with_object_store(objects);
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, submitted) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/runs",
+                json!({
+                    "workload": {
+                        "command": ["/bin/sh", "-lc", "true"],
+                        "artifacts": ["/workspace/report.txt"],
+                    },
+                    "requested_runtime": "docker",
+                    "max_attempts": 3,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "submit: {submitted}");
+        let run = run_document(&submitted);
+        assert_eq!(
+            run.state,
+            RunState::Failed,
+            "an artifact that was never stored is not a success"
+        );
+
+        let attempts = fixture
+            .store
+            .list_run_attempts(fixture.tenant, run.id)
+            .await
+            .expect("attempts are readable");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "a store that refuses every write would otherwise cost a machine per \
+             attempt, re-running a workload that already succeeded"
+        );
+    }
+
+    /// An artifact store whose every write fails.
+    ///
+    /// Real enough to be worth having: the point is that collection has a failure
+    /// path at all, and a store that only ever succeeds cannot produce one.
+    struct UnwritableStore;
+
+    #[async_trait::async_trait]
+    impl ArtifactStore for UnwritableStore {
+        async fn put(&self, _: &str, _: bytes::Bytes) -> Result<ObjectMetadata, CoreError> {
+            Err(CoreError::Transient(
+                "the object store is unavailable".into(),
+            ))
+        }
+        async fn get(&self, _: &str) -> Result<Vec<u8>, CoreError> {
+            Err(CoreError::NotFound("no such object".into()))
+        }
+        async fn get_checked(&self, _: &str, _: &GetObjectOptions) -> Result<Vec<u8>, CoreError> {
+            Err(CoreError::NotFound("no such object".into()))
+        }
+        async fn put_stream(
+            &self,
+            _: &str,
+            _: &mut dyn aiec_core::storage::ArtifactSource,
+            _: u64,
+        ) -> Result<ObjectMetadata, CoreError> {
+            Err(CoreError::Transient(
+                "the object store is unavailable".into(),
+            ))
+        }
+        async fn get_verified(
+            &self,
+            _: &str,
+            _: &GetObjectOptions,
+            _: u64,
+        ) -> Result<aiec_core::storage::ArtifactDownload, CoreError> {
+            Err(CoreError::NotFound("no such object".into()))
+        }
+        async fn delete(&self, _: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn list(&self, _: &str) -> Result<Vec<ObjectMetadata>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_if_match(&self, _: &str, _: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
     }
 
     /// Cancelling a finished run is not a failure: the caller wanted no machine

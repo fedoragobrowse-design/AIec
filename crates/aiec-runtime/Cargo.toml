@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 bollard.workspace = true
 aiec-core.workspace = true
+aiec-guard.workspace = true
 aiec-network-linux = { path = "../aiec-network-linux" }
 async-trait.workspace = true
 base64.workspace = true
@@ -24,3 +25,6 @@ tar.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

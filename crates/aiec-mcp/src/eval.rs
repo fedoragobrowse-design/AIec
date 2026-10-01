@@ -1,17 +1,15 @@
 //! Provider-agnostic evaluation workflows.
 //!
-//! These are the high-level tools a user actually wants: prepare a repository,
-//! run a task against it, run one OMP revision, or compare two revisions. They
-//! compose the primitives in [`crate::sandbox`] and add three things the
-//! primitives deliberately do not:
+//! Legacy repository preparation/task tools still compose sandbox primitives.
+//! OMP tools instead expand through the API's thin adapter into ordinary durable
+//! Runs, using the generic client's bounded batch rather than owning machines.
+//! Both paths isolate work and report cleanup failures; durable lifetime,
+//! cancellation, timeout and retention belong to the control plane.
 //!
 //! 1. **Isolation.** Every run gets its own sandbox, so a comparison never
 //!    measures a workspace a previous run dirtied.
-//! 2. **Cleanup that cannot be skipped.** A sandbox is owned by a
-//!    [`SandboxGuard`] for the length of a workflow. The guard is released on a
-//!    single exit point *before* any result is propagated, so an early `?`
-//!    return, a failing task and a failing validation all still destroy the
-//!    machine unless the caller asked to keep it.
+//! 2. **Cleanup.** Legacy repository workflows release their [`SandboxGuard`];
+//!    durable OMP workflows return the Run's authoritative cleanup evidence.
 //! 3. **Refusal to judge.** [`compare_omp`] returns measurements. Which
 //!    revision is better is a judgement the caller makes; this module does not
 //!    encode one, and it never reads the host filesystem to get its numbers.
@@ -25,12 +23,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
-use futures::future::join_all;
+use aiec_api::omp::{OmpRunSpec, actual_omp_revision, to_run_request, wall_time_ms};
+use aiec_client::CreateRunRequest;
+use aiec_core::run::{
+    CapabilityRequirements, CleanupReport, CommandOutcome, ResourceRequirements, RetentionPolicy,
+    Run, RunState,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::{ErrorCode, McpError};
-use crate::sandbox::{ExecOutcome, LocalAiec};
+use crate::guard::LocalEndpoint;
+use crate::sandbox::{ExecOutcome, LocalAiec, map_client_error};
 
 /// The image used when a caller does not name one.
 ///
@@ -44,8 +48,6 @@ pub const DEFAULT_TIMEOUT_SECONDS: u64 = 900;
 
 /// Where a cloned target repository lives inside the sandbox.
 pub const REPO_PATH: &str = "/workspace/repository";
-/// Where a cloned OMP checkout lives inside the sandbox.
-pub const OMP_PATH: &str = "/workspace/omp";
 
 const SANDBOX_CPU: u32 = 2;
 const SANDBOX_MEMORY_MB: u32 = 2048;
@@ -178,7 +180,7 @@ pub async fn prepare_repo(
         timeout,
     )
     .await?;
-    aiec.mark_tool_owned(sandbox_id, None);
+    aiec.mark_tool_owned(sandbox_id);
 
     let mut guard = SandboxGuard::new(aiec, sandbox_id, false);
     // The workspace was cloned during create, so this confirms it is really
@@ -274,7 +276,7 @@ pub async fn run_repo_task(
         timeout,
     )
     .await?;
-    aiec.mark_tool_owned(sandbox_id, None);
+    aiec.mark_tool_owned(sandbox_id);
     let guard = SandboxGuard::new(aiec, sandbox_id, request.keep_sandbox);
 
     let outcome = repo_task_workflow(
@@ -395,15 +397,21 @@ pub struct OmpRunRequest {
     /// The repository OMP is pointed at.
     pub target_repo: String,
     pub target_ref: Option<String>,
-    /// What OMP is asked to do, passed on stdin and in `OMP_TASK`.
+    /// Natural-language task: positional argument by default, stdin for overrides.
     pub task: String,
     /// Run once before OMP, in the target repository.
     pub setup_command: Option<Vec<String>>,
-    /// How to invoke OMP. `["omp", "run"]` on `PATH` when absent.
+    /// Builds OMP in its checkout; defaults to Bun install and build.
+    pub build_command: Option<Vec<String>>,
+    /// Override invocation. Task bytes arrive on stdin and in `OMP_TASK`.
     pub omp_command: Option<Vec<String>>,
     pub validation_commands: Vec<Vec<String>>,
     pub timeout_seconds: Option<u64>,
     pub keep_sandbox: bool,
+    pub resources: Option<ResourceRequirements>,
+    pub requirements: CapabilityRequirements,
+    pub environment: BTreeMap<String, String>,
+    pub secrets: Vec<String>,
     /// Must be 1: this function performs exactly one isolated run. Use
     /// [`compare_omp`] to repeat a measurement.
     pub repetitions: u32,
@@ -411,22 +419,102 @@ pub struct OmpRunRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OmpRunResult {
+    pub run_id: Uuid,
+    pub state: RunState,
+    pub failure_reason: Option<String>,
     pub omp_ref: String,
     pub target_ref: Option<String>,
-    /// The sandbox the run used, for correlation. It has already been
-    /// destroyed unless the caller asked to keep it.
+    pub actual_omp_ref: Option<String>,
+    pub actual_target_ref: Option<String>,
+    /// Only set when the control plane retained the machine.
     pub sandbox_id: Option<Uuid>,
-    /// The runtime the control plane actually placed the sandbox on.
-    pub runtime: String,
-    /// Wall time for the whole run, clone to evidence.
-    pub wall_time_ms: u64,
-    pub omp: CommandResult,
-    pub validations: Vec<CommandResult>,
+    pub runtime: Option<String>,
+    pub wall_time_ms: Option<u64>,
+    pub phase_ms: BTreeMap<String, u64>,
+    /// Null means preparation failed or the task otherwise never ran.
+    pub omp: Option<CommandOutcome>,
+    pub setup: Vec<CommandOutcome>,
+    pub validations: Vec<CommandOutcome>,
     pub git_status: String,
     pub git_diff: String,
+    pub git_evidence_truncated: bool,
     pub changed_files: Vec<String>,
-    /// OMP exited zero and every validation passed.
+    pub cleanup_failed: Option<CleanupReport>,
     pub success: bool,
+}
+
+impl OmpRunResult {
+    fn from_run(request: &OmpRunRequest, run: Run) -> Self {
+        let actual_omp_ref = actual_omp_revision(&run);
+        let wall_time_ms = wall_time_ms(&run);
+        Self {
+            run_id: run.id,
+            state: run.state,
+            failure_reason: run.failure_reason,
+            omp_ref: request.omp_ref.clone(),
+            target_ref: request.target_ref.clone(),
+            actual_omp_ref,
+            actual_target_ref: run.results.commit,
+            sandbox_id: run.retained_sandbox_id,
+            runtime: run.placement.runtime,
+            wall_time_ms,
+            phase_ms: run.results.phase_ms,
+            omp: run.results.task,
+            setup: run.results.setup,
+            validations: run.results.validations,
+            git_status: run.results.git_status,
+            git_diff: run.results.git_diff,
+            git_evidence_truncated: run.results.git_evidence_truncated,
+            changed_files: run.results.changed_files,
+            cleanup_failed: run.results.cleanup_failed,
+            success: run.state == RunState::Succeeded,
+        }
+    }
+}
+
+/// The same pure adapter used by the API, submitted over the ordinary Run route.
+fn durable_omp_request(
+    aiec: &LocalAiec,
+    request: &OmpRunRequest,
+) -> Result<CreateRunRequest, McpError> {
+    validate_omp_request(request)?;
+    let runtime = request.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME);
+    LocalEndpoint::require_local_runtime(runtime)?;
+    let spec = OmpRunSpec {
+        omp_repo: validate_repo_url(&request.omp_repo)?,
+        omp_ref: validate_reference(&request.omp_ref)?,
+        task: request.task.clone(),
+        target_repo: validate_repo_url(&request.target_repo)?,
+        target_ref: validate_optional_reference(request.target_ref.as_deref())?,
+        setup_command: request.setup_command.clone(),
+        build_command: request.build_command.clone(),
+        omp_command: request.omp_command.clone(),
+        validations: request.validation_commands.clone(),
+        timeout_seconds: Some(resolve_timeout(request.timeout_seconds)),
+        runtime: Some(runtime.to_owned()),
+        resources: request.resources.clone(),
+        requirements: request.requirements.clone(),
+        retention: Some(if request.keep_sandbox {
+            RetentionPolicy::KeepAlways
+        } else {
+            RetentionPolicy::Destroy
+        }),
+        retained_seconds: Some(aiec.default_ttl_seconds() as i64),
+        environment: request.environment.clone(),
+        secrets: request.secrets.clone(),
+    };
+    let expanded = to_run_request(&spec).map_err(|error| McpError::invalid(error.to_string()))?;
+    Ok(CreateRunRequest {
+        workload: expanded.workload,
+        resources: expanded.resources,
+        requirements: expanded.requirements,
+        retention: expanded.retention,
+        requested_runtime: expanded.requested_runtime,
+        retained_seconds: expanded.retained_seconds,
+        idempotency_key: expanded.idempotency_key,
+        parent_run_id: expanded.parent_run_id,
+        matrix_id: expanded.matrix_id,
+    })
 }
 
 /// Runs one OMP revision against one target repository, in its own sandbox.
@@ -438,135 +526,13 @@ pub async fn run_omp_once(
     aiec: &LocalAiec,
     request: &OmpRunRequest,
 ) -> Result<OmpRunResult, McpError> {
-    validate_omp_request(request)?;
-
-    let timeout = resolve_timeout(request.timeout_seconds);
-    let target_url = validate_repo_url(&request.target_repo)?;
-    let target_ref = validate_optional_reference(request.target_ref.as_deref())?;
-    let (view, sandbox_id, _) = create_sandbox_with_repo(
-        aiec,
-        DEFAULT_IMAGE,
-        request.runtime.as_deref().unwrap_or(DEFAULT_RUNTIME),
-        &target_url,
-        target_ref.as_deref(),
-        timeout,
-    )
-    .await?;
-    aiec.mark_tool_owned(sandbox_id, None);
-    let guard = SandboxGuard::new(aiec, sandbox_id, request.keep_sandbox);
-
-    let outcome = omp_workflow(aiec, sandbox_id, &guard, request, timeout, &view.runtime).await;
-
-    guard.release().await;
-    let result = outcome?;
-    Ok(result)
-}
-
-/// Everything that happens inside an OMP sandbox, after it exists.
-async fn omp_workflow(
-    aiec: &LocalAiec,
-    sandbox_id: Uuid,
-    guard: &SandboxGuard<'_>,
-    request: &OmpRunRequest,
-    timeout: u64,
-    runtime: &str,
-) -> Result<OmpRunResult, McpError> {
-    let started = Instant::now();
-
-    // The OMP revision first: a bad revision must not get as far as the
-    // target repository, or the run would look like a target failure.
-    // The OMP checkout is not part of the prepared workspace, so it is cloned
-    // here. The target repository already is: AIec materialised it during
-    // create, and cloning it again collides on an existing `origin`.
-    clone_revision(
-        aiec,
-        sandbox_id,
-        &request.omp_repo,
-        Some(&request.omp_ref),
-        OMP_PATH,
-        timeout,
-    )
-    .await?;
-    let _ = &request.target_repo;
-    let _ = request.target_ref.as_deref();
-
-    // The OMP checkout is passed by path and revision, so the command does not
-    // have to know where either of them lives.
-    let mut environment = BTreeMap::new();
-    environment.insert("OMP_REPO".to_owned(), OMP_PATH.to_owned());
-    environment.insert("OMP_REF".to_owned(), request.omp_ref.clone());
-    environment.insert("OMP_TARGET_REPO".to_owned(), REPO_PATH.to_owned());
-    if let Some(reference) = &request.target_ref {
-        environment.insert("OMP_TARGET_REF".to_owned(), reference.clone());
-    }
-    environment.insert("OMP_TASK".to_owned(), request.task.clone());
-
-    if let Some(setup) = &request.setup_command {
-        let outcome = aiec
-            .exec(
-                sandbox_id,
-                setup,
-                Some(REPO_PATH.to_owned()),
-                environment.clone(),
-                None,
-                timeout,
-            )
-            .await?;
-        if !succeeded(&outcome) {
-            return Err(step_failure("the setup command", &outcome));
-        }
-    }
-
-    let omp_command = request
-        .omp_command
-        .clone()
-        .unwrap_or_else(|| vec!["omp".to_owned(), "run".to_owned()]);
-    let omp = CommandResult::from_outcome(
-        &aiec
-            .exec(
-                sandbox_id,
-                &omp_command,
-                Some(REPO_PATH.to_owned()),
-                environment.clone(),
-                Some(request.task.clone()),
-                timeout,
-            )
-            .await?,
-    );
-
-    let validations = run_validations(
-        aiec,
-        sandbox_id,
-        &request.validation_commands,
-        &environment,
-        timeout,
-    )
-    .await?;
-
-    let evidence = aiec.git_evidence(sandbox_id, REPO_PATH).await?;
-    let success = omp.ok && all_ok(&validations);
-    let wall_time_ms = started.elapsed().as_millis() as u64;
-    tracing::debug!(
-        sandbox_id = %sandbox_id,
-        omp_ref = %request.omp_ref,
-        wall_time_ms,
-        success,
-        "omp run finished"
-    );
-
-    Ok(OmpRunResult {
-        omp_ref: request.omp_ref.clone(),
-        target_ref: request.target_ref.clone(),
-        sandbox_id: guard.sandbox_id(),
-        runtime: runtime.to_owned(),
-        wall_time_ms,
-        omp,
-        validations,
-        git_status: evidence.git_status,
-        git_diff: evidence.git_diff,
-        changed_files: evidence.changed_files,
-        success,
-    })
+    let durable = durable_omp_request(aiec, request)?;
+    let run = aiec
+        .client()
+        .create_run(&durable)
+        .await
+        .map_err(|error| map_client_error(&error))?;
+    Ok(OmpRunResult::from_run(request, run))
 }
 
 // ---------------------------------------------------------------------------
@@ -585,11 +551,11 @@ pub struct CompareOmpRequest {
     pub target_repo: String,
     pub target_ref: Option<String>,
     pub task: String,
-    /// Installs or prepares the agent before it runs, exactly as for
-    /// `aiec_test_omp`. Without it a comparison can only run whatever the
-    /// default command is, which is not a comparison of anything.
+    /// Prepares the target repository after the OMP checkout is built.
     pub setup_command: Option<Vec<String>>,
-    /// The command that runs the agent. Defaults to `["omp", "run"]`.
+    /// Builds OMP in its checkout; defaults to Bun install and build.
+    pub build_command: Option<Vec<String>>,
+    /// Override invocation, with task bytes on stdin and in `OMP_TASK`.
     pub omp_command: Option<Vec<String>>,
     pub validation_commands: Vec<Vec<String>>,
     /// Repetitions per side. One when absent.
@@ -598,6 +564,10 @@ pub struct CompareOmpRequest {
     /// How many sandboxes may exist at once. Defaults to, and is capped by,
     /// the server's own configured limit.
     pub max_parallel: Option<usize>,
+    pub resources: Option<ResourceRequirements>,
+    pub requirements: CapabilityRequirements,
+    pub environment: BTreeMap<String, String>,
+    pub secrets: Vec<String>,
 }
 
 /// The measurements for one side of a comparison.
@@ -617,11 +587,22 @@ pub struct SideSummary {
     /// Validations that ran, across every run on this side.
     pub validation_total: u32,
     /// Wall time summed over the runs on this side.
-    pub wall_time_ms: u64,
-    /// OMP's exit code from each run, in run order.
-    pub exit_codes: Vec<i32>,
+    pub wall_time_ms: Option<u64>,
+    pub phase_ms: BTreeMap<String, u64>,
+    /// One slot per durable run. Null means its task never executed.
+    pub exit_codes: Vec<Option<i32>>,
+    pub missing_task_runs: u32,
+    pub setup_failures: u32,
+    pub submission_failures: u32,
+    pub actual_omp_revisions: Vec<Option<String>>,
+    pub actual_target_revisions: Vec<Option<String>>,
+    pub cleanup_failures: Vec<CleanupReport>,
     /// Distinct files changed by at least one run on this side.
     pub changed_file_count: usize,
+    /// Runs with clipped git evidence; changed-file/diff totals are incomplete.
+    pub git_evidence_truncations: usize,
+    /// Commands whose stored output previews were clipped.
+    pub output_preview_truncations: usize,
     /// The tail of the last run's output, from the agent and then the
     /// validations.
     ///
@@ -630,7 +611,7 @@ pub struct SideSummary {
     /// agent that dumped a build log should not be able to blow up the report.
     #[serde(default)]
     pub last_output: String,
-    /// Diff size summed over the runs on this side.
+    /// Captured diff-preview bytes summed over this side, not full diff size.
     pub total_diff_bytes: usize,
 }
 
@@ -644,10 +625,19 @@ impl SideSummary {
             failed_runs: 0,
             validation_passes: 0,
             validation_total: 0,
-            wall_time_ms: 0,
+            wall_time_ms: if runs.is_empty() { None } else { Some(0) },
+            phase_ms: BTreeMap::new(),
             exit_codes: Vec::with_capacity(runs.len()),
+            missing_task_runs: 0,
+            setup_failures: 0,
+            submission_failures: 0,
+            actual_omp_revisions: Vec::with_capacity(runs.len()),
+            actual_target_revisions: Vec::with_capacity(runs.len()),
+            cleanup_failures: Vec::new(),
             changed_file_count: 0,
             total_diff_bytes: 0,
+            git_evidence_truncations: 0,
+            output_preview_truncations: 0,
             last_output: String::new(),
         };
 
@@ -662,14 +652,52 @@ impl SideSummary {
             }
             summary.validation_total += run.validations.len() as u32;
             summary.validation_passes += run.validations.iter().filter(|v| v.ok).count() as u32;
-            summary.wall_time_ms = summary.wall_time_ms.saturating_add(run.wall_time_ms);
-            summary.exit_codes.push(run.omp.exit_code);
+            summary.wall_time_ms = summary
+                .wall_time_ms
+                .zip(run.wall_time_ms)
+                .map(|(total, elapsed)| total.saturating_add(elapsed));
+            summary
+                .exit_codes
+                .push(run.omp.as_ref().map(|task| task.exit_code));
+            summary.missing_task_runs += u32::from(run.omp.is_none());
+            summary.setup_failures += run.setup.iter().filter(|step| !step.ok).count() as u32;
+            summary
+                .actual_omp_revisions
+                .push(run.actual_omp_ref.clone());
+            summary
+                .actual_target_revisions
+                .push(run.actual_target_ref.clone());
+            if let Some(cleanup) = &run.cleanup_failed {
+                summary.cleanup_failures.push(cleanup.clone());
+            }
+            for (phase, elapsed) in &run.phase_ms {
+                let total = summary.phase_ms.entry(phase.clone()).or_default();
+                *total = total.saturating_add(*elapsed);
+            }
             summary.total_diff_bytes = summary.total_diff_bytes.saturating_add(run.git_diff.len());
+            summary.git_evidence_truncations += usize::from(run.git_evidence_truncated);
+            summary.output_preview_truncations += run
+                .setup
+                .iter()
+                .chain(run.omp.iter())
+                .chain(run.validations.iter())
+                .filter(|command| command.output_preview_truncated)
+                .count();
             changed.extend(run.changed_files.iter().map(String::as_str));
-            // The most recent run stands in for the side, so a repeated failure
-            // shows its reason rather than a bare exit code.
-            if run.omp.exit_code != 0 || !run.omp.ok {
-                summary.last_output = tail_of(&format!("{}\n{}", run.omp.stdout, run.omp.stderr));
+            // Include successful output too: absence is not evidence that an
+            // agent did nothing. Setup failures and validation diagnostics stay visible.
+            summary.last_output.clear();
+            for step in run
+                .setup
+                .iter()
+                .chain(run.omp.iter())
+                .chain(run.validations.iter())
+            {
+                append_output_tail(&mut summary.last_output, &step.stdout);
+                append_output_tail(&mut summary.last_output, &step.stderr);
+            }
+            if let Some(reason) = &run.failure_reason {
+                append_output_tail(&mut summary.last_output, reason);
             }
         }
         summary.changed_file_count = changed.len();
@@ -711,19 +739,51 @@ pub struct CleanupFailure {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct OmpSubmissionFailure {
+    pub side: String,
+    pub repetition: u32,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CompareOmpResult {
     /// Correlates every sandbox and log line of this comparison.
     pub evaluation_id: Uuid,
     pub baseline: SideSummary,
     pub candidate: SideSummary,
-    /// Every sandbox this comparison created. All of them are destroyed.
+    /// Intentionally retained machines; cleanup failures are reported separately.
     pub sandbox_ids: Vec<Uuid>,
+    pub baseline_runs: Vec<OmpRunResult>,
+    pub candidate_runs: Vec<OmpRunResult>,
+    pub submission_failures: Vec<OmpSubmissionFailure>,
     /// The concurrency actually used.
     pub max_parallel: usize,
 }
 
 /// The last few kilobytes of a run's output, so a failing comparison says why
 /// without letting an agent's build log dominate the report.
+fn append_output_tail(output: &mut String, text: &str) {
+    const LIMIT: usize = 2048;
+    if text.is_empty() {
+        return;
+    }
+    let mut start = text.len().saturating_sub(LIMIT);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if start > 0 {
+        output.clear();
+    } else if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(&text[start..]);
+    let mut trim = output.len().saturating_sub(LIMIT);
+    while !output.is_char_boundary(trim) {
+        trim += 1;
+    }
+    output.drain(..trim);
+}
+
 fn tail_of(text: &str) -> String {
     const LIMIT: usize = 2048;
     if text.len() <= LIMIT {
@@ -736,90 +796,104 @@ fn tail_of(text: &str) -> String {
     format!("…{}", text[start..].trim())
 }
 
-/// Which side of a comparison a run belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    Baseline,
-    Candidate,
-}
-
 /// Runs two OMP revisions against the same target and returns measurements.
 ///
-/// Every run gets its own sandbox, and the runs are spread over the sandbox
-/// pool in bounded chunks. Both sides see the same target, task, validations
-/// and timeout, and the two sides alternate so a single slow machine cannot
-/// consume the whole first chunk and skew one side.
+/// Every cell is an ordinary durable Run. The generic client's bounded sliding
+/// window schedules the batch; there is no OMP-specific sandbox lifetime.
 pub async fn compare_omp(
     aiec: &LocalAiec,
     request: CompareOmpRequest,
 ) -> Result<CompareOmpResult, McpError> {
-    validate_repo_url(&request.omp_repo)?;
-    validate_repo_url(&request.target_repo)?;
-    validate_reference(&request.baseline_ref)?;
-    validate_reference(&request.candidate_ref)?;
-    validate_optional_reference(request.target_ref.as_deref())?;
-    validate_task(&request.task)?;
-    for command in &request.validation_commands {
-        validate_command(command, "validation command")?;
-    }
-
     let repetitions = resolve_repetitions(request.repetitions)?;
     let max_parallel = resolve_max_parallel(aiec, request.max_parallel);
     let evaluation_id = Uuid::now_v7();
-    let timeout = resolve_timeout(request.timeout_seconds);
-
-    let mut plan: Vec<(Side, &str)> = Vec::with_capacity(repetitions as usize * 2);
-    for _ in 0..repetitions {
-        plan.push((Side::Baseline, &request.baseline_ref));
-        plan.push((Side::Candidate, &request.candidate_ref));
-    }
-
-    let mut completed: Vec<(Side, Result<OmpRunResult, McpError>)> = Vec::with_capacity(plan.len());
-    for chunk in plan.chunks(max_parallel) {
-        let runs = chunk.iter().map(|(side, omp_ref)| {
+    let mut planned = Vec::with_capacity(repetitions as usize * 2);
+    let mut requests = Vec::with_capacity(repetitions as usize * 2);
+    for repetition in 0..repetitions {
+        for (side, revision) in [
+            ("baseline", &request.baseline_ref),
+            ("candidate", &request.candidate_ref),
+        ] {
             let run = OmpRunRequest {
                 runtime: request.runtime.clone(),
                 omp_repo: request.omp_repo.clone(),
-                omp_ref: (*omp_ref).to_owned(),
+                omp_ref: revision.clone(),
                 target_repo: request.target_repo.clone(),
                 target_ref: request.target_ref.clone(),
                 task: request.task.clone(),
                 setup_command: request.setup_command.clone(),
+                build_command: request.build_command.clone(),
                 omp_command: request.omp_command.clone(),
                 validation_commands: request.validation_commands.clone(),
-                timeout_seconds: Some(timeout),
-                // A comparison owns its sandboxes: they exist to be measured.
+                timeout_seconds: request.timeout_seconds,
                 keep_sandbox: false,
                 repetitions: 1,
+                resources: request.resources.clone(),
+                requirements: request.requirements.clone(),
+                environment: request.environment.clone(),
+                secrets: request.secrets.clone(),
             };
-            async move { (*side, run_omp_once(aiec, &run).await) }
-        });
-        completed.extend(join_all(runs).await);
-    }
-
-    // Every run above released its own sandbox before returning, so
-    // propagating the first failure here cannot leak one.
-    let mut baseline_runs = Vec::with_capacity(repetitions as usize);
-    let mut candidate_runs = Vec::with_capacity(repetitions as usize);
-    for (side, outcome) in completed {
-        let run = outcome?;
-        match side {
-            Side::Baseline => baseline_runs.push(run),
-            Side::Candidate => candidate_runs.push(run),
+            let mut durable = durable_omp_request(aiec, &run)?;
+            durable.matrix_id = Some(evaluation_id);
+            durable.idempotency_key = Some(format!("omp-{evaluation_id}-{side}-{repetition}"));
+            requests.push(durable);
+            planned.push((side, repetition, run));
         }
     }
-
+    let cells = aiec
+        .client()
+        .run_cells(&requests, max_parallel)
+        .await
+        .map_err(|error| map_client_error(&error))?;
+    let mut baseline_runs = Vec::with_capacity(repetitions as usize);
+    let mut candidate_runs = Vec::with_capacity(repetitions as usize);
+    let mut submission_failures = Vec::new();
+    for cell in cells {
+        let (side, repetition, requested) = &planned[cell.index];
+        if let Some(run) = cell.run {
+            let outcome = OmpRunResult::from_run(requested, run);
+            if *side == "baseline" {
+                baseline_runs.push(outcome);
+            } else {
+                candidate_runs.push(outcome);
+            }
+        } else {
+            submission_failures.push(OmpSubmissionFailure {
+                side: (*side).to_owned(),
+                repetition: *repetition,
+                error: cell
+                    .error
+                    .unwrap_or_else(|| "the control plane returned no Run".into()),
+            });
+        }
+    }
+    let mut baseline = SideSummary::from_runs("baseline", &request.baseline_ref, &baseline_runs);
+    let mut candidate =
+        SideSummary::from_runs("candidate", &request.candidate_ref, &candidate_runs);
+    for failure in &submission_failures {
+        let summary = if failure.side == "baseline" {
+            &mut baseline
+        } else {
+            &mut candidate
+        };
+        summary.failed_runs += 1;
+        summary.submission_failures += 1;
+        summary.last_output = tail_of(&failure.error);
+        summary.wall_time_ms = None;
+    }
     let sandbox_ids = baseline_runs
         .iter()
         .chain(candidate_runs.iter())
         .filter_map(|run| run.sandbox_id)
         .collect();
-
     Ok(CompareOmpResult {
         evaluation_id,
-        baseline: SideSummary::from_runs("baseline", &request.baseline_ref, &baseline_runs),
-        candidate: SideSummary::from_runs("candidate", &request.candidate_ref, &candidate_runs),
+        baseline,
+        candidate,
         sandbox_ids,
+        baseline_runs,
+        candidate_runs,
+        submission_failures,
         max_parallel,
     })
 }
@@ -957,48 +1031,6 @@ async fn head_revision(
 // Running things inside a sandbox
 // ---------------------------------------------------------------------------
 
-/// Clones one revision of a repository into `path` and returns the commit.
-///
-/// This is the one place a shell script is genuinely needed: `git init`,
-/// `remote add`, `fetch` and `checkout` are four commands over one directory.
-/// Fetching by revision rather than cloning a branch means a tag or a commit
-/// works exactly as well as a branch name. Every interpolated component is a
-/// validated URL or ref wrapped in single quotes.
-async fn clone_revision(
-    aiec: &LocalAiec,
-    sandbox_id: Uuid,
-    repo_url: &str,
-    reference: Option<&str>,
-    path: &str,
-    timeout_seconds: u64,
-) -> Result<String, McpError> {
-    // Without an explicit revision, fetch what the remote calls HEAD, so the
-    // default is pinned exactly the way an explicit revision is.
-    let wanted = reference.unwrap_or("HEAD");
-
-    let script = format!(
-        "set -e\n\
-         mkdir -p {target}\n\
-         git init -q {target}\n\
-         cd {target}\n\
-         git remote add origin {url}\n\
-         git fetch --depth 1 origin {rev}\n\
-         git checkout --detach FETCH_HEAD\n\
-         git rev-parse HEAD\n",
-        target = shell_quote(path),
-        url = shell_quote(repo_url),
-        rev = shell_quote(wanted),
-    );
-
-    let outcome = aiec
-        .exec_shell(sandbox_id, &script, timeout_seconds)
-        .await?;
-    if !succeeded(&outcome) {
-        return Err(git_failure(repo_url, reference, &outcome));
-    }
-    Ok(outcome.stdout.trim().to_owned())
-}
-
 /// Runs every validation, in order, and keeps the failures.
 ///
 /// A validation that exits non-zero is a result, not an error, so all of them
@@ -1032,56 +1064,6 @@ async fn run_validations(
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
-
-/// A git step that did not succeed.
-///
-/// A URL or revision the remote does not have is the caller's mistake. Anything
-/// else — no git in the image, no route to the remote, a full disk — means the
-/// sandbox could not do the job, which is a different thing for a caller to fix.
-fn git_failure(repo_url: &str, reference: Option<&str>, outcome: &ExecOutcome) -> McpError {
-    let what = match reference {
-        Some(reference) => format!("`{repo_url}` at `{reference}`"),
-        None => format!("`{repo_url}`"),
-    };
-    let code = if names_a_bad_target(&outcome.stderr) {
-        ErrorCode::InvalidArgument
-    } else {
-        ErrorCode::LocalRuntimeUnavailable
-    };
-    McpError::new(
-        code,
-        format!(
-            "could not check out {what} inside the sandbox: git exited {}: {}",
-            outcome.exit_code,
-            first_lines(&outcome.stderr, 4)
-        ),
-    )
-}
-
-/// Whether stderr blames the requested URL or revision rather than the sandbox.
-///
-/// The markers are the phrasings git servers actually use, and each one is
-/// specific: a bare `not found` is not one of them, because it also matches
-/// `git: not found`, which is a missing binary in the image and not a mistake
-/// the caller made.
-fn names_a_bad_target(stderr: &str) -> bool {
-    const MARKERS: [&str; 12] = [
-        "could not resolve host",
-        "unable to access",
-        "does not appear to be a git repository",
-        "repository not found",
-        "remote: not found",
-        "does not exist",
-        "couldn't find remote ref",
-        "unknown revision",
-        "not our ref",
-        "empty repository",
-        "authentication failed",
-        "access denied",
-    ];
-    let lowered = stderr.to_ascii_lowercase();
-    MARKERS.iter().any(|marker| lowered.contains(marker))
-}
 
 /// A workflow step that failed for a reason outside the caller's arguments.
 fn step_failure(what: &str, outcome: &ExecOutcome) -> McpError {
@@ -1355,6 +1337,9 @@ fn validate_omp_request(request: &OmpRunRequest) -> Result<(), McpError> {
     if let Some(setup) = &request.setup_command {
         validate_command(setup, "setup command")?;
     }
+    if let Some(build) = &request.build_command {
+        validate_command(build, "build command")?;
+    }
     if let Some(omp_command) = &request.omp_command {
         validate_command(omp_command, "omp command")?;
     }
@@ -1398,16 +1383,6 @@ fn resolve_timeout(timeout_seconds: Option<u64>) -> u64 {
         .clamp(1, 3_600)
 }
 
-/// Wraps a value so a shell reads it as one literal word.
-///
-/// Single quotes suppress every expansion; an embedded quote is closed,
-/// escaped and reopened, which is the only sequence a POSIX shell reads as a
-/// literal quote inside a single-quoted word.
-fn shell_quote(value: &str) -> String {
-    let escaped = value.replace('\'', "'\\''");
-    format!("'{escaped}'")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1423,8 +1398,15 @@ mod tests {
         }
     }
 
-    fn command(exit_code: i32) -> CommandResult {
-        CommandResult::new(exit_code, "out", "err", 10)
+    fn command(exit_code: i32) -> CommandOutcome {
+        CommandOutcome {
+            exit_code,
+            stdout: "out".into(),
+            stderr: "err".into(),
+            duration_ms: 10,
+            ok: exit_code == 0,
+            ..Default::default()
+        }
     }
 
     fn run(
@@ -1435,15 +1417,28 @@ mod tests {
         files: &[&str],
     ) -> OmpRunResult {
         OmpRunResult {
+            run_id: Uuid::nil(),
+            state: if success {
+                RunState::Succeeded
+            } else {
+                RunState::Failed
+            },
+            failure_reason: None,
             omp_ref: "refs/heads/main".to_owned(),
             target_ref: None,
+            actual_omp_ref: None,
+            actual_target_ref: None,
             sandbox_id: Some(Uuid::nil()),
-            runtime: DEFAULT_RUNTIME.to_owned(),
-            wall_time_ms: 100,
-            omp: command(exit_code),
+            runtime: Some(DEFAULT_RUNTIME.to_owned()),
+            wall_time_ms: Some(100),
+            phase_ms: BTreeMap::new(),
+            setup: Vec::new(),
+            cleanup_failed: None,
+            omp: Some(command(exit_code)),
             validations: validations.iter().map(|code| command(*code)).collect(),
             git_status: String::new(),
             git_diff: diff.to_owned(),
+            git_evidence_truncated: false,
             changed_files: files.iter().map(|file| (*file).to_owned()).collect(),
             success,
         }
@@ -1610,28 +1605,6 @@ mod tests {
         );
     }
 
-    // -- quoting -------------------------------------------------------------
-
-    #[test]
-    fn quoting_closes_and_reopens_around_an_embedded_quote() {
-        assert_eq!(shell_quote("main"), "'main'");
-        assert_eq!(shell_quote("/workspace/repo"), "'/workspace/repo'");
-        // A single quote cannot survive inside single quotes, so the word is
-        // closed, escaped and reopened and the payload stays one literal word.
-        assert_eq!(shell_quote("a'; id; '"), "'a'\\''; id; '\\'''");
-    }
-
-    #[test]
-    fn a_quoted_payload_carries_no_live_metacharacter() {
-        let quoted = shell_quote("https://x/o/r'; touch /tmp/pwned; #");
-        // Everything dangerous sits between the outer quotes. The payload's own
-        // quote becomes `'\''`, so the word holds two outer quotes plus three
-        // for the escaped one, and no quote in it is ever live.
-        assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
-        assert!(quoted.contains("'\\''"));
-        assert_eq!(quoted.matches('\'').count(), 5);
-    }
-
     // -- commands ------------------------------------------------------------
 
     #[test]
@@ -1704,29 +1677,11 @@ mod tests {
         assert_eq!(summary.failed_runs, 1);
         assert_eq!(summary.validation_passes, 3);
         assert_eq!(summary.validation_total, 4);
-        assert_eq!(summary.wall_time_ms, 200);
-        assert_eq!(summary.exit_codes, vec![0, 1]);
+        assert_eq!(summary.wall_time_ms, Some(200));
+        assert_eq!(summary.exit_codes, vec![Some(0), Some(1)]);
         // Distinct files across the runs, not a sum: `a.rs` was touched twice.
         assert_eq!(summary.changed_file_count, 3);
         assert_eq!(summary.total_diff_bytes, 15);
-    }
-
-    #[test]
-    fn a_summary_carries_the_label_it_was_given_and_never_ranks() {
-        // The two sides are aggregated independently, so neither can influence
-        // the other's numbers, and a label is never rewritten into a ranking.
-        let better =
-            SideSummary::from_runs("candidate", "next", &[run(true, 0, &[0], "x", &["a"])]);
-        let worse = SideSummary::from_runs("baseline", "main", &[run(false, 1, &[1], "", &[])]);
-        assert_eq!(better.label, "candidate");
-        assert_eq!(worse.label, "baseline");
-        assert_eq!(better.successful_runs, 1);
-        assert_eq!(worse.successful_runs, 0);
-        // Aggregating the candidate's runs again changes nothing: the summary
-        // is a function of its own runs alone.
-        let again = SideSummary::from_runs("candidate", "next", &[run(true, 0, &[0], "x", &["a"])]);
-        assert_eq!(better.exit_codes, again.exit_codes);
-        assert_eq!(better.total_diff_bytes, again.total_diff_bytes);
     }
 
     #[test]
@@ -1736,10 +1691,44 @@ mod tests {
         assert_eq!(summary.failed_runs, 0);
         assert_eq!(summary.validation_passes, 0);
         assert_eq!(summary.validation_total, 0);
-        assert_eq!(summary.wall_time_ms, 0);
+        assert_eq!(summary.wall_time_ms, None);
         assert!(summary.exit_codes.is_empty());
         assert_eq!(summary.changed_file_count, 0);
         assert_eq!(summary.total_diff_bytes, 0);
+    }
+
+    #[test]
+    fn preparation_failure_is_missing_task_not_a_synthetic_exit_or_duration() {
+        let mut failed = run(false, 0, &[], "", &[]);
+        failed.omp = None;
+        failed.wall_time_ms = None;
+        failed.setup = vec![command(23)];
+        failed.failure_reason = Some("agent build failed".into());
+        failed.cleanup_failed = Some(CleanupReport {
+            sandbox_id: Uuid::nil(),
+            error: "destroy refused".into(),
+        });
+        let summary = SideSummary::from_runs("baseline", "main", &[failed]);
+        assert_eq!(summary.exit_codes, vec![None]);
+        assert_eq!(summary.wall_time_ms, None);
+        assert_eq!(summary.missing_task_runs, 1);
+        assert_eq!(summary.setup_failures, 1);
+        assert_eq!(summary.cleanup_failures[0].error, "destroy refused");
+        assert!(summary.last_output.contains("agent build failed"));
+    }
+
+    #[test]
+    fn successful_task_and_failed_validation_outputs_remain_visible() {
+        let mut measured = run(false, 0, &[42], "", &[]);
+        measured.omp.as_mut().unwrap().stdout = "TASK_REACHED".into();
+        measured.omp.as_mut().unwrap().stderr.clear();
+        measured.validations[0].stdout.clear();
+        measured.validations[0].stderr = "CHECK_FAILED".into();
+        let summary = SideSummary::from_runs("candidate", "next", &[measured]);
+        assert_eq!(summary.exit_codes, vec![Some(0)]);
+        assert_eq!(summary.validation_passes, 0);
+        assert!(summary.last_output.contains("TASK_REACHED"));
+        assert!(summary.last_output.contains("CHECK_FAILED"));
     }
 
     // -- command validation --------------------------------------------------
@@ -1808,10 +1797,15 @@ mod tests {
             task: "fix the flaky test".to_owned(),
             setup_command: None,
             omp_command: None,
+            build_command: None,
             validation_commands: Vec::new(),
             timeout_seconds: None,
             keep_sandbox: false,
             repetitions: 1,
+            resources: None,
+            requirements: Default::default(),
+            environment: BTreeMap::new(),
+            secrets: Vec::new(),
         }
     }
 
@@ -1886,58 +1880,6 @@ mod tests {
     }
 
     // -- errors --------------------------------------------------------------
-
-    #[test]
-    fn a_missing_remote_is_the_callers_mistake_and_a_broken_sandbox_is_not() {
-        assert!(names_a_bad_target("ERROR: Repository not found."));
-        assert!(names_a_bad_target(
-            "fatal: unable to access 'https://github.com/owner/repo/': Could not resolve host"
-        ));
-        assert!(names_a_bad_target(
-            "ssh: Could not resolve hostname github.com: Name or service not known"
-        ));
-        assert!(names_a_bad_target("fatal: couldn't find remote ref main"));
-        assert!(names_a_bad_target("remote: HTTP Basic: Access denied"));
-        // The same shape of words, but about the machine rather than the URL.
-        assert!(!names_a_bad_target("/bin/sh: git: not found"));
-        assert!(!names_a_bad_target(
-            "fatal: could not read Username for 'https://x': No such device"
-        ));
-        assert!(!names_a_bad_target("No space left on device"));
-    }
-
-    #[test]
-    fn a_failed_clone_reports_the_target_and_the_typed_cause() {
-        let refused = git_failure(
-            "https://github.com/owner/repo",
-            Some("main"),
-            &ExecOutcome {
-                exit_code: 128,
-                stdout: String::new(),
-                stderr: "ERROR: Repository not found.\n".to_owned(),
-                timed_out: false,
-                duration_ms: 5,
-                truncated: false,
-            },
-        );
-        assert_eq!(refused.code, ErrorCode::InvalidArgument);
-        assert!(refused.message.contains("owner/repo"));
-        assert!(refused.message.contains("Repository not found"));
-
-        let broken = git_failure(
-            "https://github.com/owner/repo",
-            None,
-            &ExecOutcome {
-                exit_code: 127,
-                stdout: String::new(),
-                stderr: "git: not found".to_owned(),
-                timed_out: false,
-                duration_ms: 5,
-                truncated: false,
-            },
-        );
-        assert_eq!(broken.code, ErrorCode::LocalRuntimeUnavailable);
-    }
 
     #[test]
     fn a_failing_step_reports_both_streams_and_never_leaks_nothing() {

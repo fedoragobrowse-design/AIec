@@ -18,6 +18,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -41,11 +42,13 @@ dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap",
  "futures",
  "hex",
  "http",
+ "libc",
  "metrics",
  "parking_lot",
  "reqwest",
@@ -61,6 +64,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -70,6 +74,7 @@ dependencies = [
  "aiec-api",
  "aiec-client",
  "aiec-core",
+ "aiec-guard",
  "aiec-runtime",
  "aiec-storage",
  "anyhow",
@@ -106,18 +111,56 @@ dependencies = [
 name = "aiec-core"
 version = "0.1.0"
 dependencies = [
+ "aiec-guard",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "hex",
  "hmac",
+ "libc",
  "proptest",
  "serde",
  "serde_json",
  "sha2",
  "thiserror",
  "tokio",
+ "url",
  "uuid",
+]
+
+[[package]]
+name = "aiec-guard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "hickory-proto",
+ "http",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "libc",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -137,8 +180,10 @@ dependencies = [
 name = "aiec-mcp"
 version = "0.1.0"
 dependencies = [
+ "aiec-api",
  "aiec-client",
  "aiec-core",
+ "aiec-guard",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -165,8 +210,13 @@ name = "aiec-network-linux"
 version = "0.1.0"
 dependencies = [
  "aiec-core",
+ "aiec-guard",
  "async-trait",
  "chrono",
+ "hex",
+ "ipnet",
+ "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -176,8 +226,10 @@ name = "aiec-runtime"
 version = "0.1.0"
 dependencies = [
  "aiec-core",
+ "aiec-guard",
  "aiec-network-linux",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bollard",
  "bytes",
@@ -205,8 +257,10 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "futures-util",
  "hex",
  "hmac",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -214,6 +268,8 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -700,6 +756,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "critical-section"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+
+[[package]]
 name = "crossbeam-queue"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,6 +819,12 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "der"
@@ -817,6 +885,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "enum-as-inner"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1132,6 +1212,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hickory-proto"
+version = "0.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
+dependencies = [
+ "async-trait",
+ "cfg-if",
+ "data-encoding",
+ "enum-as-inner",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "idna",
+ "ipnet",
+ "once_cell",
+ "rand 0.9.5",
+ "ring",
+ "thiserror",
+ "tinyvec",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1444,6 +1549,9 @@ name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -1671,6 +1779,10 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+dependencies = [
+ "critical-section",
+ "portable-atomic",
+]
 
 [[package]]
 name = "once_cell_polyfill"
@@ -2383,6 +2495,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3065,6 +3190,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

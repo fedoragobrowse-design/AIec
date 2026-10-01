@@ -3,9 +3,11 @@ use aiec_core::run::{
     RunState, WorkloadSpec,
 };
 use aiec_core::*;
+use chrono::{DateTime, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
@@ -15,6 +17,7 @@ use uuid::Uuid;
 pub use aiec_core::run::{
     BatchOptions, CommandOutcome, Placement, RepoSpec, RunResults, RunSandbox,
 };
+pub use aiec_core::storage::{MatrixCell, MatrixCursor};
 
 /// The ceiling on a client-side batch, matching the control plane's own limit
 /// so a client cannot be the thing that makes a batch unbounded.
@@ -53,7 +56,7 @@ pub struct CreateRunRequest {
 }
 
 /// One collected artifact, with the path its bytes are served from.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RunArtifact {
     /// The record itself, flattened because that is how the API emits it.
     #[serde(flatten)]
@@ -78,39 +81,151 @@ pub struct RunCell {
     pub error: Option<String>,
 }
 
+/// A list of runs to execute under one concurrency bound.
+///
+/// The list, not the client's own scheduling: the control plane holds the
+/// window, so every cell is a run the platform knows about and a client that
+/// gives up cannot silently strand the rest.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalBatchRequest {
+    #[serde(default)]
+    pub requests: Vec<CreateRunRequest>,
+    #[serde(default)]
+    pub options: BatchOptions,
+}
+
+/// The same workload, run several times.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalRepetitionRequest {
+    pub request: CreateRunRequest,
+    #[serde(default = "one_repetition")]
+    pub repetitions: u32,
+    #[serde(default)]
+    pub options: BatchOptions,
+}
+
+fn one_repetition() -> u32 {
+    1
+}
+
+/// One matrix cell: a named combination of variables.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalMatrixCell {
+    /// The variable name and value, e.g. `{"model": "opus"}`.
+    pub axis: BTreeMap<String, String>,
+    pub request: CreateRunRequest,
+}
+
+/// A set of combinations to run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EvalMatrixSpec {
+    #[serde(default)]
+    pub cells: Vec<EvalMatrixCell>,
+    #[serde(default)]
+    pub options: BatchOptions,
+}
+
+/// One matrix cell's outcome, kept whole.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalCellResult {
+    pub axis: BTreeMap<String, String>,
+    /// The run itself, not a summary of it: the task, setup and validation
+    /// outcomes, the placement, the timings and the cleanup report are the
+    /// evidence, and an evaluation that kept only a pass/fail would discard
+    /// the part a reader needs.
+    ///
+    /// Absent when the cell was refused before it ran. The control plane
+    /// reports such a cell beside the ones that did run rather than failing the
+    /// whole request, so a client that insisted on a run for every cell would
+    /// turn a partial result back into the error the server was avoiding.
+    #[serde(default)]
+    pub run: Option<Run>,
+    /// Why this cell produced no run.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What a matrix produced.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalMatrixResult {
+    pub matrix_id: Uuid,
+    pub requested_at: DateTime<Utc>,
+    pub max_parallel: usize,
+    pub effective_parallel: usize,
+    pub results: Vec<EvalCellResult>,
+}
+
+/// A tenant-scoped bounded page; aggregates describe this page, not the matrix.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalMatrixPage {
+    pub matrix_id: Uuid,
+    pub cells: Vec<MatrixCell>,
+    pub successes: usize,
+    pub by_axis: BTreeMap<String, (usize, usize)>,
+    pub next: Option<MatrixCursor>,
+}
+
 /// How long the control plane gives a run that states no timeout of its own.
 const DEFAULT_RUN_TIMEOUT_SECONDS: u64 = 600;
 
 /// The ceiling on a run timeout, matching what the control plane clamps to.
 const MAX_RUN_TIMEOUT_SECONDS: u64 = 86_400;
 
-/// Slack added to a run's own timeout before the client stops waiting.
+/// How long the control plane can hold a run in its durable queue before it
+/// stops trying to claim one.
+///
+/// `POST /v1/runs` admits to the queue *before* it answers
+/// (`run_queue::enqueue_and_wait`), and an unclaimed run stays `queued` until
+/// `queue_deadline = now() + queue_timeout_seconds` before it even gets an
+/// execution deadline (`crates/aiec-storage/src/run_queue.rs`). The queue
+/// timeout is server configuration, so a client cannot read it from the task it
+/// was handed: it takes the validated ceiling rather than the 300 s default,
+/// because a deployment that raised `AIEC_RUN_QUEUE_TIMEOUT_SECONDS` would
+/// otherwise still time out this client.
+const MAX_RUN_QUEUE_WAIT_SECONDS: u64 = 86_400;
+
+/// Slack added on top of the queue deadline and a run's own timeout before the
+/// client stops waiting.
 ///
 /// The API drives a run to a terminal state before it answers, so the wait for
 /// `POST /v1/runs` *is* the run. A 60-second client timeout would abandon a
 /// perfectly healthy ten-minute workload and report it as a transport failure.
 ///
-/// It must also be *longer* than the server's own budget, by enough that the
-/// server always gives up first. The control plane adds a grace period on top of
-/// the stated timeout for placement and teardown; a client that waits less than
-/// that drops the connection while the server is still working, which cancels
-/// the run's future mid-flight, leaves the row non-terminal with no terminal
-/// event, and leaks the machine. Those are the runs that hold a machine longest,
-/// so the slack is what the failure costs most.
+/// It must also be *longer* than the server's own remaining budget, by enough
+/// that the server always gives up first. The control plane adds a grace period
+/// on top of the stated timeout for placement and teardown; a client that waits
+/// less than that drops the connection while the server is still working, which
+/// cancels the run's future mid-flight, leaves the row non-terminal with no
+/// terminal event, and leaks the machine. Those are the runs that hold a machine
+/// longest, so the slack is what the failure costs most.
+///
+/// With the queue ceiling above, the whole wait is checkable against
+/// `crates/aiec-storage/src/run_queue.rs`:
+///
+/// ```text
+/// queue_deadline  = now() + queue_timeout_seconds  (<= MAX_RUN_QUEUE_WAIT_SECONDS)
+/// execution_secs  = timeout_seconds + 120          (PLACEMENT_GRACE_SECONDS)
+/// answer         <= queue_deadline + execution_secs + the round trip
+/// ```
+///
+/// The queue allowance is per run, so `eval_timeout` and `longest_run_budget`
+/// multiply it by the cell count - which is what that wait has to cover anyway,
+/// since each cell is queued and executed separately.
 const RUN_RESPONSE_SLACK_SECONDS: u64 = 300;
 
-/// How long a cancel may take: it transitions the run, then waits for each
-/// machine it was holding to be destroyed.
-const CANCEL_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// The wait allowed for one run, taken from the timeout the workload states.
+/// The wait allowed for one run: the queue it may sit in, the execution it may
+/// take, and the slack between them and the answer.
 fn run_response_timeout(workload: &WorkloadSpec) -> Duration {
     let stated = workload
         .timeout_seconds
         .unwrap_or(DEFAULT_RUN_TIMEOUT_SECONDS)
         .clamp(30, MAX_RUN_TIMEOUT_SECONDS);
-    Duration::from_secs(stated + RUN_RESPONSE_SLACK_SECONDS)
+    Duration::from_secs(MAX_RUN_QUEUE_WAIT_SECONDS + stated + RUN_RESPONSE_SLACK_SECONDS)
 }
+
+/// How long a cancel may take: it transitions the run, then waits for each
+/// machine it was holding to be destroyed.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Checks a caller-stated batch limit against the bound the control plane puts
 /// on one, so a client cannot be the thing that makes a batch unbounded.
@@ -121,6 +236,28 @@ fn check_batch_parallelism(max_parallel: usize) -> Result<usize, ClientError> {
         )));
     }
     Ok(max_parallel)
+}
+
+/// The wait allowed for a whole evaluation.
+///
+/// The server can lower concurrency after admission. Until it advertises that
+/// window before the blocking response, only the serial bound covers every cell.
+///
+/// The queue allowance inside `per_run` is per run, so this multiplies it by the
+/// cell count - which is what the evaluation has to cover anyway, since each cell
+/// is queued and executed on its own.
+fn eval_timeout(per_run: Duration, cells: usize) -> Duration {
+    per_run.saturating_mul(u32::try_from(cells.max(1)).unwrap_or(u32::MAX))
+}
+
+/// The longest single-run wait in a set, which is the one the evaluation as a
+/// whole has to accommodate. An empty set falls back to the default budget
+/// rather than to a wait of nothing.
+fn longest_run_budget<'a>(workloads: impl Iterator<Item = &'a WorkloadSpec>) -> Duration {
+    workloads
+        .map(run_response_timeout)
+        .max()
+        .unwrap_or_else(|| run_response_timeout(&WorkloadSpec::default()))
 }
 
 #[derive(Debug, Error)]
@@ -506,6 +643,87 @@ impl AIecClient {
             .filter_map(|cell| cell.run)
             .collect())
     }
+
+    /// Runs a list of workloads under one concurrency bound, on the control
+    /// plane.
+    ///
+    /// The window is the server's, not the client's: every cell is a run the
+    /// platform knows about, and the answer comes back once they have all
+    /// settled, which is why the wait is sized for the whole batch.
+    pub async fn eval_batch(&self, request: &EvalBatchRequest) -> Result<Vec<Run>, ClientError> {
+        check_batch_parallelism(request.options.max_parallel)?;
+        let timeout = eval_timeout(
+            longest_run_budget(request.requests.iter().map(|cell| &cell.workload)),
+            request.requests.len(),
+        );
+        self.send(
+            self.request(reqwest::Method::POST, "/v1/eval/batch")
+                .timeout(timeout)
+                .json(request),
+        )
+        .await
+    }
+
+    /// Runs one workload several times, each repetition on its own machine.
+    pub async fn eval_repetitions(
+        &self,
+        request: &EvalRepetitionRequest,
+    ) -> Result<Vec<Run>, ClientError> {
+        check_batch_parallelism(request.options.max_parallel)?;
+        if request.repetitions == 0 {
+            return Err(ClientError::Configuration(
+                "repetitions must be at least 1".into(),
+            ));
+        }
+        let timeout = eval_timeout(
+            run_response_timeout(&request.request.workload),
+            request.repetitions as usize,
+        );
+        self.send(
+            self.request(reqwest::Method::POST, "/v1/eval/repetitions")
+                .timeout(timeout)
+                .json(request),
+        )
+        .await
+    }
+
+    /// Expands and runs a matrix, reporting every cell with its own run.
+    pub async fn eval_matrix(
+        &self,
+        spec: &EvalMatrixSpec,
+    ) -> Result<EvalMatrixResult, ClientError> {
+        check_batch_parallelism(spec.options.max_parallel)?;
+        let timeout = eval_timeout(
+            longest_run_budget(spec.cells.iter().map(|cell| &cell.request.workload)),
+            spec.cells.len(),
+        );
+        self.send(
+            self.request(reqwest::Method::POST, "/v1/eval/matrix")
+                .timeout(timeout)
+                .json(spec),
+        )
+        .await
+    }
+
+    /// Recovers one bounded page without loading every run in the matrix.
+    pub async fn eval_matrix_page(
+        &self,
+        matrix: Uuid,
+        limit: u32,
+        after: Option<MatrixCursor>,
+    ) -> Result<EvalMatrixPage, ClientError> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(after) = after {
+            query.push(("after_requested_at", after.requested_at.to_rfc3339()));
+            query.push(("after_id", after.id.to_string()));
+        }
+        self.send(
+            self.request(reqwest::Method::GET, &format!("/v1/eval/matrix/{matrix}"))
+                .query(&query),
+        )
+        .await
+    }
+
     async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<(), ClientError> {
         let response = request.send().await?;
         let status = response.status();
@@ -537,7 +755,7 @@ fn urlencode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The client's patience must exceed the server's budget.
+    /// The client's patience must exceed the server's budget, queue included.
     ///
     /// A client that gives up first does not merely fail: it drops the
     /// connection, the server's `execute` future is cancelled mid-flight, and
@@ -546,21 +764,41 @@ mod tests {
     /// hold compute longest - the opposite of what a shorter timeout buys.
     #[test]
     fn the_client_outlasts_the_servers_own_budget() {
-        // Mirrors the control plane's PLACEMENT_GRACE_SECONDS. Duplicated on
-        // purpose rather than imported: if the server ever changes its grace,
-        // this assertion should fail loudly here instead of both sides moving
-        // together and nobody noticing the relationship.
+        // Mirrors the control plane's PLACEMENT_GRACE_SECONDS and the
+        // `1..=86_400` check on RunQueueLimits::queue_timeout_seconds.
+        // Duplicated on purpose rather than imported: if the server ever
+        // changes either bound, this assertion should fail loudly here instead
+        // of both sides moving together and nobody noticing the relationship.
         const SERVER_PLACEMENT_GRACE_SECONDS: u64 = 120;
+        const SERVER_MAX_QUEUE_WAIT_SECONDS: u64 = 86_400;
         const _: () = assert!(
             RUN_RESPONSE_SLACK_SECONDS > SERVER_PLACEMENT_GRACE_SECONDS,
             "the client gives up before the server does: a client that drops the \
              connection mid-run cancels the server's future and leaks the machine"
         );
+        const _: () = assert!(
+            MAX_RUN_QUEUE_WAIT_SECONDS >= SERVER_MAX_QUEUE_WAIT_SECONDS,
+            "the client waits less than the queue can hold a run, so a run that \
+             waits its whole queue deadline times out with no run id while the \
+             server keeps executing it"
+        );
         let workload = WorkloadSpec {
             timeout_seconds: Some(600),
             ..WorkloadSpec::default()
         };
-        assert_eq!(run_response_timeout(&workload).as_secs(), 900);
+        let wait = run_response_timeout(&workload).as_secs();
+        assert_eq!(
+            wait,
+            SERVER_MAX_QUEUE_WAIT_SECONDS + 600 + RUN_RESPONSE_SLACK_SECONDS
+        );
+        // The queue is spent before execution begins, so the whole server
+        // budget - the deadline it may sit queued for, then the execution it
+        // may take once claimed - has to fit inside the wait.
+        assert!(
+            wait > SERVER_MAX_QUEUE_WAIT_SECONDS + 600 + SERVER_PLACEMENT_GRACE_SECONDS,
+            "a run queued for {SERVER_MAX_QUEUE_WAIT_SECONDS}s then executed for \
+            600s would still be running when the client gives up"
+        );
     }
 
     use super::*;
@@ -648,6 +886,7 @@ mod tests {
             idempotency_key: None,
             parent_run_id: None,
             matrix_id: None,
+            matrix_cell: None,
         }
     }
 
@@ -739,6 +978,46 @@ mod tests {
                 AxumStatus::OK,
                 serde_json::json!([run_document(RunState::Running)]),
             ),
+            // The evaluation routes answer with the runs and nothing else: one
+            // per cell that was asked for, exactly as the API returns them.
+            "/v1/eval/batch" | "/v1/eval/repetitions" => {
+                let cells = if path == "/v1/eval/batch" {
+                    body.get("requests")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                } else {
+                    body.get("repetitions").and_then(Value::as_u64).unwrap_or(0) as usize
+                };
+                let runs: Vec<Value> = (0..cells)
+                    .map(|_| run_document(RunState::Succeeded))
+                    .collect();
+                (AxumStatus::OK, serde_json::json!(runs))
+            }
+            "/v1/eval/matrix" => {
+                let results: Vec<Value> = body["cells"]
+                    .as_array()
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .map(|cell| {
+                                serde_json::json!({
+                                    "axis": cell["axis"],
+                                    "run": run_document(RunState::Succeeded),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (
+                    AxumStatus::OK,
+                    serde_json::json!({
+                        "matrix_id": Uuid::now_v7(),
+                        "requested_at": Utc::now().to_rfc3339(),
+                        "max_parallel": body["options"]["max_parallel"],
+                        "results": results,
+                    }),
+                )
+            }
             other if other.ends_with("/events") => (AxumStatus::OK, serde_json::json!([])),
             other if other.ends_with("/artifacts") => (
                 AxumStatus::OK,
@@ -806,6 +1085,7 @@ mod tests {
             memory_mb: 2048,
             disk_mb: 4096,
             network: NetworkPolicy::Internet,
+            guard: None,
         };
         wanted.requirements.full_kernel_isolation = true;
         wanted.retention = RetentionPolicy::KeepOnFailure;
@@ -1071,5 +1351,83 @@ mod tests {
             "a batch with no parallelism cannot run anything"
         );
         serving.abort();
+    }
+
+    /// A repetition count of zero and a bound of zero are both ways of
+    /// evaluating nothing, and both are refused here rather than being sent
+    /// and answered with an empty success.
+    #[tokio::test]
+    async fn an_evaluation_that_would_run_nothing_is_refused_before_it_is_sent() {
+        let stub = Stub::new();
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+        let base = EvalRepetitionRequest {
+            request: request(&["true"]),
+            repetitions: 0,
+            options: BatchOptions { max_parallel: 2 },
+        };
+
+        assert!(client.eval_repetitions(&base).await.is_err());
+        assert!(
+            client
+                .eval_repetitions(&EvalRepetitionRequest {
+                    repetitions: 3,
+                    ..base.clone()
+                })
+                .await
+                .is_ok(),
+            "three repetitions of the same workload is the ordinary case"
+        );
+        assert!(
+            client
+                .eval_batch(&EvalBatchRequest {
+                    requests: vec![request(&["true"])],
+                    options: BatchOptions { max_parallel: 0 },
+                })
+                .await
+                .is_err(),
+            "a bound of zero cannot run anything"
+        );
+        let paths: Vec<String> = stub
+            .requests()
+            .await
+            .into_iter()
+            .map(|seen| seen.path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/v1/eval/repetitions"],
+            "only the request that could run something was sent"
+        );
+        serving.abort();
+    }
+
+    /// The slowest cell is the one the whole evaluation has to accommodate.
+    #[test]
+    fn an_evaluation_waits_for_its_slowest_cell() {
+        let short = WorkloadSpec {
+            timeout_seconds: Some(60),
+            ..Default::default()
+        };
+        let long = WorkloadSpec {
+            timeout_seconds: Some(3600),
+            ..Default::default()
+        };
+        // Literal seconds, not the constants the implementation adds: this is
+        // where the arithmetic is pinned, so a reader can check 86_400 (queue
+        // ceiling) + stated timeout + 300 (slack) against run_queue.rs. The
+        // queue allowance is per run, so it appears in every cell's share of an
+        // evaluation's wait.
+        assert_eq!(
+            longest_run_budget([&short, &long].into_iter()).as_secs(),
+            90_300,
+            "a fast cell does not shorten the wait for a slow one"
+        );
+        assert_eq!(
+            longest_run_budget([&short].into_iter()).as_secs(),
+            86_760,
+            "a cell's own budget is waited out, after the queue it may sit in, \
+             plus the slack the server needs"
+        );
     }
 }

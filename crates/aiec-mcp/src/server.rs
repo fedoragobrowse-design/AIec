@@ -187,6 +187,9 @@ pub struct TestOmpArgs {
     pub task: String,
     #[serde(default)]
     pub setup_command: Option<Vec<String>>,
+    /// Builds the OMP checkout. Defaults to Bun install and build.
+    #[serde(default)]
+    pub build_command: Option<Vec<String>>,
     #[serde(default)]
     pub omp_command: Option<Vec<String>>,
     #[serde(default)]
@@ -195,15 +198,31 @@ pub struct TestOmpArgs {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub keep_sandbox: Option<bool>,
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub disk_mb: Option<u32>,
+    #[serde(default)]
+    pub requirements: Option<crate::runs::RunRequirements>,
+    /// Non-secret environment only. Use `secrets` for tenant credential references.
+    #[serde(default)]
+    pub environment: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CompareOmpArgs {
     pub omp_repo: String,
-    /// Prepares the agent before it runs, exactly as for `aiec_test_omp`.
+    /// Prepares the target repository before the agent runs.
     #[serde(default)]
     pub setup_command: Option<Vec<String>>,
-    /// The command that runs the agent. Defaults to `["omp", "run"]`.
+    /// Builds the OMP checkout. Defaults to Bun install and build.
+    #[serde(default)]
+    pub build_command: Option<Vec<String>>,
+    /// Override invocation, with the task on stdin and in OMP_TASK.
     #[serde(default)]
     pub omp_command: Option<Vec<String>>,
     /// Runtime for every sandbox the comparison creates.
@@ -223,6 +242,19 @@ pub struct CompareOmpArgs {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub max_parallel: Option<usize>,
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub disk_mb: Option<u32>,
+    #[serde(default)]
+    pub requirements: Option<crate::runs::RunRequirements>,
+    /// Non-secret environment only. Use `secrets` for tenant credential references.
+    #[serde(default)]
+    pub environment: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub secrets: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +524,9 @@ keep_sandbox is set.",
     /// Builds one OMP revision in a clean sandbox and runs it against a target repo.
     #[tool(
         name = "aiec_test_omp",
-        description = "In a fresh local sandbox, clone a given OMP revision, build it, clone a \
-target repository, run OMP against a task, run validations and return structured evidence. \
-Set keep_sandbox to leave the machine for debugging.",
+        description = "Submit an ordinary durable Run on the local AIec control plane, clone \
+and build a given OMP revision, run its Bun checkout launcher against a target task, and \
+return real setup, task, validation, git and cleanup evidence. Set keep_sandbox for debugging.",
         annotations(
             title = "Test OMP revision",
             read_only_hint = false,
@@ -516,11 +548,22 @@ Set keep_sandbox to leave the machine for debugging.",
                     target_ref: args.target_ref,
                     task: args.task,
                     setup_command: args.setup_command,
+                    build_command: args.build_command,
                     omp_command: args.omp_command,
                     validation_commands: args.validation_commands.unwrap_or_default(),
                     timeout_seconds: args.timeout_seconds,
                     keep_sandbox: args.keep_sandbox.unwrap_or(false),
                     repetitions: 1,
+                    resources: Some(aiec_core::run::ResourceRequirements {
+                        cpu: args.cpu.unwrap_or(2),
+                        memory_mb: args.memory_mb.unwrap_or(2048),
+                        disk_mb: args.disk_mb.unwrap_or(2048),
+                        network: aiec_core::network::NetworkPolicy::Internet,
+                        guard: None,
+                    }),
+                    requirements: args.requirements.unwrap_or_default().into(),
+                    environment: args.environment.unwrap_or_default(),
+                    secrets: args.secrets.unwrap_or_default(),
                 },
             )
             .await
@@ -557,11 +600,22 @@ measurements. Returns measurements only, never a judgement about which is better
                     target_ref: args.target_ref,
                     task: args.task,
                     setup_command: args.setup_command,
+                    build_command: args.build_command,
                     omp_command: args.omp_command,
                     validation_commands: args.validation_commands.unwrap_or_default(),
                     repetitions: args.repetitions,
                     timeout_seconds: args.timeout_seconds,
                     max_parallel: Some(max_parallel),
+                    resources: Some(aiec_core::run::ResourceRequirements {
+                        cpu: args.cpu.unwrap_or(2),
+                        memory_mb: args.memory_mb.unwrap_or(2048),
+                        disk_mb: args.disk_mb.unwrap_or(2048),
+                        network: aiec_core::network::NetworkPolicy::Internet,
+                        guard: None,
+                    }),
+                    requirements: args.requirements.unwrap_or_default().into(),
+                    environment: args.environment.unwrap_or_default(),
+                    secrets: args.secrets.unwrap_or_default(),
                 },
             )
             .await
@@ -661,6 +715,13 @@ impl AiecMcp {
                 };
                 if let Some(object) = details.as_object_mut() {
                     object.insert("code".to_owned(), json!(error.code.as_str()));
+                    // The sandbox id travels with the failure. A destroy that
+                    // leaves a machine behind is the case that matters: the
+                    // caller has to be able to name the machine it still holds,
+                    // and the resource path already reports it this way.
+                    if let Some(id) = &error.sandbox_id {
+                        object.insert("sandbox_id".to_owned(), json!(id));
+                    }
                     object.insert("request_id".to_owned(), json!(request_id.to_string()));
                 }
                 Err(McpErrorData::invalid_params(
@@ -838,3 +899,105 @@ pub type Shared = Arc<AiecMcp>;
 
 /// Error code for an unreachable control plane, re-exported for callers.
 pub const UNAVAILABLE: ErrorCode = ErrorCode::AiecApiUnavailable;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server pointed at an address nothing answers on: `report` never
+    /// reaches the control plane in these tests, so the endpoint is only there
+    /// to satisfy the local-only check.
+    fn server() -> AiecMcp {
+        let config = Config {
+            bind: "127.0.0.1:0".parse().expect("a socket address"),
+            endpoint: crate::guard::LocalEndpoint::parse("http://127.0.0.1:1", false)
+                .expect("loopback is local"),
+            api_key: "test-key".to_owned(),
+            token: Arc::new(zeroize::Zeroizing::new("test-token".to_owned())),
+            max_parallel: 1,
+            default_ttl_seconds: 1800,
+            max_output_bytes: 1_048_576,
+            cleanup_on_shutdown: false,
+        };
+        AiecMcp::new(&config).expect("a local endpoint builds a client")
+    }
+
+    /// The machine a destroy could not clean up is still the caller's to
+    /// dispose of, so the id has to arrive with the error. Without it the
+    /// caller is left holding a sandbox it can neither identify nor clean up.
+    #[tokio::test]
+    async fn a_tool_error_names_the_sandbox_it_could_not_clean_up() {
+        let id = Uuid::now_v7();
+        let failure = server()
+            .report("aiec_destroy_sandbox", async {
+                Err::<serde_json::Value, McpError>(
+                    McpError::new(
+                        ErrorCode::AiecApiUnavailable,
+                        "the sandbox is still `running` after destroy was requested",
+                    )
+                    .with_sandbox(id),
+                )
+            })
+            .await
+            .expect_err("the tool failed");
+
+        let details = failure.data.expect("the error carries details");
+        assert_eq!(
+            details["sandbox_id"].as_str(),
+            Some(id.to_string().as_str()),
+            "the tool error dropped the sandbox id: {details}"
+        );
+    }
+
+    /// The id is added to whatever the tool already attached, not in place of
+    /// it: the reason for the failure is what the caller acts on first.
+    #[tokio::test]
+    async fn a_tool_error_keeps_its_own_details_alongside_the_sandbox_id() {
+        let id = Uuid::now_v7();
+        let failure = server()
+            .report("aiec_destroy_sandbox", async {
+                Err::<serde_json::Value, McpError>(
+                    McpError::new(
+                        ErrorCode::AiecApiUnavailable,
+                        "the sandbox is still `running`",
+                    )
+                    .with_sandbox(id)
+                    .with_details(json!({ "state": "running" })),
+                )
+            })
+            .await
+            .expect_err("the tool failed");
+
+        let details = failure.data.expect("the error carries details");
+        assert_eq!(
+            details["sandbox_id"].as_str(),
+            Some(id.to_string().as_str())
+        );
+        assert_eq!(details["state"].as_str(), Some("running"));
+        assert_eq!(
+            details["code"].as_str(),
+            Some(ErrorCode::AiecApiUnavailable.as_str())
+        );
+    }
+
+    /// A failure with no sandbox to name says so by omission rather than
+    /// reporting an empty id the caller might try to act on.
+    #[tokio::test]
+    async fn a_tool_error_without_a_sandbox_carries_no_sandbox_id() {
+        let failure = server()
+            .report("aiec_list_sandboxes", async {
+                Err::<serde_json::Value, McpError>(McpError::new(
+                    ErrorCode::AiecApiUnavailable,
+                    "the local AIec control plane is unreachable",
+                ))
+            })
+            .await
+            .expect_err("the tool failed");
+
+        let details = failure.data.expect("the error carries details");
+        assert!(
+            details.get("sandbox_id").is_none(),
+            "an empty sandbox id was invented: {details}"
+        );
+    }
+}

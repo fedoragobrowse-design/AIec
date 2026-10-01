@@ -6,9 +6,14 @@ license.workspace = true
 
 [dependencies]
 aiec-core.workspace = true
+aiec-guard.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+ipnet.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
-uuid.workspace = true

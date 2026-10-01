@@ -8,11 +8,19 @@ use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::{io::AsyncWriteExt, process::Command};
 
+mod guard;
+pub use guard::GuardNetworkManager;
+
 /// Address space the per-sandbox point-to-point subnets are carved from.
 const TAP_BASE: &str = "172.30";
 /// Prefix length of a per-sandbox link.
 const TAP_PREFIX: u8 = 30;
-
+/// How many independent links the address space holds.
+///
+/// 16 third octets of 64 aligned /30s each. The count matters less than the
+/// alignment: a /30 whose network address is not a multiple of four is not a
+/// network, and `ip` and nftables both mask it down to the nearest one that is.
+const TAP_SLOTS: u32 = 1024;
 /// Addresses of the point-to-point link between the host TAP and the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TapAddressPlan {
@@ -26,15 +34,19 @@ struct TapAddressPlan {
 
 /// Derives a stable point-to-point subnet from a sandbox identifier.
 ///
-/// The /30 is selected on the third octet only, so the host always owns `.1` and
-/// the guest always owns `.2`; no sandbox can be handed a network or broadcast
-/// address, or an address outside the sandbox's own subnet.
+/// The /30 is aligned to four addresses, so the declared network is the network
+/// the kernel and nftables actually use, and the host always owns `.1` of it
+/// while the guest owns `.2`. No sandbox can be handed a network or broadcast
+/// address, an address outside its own subnet, or a subnet another sandbox
+/// already holds.
 fn tap_address_plan(id: SandboxId) -> TapAddressPlan {
-    let third = ((id.as_u128() % 200) as u8) + 8;
+    let slot = (id.as_u128() % u128::from(TAP_SLOTS)) as u32;
+    let third = 8 + (slot / 64) as u8;
+    let fourth = (slot % 64) * 4;
     TapAddressPlan {
-        network: format!("{TAP_BASE}.{third}.0/{TAP_PREFIX}"),
-        host: format!("{TAP_BASE}.{third}.1"),
-        guest: format!("{TAP_BASE}.{third}.2"),
+        network: format!("{TAP_BASE}.{third}.{fourth}/{TAP_PREFIX}"),
+        host: format!("{TAP_BASE}.{third}.{}", fourth + 1),
+        guest: format!("{TAP_BASE}.{third}.{}", fourth + 2),
     }
 }
 
@@ -286,37 +298,128 @@ mod tests {
     #[test]
     fn subnet_allocation_is_always_a_valid_point_to_point_link() {
         fn assert_valid(plan: &TapAddressPlan) {
-            let (network, prefix) = plan.network.rsplit_once('/').expect("cidr suffix");
-            let host = plan.host.clone();
-            let guest = plan.guest.clone();
-            let third: u8 = host
-                .split('.')
-                .nth(2)
-                .expect("third octet")
-                .parse()
-                .expect("numeric third octet");
-            assert!(
-                (8..=207).contains(&third),
-                "third octet {third} out of range"
-            );
-            let expected = format!("{TAP_BASE}.{third}");
-            assert_eq!(network, format!("{expected}.0").as_str());
+            let (address, prefix) = plan.network.rsplit_once('/').expect("cidr suffix");
             assert_eq!(prefix, TAP_PREFIX.to_string());
-            assert_eq!(host, format!("{expected}.1").as_str());
-            assert_eq!(guest, format!("{expected}.2").as_str());
+            let mut octets: Vec<u8> = address
+                .split('.')
+                .map(|part| part.parse().expect("numeric octet"))
+                .collect();
+            assert_eq!(octets.len(), 4, "a dotted quad");
+            assert_eq!(octets[0], 172, "{address} is outside the reserved range");
+            assert!(
+                (8..=23).contains(&octets[2]),
+                "{address} is outside the reserved range"
+            );
+            // Aligned: the last octet of a /30 network address is a multiple of
+            // four, and `.1` and `.2` of that block are the two usable hosts.
+            let block = octets.pop().expect("fourth octet");
+            assert_eq!(block % 4, 0, "{address} is not aligned to a /30");
+            let stem = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
+            assert_eq!(address, format!("{stem}.{block}").as_str());
+            assert_eq!(plan.host, format!("{stem}.{}", block + 1).as_str());
+            assert_eq!(plan.guest, format!("{stem}.{}", block + 2).as_str());
         }
 
-        // Every reachable third octet maps to a distinct subnet, and each sandbox
-        // ends up with a usable host and guest address on its own /30.
+        // Every slot in the address space maps to a distinct subnet, and each
+        // sandbox ends up with a usable host and guest address on its own /30.
         let mut seen = std::collections::HashSet::new();
-        for index in 0..200u128 {
+        for index in 0..u128::from(TAP_SLOTS) {
             let plan = tap_address_plan(uuid::Uuid::from_u128(index));
             assert_valid(&plan);
             assert!(seen.insert(plan.network.clone()));
         }
+        assert_eq!(seen.len(), TAP_SLOTS as usize, "the pool is fully used");
+        // Two identifiers that differ only in the low bits have to land on
+        // different links, because that is exactly the case an unaligned plan
+        // collapses.
+        for index in 1..u128::from(TAP_SLOTS) {
+            let a = tap_address_plan(uuid::Uuid::from_u128(index - 1));
+            let b = tap_address_plan(uuid::Uuid::from_u128(index));
+            assert_ne!(a.network, b.network);
+            assert_ne!(a.host, b.host);
+        }
+        // And the pool wraps rather than running off the end of the address
+        // space, so a sandbox beyond the last slot still gets a real link.
+        assert_valid(&tap_address_plan(uuid::Uuid::from_u128(u128::from(
+            TAP_SLOTS,
+        ))));
         for _ in 0..256 {
             assert_valid(&tap_address_plan(uuid::Uuid::now_v7()));
         }
+    }
+
+    /// The declared network has to BE a network address, and it has to be the
+    /// one the host and guest actually end up on.
+    ///
+    /// The old plan took the third octet from the identifier and wrote it into
+    /// `/30` unaligned, so `172.30.9.0/30` was handed to `ip` and to nftables.
+    /// Both mask it to `172.30.8.0/30`, which meant a sandbox with third octet 9
+    /// and one with third octet 8 were given the same subnet and the same host
+    /// address on two different links, while the rules named a network that
+    /// does not exist. The old distinctness check compared the unnormalised
+    /// strings, so it passed on values that collide.
+    #[test]
+    fn every_subnet_is_aligned_and_two_sandboxes_never_share_one() {
+        /// The address `network` masks to at its prefix length.
+        fn masked(network: &str) -> String {
+            let (address, prefix) = network.split_once('/').expect("cidr suffix");
+            let prefix: u32 = prefix.parse().expect("prefix length");
+            let octets: Vec<u32> = address
+                .split('.')
+                .map(|part| part.parse().expect("numeric octet"))
+                .collect();
+            let bits = 32 - prefix;
+            let value = octets.iter().fold(0u32, |acc, octet| (acc << 8) | octet);
+            let masked = if bits >= 32 {
+                value
+            } else {
+                value & (!0u32 << bits)
+            };
+            format!(
+                "{}.{}.{}.{}/{prefix}",
+                (masked >> 24) & 0xff,
+                (masked >> 16) & 0xff,
+                (masked >> 8) & 0xff,
+                masked & 0xff
+            )
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..u128::from(TAP_SLOTS) {
+            let plan = tap_address_plan(uuid::Uuid::from_u128(index));
+            assert_eq!(
+                masked(&plan.network),
+                plan.network,
+                "{} is not a /{TAP_PREFIX} network address",
+                plan.network
+            );
+            // The host and the guest sit either side of the link, inside the
+            // subnet they are told about, and neither is the network or the
+            // broadcast address.
+            let block = plan.network.split_once('/').expect("cidr suffix").0;
+            let prefix = format!("{}.", block.rsplit_once('.').expect("dotted quad").0);
+            for address in [&plan.host, &plan.guest] {
+                assert!(
+                    address.starts_with(&prefix),
+                    "{address} is not inside {}",
+                    plan.network
+                );
+            }
+            assert!(
+                seen.insert(plan.network.clone()),
+                "two ids share {}",
+                plan.network
+            );
+        }
+        // The pool wraps, so two identifiers more than a pool apart can share a
+        // subnet. That is only safe while they are not live at the same time,
+        // which is what the pool size buys: 1024 links against a cluster that
+        // runs a few dozen sandboxes at once.
+        assert_eq!(
+            tap_address_plan(uuid::Uuid::from_u128(0)).network,
+            tap_address_plan(uuid::Uuid::from_u128(u128::from(TAP_SLOTS))).network,
+            "the pool wraps rather than running out of addresses"
+        );
     }
 
     #[test]

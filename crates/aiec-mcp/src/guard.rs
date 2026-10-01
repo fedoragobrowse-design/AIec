@@ -56,19 +56,20 @@ impl LocalEndpoint {
                     "the AIec base URL must be http:// or https://, got `{trimmed}`"
                 ))
             })?;
+        let scheme = &trimmed[..trimmed.len() - rest.len()];
 
-        // Authority ends at the first '/', '?' or '#'.
-        let authority = rest
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default()
-            .to_owned();
+        // Authority ends at the first '/', '?' or '#'; what follows is path,
+        // query and fragment, kept as written.
+        let (authority, tail) = match rest.find(['/', '?', '#']) {
+            Some(at) => (&rest[..at], &rest[at..]),
+            None => (rest, ""),
+        };
         // Strip any userinfo and IPv6 brackets, then keep host and port.
         let authority = match authority.rsplit_once('@') {
-            Some((_, host)) => host.to_owned(),
+            Some((_, host)) => host,
             None => authority,
         };
-        let (host, _port) = split_host_port(&authority);
+        let (host, _port) = split_host_port(authority);
 
         if host.is_empty() {
             return Err(McpError::invalid(format!(
@@ -78,7 +79,13 @@ impl LocalEndpoint {
 
         let locality = classify_host(&host, allow_private_network)?;
         Ok(Self {
-            url: trimmed.trim_end_matches('/').to_owned(),
+            // Rebuilt from the userinfo-free authority rather than kept as
+            // `trimmed`: this string is logged at startup, returned by
+            // aiec_health and served on the unauthenticated /health route, so a
+            // credential embedded in the URL must not survive parsing.
+            url: format!("{scheme}{authority}{tail}")
+                .trim_end_matches('/')
+                .to_owned(),
             host,
             is_loopback: locality == Locality::Loopback,
         })
@@ -330,6 +337,33 @@ mod tests {
         let error =
             LocalEndpoint::parse("https://127.0.0.1@api.aiec.gobrowse.dev", false).unwrap_err();
         assert!(error.message.contains("aiec.gobrowse.dev"));
+    }
+
+    /// The userinfo is dropped to make the host decision, so it must not be
+    /// kept for anything else either: `url` is printed at startup, returned by
+    /// the health tool and served on the unauthenticated /health route.
+    #[test]
+    fn userinfo_is_stripped_from_the_stored_url() {
+        let endpoint = LocalEndpoint::parse("https://af_live_secret@127.0.0.1:18443/", false)
+            .expect("a loopback host is local whoever the userinfo claims");
+        assert_eq!(endpoint.url, "https://127.0.0.1:18443");
+        assert!(
+            !endpoint.url.contains("af_live_secret"),
+            "the stored URL still carries the credential: {}",
+            endpoint.url
+        );
+        assert!(endpoint.is_loopback());
+        assert_eq!(endpoint.host(), "127.0.0.1");
+    }
+
+    /// Only the userinfo is removed; the path and query are the operator's and
+    /// the locality decision is unaffected either way.
+    #[test]
+    fn stripping_userinfo_keeps_the_path_and_the_locality() {
+        let endpoint =
+            LocalEndpoint::parse("http://user:pw@127.0.0.1:18443/v1/?debug=1", false).unwrap();
+        assert_eq!(endpoint.url, "http://127.0.0.1:18443/v1/?debug=1");
+        assert!(endpoint.is_loopback());
     }
 
     #[test]

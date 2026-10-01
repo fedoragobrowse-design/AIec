@@ -13,12 +13,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aiec_core::TenantId;
-use aiec_core::run::{RepoSpec, RetentionPolicy, RunState, WorkloadSpec};
+use aiec_core::network::NetworkPolicy;
+use aiec_core::run::{
+    CapabilityRequirements, RepoSpec, ResourceRequirements, RetentionPolicy, Run, RunState,
+    WorkloadSpec,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::eval_matrix::{CellResult, MatrixCell, MatrixResult, MatrixSpec, run_matrix};
+use crate::eval_matrix::{MatrixCell, MatrixSpec, run_matrix};
 use crate::runs::RunRequest;
 use crate::{AppState, CoreError};
 
@@ -35,10 +39,13 @@ pub struct OmpRunSpec {
     pub target_repo: String,
     #[serde(default)]
     pub target_ref: Option<String>,
-    /// Prepares the agent before it runs.
+    /// Prepares the target repository after the agent checkout is ready.
     #[serde(default)]
     pub setup_command: Option<Vec<String>>,
-    /// Runs the agent. Defaults to `omp run` with the task on stdin.
+    /// Builds the agent in its checkout. Defaults to `bun install && bun run build`.
+    #[serde(default)]
+    pub build_command: Option<Vec<String>>,
+    /// Runs the checkout's Bun launcher in print mode, with the task as an argument.
     #[serde(default)]
     pub omp_command: Option<Vec<String>>,
     /// Checked after the agent finishes. All of them run, even after one fails.
@@ -46,6 +53,21 @@ pub struct OmpRunSpec {
     pub validations: Vec<Vec<String>>,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub resources: Option<ResourceRequirements>,
+    #[serde(default)]
+    pub requirements: CapabilityRequirements,
+    #[serde(default)]
+    pub retention: Option<RetentionPolicy>,
+    #[serde(default)]
+    pub retained_seconds: Option<i64>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Tenant secret references only, never credential values.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 fn default_repetitions() -> u32 {
@@ -73,7 +95,12 @@ pub struct OmpComparisonSpec {
 /// Documented rather than clever: a caller overrides it when the agent's CLI
 /// differs, and the command that actually ran is visible in the run's results
 /// so nobody has to guess.
-pub const DEFAULT_OMP_COMMAND: &[&str] = &["omp", "run"];
+pub const DEFAULT_OMP_COMMAND: &[&str] = &[
+    "/bin/sh",
+    "/workspace/omp/packages/coding-agent/scripts/omp",
+    "--print",
+    "--",
+];
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -84,55 +111,151 @@ fn shell_quote(value: &str) -> String {
 /// The agent is cloned and built as *setup*, the task is the *command*, and the
 /// checks are *validations* — three things the platform already schedules. The
 /// only OMP-specific part left is the command itself.
-pub fn to_run_request(spec: &OmpRunSpec) -> RunRequest {
-    // A caller's setup is one command; the workload takes a list of them.
-    let setup = spec
-        .setup_command
-        .clone()
-        .map(|command| vec![command])
-        .unwrap_or_else(|| {
-            vec![vec![
-                "/bin/sh".to_owned(),
-                "-lc".to_owned(),
-                format!(
-                    // No `|| true` on the build. This tool exists to compare
-                    // revisions, and a revision that does not build is the most
-                    // important thing it can report; swallowing that turns
-                    // "this revision is broken" into a confusing failure much
-                    // later. A caller whose agent genuinely cannot be built
-                    // here overrides `setup_command` and says so.
-                    "set -e; git clone --depth 1 --branch {r} {repo} /workspace/omp && cd /workspace/omp && bun install && bun run build",
-                    r = shell_quote(&spec.omp_ref),
-                    repo = shell_quote(&spec.omp_repo),
-                ),
-            ]]
-        });
+pub fn to_run_request(spec: &OmpRunSpec) -> Result<RunRequest, CoreError> {
+    let agent = RepoSpec {
+        url: spec.omp_repo.clone(),
+        reference: Some(spec.omp_ref.clone()),
+        ..Default::default()
+    };
+    agent.validate()?;
+    let target = RepoSpec {
+        url: spec.target_repo.clone(),
+        reference: spec.target_ref.clone(),
+        ..Default::default()
+    };
+    target.validate()?;
+    // The generic repository admission rejects HTTPS credentials; SSH remotes
+    // also must not smuggle a password into a durable workload or its logs.
+    for repo in [&agent, &target] {
+        if repo.url.contains('\0')
+            || repo.url.strip_prefix("ssh://").is_some_and(|url| {
+                url.split('/')
+                    .next()
+                    .unwrap_or_default()
+                    .split_once('@')
+                    .is_some_and(|(user, _)| user.contains(':'))
+            })
+        {
+            return Err(CoreError::InvalidRequest(
+                "a repository URL must not carry credentials or null bytes".into(),
+            ));
+        }
+    }
+    if spec.task.trim().is_empty() || spec.task.contains('\0') || spec.omp_ref.is_empty() {
+        return Err(CoreError::InvalidRequest(
+            "task and OMP revision must be non-empty and contain no null bytes".into(),
+        ));
+    }
 
-    let command = spec.omp_command.clone().unwrap_or_else(|| {
-        DEFAULT_OMP_COMMAND
-            .iter()
-            .map(|part| (*part).to_owned())
-            .collect()
+    // Fetch rather than clone --branch: commit hashes, branches and tags all work.
+    // Cloning is never skipped by an override to the build or target setup.
+    let mut setup = vec![vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "set -e; mkdir -p /workspace/omp; git init -q /workspace/omp; \
+                 git -C /workspace/omp remote add origin {repo}; \
+                 git -C /workspace/omp fetch --depth 1 -- origin {revision}; \
+                 git -C /workspace/omp checkout --detach FETCH_HEAD",
+            repo = shell_quote(&spec.omp_repo),
+            revision = shell_quote(&spec.omp_ref),
+        ),
+    ]];
+    let build = spec.build_command.clone().unwrap_or_else(|| {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "bun install && bun run build".into(),
+        ]
     });
+    if build.is_empty() {
+        return Err(CoreError::InvalidRequest(
+            "the OMP build command is empty".into(),
+        ));
+    }
+    let mut build_in_checkout = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "cd /workspace/omp && exec \"$@\"".into(),
+        "omp-build".into(),
+    ];
+    build_in_checkout.extend(build);
+    setup.push(build_in_checkout);
+    if let Some(command) = &spec.setup_command {
+        setup.push(command.clone());
+    }
+    setup.push(vec![
+        "git".into(),
+        "-C".into(),
+        "/workspace/omp".into(),
+        "rev-parse".into(),
+        "HEAD".into(),
+    ]);
 
-    RunRequest {
+    let command = if let Some(command) = &spec.omp_command {
+        if command.is_empty() {
+            return Err(CoreError::InvalidRequest("the OMP command is empty".into()));
+        }
+        // WorkloadSpec has no stdin field. A constant wrapper delivers task
+        // bytes to overrides without interpolating them into shell syntax.
+        let mut wrapped = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$OMP_TASK\" | \"$@\"".into(),
+            "omp-task".into(),
+        ];
+        wrapped.extend(command.clone());
+        wrapped
+    } else {
+        let mut command: Vec<String> = DEFAULT_OMP_COMMAND
+            .iter()
+            .map(|part| (*part).into())
+            .collect();
+        command.push(spec.task.clone());
+        command
+    };
+    let mut environment = spec.environment.clone();
+    environment
+        .entry("HOME".into())
+        .or_insert_with(|| "/workspace/omp-home".into());
+    environment
+        .entry("BUN_INSTALL_CACHE_DIR".into())
+        .or_insert_with(|| "/workspace/omp-cache".into());
+    environment.insert("OMP_REPO".into(), "/workspace/omp".into());
+    environment.insert("OMP_REF".into(), spec.omp_ref.clone());
+    environment.insert("OMP_TARGET_REPO".into(), "/workspace/repository".into());
+    if let Some(reference) = &spec.target_ref {
+        environment.insert("OMP_TARGET_REF".into(), reference.clone());
+    }
+    environment.insert("OMP_TASK".into(), spec.task.clone());
+
+    let request = RunRequest {
         workload: WorkloadSpec {
-            repo: Some(RepoSpec {
-                url: spec.target_repo.clone(),
-                reference: spec.target_ref.clone(),
-                ..Default::default()
-            }),
+            repo: Some(target),
             setup,
             command,
             validations: spec.validations.clone(),
+            environment,
+            secrets: spec.secrets.clone(),
             git_evidence: true,
             timeout_seconds: spec.timeout_seconds.or(Some(1800)),
             ..Default::default()
         },
-        // A failed evaluation is exactly the one worth opening the machine for.
-        retention: RetentionPolicy::KeepOnFailure,
+        resources: spec.resources.clone().unwrap_or(ResourceRequirements {
+            cpu: 2,
+            memory_mb: 2048,
+            disk_mb: 2048,
+            network: NetworkPolicy::Internet,
+            guard: None,
+        }),
+        requirements: spec.requirements.clone(),
+        requested_runtime: spec.runtime.clone(),
+        retention: spec.retention.unwrap_or(RetentionPolicy::KeepOnFailure),
+        retained_seconds: spec.retained_seconds,
         ..Default::default()
-    }
+    };
+    request.workload.validate()?;
+    Ok(request)
 }
 
 /// One side's measurements across its repetitions.
@@ -143,8 +266,17 @@ pub struct OmpSideReport {
     pub total_runs: u32,
     pub successful_runs: u32,
     pub failed_runs: u32,
-    pub exit_codes: Vec<i32>,
-    pub wall_time_ms: u64,
+    /// One slot per run. Null means the task never executed.
+    pub exit_codes: Vec<Option<i32>>,
+    /// Sum of observed settled wall times; absent if any run lacks timestamps.
+    pub wall_time_ms: Option<u64>,
+    pub phase_ms: BTreeMap<String, u64>,
+    pub setup_failures: u32,
+    pub validation_failures: u32,
+    pub missing_task_runs: u32,
+    pub actual_omp_revisions: Vec<Option<String>>,
+    /// Authoritative durable outcomes, including git evidence and cleanup failures.
+    pub runs: Vec<Run>,
     /// Sandboxes retained for debugging, so a failure can be opened.
     pub retained_sandbox_ids: Vec<Uuid>,
 }
@@ -200,7 +332,7 @@ pub async fn compare(
             axis.insert("side".to_owned(), label.to_owned());
             axis.insert("revision".to_owned(), side.omp_ref.clone());
             axis.insert("repetition".to_owned(), repetition.to_string());
-            let mut request = to_run_request(side);
+            let mut request = to_run_request(side)?;
             request.matrix_id = Some(evaluation_id);
             // Every cell gets its own key: a shared one would hand the second
             // repetition the first one's run, and nothing would execute.
@@ -217,56 +349,124 @@ pub async fn compare(
     };
     let result = run_matrix(state, tenant, &matrix).await?;
 
+    let mut baseline = Vec::new();
+    let mut candidate = Vec::new();
+    for cell in result.results {
+        // A cell that never became a run is kept as an error on its own side
+        // rather than dropped: a comparison that silently compared one sample
+        // because the other side was refused is a comparison of the wrong
+        // experiment.
+        let run = match (cell.run, cell.error) {
+            (Some(run), _) => run,
+            (None, Some(error)) => {
+                let side = cell
+                    .axis
+                    .get("side")
+                    .cloned()
+                    .unwrap_or_else(|| "unlabelled".to_owned());
+                return Err(CoreError::InvalidRequest(format!(
+                    "the {side} side did not run: {error}"
+                )));
+            }
+            (None, None) => {
+                return Err(CoreError::InvalidRequest(
+                    "OMP matrix cell produced neither a run nor an error".into(),
+                ));
+            }
+        };
+        match cell.axis.get("side").map(String::as_str) {
+            Some("baseline") => baseline.push(run),
+            Some("candidate") => candidate.push(run),
+            _ => {
+                return Err(CoreError::InvalidRequest(
+                    "OMP matrix cell lost its side axis".into(),
+                ));
+            }
+        }
+    }
     Ok(OmpComparisonReport {
-        evaluation_id,
-        requested_at: Utc::now(),
-        baseline: summarise(
-            "baseline",
-            &spec.baseline.omp_ref,
-            side_of(&result, "baseline"),
-        ),
-        candidate: summarise(
-            "candidate",
-            &spec.candidate.omp_ref,
-            side_of(&result, "candidate"),
-        ),
+        evaluation_id: result.matrix_id,
+        requested_at: result.requested_at,
+        baseline: summarise("baseline", &spec.baseline.omp_ref, baseline),
+        candidate: summarise("candidate", &spec.candidate.omp_ref, candidate),
         max_parallel: matrix.options.max_parallel,
     })
 }
 
-fn side_of<'a>(result: &'a MatrixResult, side: &'a str) -> Vec<&'a CellResult> {
-    result
-        .results
+/// The actual checked-out agent revision, from its recorded setup command.
+pub fn actual_omp_revision(run: &Run) -> Option<String> {
+    run.results
+        .setup
         .iter()
-        .filter(|cell| cell.axis.get("side").map(String::as_str) == Some(side))
-        .collect()
+        .rev()
+        .find(|step| {
+            step.ok
+                && step.command.iter().map(String::as_str).eq([
+                    "git",
+                    "-C",
+                    "/workspace/omp",
+                    "rev-parse",
+                    "HEAD",
+                ])
+        })
+        .map(|step| step.stdout.trim().to_owned())
+        .filter(|revision| !revision.is_empty())
 }
 
-fn summarise(label: &str, revision: &str, cells: Vec<&CellResult>) -> OmpSideReport {
+/// Whole-run elapsed time from authoritative timestamps, never an invented zero.
+pub fn wall_time_ms(run: &Run) -> Option<u64> {
+    let completed = run.completed_at?;
+    u64::try_from((completed - run.requested_at).num_milliseconds()).ok()
+}
+
+fn summarise(label: &str, revision: &str, runs: Vec<Run>) -> OmpSideReport {
     let mut report = OmpSideReport {
         label: label.to_owned(),
         revision: revision.to_owned(),
-        total_runs: cells.len() as u32,
+        total_runs: runs.len() as u32,
         successful_runs: 0,
         failed_runs: 0,
-        exit_codes: Vec::new(),
-        wall_time_ms: 0,
+        exit_codes: Vec::with_capacity(runs.len()),
+        wall_time_ms: if runs.is_empty() { None } else { Some(0) },
+        phase_ms: BTreeMap::new(),
+        setup_failures: 0,
+        validation_failures: 0,
+        missing_task_runs: 0,
+        actual_omp_revisions: Vec::with_capacity(runs.len()),
         retained_sandbox_ids: Vec::new(),
+        runs,
     };
-    let mut seen: BTreeSet<Uuid> = BTreeSet::new();
-    for cell in cells {
-        if cell.succeeded {
+    let mut seen = BTreeSet::new();
+    for run in &report.runs {
+        if run.state == RunState::Succeeded {
             report.successful_runs += 1;
         } else {
             report.failed_runs += 1;
         }
-        if let Some(sandbox) = cell.sandbox_id
+        if let Some(sandbox) = run.retained_sandbox_id
             && seen.insert(sandbox)
         {
             report.retained_sandbox_ids.push(sandbox);
         }
-        if cell.state == RunState::Failed {
-            report.exit_codes.push(1);
+        report
+            .exit_codes
+            .push(run.results.task.as_ref().map(|task| task.exit_code));
+        report.missing_task_runs += u32::from(run.results.task.is_none());
+        report.setup_failures += run.results.setup.iter().filter(|step| !step.ok).count() as u32;
+        report.validation_failures += run
+            .results
+            .validations
+            .iter()
+            .filter(|step| !step.ok)
+            .count() as u32;
+        report.actual_omp_revisions.push(actual_omp_revision(run));
+        report.wall_time_ms = report
+            .wall_time_ms
+            .zip(wall_time_ms(run))
+            .map(|(total, elapsed)| total.saturating_add(elapsed));
+        for (phase, elapsed) in &run.results.phase_ms {
+            let total = report.phase_ms.entry(phase.clone()).or_default();
+            *total = total.saturating_add(*elapsed);
         }
     }
     report
@@ -293,30 +493,33 @@ mod tests {
             target_repo: "https://github.com/me/fixture".into(),
             target_ref: None,
             setup_command: None,
+            build_command: None,
             omp_command: None,
             validations: vec![vec!["bun".into(), "test".into()]],
             timeout_seconds: None,
+            runtime: None,
+            resources: None,
+            requirements: Default::default(),
+            retention: None,
+            retained_seconds: None,
+            environment: BTreeMap::new(),
+            secrets: Vec::new(),
         }
     }
 
     #[test]
-    fn an_omp_run_becomes_an_ordinary_workload() {
-        let request = to_run_request(&spec());
-        assert_eq!(request.workload.command, vec!["omp", "run"]);
-        assert_eq!(request.workload.setup.len(), 1);
-        assert_eq!(request.workload.validations.len(), 1);
-        assert!(request.workload.git_evidence);
-        assert_eq!(request.retention, RetentionPolicy::KeepOnFailure);
-    }
-
-    #[test]
-    fn a_hostile_revision_cannot_escape_the_setup_script() {
-        let mut hostile = spec();
-        hostile.omp_ref = "main; rm -rf /".into();
-        let request = to_run_request(&hostile);
-        let script = request.workload.setup[0][2].clone();
-        // Quoted, so the semicolon is data rather than a command.
-        assert!(script.contains("'main; rm -rf /'"), "script was: {script}");
+    fn credential_urls_are_rejected_before_a_run_can_be_recorded() {
+        for remote in [
+            "https://token@github.com/me/private",
+            "ssh://user:password@github.com/me/private",
+        ] {
+            let mut request = spec();
+            request.omp_repo = remote.into();
+            assert!(to_run_request(&request).is_err());
+            request = spec();
+            request.target_repo = remote.into();
+            assert!(to_run_request(&request).is_err());
+        }
     }
 
     #[test]

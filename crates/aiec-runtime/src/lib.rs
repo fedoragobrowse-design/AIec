@@ -1,7 +1,8 @@
 use aiec_core::protocol::{self, Operation, Request, RequestPayload, Response, ResponsePayload};
 use aiec_core::{
+    host_pressure::{HostPressure, HostReserves},
     network::{NetworkAttachment, NetworkBackend},
-    runtime::{RuntimeCapabilities, RuntimeHealth},
+    runtime::{FileChunk, FileChunkRequest, RuntimeCapabilities, RuntimeHealth},
     snapshots::{
         CapturedSnapshot, MAX_WORKSPACE_ARCHIVE_BYTES, PortableWorkspaceArchive,
         PortableWorkspaceEntry, SnapshotCapabilities, SnapshotKind, SnapshotMetadata,
@@ -9,6 +10,8 @@ use aiec_core::{
     },
     *,
 };
+use aiec_network_linux::GuardNetworkManager;
+#[cfg(test)]
 use aiec_network_linux::LinuxNetworkManager;
 use async_trait::async_trait;
 use base64::Engine;
@@ -17,12 +20,16 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, PoisonError},
     time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::{io::AsyncReadExt, process::Command, sync::Mutex};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::{Mutex, oneshot},
+};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -48,12 +55,198 @@ mod docker;
 pub mod e2b;
 pub mod guest_artifact;
 pub use docker::DockerRuntime;
+pub mod rootfs;
 pub use e2b::{E2bConfig, E2bRuntime, RuntimePathProvider};
 
 fn into_core(error: RuntimeError) -> CoreError {
     match error {
         RuntimeError::Core(error) => error,
         other => CoreError::Io(std::io::Error::other(other.to_string())),
+    }
+}
+
+/// How many sandboxes may have a lifecycle operation in flight at once.
+///
+/// A worker runs a handful of sandboxes, so this is generous for a real node
+/// and still a number: past it, a new sandbox is refused rather than allowed to
+/// grow a map keyed by a request-supplied id.
+pub const MAX_CONCURRENT_LIFECYCLES: usize = 4_096;
+
+/// One sandbox's lifecycle operations, taken one at a time.
+///
+/// A sandbox's create, start, stop, restore and destroy all answer the same
+/// question - what exists for this sandbox id right now - and they answer it by
+/// writing: a create materializes an owner marker and a rootfs into a directory
+/// a destroy removes, a start inserts a live VM into the map a stop takes it
+/// out of. Run together on one id they interleave. A destroy can report
+/// success while a create is still copying, and the copy then recreates the
+/// directory the destroy was asked to clear: a machine that a completed destroy
+/// already promised nobody would ever boot. The other order is worse, because a
+/// start that boots after its sandbox was destroyed leaves a live process
+/// behind a successful destroy.
+///
+/// Serializing by id fixes both orders without serializing the host. Sandboxes
+/// are independent, and only two operations on the *same* id can conflict, so
+/// every other sandbox boots while one of them is busy.
+///
+/// Exec is deliberately not one of the operations that queue. A command is the
+/// thing an operator interrupts by destroying its sandbox, so a destroy that
+/// waited for a long `exec` would be waiting for exactly the work it exists to
+/// stop. Exec takes no gate, and a destroy therefore proceeds while a command is
+/// running.
+///
+/// The table is bounded and self-clearing. An entry exists exactly while some
+/// caller holds it or is queued behind it, and the last one out removes it, so
+/// the map tracks concurrent work rather than every sandbox this worker has
+/// ever seen. [`Self::enter`] refuses rather than grows when that bound is
+/// reached, because the alternative is an unbounded map.
+#[derive(Debug)]
+pub struct SandboxLifecycle {
+    gates: StdMutex<GateTable>,
+}
+
+impl Default for SandboxLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug)]
+struct GateTable {
+    gates: HashMap<Uuid, GateState>,
+    bound: usize,
+}
+
+#[derive(Debug)]
+struct GateState {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// Callers that hold this gate or are queued for it.
+    users: usize,
+}
+
+/// The lifecycle table is already at its bound.
+///
+/// A distinct error rather than a wait: the callers in flight are all
+/// legitimate, and refusing is the only answer that keeps the table finite.
+#[derive(Debug, Error)]
+#[error("too many sandbox lifecycle operations are already in flight")]
+pub struct LifecycleBusy;
+
+/// Exclusive use of one sandbox, released when dropped.
+///
+/// Holds the token so the table entry lives as long as the work, and the
+/// sandbox's own lock so no second caller can be inside it.
+#[derive(Debug)]
+pub struct SandboxLifecycleGuard {
+    /// Dropped first. Releasing the table entry before the sandbox's lock would
+    /// let a new caller build a second lock for the same id and enter the
+    /// critical section while this one is still inside it.
+    _held: tokio::sync::OwnedMutexGuard<()>,
+    /// Named for its drop order, not its value: releasing the table entry after
+    /// the sandbox lock is what keeps a newcomer out of this critical section.
+    _reservation: LifecycleReservation,
+}
+
+/// One caller's place in the table, released even if it never gets the lock.
+///
+/// A caller that is cancelled while queued has already been counted, so the
+/// count is released here rather than in the guard that may never be built.
+#[derive(Debug)]
+struct LifecycleReservation {
+    lifecycle: Arc<SandboxLifecycle>,
+    sandbox_id: Uuid,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for LifecycleReservation {
+    fn drop(&mut self) {
+        // Recovered rather than propagated: this lock is held for a map update
+        // and never across an await, and a panic in one sandbox's bookkeeping
+        // must not make every other sandbox on the node unreleasable.
+        let mut table = self
+            .lifecycle
+            .gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(state) = table.gates.get_mut(&self.sandbox_id) {
+            state.users -= 1;
+            if state.users == 0 {
+                table.gates.remove(&self.sandbox_id);
+            }
+        }
+    }
+}
+
+impl SandboxLifecycle {
+    pub fn new() -> Self {
+        Self {
+            gates: StdMutex::new(GateTable {
+                gates: HashMap::new(),
+                bound: MAX_CONCURRENT_LIFECYCLES,
+            }),
+        }
+    }
+
+    /// Waits for exclusive use of `sandbox_id`, in arrival order.
+    ///
+    /// The wait is unbounded by design: every holder is itself bounded, and a
+    /// caller that gave up here would have to decide what state its abandoned
+    /// operation left behind. The guard is returned only once the sandbox is
+    /// genuinely free.
+    pub async fn enter(
+        self: &Arc<Self>,
+        sandbox_id: Uuid,
+    ) -> Result<SandboxLifecycleGuard, LifecycleBusy> {
+        let reservation = self.reserve(sandbox_id)?;
+        let held = reservation.lock.clone().lock_owned().await;
+        Ok(SandboxLifecycleGuard {
+            _held: held,
+            _reservation: reservation,
+        })
+    }
+
+    fn reserve(self: &Arc<Self>, sandbox_id: Uuid) -> Result<LifecycleReservation, LifecycleBusy> {
+        let mut table = self.gates.lock().unwrap_or_else(PoisonError::into_inner);
+        let existing = table.gates.get(&sandbox_id).map(|state| state.lock.clone());
+        let lock = match existing {
+            Some(lock) => {
+                let state = table
+                    .gates
+                    .get_mut(&sandbox_id)
+                    .expect("the entry was just read under this lock");
+                state.users += 1;
+                lock
+            }
+            None => {
+                if table.gates.len() >= table.bound {
+                    return Err(LifecycleBusy);
+                }
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                table.gates.insert(
+                    sandbox_id,
+                    GateState {
+                        lock: Arc::clone(&lock),
+                        users: 1,
+                    },
+                );
+                lock
+            }
+        };
+        Ok(LifecycleReservation {
+            lifecycle: Arc::clone(self),
+            sandbox_id,
+            lock,
+        })
+    }
+
+    /// Sandboxes with a lifecycle operation in flight.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.gates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .gates
+            .len()
     }
 }
 
@@ -72,6 +265,7 @@ fn bwrap_capabilities() -> RuntimeCapabilities {
 fn firecracker_capabilities(
     _network: &dyn NetworkBackend,
     artifact: Option<&guest_artifact::GuestArtifact>,
+    minimum_disk_mb: u64,
 ) -> RuntimeCapabilities {
     RuntimeCapabilities {
         isolation: aiec_core::runtime::RuntimeIsolation::MicroVm,
@@ -87,6 +281,10 @@ fn firecracker_capabilities(
         pause_reclaims_resources: false,
         vsock: true,
         coding_guest: artifact.is_some_and(guest_artifact::GuestArtifact::is_coding_guest),
+        // Reported, not matched: `capabilities_satisfy` compares booleans, so
+        // this never narrows worker selection. It is what tells the scheduler
+        // that a disk smaller than the base image cannot be honoured here.
+        minimum_disk_mb,
         ..RuntimeCapabilities::default()
     }
 }
@@ -124,18 +322,47 @@ pub struct WorkspaceArchive {
     pub checksum_sha256: String,
 }
 
+/// Rejects an object key that must never reach a local path.
+///
+/// A key names an object in the store; it is not a filename on this host. What
+/// is refused here is the shape that would be a problem even after hashing -
+/// nothing, empty, control bytes, a traversal component - because a key that
+/// says `../../etc/passwd` is a caller bug worth reporting rather than
+/// silently absorbing.
 fn validate_archive_key(key: &str) -> Result<(), RuntimeError> {
-    if key.is_empty()
-        || key.len() > 128
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    if key.is_empty() || key.len() > 1024 {
+        return Err(RuntimeError::Archive(
+            "archive key must be 1 to 1024 bytes".into(),
+        ));
+    }
+    if key.bytes().any(|byte| byte.is_ascii_control()) || key.contains('\\') {
+        return Err(RuntimeError::Archive(
+            "archive key has an unsafe character".into(),
+        ));
+    }
+    if key
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
     {
         return Err(RuntimeError::Archive(
-            "invalid workspace archive key".into(),
+            "archive key contains a traversal or an empty component".into(),
         ));
     }
     Ok(())
+}
+
+/// The local file name an object key is stored under.
+///
+/// Derived by digest rather than used verbatim, because keys are
+/// tenant-prefixed and contain separators: `tenants/<uuid>/snapshots/<uuid>` is
+/// the right shape for an object store and the wrong shape for a filename, and
+/// a runtime that insists on a flat key is a runtime that decides what the
+/// control plane is allowed to name objects. The Firecracker runtime already
+/// hashed its snapshot directory this way; this makes the other two agree.
+pub(crate) fn local_archive_name(key: &str) -> Result<String, RuntimeError> {
+    validate_archive_key(key)?;
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    Ok(digest[..32].to_owned())
 }
 
 #[derive(Clone)]
@@ -395,7 +622,10 @@ impl BubblewrapRuntime {
     }
     pub async fn snapshot(&self, s: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
         let root = self.base(s).join("workspace");
-        let out = self.root.join("snapshots").join(format!("{key}.tar"));
+        let out = self
+            .root
+            .join("snapshots")
+            .join(format!("{}.tar", local_archive_name(key)?));
         if let Some(p) = out.parent() {
             tokio::fs::create_dir_all(p).await?;
         }
@@ -418,7 +648,10 @@ impl BubblewrapRuntime {
         Ok(tokio::fs::metadata(out).await?.len())
     }
     pub async fn restore(&self, s: &Sandbox, key: &str) -> Result<(), RuntimeError> {
-        let archive = self.root.join("snapshots").join(format!("{key}.tar"));
+        let archive = self
+            .root
+            .join("snapshots")
+            .join(format!("{}.tar", local_archive_name(key)?));
         let root = self.base(s).join("workspace");
         let output = Command::new("tar")
             .arg("-xf")
@@ -449,7 +682,12 @@ impl BubblewrapRuntime {
                 "workspace archive exceeds 64 MiB".into(),
             ));
         }
-        let bytes = tokio::fs::read(self.root.join("snapshots").join(format!("{key}.tar"))).await?;
+        let bytes = tokio::fs::read(
+            self.root
+                .join("snapshots")
+                .join(format!("{}.tar", local_archive_name(key)?)),
+        )
+        .await?;
         Ok(WorkspaceArchive {
             key: key.to_owned(),
             checksum_sha256: hex::encode(Sha256::digest(&bytes)),
@@ -475,9 +713,10 @@ impl BubblewrapRuntime {
         }
         let directory = self.root.join("snapshots");
         tokio::fs::create_dir_all(&directory).await?;
-        let temporary = directory.join(format!(".{}.import", archive.key));
+        let name = local_archive_name(&archive.key)?;
+        let temporary = directory.join(format!(".{name}.import"));
         tokio::fs::write(&temporary, &archive.bytes).await?;
-        tokio::fs::rename(temporary, directory.join(format!("{}.tar", archive.key))).await?;
+        tokio::fs::rename(temporary, directory.join(format!("{name}.tar"))).await?;
         self.restore(sandbox, &archive.key).await
     }
     async fn destroy(&self, s: &Sandbox) -> Result<(), RuntimeError> {
@@ -523,6 +762,16 @@ impl SandboxRuntime for BubblewrapRuntime {
     }
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         Self::get_file(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn get_file_chunk(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError> {
+        let root = self.base(sandbox).join("workspace");
+        tokio::task::spawn_blocking(move || request.read_workspace(&root))
+            .await
+            .map_err(|error| CoreError::Backend(error.to_string()))?
     }
     async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
         Self::list_files(self, sandbox, path)
@@ -626,6 +875,26 @@ impl SnapshotProvider for BubblewrapRuntime {
     }
 }
 
+/// Where a create re-reads host headroom from before it allocates anything.
+///
+/// [`HostPressure::measure`] is the only thing that reads a real host. This is
+/// the seam that lets a test state a reading instead of inheriting whatever
+/// machine it happens to run on, which is the only way an admission decision
+/// can be asserted at all.
+pub trait HostPressureProbe: Send + Sync {
+    fn measure(&self, workspace: &Path, reserves: HostReserves) -> HostPressure;
+}
+
+/// Reads the host this worker is running on.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeasuredHostPressure;
+
+impl HostPressureProbe for MeasuredHostPressure {
+    fn measure(&self, workspace: &Path, reserves: HostReserves) -> HostPressure {
+        HostPressure::measure(workspace, reserves)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FirecrackerConfig {
     pub binary: PathBuf,
@@ -643,6 +912,38 @@ pub struct FirecrackerConfig {
     pub guest_artifact: Option<guest_artifact::GuestArtifact>,
     /// Whether the deployment refuses to start without a verified coding guest image.
     pub require_coding_guest: bool,
+    /// Host memory and disk held back before a create is admitted.
+    ///
+    /// The same reserve the worker's heartbeat publishes, so the reading a
+    /// placement was admitted on and the reading a boot re-checks against are
+    /// measured against one number. Defaults to [`HostReserves::default`].
+    pub host_reserves: HostReserves,
+}
+
+/// The guest artifact metadata in `dir`, or `None` when there is no document.
+///
+/// Three outcomes, and the middle one is the one that used to be lost: no
+/// document is a deployment without guest metadata, a document that does not
+/// load is a deployment that must not start. Folding the second into the first
+/// meant a guest image declaring an older protocol became `None`, every later
+/// gate is `Some`-conditional, and the worker started against a guest it cannot
+/// speak to - the failure then surfaces as every bounded chunk read erroring at
+/// runtime instead of at startup, which is exactly when nobody is watching.
+fn load_guest_artifact_metadata(
+    dir: &Path,
+) -> Result<Option<guest_artifact::GuestArtifact>, RuntimeError> {
+    let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let artifact = guest_artifact::load_guest_artifact(&path)?;
+    tracing::info!(
+        path = %path.display(),
+        profile = %artifact.profile,
+        version = %artifact.artifact_version,
+        "loaded firecracker guest artifact metadata"
+    );
+    Ok(Some(artifact))
 }
 
 impl FirecrackerConfig {
@@ -656,22 +957,32 @@ impl FirecrackerConfig {
             .ok()
             .map(PathBuf::from)
             .or_else(|| rootfs.parent().map(Path::to_path_buf));
-        let guest_artifact = guest_artifact_dir.as_deref().and_then(|dir| {
-            let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
-            let artifact = guest_artifact::load_guest_artifact(&path);
-            match &artifact {
-                Ok(artifact) => tracing::info!(
-                    path = %path.display(),
-                    profile = %artifact.profile,
-                    version = %artifact.artifact_version,
-                    "loaded firecracker guest artifact metadata"
-                ),
-                Err(error) => {
-                    tracing::debug!(path = %path.display(), %error, "no firecracker guest artifact metadata")
-                }
-            }
-            artifact.ok()
-        });
+        // A document that is present and rejected is not the same thing as no
+        // document. Collapsing the two into `.ok()` meant a guest image
+        // declaring an older protocol became "no metadata", every later gate is
+        // `Some`-conditional, and the worker started happily against a guest it
+        // cannot speak to - the failure then surfaces as every bounded chunk
+        // read erroring at runtime instead of at startup, which is exactly the
+        // moment an operator is not watching.
+        let guest_artifact = match guest_artifact_dir.as_deref() {
+            None => None,
+            Some(dir) => Some(load_guest_artifact_metadata(dir)?),
+        }
+        .flatten();
+        // The same variables `aiec worker` reads for the reserve it publishes
+        // in every heartbeat, so the reading a placement is admitted on and the
+        // reading a create re-checks against it are held to one number instead
+        // of two that can drift.
+        let reserve_mib = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(default)
+        };
+        let host_reserves = HostReserves::from_mib(
+            reserve_mib("AIEC_WORKER_MEMORY_RESERVE_MIB", 512),
+            reserve_mib("AIEC_WORKER_DISK_RESERVE_MIB", 2 * 1024),
+        );
         Ok(Self {
             binary: PathBuf::from(required("AIEC_FIRECRACKER_BIN")?),
             kernel: PathBuf::from(required("AIEC_KERNEL")?),
@@ -688,6 +999,7 @@ impl FirecrackerConfig {
             guest_artifact,
             require_coding_guest: std::env::var("AIEC_REQUIRE_CODING_GUEST")
                 .is_ok_and(|value| value == "1"),
+            host_reserves,
         })
     }
 
@@ -740,41 +1052,24 @@ impl FirecrackerConfig {
         Ok(())
     }
 
-    /// Verifies the guest image digest, at most once per process.
+    /// Verifies the guest image digest, once per artifact identity.
     ///
-    /// A worker calls this before it boots a guest. The result is cached because
-    /// the same image is used for every sandbox on the node and the digest of a
-    /// multi-gigabyte rootfs is not cheap to recompute per create.
+    /// A worker calls this before it boots a guest. The result is cached
+    /// because the same image is used for every sandbox on the node and the
+    /// digest of a multi-gigabyte rootfs is not cheap to recompute per create.
+    /// The cache is bounded on every axis it can grow on - entries, image bytes,
+    /// how long a verdict is trusted, and how many images are hashed at once -
+    /// and it is keyed on the complete identity of the files that were hashed,
+    /// so a verdict is only ever reused for the same bytes at the same paths.
     pub fn verify_guest_image(&self) -> Result<(), RuntimeError> {
-        // Keyed on the artifact's identity, not on the process.
-        //
-        // This was a bare `OnceLock`: one result for the whole process,
-        // whatever was being verified. It happens to be correct today because
-        // there is exactly one configured guest image, and it would be silently,
-        // dangerously wrong the moment there were two - a worker pointed at a
-        // second, unverified image would inherit the first one's verdict, which
-        // is precisely the failure the specification names when it says never to
-        // skip integrity verification because you checked once "sometime
-        // earlier".
-        //
-        // The key is path, size and mtime for each file that takes part, which
-        // is the specification's own example. Replacing a rootfs in place, or
-        // pointing the runtime at a different one, misses the cache and is
-        // verified again. Nothing is trusted because it was trusted before; it
-        // is trusted because *these bytes at these paths* were.
-        static VERIFIED: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
-        > = std::sync::OnceLock::new();
-        let cache =
-            VERIFIED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-        let key = match artifact_identity(
+        let identity = match artifact_identity(
             &self.rootfs,
             &self.kernel,
+            self.guest_artifact_dir.as_deref(),
             self.guest_artifact.as_ref(),
             self.require_coding_guest,
         ) {
-            Ok(key) => key,
+            Ok(identity) => identity,
             // If the artifacts cannot be stat'd there is nothing to key on, and
             // the honest response is to verify rather than to guess.
             Err(_error) => {
@@ -783,25 +1078,15 @@ impl FirecrackerConfig {
                     .map_err(|error| RuntimeError::Unavailable(error.to_string()));
             }
         };
-
-        if let Ok(entries) = cache.lock()
-            && let Some(outcome) = entries.get(&key)
-        {
-            return match outcome {
-                Ok(()) => Ok(()),
-                Err(error) => Err(RuntimeError::Unavailable(error.clone())),
-            };
-        }
-        let outcome = self
-            .check_guest_artifact()
-            .map_err(|error| error.to_string());
-        if let Ok(mut entries) = cache.lock() {
-            entries.insert(key, outcome.clone());
-        }
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(error) => Err(RuntimeError::Unavailable(error)),
-        }
+        static VERIFIED: std::sync::LazyLock<VerificationCache> =
+            std::sync::LazyLock::new(VerificationCache::default);
+        let cache = &*VERIFIED;
+        cache
+            .verify(&identity.key, identity.bytes, || {
+                self.check_guest_artifact()
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(RuntimeError::Unavailable)
     }
 
     /// Hashes the guest image and compares it with the recorded metadata.
@@ -840,6 +1125,9 @@ impl FirecrackerConfig {
     /// every API boot. [`Self::check_guest_artifact`] adds the digest
     /// verification and is the check a worker runs before it boots a guest.
     pub fn check_guest_capabilities(&self) -> Result<(), RuntimeError> {
+        if let Some(artifact) = &self.guest_artifact {
+            artifact.verify_protocol()?;
+        }
         if self.require_coding_guest {
             let Some(artifact) = &self.guest_artifact else {
                 return Err(RuntimeError::Unavailable(
@@ -897,6 +1185,31 @@ impl FirecrackerConfig {
         let digest = hex::encode(Sha256::digest(key.as_bytes()));
         self.state_dir.join("snapshots").join(digest)
     }
+
+    /// Smallest disk, in MiB, a sandbox on this configuration can hold.
+    ///
+    /// Every sandbox's disk starts as a copy of the base image, so a request
+    /// below the image's own size cannot be honoured: the copy needs the whole
+    /// image before the guest writes a byte, and the guest may then fill the
+    /// whole filesystem. Reporting the image's own size as a floor is what
+    /// keeps a small request from being admitted onto a host that cannot hold
+    /// the image it is about to copy. Zero when the image cannot be read, which
+    /// [`Self::check`] refuses anyway, so no floor is claimed for it.
+    pub fn minimum_disk_mb(&self) -> u64 {
+        self.base_image_bytes()
+            .div_ceil(aiec_core::host_pressure::MIB)
+    }
+
+    /// Logical size of the base image, or zero when it cannot be read.
+    ///
+    /// A single `stat` of a file this path is about to read in full anyway, and
+    /// the answer is used twice on one create: for the disk the host has to
+    /// have, and for the comparison that decides whether the copy is resized.
+    pub fn base_image_bytes(&self) -> u64 {
+        std::fs::metadata(&self.rootfs)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default()
+    }
 }
 
 struct FirecrackerVm {
@@ -912,7 +1225,30 @@ struct FirecrackerVm {
 pub struct FirecrackerRuntime {
     pub config: FirecrackerConfig,
     vms: Arc<Mutex<HashMap<Uuid, FirecrackerVm>>>,
+
+    /// Cancellation handles for the lifetime timers still armed, keyed by the
+    /// start token of the VM each timer protects.
+    ///
+    /// A timer owns a sender here and holds the matching receiver inside the
+    /// task it spawned, so taking the entry out ends that task at once. Every
+    /// path that takes a VM out of the map takes its entry out first: a stopped
+    /// or destroyed sandbox has nothing left to time out, so its timer must not
+    /// stay sleeping - holding a runtime and a sandbox alive - for the rest of
+    /// a TTL that can no longer act on anything.
+    ///
+    /// Keyed by start token rather than by sandbox id because one id outlives
+    /// its VM: a restarted sandbox is a new token, and a timer may only ever be
+    /// able to end its own.
+    lifetimes: Arc<Mutex<HashMap<Uuid, oneshot::Sender<()>>>>,
     network: Arc<dyn NetworkBackend>,
+    /// One gate per sandbox for the operations that change what exists for it.
+    ///
+    /// Shared by every clone of this runtime, which is what makes the guarantee
+    /// hold for a worker: the clone a lifetime timer stops a VM with is the
+    /// clone a request creates one with.
+    lifecycle: Arc<SandboxLifecycle>,
+    /// The host a create re-measures before it materializes anything.
+    pressure: Arc<dyn HostPressureProbe>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -929,26 +1265,63 @@ pub struct LocalReconciliationReport {
 
 /// Identity of the artifacts a verification result is valid for.
 ///
-/// Path alone is not enough - a rootfs can be replaced at the same path - and a
-/// process-wide result is not enough at all. Size and mtime together catch the
-/// replacement that matters: an image swapped for a different one is a
-/// different length, and an image rewritten in place moves its mtime.
+/// A path is not enough - a rootfs can be replaced at the same path - and a
+/// process-wide result is not enough at all. The identity is everything the
+/// check actually reads: for each file, its size, its nanosecond modification
+/// time, its nanosecond status-change time, and the inode and device it lives
+/// on, plus the artifact metadata document the digest comparison is made
+/// against.
+///
+/// The nanosecond fields are the load-bearing part. `Metadata::mtime` is whole
+/// seconds on this platform, so a rootfs that is rewritten in place with the
+/// same length inside the same second is a different image with an identical
+/// key, and the cached success would be applied to bytes nobody verified. The
+/// inode and device catch the other case: a file replaced by an atomic rename
+/// can land on a different inode with a new timestamp granularity the caller
+/// cannot see, and a `rootfs` moved onto another filesystem is a different
+/// object entirely.
+///
+/// What this cannot see is a rewrite that preserves size, inode, device and
+/// every timestamp - which means writing over the image's own blocks without
+/// letting the filesystem record it. Re-hashing is the only defence against
+/// that, and doing it per create is the cost the cache exists to avoid.
+struct ArtifactIdentity {
+    /// The key a verification verdict is remembered under.
+    key: String,
+    /// The bytes the verdict is about, for the cache's byte bound.
+    bytes: u64,
+}
+
+/// Describes one file in a way that changes when its content does.
+fn describe_file(path: &Path) -> std::io::Result<(String, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok((
+        format!(
+            "{}:dev={}:ino={}:size={}:mtime={}.{}:ctime={}.{}",
+            path.display(),
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        ),
+        meta.size(),
+    ))
+}
+
+/// Builds the identity a verification verdict is valid for.
 fn artifact_identity(
     rootfs: &Path,
     kernel: &Path,
+    artifact_dir: Option<&Path>,
     artifact: Option<&guest_artifact::GuestArtifact>,
     require_coding_guest: bool,
-) -> std::io::Result<String> {
-    let describe = |path: &Path| -> std::io::Result<String> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(path)?;
-        Ok(format!(
-            "{}:{}:{}",
-            path.display(),
-            meta.size(),
-            meta.mtime()
-        ))
-    };
+) -> std::io::Result<ArtifactIdentity> {
+    let (rootfs_identity, rootfs_bytes) = describe_file(rootfs)?;
+    let (kernel_identity, kernel_bytes) = describe_file(kernel)?;
     // The whole artifact metadata, serialised, plus the flag derived from it.
     //
     // Listing fields by hand is how the previous version was wrong: a key built
@@ -957,17 +1330,325 @@ fn artifact_identity(
     // would satisfy a strict one. Serialising the input means a field added to
     // the check later is in the key the day it is added, rather than on the day
     // somebody remembers.
-    let identity = serde_json::to_string(&artifact).unwrap_or_else(|_| "unserialisable".into());
-    Ok(format!(
-        "{}|{}|coding={require_coding_guest}|{identity}",
-        describe(rootfs)?,
-        describe(kernel)?,
-    ))
+    let metadata = serde_json::to_string(&artifact).unwrap_or_else(|_| "unserialisable".into());
+    // `check_guest_artifact` re-reads the document from disk on every call, so
+    // the in-memory copy is not what the verdict is about. Keying on the
+    // loaded metadata alone would let a manifest edited under a running worker
+    // keep the success recorded against the old one, which is the same
+    // "verified sometime earlier" failure one level down.
+    let manifest = match (artifact, artifact_dir) {
+        (Some(_), Some(dir)) => describe_file(&dir.join(guest_artifact::GUEST_ARTIFACT_FILE))?.0,
+        _ => "no-manifest".to_string(),
+    };
+    Ok(ArtifactIdentity {
+        key: format!(
+            "{rootfs_identity}|{kernel_identity}|{manifest}|coding={require_coding_guest}|{metadata}"
+        ),
+        bytes: rootfs_bytes + kernel_bytes,
+    })
+}
+
+/// The bounds a [`VerificationCache`] works within.
+///
+/// The cache exists so a worker does not re-hash a multi-gigabyte rootfs on
+/// every create. It remembers an expensive, immutable fact, so it is bounded on
+/// every axis a long-lived process can grow on: how many identities are
+/// remembered, how many image bytes those identities account for, how long a
+/// verdict is trusted, and how many images are being hashed at the same time.
+/// The numbers are deliberately small and conservative - a worker has one
+/// image, and a cache that cannot hold two is a bound rather than an outage.
+#[derive(Clone, Copy, Debug)]
+struct VerificationLimits {
+    /// Maximum number of distinct artifact identities remembered.
+    max_entries: usize,
+    /// Maximum total image bytes the remembered identities may account for.
+    max_bytes: u64,
+    /// How long a successful verification is trusted without rehashing.
+    success_ttl: Duration,
+    /// How long a failed verification is remembered.
+    ///
+    /// Short on purpose. A failure has to stay visible - caching successes and
+    /// dropping failures would turn a broken image into a silently booting one -
+    /// but a worker that is repaired must not be told "still broken" forever
+    /// either. A new artifact is a new identity, so nothing here can make an
+    /// old verdict apply to bytes nobody verified; this bound only decides when
+    /// the same bytes get a second chance.
+    failure_ttl: Duration,
+    /// Maximum number of distinct images hashed concurrently.
+    max_concurrent: usize,
+}
+
+impl Default for VerificationLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 8,
+            max_bytes: 8 * 1024 * 1024 * 1024,
+            // The image is immutable for the life of a worker, so an hour is
+            // generous; it exists so a long-lived process still re-verifies
+            // rather than trusting a verdict forever.
+            success_ttl: Duration::from_secs(3600),
+            failure_ttl: Duration::from_secs(60),
+            // Hashing is I/O bound and reads the whole image. Two at a time keeps
+            // a worker from saturating its own disk during a restart storm
+            // without ever serialising legitimate distinct images.
+            max_concurrent: 2,
+        }
+    }
+}
+
+/// One remembered verdict.
+struct VerificationEntry {
+    outcome: Result<(), String>,
+    verified_at: Instant,
+    /// The image bytes this verdict is about, for the cache's byte bound.
+    bytes: u64,
+}
+
+/// The single verification running for one identity, and the result waiters
+/// block on.
+#[derive(Default)]
+struct VerificationSlot {
+    outcome: std::sync::Mutex<Option<Result<(), String>>>,
+    settled: std::sync::Condvar,
+}
+
+impl VerificationSlot {
+    /// Publishes the verdict and releases every waiter.
+    fn complete(&self, outcome: Result<(), String>) {
+        *lock(&self.outcome) = Some(outcome);
+        self.settled.notify_all();
+    }
+
+    /// Blocks until the one verification this slot stands for has finished.
+    fn wait(&self) -> Result<(), String> {
+        let mut outcome = lock(&self.outcome);
+        loop {
+            if let Some(outcome) = outcome.as_ref() {
+                return outcome.clone();
+            }
+            outcome = self
+                .settled
+                .wait(outcome)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+/// Everything the cache is currently holding.
+#[derive(Default)]
+struct VerificationState {
+    entries: HashMap<String, VerificationEntry>,
+    /// The sum of `bytes` over `entries`, so the byte bound is O(1) to enforce.
+    accounted_bytes: u64,
+    /// Identities currently being verified, each with the slot its waiters use.
+    in_flight: HashMap<String, Arc<VerificationSlot>>,
+    /// How many verifications are running, for the concurrency bound.
+    hashing: usize,
+}
+
+impl VerificationState {
+    /// Returns a verdict that is still inside its time to live, dropping one
+    /// that is not.
+    fn fresh(&mut self, key: &str, limits: &VerificationLimits) -> Option<Result<(), String>> {
+        let ttl = match self.entries.get(key) {
+            Some(entry) if entry.outcome.is_ok() => limits.success_ttl,
+            Some(_) => limits.failure_ttl,
+            None => return None,
+        };
+        match self.entries.get(key) {
+            Some(entry) if entry.verified_at.elapsed() < ttl => Some(entry.outcome.clone()),
+            Some(_) => {
+                self.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.accounted_bytes = self.accounted_bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    /// Remembers a verdict, evicting oldest-first until the bounds hold again.
+    ///
+    /// Eviction is by oldest verification time with the key as the tie-break, so
+    /// two processes that reach the same limits drop the same entry rather than
+    /// each keeping whichever one it happened to reach first.
+    fn record(
+        &mut self,
+        key: String,
+        outcome: Result<(), String>,
+        bytes: u64,
+        limits: &VerificationLimits,
+    ) {
+        self.remove(&key);
+        self.entries.insert(
+            key.clone(),
+            VerificationEntry {
+                outcome,
+                verified_at: Instant::now(),
+                bytes,
+            },
+        );
+        self.accounted_bytes += bytes;
+        while self.entries.len() > limits.max_entries || self.accounted_bytes > limits.max_bytes {
+            let Some(oldest) = self.oldest() else { break };
+            self.remove(&oldest);
+        }
+    }
+
+    fn oldest(&self) -> Option<String> {
+        self.entries
+            .iter()
+            .min_by(|left, right| {
+                left.1
+                    .verified_at
+                    .cmp(&right.1.verified_at)
+                    .then_with(|| left.0.cmp(right.0))
+            })
+            .map(|(key, _)| key.clone())
+    }
+}
+
+/// A process-wide cache of guest image verification verdicts.
+///
+/// One entry per artifact identity, and at most one verification running per
+/// identity: a worker that restarts twice in a minute would otherwise hash the
+/// same multi-gigabyte image twice at once, on the disk the guests are about to
+/// share with it.
+#[derive(Default)]
+struct VerificationCache {
+    limits: VerificationLimits,
+    state: std::sync::Mutex<VerificationState>,
+    /// Signalled when a verification settles or a concurrency slot frees.
+    changed: std::sync::Condvar,
+}
+
+impl VerificationCache {
+    /// A cache with explicit bounds. The process-wide cache uses
+    /// [`VerificationLimits::default`]; only the tests need to move the numbers.
+    #[cfg(test)]
+    fn new(limits: VerificationLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the verdict for `key`, verifying it with `work` if there is no
+    /// live one.
+    fn verify(
+        &self,
+        key: &str,
+        bytes: u64,
+        work: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        loop {
+            let mut state = lock(&self.state);
+            if let Some(outcome) = state.fresh(key, &self.limits) {
+                return outcome;
+            }
+            // Someone is already hashing these exact bytes: wait for their
+            // verdict rather than hashing them a second time.
+            if let Some(slot) = state.in_flight.get(key).cloned() {
+                drop(state);
+                return slot.wait();
+            }
+            if state.hashing >= self.limits.max_concurrent {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            }
+            let slot = Arc::new(VerificationSlot::default());
+            state.in_flight.insert(key.to_owned(), slot.clone());
+            state.hashing += 1;
+            drop(state);
+
+            // The guard is what makes a panic safe: without it the identity
+            // would stay in flight forever and every later caller for it would
+            // block on a slot nobody will ever complete.
+            let mut run = InFlight {
+                cache: self,
+                key: key.to_owned(),
+                slot: slot.clone(),
+                armed: true,
+            };
+            let outcome = work();
+            run.settle(outcome.clone(), bytes);
+            return outcome;
+        }
+    }
+
+    /// Records a settled verification and releases its waiters.
+    fn settle(
+        &self,
+        key: &str,
+        slot: &Arc<VerificationSlot>,
+        outcome: Result<(), String>,
+        bytes: u64,
+    ) {
+        let mut state = lock(&self.state);
+        state.hashing = state.hashing.saturating_sub(1);
+        state.in_flight.remove(key);
+        state.record(key.to_owned(), outcome.clone(), bytes, &self.limits);
+        drop(state);
+        slot.complete(outcome);
+        // Woken here rather than at the call site so that a verification that
+        // unwound also releases a caller waiting for a concurrency slot.
+        self.changed.notify_all();
+    }
+
+    /// Releases a verification that unwound, so nobody waits on it forever.
+    fn abandon(&self, key: &str, slot: &Arc<VerificationSlot>) {
+        self.settle(
+            key,
+            slot,
+            Err("guest image verification did not complete".to_string()),
+            0,
+        );
+    }
+}
+
+/// A verification that is in flight, and must be settled or abandoned.
+struct InFlight<'a> {
+    cache: &'a VerificationCache,
+    key: String,
+    slot: Arc<VerificationSlot>,
+    armed: bool,
+}
+
+impl InFlight<'_> {
+    fn settle(&mut self, outcome: Result<(), String>, bytes: u64) {
+        self.armed = false;
+        self.cache.settle(&self.key, &self.slot, outcome, bytes);
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cache.abandon(&self.key, &self.slot);
+        }
+    }
+}
+
+/// Locks a mutex the crash of an unrelated task must not turn into a
+/// permanently broken cache: a poisoned verdict is a wrong answer, not a reason
+/// to refuse every later one.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl FirecrackerRuntime {
     pub fn new(config: FirecrackerConfig) -> Self {
-        Self::with_network_backend(config, Arc::new(LinuxNetworkManager::new()))
+        let network = GuardNetworkManager::new(config.state_dir.join("guard"));
+        Self::with_network_backend(config, Arc::new(network))
     }
 
     pub fn with_network_backend(
@@ -977,8 +1658,17 @@ impl FirecrackerRuntime {
         Self {
             config,
             vms: Arc::new(Mutex::new(HashMap::new())),
+            lifetimes: Arc::new(Mutex::new(HashMap::new())),
             network,
+            lifecycle: Arc::new(SandboxLifecycle::new()),
+            pressure: Arc::new(MeasuredHostPressure),
         }
+    }
+
+    /// Replaces the host a create re-measures its headroom against.
+    pub fn with_host_pressure_probe(mut self, pressure: Arc<dyn HostPressureProbe>) -> Self {
+        self.pressure = pressure;
+        self
     }
 
     /// Records this worker's ownership of a VM directory without touching
@@ -1226,9 +1916,15 @@ impl FirecrackerRuntime {
                 ));
             }
         }
+        // JSON byte arrays need at most four wire bytes per payload byte.
+        let response_limit = if matches!(request.operation, Operation::ReadFileChunk) {
+            aiec_core::runtime::FILE_CHUNK_BYTES * 4 + 4096
+        } else {
+            protocol::MAX_FRAME
+        };
         let response = match tokio::time::timeout(
             remaining,
-            read_frame_async(&mut stream, &self.config.guest_secret),
+            read_frame_async_bounded(&mut stream, &self.config.guest_secret, response_limit),
         )
         .await
         {
@@ -1240,6 +1936,11 @@ impl FirecrackerRuntime {
             }
         };
         let response: Response = serde_json::from_slice(&response)?;
+        if response.version != protocol::PROTOCOL_VERSION {
+            return Err(RuntimeError::Protocol(protocol::ProtocolError::Version(
+                response.version,
+            )));
+        }
         if response.request_id != request.request_id {
             return Err(RuntimeError::Protocol(protocol::ProtocolError::Malformed(
                 "request id mismatch".into(),
@@ -1318,7 +2019,7 @@ impl FirecrackerRuntime {
         sandbox: &Sandbox,
         vm: &mut FirecrackerVm,
     ) -> Result<(), RuntimeError> {
-        vm.network = if sandbox.network.is_enabled() {
+        vm.network = if sandbox.network.is_enabled() || sandbox.environment.guard.is_some() {
             Some(self.network.prepare(sandbox, &sandbox.network).await?)
         } else {
             None
@@ -1351,7 +2052,50 @@ impl FirecrackerRuntime {
                 .guest_call(sandbox.id, Operation::Health, RequestPayload::None)
                 .await
             {
-                Ok(ResponsePayload::Health { ready: true }) => return Ok(()),
+                Ok(ResponsePayload::Health { ready: true }) => {
+                    if sandbox.environment.guard.is_some() {
+                        let gateway = vm
+                            .network
+                            .as_ref()
+                            .and_then(|network| network.addresses.first())
+                            .ok_or_else(|| {
+                                RuntimeError::Unavailable("Guard gateway attachment missing".into())
+                            })?
+                            .parse::<std::net::Ipv4Addr>()
+                            .map_err(|_| {
+                                RuntimeError::Unavailable("invalid Guard gateway address".into())
+                            })?;
+                        // Existing rootfs images contain public resolvers. Configure
+                        // the only permitted resolver before accepting workloads.
+                        let configured = self.guest_call(
+                            sandbox.id,
+                            Operation::Exec,
+                            RequestPayload::Exec {
+                                argv: vec!["/bin/sh".into(), "-c".into(), format!(
+                                    "printf 'nameserver {gateway}\\noptions timeout:1 attempts:1\\n' > /etc/resolv.conf"
+                                )],
+                                cwd: None,
+                                env: Default::default(),
+                                timeout_ms: 3000,
+                                output_limit: 1024,
+                                stdin: Vec::new(),
+                            },
+                        ).await?;
+                        if !matches!(
+                            configured,
+                            ResponsePayload::Exec {
+                                exit_code: 0,
+                                timed_out: false,
+                                ..
+                            }
+                        ) {
+                            return Err(RuntimeError::Unavailable(
+                                "Guard guest resolver setup failed".into(),
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
                 Ok(_) => {}
                 Err(error) if tokio::time::Instant::now() < deadline => {
                     let _ = error;
@@ -1362,12 +2106,43 @@ impl FirecrackerRuntime {
         }
     }
 
-    fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
+    /// Publishes a booted VM and arms the timeout that stops it later.
+    ///
+    /// A VM already under this sandbox's id is replaced, and its timer ended
+    /// with it: the entry in the map is the authority on what this id is
+    /// running, and a second one running beside it has nothing left to time
+    /// out.
+    async fn publish_vm(&self, sandbox: &Sandbox, vm: FirecrackerVm) {
+        let token = vm.start_token;
+        let displaced = self.vms.lock().await.insert(sandbox.id, vm);
+        if let Some(displaced) = displaced {
+            self.lifetimes.lock().await.remove(&displaced.start_token);
+        }
+        self.schedule_lifetime(sandbox, token).await;
+    }
+
+    /// Arms the timeout that stops this sandbox's VM when its TTL runs out.
+    ///
+    /// The timer waits on its own timeout racing its own cancellation, so it
+    /// ends when its entry is taken from [`Self::lifetimes`] without anything
+    /// having to reach into the task - and ends when the timeout wins, having
+    /// stopped the VM that token started.
+    async fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
+        let (cancelled, expiry) = oneshot::channel();
+        self.lifetimes.lock().await.insert(token, cancelled);
         let runtime = self.clone();
         let lifetime = sandbox.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(lifetime.timeout_seconds)).await;
-            runtime.stop_if_token(&lifetime, token).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(lifetime.timeout_seconds)) => {
+                    runtime.stop_if_token(&lifetime, token).await;
+                }
+                _ = expiry => {}
+            }
+            // Spent on either path, and only this timer may drop this entry: a
+            // sandbox that has already been restarted is holding a different
+            // token's timer under the same id.
+            runtime.lifetimes.lock().await.remove(&token);
         });
     }
 
@@ -1390,6 +2165,10 @@ impl FirecrackerRuntime {
             }
             vms.remove(&sandbox.id)
         };
+        // The VM is out of the map, so this timer has nothing left to stop.
+        // End it before the teardown rather than after it: a teardown that
+        // fails or blocks still leaves no sleeping task behind.
+        self.lifetimes.lock().await.remove(&token);
         if let Some(vm) = vm {
             self.terminate_vm(sandbox, vm).await;
         }
@@ -1410,9 +2189,10 @@ fn frame_bytes(secret: &[u8], body: &[u8]) -> Vec<u8> {
     frame
 }
 
-async fn read_frame_async<R: tokio::io::AsyncRead + Unpin>(
+async fn read_frame_async_bounded<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     secret: &[u8],
+    limit: usize,
 ) -> Result<Vec<u8>, RuntimeError> {
     let mut header = [0u8; 42];
     reader.read_exact(&mut header).await?;
@@ -1424,7 +2204,7 @@ async fn read_frame_async<R: tokio::io::AsyncRead + Unpin>(
         return Err(protocol::ProtocolError::Version(version).into());
     }
     let length = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
-    if length > protocol::MAX_FRAME {
+    if length > limit {
         return Err(protocol::ProtocolError::TooLarge(length).into());
     }
     let mut body = vec![0; length];
@@ -1449,10 +2229,99 @@ fn which(program: &str) -> Option<PathBuf> {
     })
 }
 
+/// Size of the buffer a disk image is streamed through when it is hashed.
+///
+/// Snapshot disks are whole sandbox disks, and a worker holds several of them
+/// plus the guests that are running. The bound is what keeps hashing one of
+/// them from being an allocation the size of the image.
+const DISK_DIGEST_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Hex-encoded SHA-256 of `path`, streamed through a bounded buffer.
+///
+/// The digest is the same one a whole-file read would produce; what it does not
+/// do is hold the image in memory to produce it. `guest_artifact.rs` already
+/// streams for the same reason, and the snapshot path reading a full disk into
+/// RAM to check it was the counter-example next to it.
+async fn disk_sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0u8; DISK_DIGEST_CHUNK];
+    let mut digest = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 impl FirecrackerRuntime {
+    /// Takes this sandbox's lifecycle gate.
+    ///
+    /// Refused rather than queued when the table is full: every holder is real
+    /// work, and the alternative to a refusal is an unbounded map keyed by a
+    /// request-supplied sandbox id.
+    async fn enter_lifecycle(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<SandboxLifecycleGuard, RuntimeError> {
+        self.lifecycle
+            .enter(sandbox_id)
+            .await
+            .map_err(|busy| RuntimeError::Unavailable(busy.to_string()))
+    }
+
+    /// The headroom this host has to have for `sandbox`, measured now.
+    ///
+    /// Fails closed on both counts: a reading that could not be taken is not a
+    /// reading, and a reading with less room than the sandbox needs is the
+    /// host's own answer. The demand is the guest's own vCPU count, its
+    /// configured memory, and the larger of the requested disk and the base
+    /// image's own size, because every sandbox disk starts as a copy of that
+    /// image and the guest may then fill the whole filesystem.
+    fn admit(
+        &self,
+        sandbox: &Sandbox,
+        base_image_bytes: u64,
+    ) -> Result<HostPressure, RuntimeError> {
+        let pressure = self
+            .pressure
+            .measure(&self.config.state_dir, self.config.host_reserves);
+        let memory_bytes =
+            u64::from(sandbox.memory_mb).saturating_mul(aiec_core::host_pressure::MIB);
+        let disk_mb = u64::from(sandbox.disk_mb)
+            .max(base_image_bytes.div_ceil(aiec_core::host_pressure::MIB));
+        let disk_bytes = disk_mb.saturating_mul(aiec_core::host_pressure::MIB);
+        match pressure.admits(sandbox.cpu, memory_bytes, disk_bytes) {
+            Ok(()) => Ok(pressure),
+            // The reading's own wording, without the `core:` prefix this crate
+            // would otherwise wrap it in: the operator reading a refused create
+            // needs the numbers, not this crate's error taxonomy.
+            Err(CoreError::Unavailable(message)) => Err(RuntimeError::Unavailable(message)),
+            Err(error) => Err(RuntimeError::Core(error)),
+        }
+    }
+
     async fn create(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         let started = Instant::now();
         tracing::info!(sandbox_id = %sandbox.id, runtime = "firecracker", stage = "create_begin", "firecracker create started");
+        // One sandbox's lifecycle at a time, so a destroy cannot report success
+        // while this create is still copying into the directory it removes, and
+        // so the copy that follows is the only one writing there.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        // Admission is the first thing this asks, before it validates anything
+        // and before it writes anything. A host that cannot physically hold the
+        // sandbox is refused whether or not its configuration is also wrong,
+        // and a refused create has not yet created a directory, copied an
+        // image, or reserved a byte. The heartbeat that admitted the placement
+        // is already stale by the time a create reaches the runtime: the host
+        // fills between the two, and this is the reading taken immediately
+        // before the money is spent.
+        // One stat of the base image, taken before the copy that reads it, and
+        // reused below where the copy is compared against it.
+        let base_image_bytes = self.config.base_image_bytes();
+        self.admit(sandbox, base_image_bytes)?;
         self.config.check()?;
         // The guest image is verified once at worker startup, not per create:
         // a worker that cannot verify its image must fail to start rather than
@@ -1466,22 +2335,65 @@ impl FirecrackerRuntime {
         let destination = self.config.rootfs(sandbox.id);
         let copy_started = Instant::now();
         tracing::info!(sandbox_id = %sandbox.id, source = %self.config.rootfs.display(), destination = %destination.display(), stage = "rootfs_copy_begin", "firecracker rootfs copy started");
-        let copied = tokio::time::timeout(
+        // Copy-on-write clone of the base image where the filesystem supports
+        // it, full copy where it does not. The blocking syscall runs on the
+        // blocking pool; the existing 120s bound still covers the whole
+        // materialization. Timing out drops the future, which is also the
+        // cancellation signal: the copy stops at its next chunk boundary and
+        // removes the destination, so a create that gave up does not leave a
+        // background copy filling a disk nobody is going to boot - or
+        // re-creating one after this path's own cleanup removed the directory.
+        let materialized = tokio::time::timeout(
             Duration::from_secs(120),
-            tokio::fs::copy(&self.config.rootfs, &destination),
+            rootfs::materialize(&self.config.rootfs, &destination),
         )
         .await
         .map_err(|_| RuntimeError::Unavailable("Firecracker rootfs copy timed out".into()))??;
-        tracing::info!(sandbox_id = %sandbox.id, bytes = copied, elapsed_ms = copy_started.elapsed().as_millis() as u64, stage = "rootfs_copy_done", "firecracker rootfs copy completed");
+        tracing::info!(sandbox_id = %sandbox.id, bytes = materialized.bytes, method = %materialized.method, elapsed_ms = copy_started.elapsed().as_millis() as u64, stage = "rootfs_copy_done", "firecracker rootfs copy completed");
         let requested = (sandbox.disk_mb as u64) * 1024 * 1024;
-        let current = tokio::fs::metadata(&self.config.rootfs).await?.len();
+        // From here on the disk image exists on this host, so every failure has
+        // to take it with it. `materialize` only cleans up after its own errors;
+        // once it returns `Ok` the responsibility is the caller's, and a
+        // `resize2fs` that fails on a multi-gigabyte image would otherwise leave
+        // exactly that behind - on a worker that admits placements against a
+        // free-disk reading taken before the copy, so the leak also defeats the
+        // pressure check that would otherwise have noticed.
+        if let Err(error) = self
+            .resize_to_requested_disk(sandbox, &destination, requested, base_image_bytes)
+            .await
+        {
+            rootfs::discard(&destination);
+            return Err(error);
+        }
+        tracing::info!(sandbox_id = %sandbox.id, elapsed_ms = started.elapsed().as_millis() as u64, stage = "create_done", "firecracker create completed");
+        Ok(())
+    }
+
+    /// Resizes a freshly materialized disk to what the sandbox asked for.
+    ///
+    /// Split out so the caller can guarantee the single cleanup path: five
+    /// failure returns in one function is five chances to leave a multi-
+    /// gigabyte image on a worker host, and `kill_on_drop` does not remove
+    /// files.
+    async fn resize_to_requested_disk(
+        &self,
+        sandbox: &Sandbox,
+        destination: &Path,
+        requested: u64,
+        current: u64,
+    ) -> Result<(), RuntimeError> {
         if requested < current {
+            // `kill_on_drop` on every tool this path runs: a create that is
+            // cancelled - a client that went away, a request the control plane
+            // abandoned - must not leave `resize2fs` writing into a directory
+            // a destroy has already been told is gone.
             let status = Command::new("e2fsck")
                 .arg("-f")
                 .arg("-y")
-                .arg(&destination)
+                .arg(destination)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
+                .kill_on_drop(true)
                 .status()
                 .await?;
             if !matches!(status.code(), Some(0) | Some(1)) {
@@ -1490,10 +2402,11 @@ impl FirecrackerRuntime {
                 ));
             }
             let output = Command::new("resize2fs")
-                .arg(&destination)
+                .arg(destination)
                 .arg(format!("{}M", sandbox.disk_mb))
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .output()
                 .await?;
             if !output.status.success() {
@@ -1503,12 +2416,13 @@ impl FirecrackerRuntime {
                 )));
             }
         } else if requested > current {
-            let file = std::fs::OpenOptions::new().write(true).open(&destination)?;
+            let file = std::fs::OpenOptions::new().write(true).open(destination)?;
             file.set_len(requested)?;
             let status = Command::new("resize2fs")
-                .arg(&destination)
+                .arg(destination)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
+                .kill_on_drop(true)
                 .status()
                 .await?;
             if !status.success() {
@@ -1517,11 +2431,15 @@ impl FirecrackerRuntime {
                 ));
             }
         }
-        tracing::info!(sandbox_id = %sandbox.id, elapsed_ms = started.elapsed().as_millis() as u64, stage = "create_done", "firecracker create completed");
         Ok(())
     }
 
     async fn start(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        // Held until the VM is in the map. A destroy that ran while this boot
+        // was configuring would clear the directory this one is booting from
+        // and return success, and the boot would then finish and publish a live
+        // process behind it.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
         self.config.check()?;
         let mut vm = self.spawn(sandbox.id).await?;
         if let Err(error) = self.configure_and_start(sandbox, &mut vm).await {
@@ -1532,15 +2450,24 @@ impl FirecrackerRuntime {
             let _ = vm.child.wait().await;
             return Err(error);
         }
-        let token = vm.start_token;
-        self.vms.lock().await.insert(sandbox.id, vm);
-        self.schedule_lifetime(sandbox, token);
+        self.publish_vm(sandbox, vm).await;
         Ok(())
     }
 
     async fn stop(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        self.stop_vm(sandbox).await
+    }
+
+    /// Takes the running VM out of the map and terminates it.
+    ///
+    /// Ungated, so the gated operations above can reach it: a destroy stops the
+    /// VM it is about to remove the state of, rather than queueing behind a
+    /// second gate for the same sandbox.
+    async fn stop_vm(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         let vm = self.vms.lock().await.remove(&sandbox.id);
         if let Some(vm) = vm {
+            self.lifetimes.lock().await.remove(&vm.start_token);
             self.terminate_vm(sandbox, vm).await;
         }
         Ok(())
@@ -1583,6 +2510,37 @@ impl FirecrackerRuntime {
         sandbox: &Sandbox,
         request: ExecRequest,
     ) -> Result<ExecResult, RuntimeError> {
+        let mut request = request;
+        if let Some(guard) = &sandbox.environment.guard {
+            let effective = guard
+                .effective_policy()
+                .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+            if let Some(model) = effective.model {
+                let gateway = self
+                    .vms
+                    .lock()
+                    .await
+                    .get(&sandbox.id)
+                    .and_then(|vm| vm.network.as_ref())
+                    .and_then(|network| network.addresses.first())
+                    .cloned()
+                    .ok_or_else(|| {
+                        RuntimeError::Unavailable("Guard model gateway missing".into())
+                    })?;
+                let base = format!("http://{gateway}:8443/model/{}/v1", model.credential);
+                let placeholder = format!("placeholder://{}", model.credential);
+                for key in ["AIEC_MODEL_API_KEY", "AIEC_AGENT_API_KEY", "OPENAI_API_KEY"] {
+                    request.environment.insert(key.into(), placeholder.clone());
+                }
+                for key in [
+                    "AIEC_MODEL_BASE_URL",
+                    "AIEC_AGENT_BASE_URL",
+                    "OPENAI_BASE_URL",
+                ] {
+                    request.environment.insert(key.into(), base.clone());
+                }
+            }
+        }
         validate_exec(&request)?;
         let payload = self
             .guest_call(
@@ -1972,6 +2930,11 @@ impl FirecrackerRuntime {
     }
 
     pub async fn snapshot(&self, sandbox: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
+        // A capture pauses the guest, writes its memory and copies its disk. A
+        // destroy issued in the middle would kill the VM halfway through and
+        // leave a snapshot object that is not a snapshot, so the destroy waits
+        // for the capture to finish and release the guest.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
         self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
             .await?;
         let vms = self.vms.lock().await;
@@ -2015,10 +2978,11 @@ impl FirecrackerRuntime {
             .await?;
             let snapshot_disk = destination.join("rootfs.ext4");
             tokio::fs::copy(&source_disk, &snapshot_disk).await?;
+            let rootfs_sha256 = disk_sha256(&snapshot_disk).await?;
             let manifest = serde_json::json!({
                 "schema": 1,
                 "source_disk": source_disk,
-                "rootfs_sha256": hex::encode(Sha256::digest(tokio::fs::read(&snapshot_disk).await?)),
+                "rootfs_sha256": rootfs_sha256,
             });
             tokio::fs::write(
                 destination.join("manifest.json"),
@@ -2051,6 +3015,10 @@ impl FirecrackerRuntime {
     }
 
     pub async fn restore(&self, sandbox: &Sandbox, object_key: &str) -> Result<(), RuntimeError> {
+        // A restore replaces this sandbox's disk and boots from it, so it is a
+        // lifecycle operation like any other: a destroy must not clear the
+        // directory between the disk copy and the boot.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
         let source = self.config.snapshot_dir(object_key);
         let manifest: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(source.join("manifest.json")).await?)?;
@@ -2064,7 +3032,7 @@ impl FirecrackerRuntime {
             ));
         }
         let snapshot_disk = source.join("rootfs.ext4");
-        let actual = hex::encode(Sha256::digest(tokio::fs::read(&snapshot_disk).await?));
+        let actual = disk_sha256(&snapshot_disk).await?;
         if actual != manifest["rootfs_sha256"].as_str().unwrap_or_default() {
             return Err(RuntimeError::Unavailable(
                 "snapshot disk checksum mismatch".into(),
@@ -2099,14 +3067,18 @@ impl FirecrackerRuntime {
                 Err(error) => return Err(error),
             }
         }
-        let token = vm.start_token;
-        self.vms.lock().await.insert(sandbox.id, vm);
-        self.schedule_lifetime(sandbox, token);
+        self.publish_vm(sandbox, vm).await;
         Ok(())
     }
 
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
-        self.stop(sandbox).await?;
+        // Held until the state and socket directories are gone. This is the
+        // operation the create above has to be behind: a destroy that returned
+        // while a create was still copying would be reporting a machine that
+        // does not exist and a create that finished afterwards would leave it
+        // behind. Neither failure is visible in the response the caller got.
+        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        self.stop_vm(sandbox).await?;
         let state = self.config.vm_dir(sandbox.id);
         let socket = self.config.socket_dir(sandbox.id);
         match tokio::fs::remove_dir_all(&state).await {
@@ -2152,6 +3124,43 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, CoreError> {
         Self::get_file(self, sandbox, path).await.map_err(into_core)
+    }
+    async fn get_file_chunk(
+        &self,
+        sandbox: &Sandbox,
+        request: FileChunkRequest,
+    ) -> Result<FileChunk, CoreError> {
+        request.validate()?;
+        match self
+            .guest_call(
+                sandbox.id,
+                Operation::ReadFileChunk,
+                RequestPayload::ReadFileChunk {
+                    request: request.clone(),
+                },
+            )
+            .await
+            .map_err(into_core)?
+        {
+            ResponsePayload::ReadFileChunk {
+                content,
+                size_bytes,
+                version,
+                eof,
+            } => {
+                let chunk = FileChunk {
+                    bytes: content.into(),
+                    size_bytes,
+                    version,
+                    eof,
+                };
+                request.validate_chunk(&chunk)?;
+                Ok(chunk)
+            }
+            _ => Err(CoreError::Backend(
+                "guest returned invalid chunk response".into(),
+            )),
+        }
     }
     async fn list_files(&self, sandbox: &Sandbox, path: &str) -> Result<Vec<FileEntry>, CoreError> {
         Self::list_files(self, sandbox, path)
@@ -2203,7 +3212,11 @@ impl SandboxRuntime for FirecrackerRuntime {
         }
     }
     fn capabilities(&self) -> RuntimeCapabilities {
-        firecracker_capabilities(self.network.as_ref(), self.config.guest_artifact.as_ref())
+        firecracker_capabilities(
+            self.network.as_ref(),
+            self.config.guest_artifact.as_ref(),
+            self.config.minimum_disk_mb(),
+        )
     }
 }
 
@@ -2275,6 +3288,7 @@ impl SnapshotProvider for FirecrackerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aiec_core::host_pressure::{GIB, MIB};
 
     fn config() -> FirecrackerConfig {
         FirecrackerConfig {
@@ -2290,6 +3304,7 @@ mod tests {
             guest_artifact_dir: None,
             guest_artifact: None,
             require_coding_guest: false,
+            host_reserves: HostReserves::default(),
         }
     }
 
@@ -2332,9 +3347,26 @@ mod tests {
     }
     #[test]
     fn firecracker_pause_is_not_reported_as_resource_reclamation() {
-        let capabilities = firecracker_capabilities(&LinuxNetworkManager::new(), None);
+        let capabilities = firecracker_capabilities(&LinuxNetworkManager::new(), None, 0);
         assert!(capabilities.pause);
         assert!(!capabilities.pause_reclaims_resources);
+    }
+
+    #[tokio::test]
+    async fn guest_chunk_rejects_oversized_frame_before_reading_body() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0; 42];
+        header[..4].copy_from_slice(b"AFG1");
+        header[4..6].copy_from_slice(&protocol::PROTOCOL_VERSION.to_be_bytes());
+        header[6..10].copy_from_slice(&(300_000u32).to_be_bytes());
+        writer.write_all(&header).await.unwrap();
+        let result = read_frame_async_bounded(&mut reader, b"secret", 64 * 1024 * 4 + 4096).await;
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Protocol(protocol::ProtocolError::TooLarge(
+                300_000
+            )))
+        ));
     }
 
     #[test]
@@ -2383,13 +3415,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
     }
 
-    #[tokio::test]
-    async fn stale_timer_token_cannot_stop_restarted_vm() {
-        let mut config = config();
-        config.readiness_timeout = Duration::from_millis(5);
-        let runtime = FirecrackerRuntime::new(config);
-        let sandbox = sandbox(Uuid::now_v7(), 60);
-        let token = Uuid::now_v7();
+    /// A VM entry backed by a real process, so a test can observe the process
+    /// that a teardown or an expiry is supposed to stop.
+    fn running_vm(start_token: Uuid) -> FirecrackerVm {
         let child = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -2398,17 +3426,29 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        runtime.vms.lock().await.insert(
-            sandbox.id,
-            FirecrackerVm {
-                child,
-                api_socket: PathBuf::from("/unused/api.sock"),
-                network: None,
-                vsock_socket: PathBuf::from("/unused/vsock.sock"),
-                rootfs: PathBuf::from("/unused/rootfs.ext4"),
-                start_token: token,
-            },
-        );
+        FirecrackerVm {
+            child,
+            api_socket: PathBuf::from("/unused/api.sock"),
+            network: None,
+            vsock_socket: PathBuf::from("/unused/vsock.sock"),
+            rootfs: PathBuf::from("/unused/rootfs.ext4"),
+            start_token,
+        }
+    }
+
+    fn process_running(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[tokio::test]
+    async fn stale_timer_token_cannot_stop_restarted_vm() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let runtime = FirecrackerRuntime::new(config);
+        let sandbox = sandbox(Uuid::now_v7(), 60);
+        let token = Uuid::now_v7();
+        let vm = running_vm(token);
+        runtime.vms.lock().await.insert(sandbox.id, vm);
         runtime.stop_if_token(&sandbox, Uuid::now_v7()).await;
         assert!(runtime.vms.lock().await.contains_key(&sandbox.id));
         let mut vm = runtime.vms.lock().await.remove(&sandbox.id).unwrap();
@@ -2449,34 +3489,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_lifetime_schedule_expires_vm() {
+    async fn a_lifetime_that_runs_out_stops_its_vm_and_ends_its_timer() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let runtime = FirecrackerRuntime::new(config);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let sandbox = sandbox(Uuid::now_v7(), 0);
+        let token = Uuid::now_v7();
+        let vm = running_vm(token);
+        let pid = vm.child.id().unwrap();
+        runtime.vms.lock().await.insert(sandbox.id, vm);
+        runtime.schedule_lifetime(&sandbox, token).await;
+        for _ in 0..100 {
+            if !process_running(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The timeout won on its own: the VM that token started is out of the
+        // map and its process is gone.
+        assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
+        assert!(!process_running(pid));
+        // And the timer that fired is spent with it, rather than left holding
+        // the runtime and the sandbox it just stopped.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(metrics.num_alive_tasks(), baseline);
+    }
+
+    #[tokio::test]
+    async fn destroying_sandboxes_ends_their_lifetime_timers() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        config.state_dir = std::env::temp_dir().join(format!("af-lifetime-{}", Uuid::now_v7()));
+        let runtime = FirecrackerRuntime::new(config);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        // An hour of TTL each: nothing in this test waits one out, so only
+        // teardown can end these timers. A timer that outlived its VM would be
+        // a task per short-lived Run that nothing ever joins up again.
+        let mut armed = Vec::new();
+        for _ in 0..8 {
+            let sandbox = sandbox(Uuid::now_v7(), 3_600);
+            let token = Uuid::now_v7();
+            let vm = running_vm(token);
+            let pid = vm.child.id().unwrap();
+            runtime.vms.lock().await.insert(sandbox.id, vm);
+            runtime.schedule_lifetime(&sandbox, token).await;
+            armed.push((sandbox, pid));
+        }
+        assert!(
+            metrics.num_alive_tasks() >= baseline + armed.len(),
+            "an armed lifetime is a live task for as long as its VM lives"
+        );
+        for (destroyed, pid) in &armed {
+            FirecrackerRuntime::destroy(&runtime, destroyed)
+                .await
+                .unwrap();
+            assert!(!process_running(*pid));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            baseline,
+            "a destroyed sandbox must not leave a lifetime task sleeping"
+        );
+        assert!(runtime.vms.lock().await.is_empty());
+        let _ = tokio::fs::remove_dir_all(&runtime.config.state_dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_destroyed_sandbox_still_gets_its_restarted_vm_expired() {
         let mut config = config();
         config.readiness_timeout = Duration::from_millis(5);
         let runtime = FirecrackerRuntime::new(config);
         let sandbox = sandbox(Uuid::now_v7(), 0);
-        let token = Uuid::now_v7();
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
+        let stale = running_vm(Uuid::now_v7());
+        let stale_token = stale.start_token;
+        runtime.vms.lock().await.insert(sandbox.id, stale);
+        runtime.schedule_lifetime(&sandbox, stale_token).await;
+        FirecrackerRuntime::destroy(&runtime, &sandbox)
+            .await
             .unwrap();
-        runtime.vms.lock().await.insert(
-            sandbox.id,
-            FirecrackerVm {
-                child,
-                api_socket: PathBuf::from("/unused/api.sock"),
-                network: None,
-                vsock_socket: PathBuf::from("/unused/vsock.sock"),
-                rootfs: PathBuf::from("/unused/rootfs.ext4"),
-                start_token: token,
-            },
-        );
-        runtime.schedule_lifetime(&sandbox, token);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Same sandbox id, new boot. A destroy ends the timer it owned, and the
+        // sandbox it left behind must still be able to arm and run its own: a
+        // destroy that broke later timers would leave this VM running until
+        // something else stopped it.
+        let fresh = running_vm(Uuid::now_v7());
+        let fresh_token = fresh.start_token;
+        let fresh_pid = fresh.child.id().unwrap();
+        runtime.vms.lock().await.insert(sandbox.id, fresh);
+        runtime.schedule_lifetime(&sandbox, fresh_token).await;
+        for _ in 0..100 {
+            if !process_running(fresh_pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
+        assert!(!process_running(fresh_pid));
     }
 
     #[tokio::test]
@@ -2597,6 +3709,7 @@ mod tests {
             capabilities: vec!["sh".into(), "git".into(), "ca-certificates".into()],
             git_version: Some("git version 2.39.5".into()),
             guest_agent_version: "0.1.0".into(),
+            guest_protocol_version: protocol::PROTOCOL_VERSION,
             rootfs_sha256: "a".repeat(64),
             kernel_sha256: None,
         };
@@ -2616,7 +3729,9 @@ mod tests {
         assert!(!SandboxRuntime::capabilities(&minimal).coding_guest);
         let unrecorded = FirecrackerRuntime::new(config());
         assert!(!SandboxRuntime::capabilities(&unrecorded).coding_guest);
-        assert!(firecracker_capabilities(&LinuxNetworkManager::new(), Some(&coding)).coding_guest);
+        assert!(
+            firecracker_capabilities(&LinuxNetworkManager::new(), Some(&coding), 0).coding_guest
+        );
     }
 
     fn artifact_config(dir: &Path, rootfs: &Path) -> FirecrackerConfig {
@@ -2637,10 +3752,96 @@ mod tests {
         std::fs::write(
             dir.join(guest_artifact::GUEST_ARTIFACT_FILE),
             format!(
-                r#"{{"artifact_version":"1.0.0","base":"debian:bookworm-slim","profile":"{profile}","capabilities":{capabilities},"guest_agent_version":"0.1.0","rootfs_sha256":"{digest}"}}"#
+                r#"{{"artifact_version":"1.0.0","base":"debian:bookworm-slim","profile":"{profile}","capabilities":{capabilities},"guest_agent_version":"0.1.0","guest_protocol_version":2,"rootfs_sha256":"{digest}"}}"#
             ),
         )
         .expect("artifact metadata");
+    }
+
+    /// The loader a worker actually uses has to tell "no metadata" apart from
+    /// "metadata this worker will not accept".
+    ///
+    /// The old test built a config by hand with the artifact already in it, so
+    /// it exercised the `Some` branch and never the path a real deployment
+    /// takes - which is where the protocol check was being swallowed.
+    #[test]
+    fn a_present_but_unusable_guest_document_is_not_treated_as_absent() {
+        let dir = std::env::temp_dir().join(format!("af-guest-meta-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("artifact directory");
+
+        // No document at all: a deployment without guest metadata is fine.
+        assert!(
+            load_guest_artifact_metadata(&dir)
+                .expect("an absent document is not an error")
+                .is_none()
+        );
+
+        let rootfs = dir.join("aiec-rootfs.ext4");
+        std::fs::write(&rootfs, b"root filesystem bytes").expect("rootfs");
+        std::fs::write(dir.join("vmlinux"), b"kernel bytes").expect("kernel");
+        write_artifact_metadata(&dir, &rootfs, r#"["git","ca-certificates"]"#, "coding");
+        assert!(
+            load_guest_artifact_metadata(&dir)
+                .expect("a good document loads")
+                .is_some()
+        );
+
+        // A document that is present and wrong must stop the worker.
+        let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
+        let current = std::fs::read_to_string(&path).expect("metadata");
+        let stale = current.replace(
+            &format!("\"guest_protocol_version\":{}", protocol::PROTOCOL_VERSION),
+            "\"guest_protocol_version\":1",
+        );
+        assert_ne!(stale, current, "metadata must record the protocol revision");
+        std::fs::write(&path, stale).expect("older metadata");
+        let error = load_guest_artifact_metadata(&dir)
+            .expect_err("an older guest protocol must fail closed, not vanish");
+        assert!(error.to_string().contains("protocol 1"), "{error}");
+
+        // And a corrupt document is refused for the same reason.
+        std::fs::write(&path, b"{ not json").expect("malformed metadata");
+        assert!(
+            load_guest_artifact_metadata(&dir).is_err(),
+            "malformed metadata must not read as absent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_guest_protocol_is_refused_before_anything_boots() {
+        let dir = std::env::temp_dir().join(format!("af-guest-proto-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("artifact directory");
+        let rootfs = dir.join("aiec-rootfs.ext4");
+        std::fs::write(&rootfs, b"root filesystem bytes").expect("rootfs");
+        std::fs::write(dir.join("vmlinux"), b"kernel bytes").expect("kernel");
+        write_artifact_metadata(&dir, &rootfs, r#"["git","ca-certificates"]"#, "coding");
+        let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
+        let current = std::fs::read_to_string(&path).expect("metadata");
+        let stale = current.replace(
+            &format!("\"guest_protocol_version\":{}", protocol::PROTOCOL_VERSION),
+            "\"guest_protocol_version\":1",
+        );
+        assert_ne!(stale, current, "metadata must record the protocol revision");
+        std::fs::write(&path, stale).expect("older metadata");
+
+        // A stale guest cannot answer a bounded range read, so a deployment must
+        // not report a usable image at all.
+        let error = guest_artifact::load_guest_artifact(&path)
+            .expect_err("an older guest protocol must fail closed");
+        assert!(error.to_string().contains("protocol 1"), "{error}");
+        let config = FirecrackerConfig {
+            guest_artifact: Some(
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("metadata"))
+                    .expect("struct"),
+            ),
+            ..config()
+        };
+        let error = config
+            .check_guest_capabilities()
+            .expect_err("startup must refuse an older guest");
+        assert!(error.to_string().contains("protocol 1"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2722,13 +3923,375 @@ mod tests {
         .expect("a coding guest with git and CA certificates satisfies the requirement");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A snapshot disk is hashed in bounded chunks, and the digest is still the
+    /// digest of the whole file.
+    ///
+    /// The image is larger than one chunk and the two copies differ only in
+    /// their *last* byte, so a hash that read only the first chunk would call
+    /// them equal and accept a snapshot disk nobody verified.
+    #[tokio::test]
+    async fn a_snapshot_disk_digest_covers_the_whole_image() {
+        let dir = std::env::temp_dir().join(format!("af-disk-digest-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let first = dir.join("first.ext4");
+        let second = dir.join("second.ext4");
+        let mut image = vec![0x5au8; DISK_DIGEST_CHUNK + 4096];
+        std::fs::write(&first, &image).expect("image");
+        // One byte different, at the very end of the image.
+        let last = image.len() - 1;
+        image[last] = 0xa5;
+        std::fs::write(&second, &image).expect("image");
+
+        let first_digest = disk_sha256(&first).await.expect("digest");
+        let second_digest = disk_sha256(&second).await.expect("digest");
+        assert_ne!(
+            first_digest, second_digest,
+            "a difference in the last bytes of a snapshot disk must be detected"
+        );
+        assert_eq!(first_digest.len(), 64);
+        assert_eq!(
+            first_digest,
+            disk_sha256(&first).await.expect("digest"),
+            "hashing the same image twice is the same answer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// A host that reports whatever the test tells it to, so an admission
+    /// decision can be asserted without depending on the machine the test runs
+    /// on - and, more to the point, without depending on how full it is.
+    struct ScriptedPressure {
+        reading: HostPressure,
+        seen: std::sync::Mutex<Vec<(PathBuf, HostReserves)>>,
+    }
+
+    impl HostPressureProbe for ScriptedPressure {
+        fn measure(&self, workspace: &Path, reserves: HostReserves) -> HostPressure {
+            lock(&self.seen).push((workspace.to_path_buf(), reserves));
+            HostPressure {
+                reserves,
+                ..self.reading.clone()
+            }
+        }
+    }
+
+    fn reading(memory: Option<u64>, disk: Option<u64>, reserves: HostReserves) -> HostPressure {
+        HostPressure::from_measurements(
+            "test-host",
+            chrono::Utc::now(),
+            aiec_core::host_pressure::HostMeasurements {
+                // A ceiling no sandbox these tests create can reach, so CPU
+                // never decides their outcome - the cases that must decide on
+                // CPU state state the reading themselves.
+                total_vcpus: Some(64),
+                available_vcpus: Some(64),
+                total_memory_bytes: Some(64 * GIB),
+                memory_available_bytes: memory,
+                total_disk_bytes: Some(500 * GIB),
+                disk_available_bytes: disk,
+            },
+            reserves,
+        )
+    }
+
+    /// A configuration whose structural check is irrelevant: admission is
+    /// answered before anything is validated, so these tests state a reading
+    /// and read the refusal, not the state of this machine.
+    fn admission_config(dir: &Path, rootfs: &Path) -> FirecrackerConfig {
+        FirecrackerConfig {
+            binary: dir.join("missing-firecracker"),
+            kernel: dir.join("vmlinux"),
+            rootfs: rootfs.to_path_buf(),
+            state_dir: dir.join("state"),
+            host_reserves: HostReserves::from_mib(0, 0),
+            ..config()
+        }
+    }
+
+    fn admission_sandbox(disk_mb: u32) -> Sandbox {
+        Sandbox {
+            memory_mb: 128,
+            disk_mb,
+            runtime: RuntimeKind::Firecracker,
+            ..sandbox(Uuid::now_v7(), 60)
+        }
+    }
+
+    /// A create that cannot be admitted never reaches the image copy, so the
+    /// disk is not spent on a sandbox this host cannot hold.
+    #[tokio::test]
+    async fn a_create_that_the_host_cannot_hold_is_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("aiec-admit-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 8 * 1024 * 1024]).expect("rootfs");
+        let sandbox = admission_sandbox(1024);
+        let runtime = FirecrackerRuntime::new(admission_config(&dir, &rootfs))
+            .with_host_pressure_probe(Arc::new(ScriptedPressure {
+                reading: reading(
+                    Some(64 * MIB),
+                    Some(400 * GIB),
+                    HostReserves::from_mib(0, 0),
+                ),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }));
+
+        let error = runtime
+            .create(&sandbox)
+            .await
+            .expect_err("a host with 64 MiB free cannot take a 128 MiB guest");
+        assert!(error.to_string().contains("memory"), "{error}");
+        assert!(
+            !runtime.config.rootfs(sandbox.id).exists(),
+            "the image was materialized for a sandbox the host cannot hold"
+        );
+        assert!(
+            !runtime.config.vm_dir(sandbox.id).exists(),
+            "the sandbox directory was created for a refused create"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reading that could not be taken is not a reading of a host with room.
+    #[tokio::test]
+    async fn an_unmeasurable_host_is_refused_rather_than_guessed() {
+        let dir = std::env::temp_dir().join(format!("aiec-admit-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 1024 * 1024]).expect("rootfs");
+        let sandbox = admission_sandbox(1024);
+        let runtime = FirecrackerRuntime::new(admission_config(&dir, &rootfs))
+            .with_host_pressure_probe(Arc::new(ScriptedPressure {
+                reading: reading(None, None, HostReserves::from_mib(0, 0)),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }));
+
+        let error = runtime
+            .create(&sandbox)
+            .await
+            .expect_err("an unmeasured host must not be admitted on");
+        assert!(
+            error.to_string().contains("could not be measured"),
+            "{error}"
+        );
+        assert!(!runtime.config.rootfs(sandbox.id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disk a create is admitted on is the larger of what was asked for and
+    /// the image every sandbox is copied from. A request below the image's own
+    /// size cannot be honoured, so a host that could hold the sandbox is
+    /// refused for it unless the image is counted - which is the whole point of
+    /// a small request existing on a large-image host.
+    #[tokio::test]
+    async fn admission_demands_the_base_image_when_the_request_is_smaller() {
+        let dir = std::env::temp_dir().join(format!("aiec-admit-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 4 * MIB as usize]).expect("rootfs");
+        // A 2 MiB request against a 4 MiB image, on a host with 3 MiB free: the
+        // request alone would be admitted, and the copy is not.
+        let sandbox = admission_sandbox(2);
+        let runtime = FirecrackerRuntime::new(admission_config(&dir, &rootfs))
+            .with_host_pressure_probe(Arc::new(ScriptedPressure {
+                reading: reading(Some(64 * MIB), Some(3 * MIB), HostReserves::from_mib(0, 0)),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }));
+        assert_eq!(runtime.config.minimum_disk_mb(), 4);
+
+        let error = runtime
+            .create(&sandbox)
+            .await
+            .expect_err("3 MiB of disk cannot hold a 4 MiB base image");
+        assert!(error.to_string().contains("disk"), "{error}");
+        assert!(
+            !runtime.config.rootfs(sandbox.id).exists(),
+            "an image was copied for a sandbox this host cannot hold"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reserve a create is admitted against is the one the worker is
+    /// configured with, and the reading is taken against the directory the
+    /// images are written to rather than `/`.
+    #[tokio::test]
+    async fn admission_uses_the_configured_reserve_and_the_state_directory() {
+        let dir = std::env::temp_dir().join(format!("aiec-admit-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 1024 * 1024]).expect("rootfs");
+        let sandbox = admission_sandbox(1024);
+        let reserves = HostReserves::from_mib(1024, 8192);
+        let probe = Arc::new(ScriptedPressure {
+            // The reading is already net of the reserve - that is what the
+            // reserve means - so what admission compares is this figure against
+            // the guest's configured memory.
+            reading: reading(Some(64 * MIB), Some(2 * GIB), reserves),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = FirecrackerRuntime::new(FirecrackerConfig {
+            host_reserves: reserves,
+            ..admission_config(&dir, &rootfs)
+        })
+        .with_host_pressure_probe(probe.clone());
+
+        let error = runtime
+            .create(&sandbox)
+            .await
+            .expect_err("a host with 64 MiB above its reserve cannot take a 128 MiB guest");
+        assert!(error.to_string().contains("memory"), "{error}");
+        let seen = lock(&probe.seen);
+        assert_eq!(seen.len(), 1, "the host is measured once per create");
+        assert_eq!(seen[0].0, dir.join("state"));
+        assert_eq!(seen[0].1, reserves);
+        drop(seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host with room is not refused by admission, and the create goes on to
+    /// the structural check that fails on this machine's missing Firecracker
+    /// binary. That the refusal is about the binary is the evidence that
+    /// admission passed.
+    #[tokio::test]
+    async fn a_host_with_room_is_admitted_and_the_create_continues() {
+        let dir = std::env::temp_dir().join(format!("aiec-admit-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 1024 * 1024]).expect("rootfs");
+        let sandbox = admission_sandbox(1024);
+        let runtime = FirecrackerRuntime::new(admission_config(&dir, &rootfs))
+            .with_host_pressure_probe(Arc::new(ScriptedPressure {
+                reading: reading(
+                    Some(64 * GIB),
+                    Some(200 * GIB),
+                    HostReserves::from_mib(0, 0),
+                ),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }));
+
+        let error = runtime.create(&sandbox).await.expect_err(
+            "this machine has no Firecracker binary, so the structural check is the refusal",
+        );
+        assert!(
+            error.to_string().contains("Firecracker binary"),
+            "admission refused a host with room: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One gate per sandbox, and nothing left behind when the work is done.
+    #[tokio::test]
+    async fn a_lifecycle_gate_serves_one_sandbox_at_a_time_and_forgets_it_afterwards() {
+        use futures_util::FutureExt;
+        let lifecycle = Arc::new(SandboxLifecycle::new());
+        let sandbox_id = Uuid::now_v7();
+        let held = lifecycle.clone().enter(sandbox_id).await.unwrap();
+
+        // A second caller for the same sandbox queues, and the queue is what
+        // keeps the entry alive: polled once, it is pending, and the caller that
+        // polled it is gone.
+        assert!(lifecycle.clone().enter(sandbox_id).now_or_never().is_none());
+        assert_eq!(
+            lifecycle.held(),
+            1,
+            "a caller that gave up while queued is not left counted"
+        );
+        // A different sandbox is a different machine and does not queue.
+        let other = lifecycle.clone().enter(Uuid::now_v7()).await.unwrap();
+        assert_eq!(lifecycle.held(), 2);
+        drop(other);
+        assert_eq!(lifecycle.held(), 1);
+        drop(held);
+        assert_eq!(
+            lifecycle.held(),
+            0,
+            "the table tracks work in flight, not sandboxes seen"
+        );
+    }
+
+    /// The table is bounded, and a full table is a refusal rather than growth.
+    #[tokio::test]
+    async fn a_full_lifecycle_table_refuses_rather_than_growing() {
+        let lifecycle = Arc::new(SandboxLifecycle::new());
+        let mut held = Vec::with_capacity(MAX_CONCURRENT_LIFECYCLES);
+        for _ in 0..MAX_CONCURRENT_LIFECYCLES {
+            held.push(lifecycle.clone().enter(Uuid::now_v7()).await.unwrap());
+        }
+        assert!(
+            lifecycle.clone().enter(Uuid::now_v7()).await.is_err(),
+            "a table at its bound must refuse, not grow"
+        );
+        // The sandboxes already in flight keep their gates and finish. A
+        // caller queued behind one of them is waiting for that sandbox, not for
+        // room in the table, so the bound never queues work it cannot serve.
+        held.clear();
+        assert_eq!(lifecycle.held(), 0);
+        assert!(
+            lifecycle.clone().enter(Uuid::now_v7()).await.is_ok(),
+            "the table is usable again once the work in flight is done"
+        );
+    }
+
+    /// A destroy issued while a create is still materializing must not report a
+    /// machine that is gone and then let the create finish behind it. The gate
+    /// is held here by the test, standing in for that create, so the ordering is
+    /// decided rather than raced.
+    #[tokio::test]
+    async fn a_destroy_waits_for_the_lifecycle_operation_holding_its_sandbox() {
+        let dir = std::env::temp_dir().join(format!("aiec-destroy-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.ext4");
+        std::fs::write(&rootfs, vec![0u8; 1024 * 1024]).expect("rootfs");
+        let runtime = FirecrackerRuntime::new(admission_config(&dir, &rootfs));
+        let sandbox = admission_sandbox(1024);
+        // The state a create that is still copying would be filling.
+        std::fs::create_dir_all(runtime.config.vm_dir(sandbox.id)).expect("vm dir");
+        std::fs::write(runtime.config.rootfs(sandbox.id), b"half an image").expect("image");
+
+        let held = runtime.lifecycle.clone().enter(sandbox.id).await.unwrap();
+        let destroy = tokio::spawn({
+            let runtime = runtime.clone();
+            let sandbox = sandbox.clone();
+            async move { runtime.destroy(&sandbox).await }
+        });
+        for _ in 0..256 {
+            if destroy.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !destroy.is_finished(),
+            "the destroy reported success while a create still held the sandbox"
+        );
+        assert!(
+            runtime.config.vm_dir(sandbox.id).exists(),
+            "the state a held create is writing was removed from under it"
+        );
+
+        drop(held);
+        destroy
+            .await
+            .expect("the destroy task")
+            .expect("the destroy itself");
+        assert!(
+            !runtime.config.vm_dir(sandbox.id).exists(),
+            "the state a completed destroy promised nobody would boot survived it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
 mod artifact_cache_tests {
     use super::artifact_identity;
     use super::guest_artifact;
+    use super::{VerificationCache, VerificationLimits};
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Two different files must not share a verification verdict.
     ///
@@ -2750,12 +4313,18 @@ mod artifact_cache_tests {
             file.write_all(b"contents").expect("write");
         }
 
-        let a = artifact_identity(&first, &kernel, None, false).expect("identity a");
-        let b = artifact_identity(&second, &kernel, None, false).expect("identity b");
+        let a = artifact_identity(&first, &kernel, None, None, false)
+            .expect("identity a")
+            .key;
+        let b = artifact_identity(&second, &kernel, None, None, false)
+            .expect("identity b")
+            .key;
         assert_ne!(a, b, "two different rootfs must not share a verdict");
         assert_eq!(
             a,
-            artifact_identity(&first, &kernel, None, false).expect("identity again"),
+            artifact_identity(&first, &kernel, None, None, false)
+                .expect("identity again")
+                .key,
             "the same unchanged artifact must still hit the cache"
         );
 
@@ -2765,12 +4334,74 @@ mod artifact_cache_tests {
         let longer = dir.join("rootfs-longer.img");
         std::fs::write(&longer, b"a considerably longer set of contents").expect("write");
         assert_ne!(
-            artifact_identity(&first, &kernel, None, false).expect("identity a"),
-            artifact_identity(&longer, &kernel, None, false).expect("identity longer"),
+            artifact_identity(&first, &kernel, None, None, false)
+                .expect("identity a")
+                .key,
+            artifact_identity(&longer, &kernel, None, None, false)
+                .expect("identity longer")
+                .key,
             "a different file at a different path must not reuse a verdict"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An image rewritten in place, within the same second and to the same
+    /// length, is a different image.
+    ///
+    /// This is the case a seconds-resolution timestamp cannot see: the key that
+    /// used to be built from `Metadata::mtime` was identical before and after
+    /// the rewrite, so the success recorded for the old bytes was handed to the
+    /// new ones. The test restores the original whole-second modification time
+    /// after the rewrite, so it fails for any key that carries neither the
+    /// nanoseconds nor the inode.
+    #[test]
+    fn an_in_place_rewrite_inside_one_second_is_a_different_artifact() {
+        let dir = std::env::temp_dir().join(format!("af-same-second-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.img");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&rootfs, b"first contents").expect("write rootfs");
+        std::fs::write(&kernel, b"kernel").expect("write kernel");
+
+        let before = artifact_identity(&rootfs, &kernel, None, None, false)
+            .expect("identity before")
+            .key;
+        let stamp = std::fs::metadata(&rootfs).expect("metadata").mtime();
+
+        // Same length, different bytes, and the timestamp forced back to the
+        // same whole second.
+        std::fs::write(&rootfs, b"other contents").expect("rewrite");
+        restore_mtime(&rootfs, stamp);
+
+        let after = artifact_identity(&rootfs, &kernel, None, None, false)
+            .expect("identity after")
+            .key;
+        assert_ne!(
+            before, after,
+            "a rootfs rewritten in place must not inherit the verdict of the bytes it replaced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Puts a file's modification time back to a whole second, so a test can
+    /// reproduce the granularity a seconds-resolution key cannot see.
+    fn restore_mtime(path: &std::path::Path, seconds: i64) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let raw = CString::new(path.as_os_str().as_bytes()).expect("path");
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: 0,
+            },
+        ];
+        let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(set, 0, "could not restore the modification time");
     }
 
     /// The coding-guest requirement is part of the check, so it is part of the key.
@@ -2790,8 +4421,12 @@ mod artifact_cache_tests {
         std::fs::write(&rootfs, b"same bytes").expect("write rootfs");
         std::fs::write(&kernel, b"same kernel").expect("write kernel");
 
-        let lax = artifact_identity(&rootfs, &kernel, None, false).expect("lax");
-        let strict = artifact_identity(&rootfs, &kernel, None, true).expect("strict");
+        let lax = artifact_identity(&rootfs, &kernel, None, None, false)
+            .expect("lax")
+            .key;
+        let strict = artifact_identity(&rootfs, &kernel, None, None, true)
+            .expect("strict")
+            .key;
         assert_ne!(
             lax, strict,
             "a lax verification must not satisfy a configuration that demands a coding guest"
@@ -2805,11 +4440,14 @@ mod artifact_cache_tests {
             capabilities: vec!["git".into()],
             git_version: Some("2.39.0".into()),
             guest_agent_version: "1".into(),
+            guest_protocol_version: aiec_core::protocol::PROTOCOL_VERSION,
             rootfs_sha256: "abc123".into(),
             kernel_sha256: Some("def456".into()),
         };
-        let with_artifact =
-            artifact_identity(&rootfs, &kernel, Some(&artifact), true).expect("with artifact");
+        write_manifest(&dir, "abc123");
+        let with_artifact = artifact_identity(&rootfs, &kernel, Some(&dir), Some(&artifact), true)
+            .expect("with artifact")
+            .key;
         assert_ne!(
             strict, with_artifact,
             "different artifact metadata is a different artifact"
@@ -2818,13 +4456,304 @@ mod artifact_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The document the digest is compared against is read from disk on every
+    /// check, so editing it under a running worker has to invalidate the
+    /// verdict.
+    ///
+    /// Keyed on the loaded copy alone, an operator who replaces the recorded
+    /// digest in `guest-capabilities.json` would keep getting the success that
+    /// was recorded against the old document - the same "verified sometime
+    /// earlier" failure, one level down from the image itself.
+    #[test]
+    fn editing_the_manifest_on_disk_invalidates_the_verdict() {
+        let dir = std::env::temp_dir().join(format!("af-manifest-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rootfs = dir.join("rootfs.img");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&rootfs, b"rootfs bytes").expect("write rootfs");
+        std::fs::write(&kernel, b"kernel bytes").expect("write kernel");
+        let artifact = guest_artifact::GuestArtifact {
+            artifact_version: "1".into(),
+            base: "debian".into(),
+            profile: "coding".into(),
+            capabilities: vec!["git".into()],
+            git_version: None,
+            guest_agent_version: "1".into(),
+            guest_protocol_version: aiec_core::protocol::PROTOCOL_VERSION,
+            rootfs_sha256: "abc123".into(),
+            kernel_sha256: None,
+        };
+        write_manifest(&dir, "abc123");
+
+        let before = artifact_identity(&rootfs, &kernel, Some(&dir), Some(&artifact), false)
+            .expect("identity before")
+            .key;
+        write_manifest(&dir, "def456");
+        let after = artifact_identity(&rootfs, &kernel, Some(&dir), Some(&artifact), false)
+            .expect("identity after")
+            .key;
+
+        assert_ne!(
+            before, after,
+            "a manifest edited under a running worker must not reuse the old verdict"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_manifest(dir: &std::path::Path, rootfs_sha256: &str) {
+        std::fs::write(
+            dir.join(guest_artifact::GUEST_ARTIFACT_FILE),
+            format!(
+                r#"{{"artifact_version":"1.0.0","base":"debian","profile":"coding","capabilities":["git"],"guest_agent_version":"0.1.0","guest_protocol_version":2,"rootfs_sha256":"{rootfs_sha256}"}}"#
+            ),
+        )
+        .expect("manifest");
+    }
+
     /// An unreadable artifact produces no key rather than a shared one.
     #[test]
     fn an_unstatable_artifact_has_no_key() {
         let missing = std::env::temp_dir().join("af-definitely-not-here-9f2c.img");
         assert!(
-            artifact_identity(&missing, &missing, None, false).is_err(),
+            artifact_identity(&missing, &missing, None, None, false).is_err(),
             "a missing file must not yield a cache key"
+        );
+    }
+
+    /// A verdict stops being trusted after its time to live, and a new identity
+    /// is verified again immediately.
+    ///
+    /// The bound that matters is not "the cache works" but "the cache cannot
+    /// outlive the fact it recorded": a verdict that is never re-checked is a
+    /// permanent exemption from integrity checking.
+    #[test]
+    fn a_verdict_is_reused_only_inside_its_time_to_live() {
+        let cache = VerificationCache::new(VerificationLimits {
+            success_ttl: Duration::from_millis(400),
+            failure_ttl: Duration::from_millis(400),
+            ..VerificationLimits::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let work = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+
+        cache.verify("rootfs-a", 1, work).expect("verified");
+        cache.verify("rootfs-a", 1, work).expect("cached verdict");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the second call reused it");
+        cache
+            .verify("rootfs-b", 1, work)
+            .expect("a new identity is verified");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a different artifact is never answered from another one's entry"
+        );
+
+        std::thread::sleep(Duration::from_millis(700));
+        cache
+            .verify("rootfs-a", 1, work)
+            .expect("re-verified after the time to live");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an expired verdict must be earned again"
+        );
+    }
+
+    /// The number of remembered identities is bounded, and the eviction is
+    /// oldest-first rather than arbitrary.
+    #[test]
+    fn the_cache_holds_a_bounded_number_of_identities() {
+        let cache = VerificationCache::new(VerificationLimits {
+            max_entries: 2,
+            ..VerificationLimits::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let work = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        for key in ["a", "b", "c"] {
+            cache.verify(key, 1, work).expect("verified");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        cache
+            .verify("c", 1, work)
+            .expect("the newest entry is still held");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the newest verdict is inside the bound"
+        );
+        cache
+            .verify("a", 1, work)
+            .expect("the evicted identity is verified again");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "the oldest entry is what the bound gives up"
+        );
+    }
+
+    /// The byte bound is enforced as bytes, not as a second entry count: a
+    /// worker pointed at a series of large images must not accumulate them.
+    #[test]
+    fn the_cache_holds_a_bounded_number_of_image_bytes() {
+        let cache = VerificationCache::new(VerificationLimits {
+            max_entries: 8,
+            max_bytes: 10,
+            ..VerificationLimits::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let work = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        cache.verify("a", 6, work).expect("verified");
+        cache.verify("b", 6, work).expect("verified");
+        cache.verify("b", 6, work).expect("still held");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cache.verify("a", 6, work).expect("verified again");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the identity that no longer fits the byte bound is verified again"
+        );
+    }
+
+    /// Concurrent callers for the same identity share one verification.
+    ///
+    /// The work here stands in for hashing a multi-gigabyte image. Two of them
+    /// at once is not a slower worker, it is two sequential readers of the same
+    /// file on the disk the guests are about to share with it.
+    #[test]
+    fn one_identity_is_never_verified_twice_at_once() {
+        let cache = Arc::new(VerificationCache::new(VerificationLimits {
+            max_concurrent: 4,
+            ..VerificationLimits::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let calls = Arc::clone(&calls);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .verify("same", 1, || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(60));
+                            Ok(())
+                        })
+                        .expect("verified")
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "four callers for one identity must share one verification"
+        );
+    }
+
+    /// Distinct identities are bounded too: a caller waits for a slot rather
+    /// than starting another full-image read.
+    #[test]
+    fn no_more_identities_are_verified_at_once_than_the_limit() {
+        let cache = Arc::new(VerificationCache::new(VerificationLimits {
+            max_concurrent: 1,
+            ..VerificationLimits::default()
+        }));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|key| {
+                let cache = Arc::clone(&cache);
+                let running = Arc::clone(&running);
+                let peak = Arc::clone(&peak);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .verify(key, 1, || {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .expect("verified")
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the concurrency bound is what keeps a restart storm off the disk"
+        );
+    }
+
+    /// A failure is remembered, reported, and does not follow a worker around
+    /// forever - and it never becomes anybody else's answer.
+    #[test]
+    fn a_failure_stays_visible_without_poisoning_new_artifacts() {
+        let cache = VerificationCache::new(VerificationLimits {
+            failure_ttl: Duration::from_millis(400),
+            ..VerificationLimits::default()
+        });
+        let calls = AtomicUsize::new(0);
+        let broken = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("root filesystem sha256 mismatch".to_string())
+        };
+
+        let failure = cache
+            .verify("broken", 1, broken)
+            .expect_err("a mismatching image must fail closed");
+        assert!(failure.contains("sha256 mismatch"), "{failure}");
+        let repeated = cache
+            .verify("broken", 1, broken)
+            .expect_err("the failure is still the answer");
+        assert_eq!(repeated, failure);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a remembered failure is not re-hashed on every create"
+        );
+
+        // A different artifact is a different identity: the broken image's
+        // verdict says nothing about it.
+        cache
+            .verify("replacement", 1, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect("a new artifact verifies on its own merits");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // A worker whose image was repaired is not told "still broken" forever.
+        std::thread::sleep(Duration::from_millis(700));
+        cache
+            .verify("broken", 1, broken)
+            .expect_err("still failing, but for a fresh look");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an expired failure is re-checked rather than remembered forever"
         );
     }
 }

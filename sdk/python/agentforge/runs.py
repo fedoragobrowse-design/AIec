@@ -19,6 +19,49 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlencode
 
+#: How long the control plane can hold a run in its durable queue before it
+#: stops trying to claim one. This is server configuration the client cannot
+#: read out of the task it was handed, so it takes the *validated ceiling*
+#: rather than the 300 s default: `RunQueueLimits::queue_timeout_seconds` is
+#: checked to `1..=86_400` (crates/aiec-core/src/run_queue.rs), and a client
+#: that waited only the default would still time out against a deployment that
+#: raised it. See crates/aiec-storage/src/run_queue.rs, where a run's queue
+#: deadline is written as `now() + queue_timeout_seconds`.
+MAX_RUN_QUEUE_WAIT_SECONDS = 86_400
+
+#: What the wait adds on top of the queue deadline and the stated execution
+#: timeout: the control plane's own placement-and-teardown grace, plus room for
+#: the answer to cross the network. The API drives a run to a terminal state
+#: before it answers, so this wait *is* the run; a client that drops first
+#: cancels the server's future mid-flight and leaves the row non-terminal with
+#: no terminal event, and the machine leaks. Those are the runs that hold a
+#: machine longest, so this is what the failure costs most. It must therefore
+#: exceed the server's grace (`PLACEMENT_GRACE_SECONDS`).
+RUN_RESPONSE_SLACK_SECONDS = 300
+
+
+def _run_response_timeout(request: dict) -> float:
+    """How long to wait for a run to come back settled.
+
+    `POST /v1/runs` admits to the durable queue *before* it answers, so the
+    server can hold the request for the queue deadline plus the execution
+    budget, not for the execution budget alone. The arithmetic, against
+    crates/aiec-storage/src/run_queue.rs:
+
+        queue_deadline = now() + queue_timeout_seconds   (<= MAX_RUN_QUEUE_WAIT_SECONDS)
+        execution_seconds = timeout_seconds + 120        (the server's grace)
+        answer          <= queue_deadline + execution_seconds + the round trip
+
+    so the wait is queue ceiling + stated timeout + slack.
+    The queue allowance is per run, so a caller summing this across the cells of
+    an evaluation multiplies it by the cell count - which is what that wait has
+    to cover anyway, since each cell is queued and executed separately.
+    """
+    stated = (request.get("workload") or {}).get("timeout_seconds")
+    execution = max(30, min(86400, 600 if stated is None else int(stated)))
+    return execution + MAX_RUN_QUEUE_WAIT_SECONDS + RUN_RESPONSE_SLACK_SECONDS
+
+
 #: Where a repository clone lands. Fixed by the control plane rather than
 #: caller-chosen, so a workload cannot point a clone at a path that shadows the
 #: agent's own tooling.
@@ -95,6 +138,25 @@ def _network_policy(network: Any) -> dict:
     )
 
 
+def _guard_config(guard: Any) -> dict | None:
+    """A Guard selection, in the shape the API deserialises.
+
+    ``None`` means no Guard policy, which for a run means no governed egress at
+    all. A string names a shipped template, so the common case is one word:
+    ``guard="model-only"``. A dict is a full selection, which is also how a
+    caller supplies the model endpoint a template needs.
+    """
+    if guard is None:
+        return None
+    if isinstance(guard, str):
+        return {"policy_template": guard.strip().lower().replace("_", "-")}
+    if isinstance(guard, dict):
+        return dict(guard)
+    raise TypeError(
+        f"a Guard selection is a template name or a dict, got {type(guard).__name__}"
+    )
+
+
 def _repo(repo: Any, ref: str | None) -> dict | None:
     """The repository a run starts from."""
     if repo is None:
@@ -139,7 +201,6 @@ class Runs:
 
     def __init__(self, client: Any):
         self.client = client
-
     # -- one run ---------------------------------------------------------
 
     def create(
@@ -159,6 +220,7 @@ class Runs:
         requirements: dict | None = None,
         retention: str = "destroy",
         network: Any = False,
+        guard: Any = None,
         runtime: str | None = None,
         idempotency_key: str | None = None,
         parent_run_id: str | None = None,
@@ -191,12 +253,15 @@ class Runs:
             retention=retention,
             network=network,
             runtime=runtime,
+            guard=guard,
             idempotency_key=idempotency_key,
             parent_run_id=parent_run_id,
             matrix_id=matrix_id,
             **extra,
         )
-        return self.client._request("POST", "/v1/runs", body)
+        return self.client._request(
+            "POST", "/v1/runs", body, timeout=_run_response_timeout(body),
+        )
 
     def request_body(
         self,
@@ -215,6 +280,7 @@ class Runs:
         requirements: dict | None = None,
         retention: str = "destroy",
         network: Any = False,
+        guard: Any = None,
         runtime: str | None = None,
         idempotency_key: str | None = None,
         parent_run_id: str | None = None,
@@ -264,6 +330,13 @@ class Runs:
             "requirements": dict(requirements or {}),
             "retention": retention,
         }
+        selection = _guard_config(guard)
+        if selection is not None:
+            # A Guard selection replaces the network policy rather than sitting
+            # beside it: two descriptions of one egress would be two paths to
+            # the internet, and the wider one would be the one that applied.
+            body["resources"]["guard"] = selection
+            body["resources"]["network"] = {"enabled": False}
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
         if runtime is not None:

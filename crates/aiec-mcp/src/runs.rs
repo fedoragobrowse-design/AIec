@@ -85,6 +85,34 @@ impl From<RunRequirements> for CapabilityRequirements {
     }
 }
 
+/// Parses a Guard template name into the selection the API deserialises.
+///
+/// A closed set rather than a free string, so a template that does not exist is
+/// refused here with a message naming the ones that do, rather than becoming a
+/// policy error after a machine has been placed.
+fn guard_config(name: &str) -> Result<aiec_guard::policy::GuardConfig, McpError> {
+    use aiec_guard::policy::{GuardConfig, PolicyTemplate, Topology};
+    let policy_template = match name.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "no-network" => PolicyTemplate::NoNetwork,
+        "model-only" => PolicyTemplate::ModelOnly,
+        "model-plus-allowlist" => PolicyTemplate::ModelPlusAllowlist,
+        "read-only-api" => PolicyTemplate::ReadOnlyApi,
+        other => {
+            return Err(McpError::invalid(format!(
+                "unknown Guard template `{other}`; use no-network, model-only, \
+                 model-plus-allowlist or read-only-api"
+            )));
+        }
+    };
+    Ok(GuardConfig {
+        topology: Topology::default(),
+        policy_template,
+        policy: None,
+        model_endpoint: None,
+        allowlist: Vec::new(),
+    })
+}
+
 /// One workload, as a calling agent states it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunArgs {
@@ -132,6 +160,15 @@ pub struct RunArgs {
     /// the guest is the thing that runs `git clone`.
     #[serde(default)]
     pub network: Option<bool>,
+    /// Govern egress from outside the guest with a Guard policy template:
+    /// `no-network`, `model-only`, `model-plus-allowlist` or `read-only-api`.
+    ///
+    /// This replaces `network` rather than accompanying it. A governed run is
+    /// not an ungoverned one that happens to be filtered, and a caller that set
+    /// both would otherwise have asked for two different egress policies and
+    /// got whichever was wider.
+    #[serde(default)]
+    pub guard: Option<String>,
     /// `destroy`, `keep_on_failure` or `keep_always`. Keeping a machine is
     /// time-limited whatever the outcome, because a failure is not a licence to
     /// hold compute forever.
@@ -206,6 +243,8 @@ pub struct RunView {
     /// Set when the sandbox clipped the output, so a missing tail is reported
     /// rather than mistaken for a clean run.
     pub truncated: bool,
+    pub output_preview_truncated: bool,
+    pub git_evidence_truncated: bool,
     /// Which validations failed, as `command -> exit code`.
     pub failed_validations: Vec<String>,
     pub changed_files: Vec<String>,
@@ -248,9 +287,11 @@ impl RunView {
             exit_code: task.map(|outcome| outcome.exit_code),
             stdout,
             stderr,
-            truncated: stdout_clipped
+            truncated: task.is_some_and(|outcome| outcome.truncated),
+            output_preview_truncated: stdout_clipped
                 || stderr_clipped
-                || task.is_some_and(|outcome| outcome.truncated),
+                || task.is_some_and(|outcome| outcome.output_preview_truncated),
+            git_evidence_truncated: run.results.git_evidence_truncated,
             failed_validations: run
                 .results
                 .validations
@@ -389,11 +430,19 @@ fn run_request(args: &RunArgs, default_image: Option<&str>) -> ToolResult<Create
             cpu: args.cpu.unwrap_or(1),
             memory_mb: args.memory_mb.unwrap_or(1024),
             disk_mb: args.disk_mb.unwrap_or(2048),
-            network: if args.network.unwrap_or(false) {
+            // A Guard selection replaces the network policy rather than
+            // sitting beside it: two descriptions of one egress would be two
+            // paths to the internet, and the wider one would be the one that
+            // applied. A caller who set both gets the governed one, and the
+            // control plane refuses the combination anyway.
+            network: if args.guard.is_some() {
+                NetworkPolicy::Disabled
+            } else if args.network.unwrap_or(false) {
                 NetworkPolicy::Internet
             } else {
                 NetworkPolicy::Disabled
             },
+            guard: args.guard.as_deref().map(guard_config).transpose()?,
         },
         requirements: args.requirements.clone().unwrap_or_default().into(),
         retention,
@@ -771,6 +820,7 @@ mod tests {
             idempotency_key: None,
             parent_run_id: None,
             matrix_id: None,
+            matrix_cell: None,
         })
         .expect("a run serialises")
     }
@@ -882,6 +932,7 @@ mod tests {
             memory_mb: None,
             disk_mb: None,
             network: None,
+            guard: None,
             retention: None,
             runtime: None,
             requirements: None,

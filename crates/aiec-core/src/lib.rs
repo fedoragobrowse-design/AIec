@@ -9,11 +9,13 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod host_pressure;
 pub mod images;
 pub mod network;
 pub mod platform;
 pub mod policy;
 pub mod run;
+pub mod run_queue;
 pub mod runtime;
 pub mod scheduler;
 pub mod snapshots;
@@ -261,6 +263,13 @@ pub struct EnvironmentSpec {
     /// Independently versioned environment layers composed above the base image.
     #[serde(default)]
     pub layers: Vec<LayerSpec>,
+    /// Out-of-guest governance. An absent policy inside a selected Guard config
+    /// means no-network; credentials are configured only on the worker gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<aiec_guard::policy::GuardConfig>,
+    /// Control-plane-derived effective policy hash. Never a source of permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_policy_hash: Option<String>,
 }
 
 /// A workspace source with an explicit lifecycle.
@@ -332,6 +341,11 @@ fn default_true() -> bool {
 impl EnvironmentSpec {
     /// Validates repository URLs, refs, toolkit names, and bounded setup argv.
     pub fn validate(&self) -> Result<(), CoreError> {
+        if let Some(guard) = &self.guard {
+            guard
+                .effective_policy()
+                .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
+        }
         if self.toolkits.len() > 16 {
             return Err(CoreError::LimitExceeded("too many toolkits".into()));
         }

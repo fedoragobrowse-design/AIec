@@ -61,7 +61,6 @@ pub struct ExecOutcome {
 struct Ownership {
     sandbox_id: Uuid,
     run_id: Uuid,
-    evaluation_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     /// Sandboxes created by a high-level tool are destroyed with it unless the
     /// caller asked to keep them for debugging.
@@ -257,7 +256,6 @@ impl LocalAiec {
             .push(Ownership {
                 sandbox_id: sandbox.id,
                 run_id,
-                evaluation_id: None,
                 created_at: Utc::now(),
                 owned_by_tool: false,
             });
@@ -565,16 +563,14 @@ impl LocalAiec {
 
     /// Marks a sandbox as belonging to a high-level tool, so it is destroyed
     /// with the run unless the caller keeps it.
-    pub fn mark_tool_owned(&self, sandbox_id: Uuid, evaluation_id: Option<Uuid>) {
+    pub fn mark_tool_owned(&self, sandbox_id: Uuid) {
         let mut owned = self.owned.lock().expect("ownership lock is not poisoned");
         if let Some(record) = owned.iter_mut().find(|r| r.sandbox_id == sandbox_id) {
             record.owned_by_tool = true;
-            record.evaluation_id = evaluation_id;
         } else {
             owned.push(Ownership {
                 sandbox_id,
                 run_id: Uuid::now_v7(),
-                evaluation_id,
                 created_at: Utc::now(),
                 owned_by_tool: true,
             });

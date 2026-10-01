@@ -2,21 +2,27 @@ use aiec_api::{
     HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
     WorkerStatus, serve_worker_tls,
 };
-use aiec_client::AIecClient;
+use aiec_client::{
+    AIecClient, BatchOptions, CreateRunRequest, EvalBatchRequest, EvalMatrixSpec,
+    EvalRepetitionRequest,
+};
 use aiec_core::*;
 use aiec_core::{
+    host_pressure::{HostPressure, HostReserves},
     platform::Platform,
+    run::{RepoSpec, RetentionPolicy, RunState},
     runtime::SandboxRuntime,
     snapshots::SnapshotProvider,
     storage::{MetadataStore, WorkerAssignment},
 };
+use aiec_guard::policy::PolicyTemplate;
 use aiec_runtime::DockerRuntime;
 use aiec_runtime::{BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -32,8 +38,16 @@ use uuid::Uuid;
 struct Cli {
     #[arg(long, env = "AIEC_URL", default_value = "http://127.0.0.1:8080")]
     url: String,
+    /// The tenant API key. A credential on a command line is in every process
+    /// listing on the host for as long as the process lives, so prefer the
+    /// environment variable or `--api-key-file`.
     #[arg(long, env = "AIEC_API_KEY")]
     api_key: Option<String>,
+    /// Reads the key from a file, trimming the trailing newline. The benchmark
+    /// harness has taken `--api-key-file` since it was written; the CLI had no
+    /// way to keep a key out of `ps` output at all.
+    #[arg(long, env = "AIEC_API_KEY_FILE")]
+    api_key_file: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -58,6 +72,16 @@ enum Command {
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommand,
+    },
+    /// A run: a workload the control plane places, drives and reclaims.
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+    /// An evaluation: many runs of the same shapes, at a bound the caller sets.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
     },
     Benchmark(BenchmarkArgs),
 }
@@ -85,6 +109,19 @@ struct WorkerArgs {
     name: String,
     #[arg(long, env = "AIEC_WORKER_CAPACITY", default_value_t = 1)]
     capacity: u32,
+    /// Host memory held back from sandbox admission, in MiB.
+    ///
+    /// Never spent on work: this is the operating system, the page cache and
+    /// this worker's own processes. Lowering it to zero hands the host's last
+    /// bytes to tenants, which is refused at admission rather than corrected
+    /// later.
+    #[arg(long, env = "AIEC_WORKER_MEMORY_RESERVE_MIB", default_value_t = 512)]
+    memory_reserve_mib: u64,
+    /// Host disk held back from sandbox admission, in MiB.
+    ///
+    /// Room for logs, images and the workspace archives a snapshot writes.
+    #[arg(long, env = "AIEC_WORKER_DISK_RESERVE_MIB", default_value_t = 2 * 1024)]
+    disk_reserve_mib: u64,
     #[arg(long, env = "AIEC_WORKER_TOKEN")]
     token: Option<String>,
     #[arg(long, env = "AIEC_WORKER_NODE_ID")]
@@ -185,11 +222,208 @@ enum SnapshotCommand {
     Delete { snapshot_id: Uuid },
 }
 
+#[derive(Subcommand)]
+enum RunCommand {
+    /// Submits a run and prints the settled record.
+    ///
+    /// The request is a JSON document so it can be reviewed in a pull request
+    /// and re-run unchanged; the flags are a shorthand for the same request and
+    /// override whatever the document said.
+    Submit(Box<RunSubmitArgs>),
+    /// One run, in full.
+    Show { run_id: Uuid },
+    /// This tenant's runs, newest first.
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Stops a run and reclaims the machine it was holding.
+    Cancel { run_id: Uuid },
+    /// What a run produced: the command outcomes, the diff and the timings.
+    Results { run_id: Uuid },
+    /// A run's history, in the order it happened.
+    Events { run_id: Uuid },
+    /// The artifacts a run collected, with a URL for each one's bytes.
+    Artifacts { run_id: Uuid },
+}
+
+#[derive(Args)]
+struct RunSubmitArgs {
+    /// A RunRequest JSON document. Flags below override the fields it states.
+    #[arg(value_name = "REQUEST_JSON")]
+    file: Option<PathBuf>,
+    #[arg(long)]
+    image: Option<String>,
+    /// A repository to clone inside the machine before the command runs.
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long = "ref")]
+    git_ref: Option<String>,
+    /// A setup command, as a JSON argument vector. Repeatable.
+    #[arg(long, value_parser = parse_argv)]
+    setup: Vec<Vec<String>>,
+    /// A validation command, as a JSON argument vector. Repeatable.
+    #[arg(long, value_parser = parse_argv)]
+    validate: Vec<Vec<String>>,
+    /// A path to collect once the run is done. Repeatable.
+    #[arg(long = "artifact")]
+    artifact: Vec<String>,
+    /// A non-secret environment entry, as KEY=VALUE. Repeatable.
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+    env: Vec<(String, String)>,
+    /// The name of a tenant secret to inject. Repeatable.
+    #[arg(long = "secret")]
+    secret: Vec<String>,
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
+    #[arg(long)]
+    cpu: Option<u32>,
+    #[arg(long)]
+    memory_mb: Option<u32>,
+    #[arg(long)]
+    disk_mb: Option<u32>,
+    /// Allow the run to reach the internet.
+    #[arg(long)]
+    network: bool,
+    /// Govern egress from outside the guest with a Guard policy template.
+    /// This replaces `--network`: a governed run is not an ungoverned one that
+    /// happens to be filtered.
+    #[arg(long, value_enum)]
+    guard: Option<GuardTemplateArg>,
+    /// Insist on a full hardware-isolated kernel.
+    #[arg(long)]
+    full_kernel_isolation: bool,
+    #[arg(long, value_enum)]
+    retention: Option<RetentionArg>,
+    /// Advanced: ask for a specific runtime rather than letting policy choose.
+    #[arg(long)]
+    requested_runtime: Option<String>,
+    /// Reusing a key returns the run that already exists instead of running the
+    /// work twice.
+    #[arg(long)]
+    idempotency_key: Option<String>,
+    /// Print the request that would be sent, and send nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// The command to run, as arguments, after `--`.
+    #[arg(last = true)]
+    command: Vec<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum RetentionArg {
+    Destroy,
+    KeepOnFailure,
+    KeepAlways,
+}
+
+impl From<RetentionArg> for RetentionPolicy {
+    fn from(value: RetentionArg) -> Self {
+        match value {
+            RetentionArg::Destroy => Self::Destroy,
+            RetentionArg::KeepOnFailure => Self::KeepOnFailure,
+            RetentionArg::KeepAlways => Self::KeepAlways,
+        }
+    }
+}
+
+/// The shipped Guard policy templates, as a closed set on the command line.
+///
+/// A closed enum rather than a free string: a template name that does not exist
+/// should be refused by the shell that completed the word, not by a policy
+/// parser after a machine has been placed.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GuardTemplateArg {
+    NoNetwork,
+    ModelOnly,
+    ModelPlusAllowlist,
+    ReadOnlyApi,
+}
+
+impl From<GuardTemplateArg> for PolicyTemplate {
+    fn from(value: GuardTemplateArg) -> Self {
+        match value {
+            GuardTemplateArg::NoNetwork => PolicyTemplate::NoNetwork,
+            GuardTemplateArg::ModelOnly => PolicyTemplate::ModelOnly,
+            GuardTemplateArg::ModelPlusAllowlist => PolicyTemplate::ModelPlusAllowlist,
+            GuardTemplateArg::ReadOnlyApi => PolicyTemplate::ReadOnlyApi,
+        }
+    }
+}
+
+/// An argument vector, written the way the wire writes it.
+///
+/// JSON rather than a quoted string, because a command is a vector and not a
+/// line: `["sh", "-c", "pytest -q && echo done"]` is one argument, and a
+/// splitter that turned it into three would be a shell injection the platform
+/// exists to make impossible.
+fn parse_argv(value: &str) -> Result<Vec<String>, String> {
+    serde_json::from_str(value).map_err(|error| format!("not a JSON argument vector: {error}"))
+}
+
+fn parse_env(value: &str) -> Result<(String, String), String> {
+    value
+        .split_once('=')
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| format!("{value} is not KEY=VALUE"))
+}
+
+#[derive(Subcommand)]
+enum EvalCommand {
+    /// Runs a list of run documents, at most `--max-parallel` machines at once.
+    Batch {
+        /// One RunRequest JSON document per cell. Repeatable, in order.
+        #[arg(long = "request", value_name = "REQUEST_JSON", required = true)]
+        request: Vec<PathBuf>,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Runs one document several times, each repetition on its own machine.
+    Repetitions {
+        #[arg(long = "request", value_name = "REQUEST_JSON", required = true)]
+        request: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        repetitions: u32,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Runs a matrix: named combinations, each cell on its own machine.
+    Matrix {
+        /// A document of `{"cells": [{"axis": {...}, "request": {...}}]}`.
+        #[arg(long = "spec", value_name = "MATRIX_JSON", required = true)]
+        spec: PathBuf,
+        /// Overrides the bound the document states.
+        #[arg(long)]
+        max_parallel: Option<usize>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Runs a suite: named tasks against repositories, expanded into a matrix.
+    Suite {
+        #[arg(long = "suite", value_name = "SUITE_JSON", required = true)]
+        suite: PathBuf,
+        /// The image every task boots. Unset leaves the default in place.
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        max_parallel: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let url = cli.url.clone();
-    let api_key = cli.api_key.clone();
+    let api_key = resolve_api_key(cli.api_key.clone(), cli.api_key_file.clone())?;
     match cli.command {
         Command::Server(args) => server(args).await,
         Command::Worker(args) => worker(&url, args).await,
@@ -199,6 +433,8 @@ async fn main() -> Result<()> {
         Command::Sandbox { command } => sandbox_command(&url, api_key.clone(), command).await,
         Command::File { command } => file_command(&url, api_key.clone(), command).await,
         Command::Snapshot { command } => snapshot_command(&url, api_key.clone(), command).await,
+        Command::Run { command } => run_command(&url, api_key.clone(), command).await,
+        Command::Eval { command } => eval_command(&url, api_key.clone(), command).await,
         Command::Benchmark(args) => benchmark(&url, api_key, args).await,
     }
 }
@@ -245,32 +481,356 @@ async fn server(args: ServerArgs) -> Result<()> {
         .artifact_store(artifacts)
         .policy(Arc::new(aiec_api::DefaultPolicy))
         .build()?;
-    let worker_token = std::env::var("AIEC_WORKER_TOKEN").unwrap_or_else(|_| generate_api_key());
+    let worker_token = ServerSecret::from_env("AIEC_WORKER_TOKEN");
     let state = aiec_api::AppState::development(platform)
         .with_runtime_kind(runtime_kind)
-        .with_worker_token(worker_token.clone());
+        .with_worker_token(worker_token.value().to_owned());
     let addr = args.bind.parse().context("invalid bind address")?;
-    let key = std::env::var("AIEC_API_KEY").unwrap_or_else(|_| generate_api_key());
+    let key = ServerSecret::from_env("AIEC_API_KEY");
     aiec_api::bootstrap_api_key(
         state.repository().as_ref(),
-        &key,
+        key.value(),
         Uuid::nil(),
         &[Scope::Admin],
     )
     .await?;
     println!(
-        "aiec server listening on {addr}\nbootstrap API key: {key}\nworker token: {worker_token}"
+        "aiec server listening on {addr}\nbootstrap API key: {}\nworker token: {}",
+        key.report(),
+        worker_token.report()
     );
     aiec_api::serve(state, addr).await.context("serve API")
+}
+
+/// Where a server credential came from.
+#[derive(Clone, Copy)]
+enum SecretOrigin {
+    /// This process invented it, so nobody else has ever seen it.
+    Generated,
+    /// The operator exported it in the named environment variable.
+    Supplied(&'static str),
+}
+
+/// A server credential plus the provenance that decides whether it may be
+/// printed.
+///
+/// A generated key has to reach the operator somehow: it is written to no file
+/// and nobody else can derive it. A key the operator exported must not be
+/// echoed. Everything a process prints lands in terminal scrollback, in the
+/// systemd or container journal, and in whatever CI job captured stdout - and
+/// an operator who put a secret in an environment variable did that precisely
+/// to keep it out of those places. Printing it again undoes the precaution and
+/// the echo looks exactly like the "here is your new key" line beside it.
+struct ServerSecret {
+    value: String,
+    origin: SecretOrigin,
+}
+
+impl ServerSecret {
+    /// Reads the credential from the environment, generating one when the
+    /// variable is unset or blank.
+    ///
+    /// A blank variable counts as unset: it would otherwise bootstrap an
+    /// unusable empty credential, and reporting that as "supplied" would leave
+    /// the operator with a server nobody can authenticate to.
+    fn from_env(name: &'static str) -> Self {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => Self {
+                value,
+                origin: SecretOrigin::Supplied(name),
+            },
+            _ => Self {
+                value: generate_api_key(),
+                origin: SecretOrigin::Generated,
+            },
+        }
+    }
+
+    fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The line the operator reads: the secret itself when this process made
+    /// it up, its origin when the operator supplied it.
+    fn report(&self) -> String {
+        match self.origin {
+            SecretOrigin::Generated => format!(
+                "{} (generated by this process; nothing else has it, store it now)",
+                self.value
+            ),
+            SecretOrigin::Supplied(name) => {
+                format!("read from ${name}; not echoed, the operator supplied it")
+            }
+        }
+    }
+}
+
+/// The key from the flag, the file, or the environment, in that order.
+///
+/// The file is trimmed: a key written with `echo` carries a newline, and a
+/// trailing newline inside an `Authorization` header is a key that does not
+/// authenticate.
+fn resolve_api_key(
+    flag: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<Option<String>> {
+    if let Some(key) = flag {
+        return Ok(Some(key));
+    }
+    let Some(path) = file else {
+        return Ok(None);
+    };
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let key = raw.trim().to_owned();
+    if key.is_empty() {
+        return Err(anyhow::anyhow!("{} is empty", path.display()));
+    }
+    Ok(Some(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key read from a file has to arrive without the newline `echo` adds:
+    /// a trailing newline inside an Authorization header does not authenticate,
+    /// and the failure looks like a wrong key rather than a dirty file.
+    #[test]
+    fn a_key_file_is_trimmed_and_an_empty_one_is_an_error() {
+        let path = std::env::temp_dir().join(format!("aiec-key-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, "af_live_abc123\n").unwrap();
+        assert_eq!(
+            resolve_api_key(None, Some(path.clone())).unwrap(),
+            Some("af_live_abc123".to_owned())
+        );
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(resolve_api_key(None, Some(path.clone())).is_err());
+        let _ = std::fs::remove_file(&path);
+        // The flag still wins, and no file is consulted when it is absent.
+        assert_eq!(
+            resolve_api_key(Some("af_live_flag".to_owned()), None).unwrap(),
+            Some("af_live_flag".to_owned())
+        );
+        assert_eq!(resolve_api_key(None, None).unwrap(), None);
+    }
+
+    /// A secret the operator exported must not be echoed back at them.
+    ///
+    /// `aiec server` prints its two credentials on startup, and that line is
+    /// what ends up in scrollback, in the systemd journal and in whatever CI
+    /// job captured stdout. A key this process invented has to be printed -
+    /// nobody else can derive it - but a key the operator put in the
+    /// environment was kept out of the logs on purpose, and re-printing it
+    /// looks identical to the "here is your new key" line beside it.
+    #[test]
+    fn a_supplied_secret_is_named_but_never_echoed() {
+        let supplied = ServerSecret {
+            value: "af_live_operatorsownkey".to_owned(),
+            origin: SecretOrigin::Supplied("AIEC_API_KEY"),
+        };
+        let line = supplied.report();
+        assert!(
+            !line.contains("af_live_operatorsownkey"),
+            "a key the operator supplied was echoed: {line}"
+        );
+        assert!(line.contains("AIEC_API_KEY"), "{line}");
+        // The secret still has to reach the call that bootstraps it.
+        assert_eq!(supplied.value(), "af_live_operatorsownkey");
+
+        let token = ServerSecret {
+            value: "worker-token-value".to_owned(),
+            origin: SecretOrigin::Supplied("AIEC_WORKER_TOKEN"),
+        };
+        assert!(!token.report().contains("worker-token-value"));
+    }
+
+    /// A generated secret is printed, because it exists nowhere else.
+    #[test]
+    fn a_generated_secret_is_printed_once_with_a_warning() {
+        let generated = ServerSecret {
+            value: "af_live_generated".to_owned(),
+            origin: SecretOrigin::Generated,
+        };
+        let line = generated.report();
+        assert!(line.contains("af_live_generated"), "{line}");
+        assert!(line.contains("store it now"), "{line}");
+    }
+
+    /// A sandbox that was created and never torn down is a failed sample.
+    ///
+    /// The benchmark used to discard the delete result and record
+    /// `created = true`, printing `success_rate=1.000` and exiting 0 while N
+    /// machines kept running and holding capacity. A transient teardown
+    /// failure - the same `worker lease generation or status changed` race the
+    /// MCP server retries - has to show up in the counts and in the exit code.
+    #[test]
+    fn a_failed_teardown_is_a_failed_sample_and_a_non_zero_exit() {
+        let samples = vec![
+            BenchmarkSample {
+                create_micros: 120_000,
+                teardown_micros: Some(80_000),
+                outcome: SampleOutcome::Destroyed,
+            },
+            BenchmarkSample {
+                create_micros: 130_000,
+                teardown_micros: Some(90_000),
+                outcome: SampleOutcome::TeardownFailed,
+            },
+            BenchmarkSample {
+                create_micros: 90_000,
+                teardown_micros: Some(70_000),
+                outcome: SampleOutcome::TeardownFailed,
+            },
+        ];
+        let report = BenchmarkReport::summarise(&samples, 500.0);
+
+        assert_eq!(report.success, 1);
+        assert_eq!(report.created, 3, "all three sandboxes were created");
+        assert_eq!(report.teardown_failed, 2);
+        assert!(!report.is_clean(), "a failed teardown must not exit 0");
+
+        let line = report.summary_line(2);
+        assert!(line.contains("success_rate=0.333"), "{line}");
+        assert!(line.contains("teardown_failed=2"), "{line}");
+        assert!(report.failure_reason().contains("may still be running"));
+    }
+
+    /// A run whose every sandbox was created and destroyed passes; a run with
+    /// nothing to measure does not get to report a perfect score either.
+    #[test]
+    fn only_a_fully_clean_run_reports_success() {
+        let clean = vec![BenchmarkSample {
+            create_micros: 1_000,
+            teardown_micros: Some(1_000),
+            outcome: SampleOutcome::Destroyed,
+        }];
+        assert!(BenchmarkReport::summarise(&clean, 5.0).is_clean());
+
+        let create_failed = vec![BenchmarkSample {
+            create_micros: 1_000,
+            teardown_micros: None,
+            outcome: SampleOutcome::CreateFailed,
+        }];
+        let report = BenchmarkReport::summarise(&create_failed, 5.0);
+        assert!(!report.is_clean());
+        assert!(report.summary_line(1).contains("success_rate=0.000"));
+        assert!(!BenchmarkReport::summarise(&[], 0.0).is_clean());
+    }
+
+    /// Creation and teardown are two measurements, not one.
+    ///
+    /// The old code evaluated `started.elapsed()` after the delete, so every
+    /// percentile it printed was a create+destroy sum presented as creation
+    /// latency.
+    #[test]
+    fn creation_and_teardown_latency_are_reported_separately() {
+        let mut samples = Vec::new();
+        for index in 0..MIN_SAMPLES_FOR_PERCENTILE {
+            samples.push(BenchmarkSample {
+                create_micros: 100_000 + index as u64,
+                teardown_micros: Some(900_000 + index as u64),
+                outcome: SampleOutcome::Destroyed,
+            });
+        }
+        let report = BenchmarkReport::summarise(&samples, 1_000.0);
+        let line = report.summary_line(4);
+
+        // Create p95 sits in the 100ms band, teardown p95 in the 900ms band:
+        // they cannot be the same number.
+        let create_p95 = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("create_p95_ms="))
+            .unwrap();
+        let teardown_p95 = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("teardown_p95_ms="))
+            .unwrap();
+        assert_ne!(create_p95, teardown_p95, "{line}");
+        // Create ran at ~100ms and teardown at ~900ms per sample. A percentile
+        // that spanned both would land somewhere the two never were.
+        assert!(
+            (create_p95.parse::<f64>().unwrap() - 100.018).abs() < 0.001,
+            "create p95 {create_p95} should be near 100.018ms in {line}"
+        );
+        assert!(
+            (teardown_p95.parse::<f64>().unwrap() - 900.018).abs() < 0.001,
+            "teardown p95 {teardown_p95} should be near 900.018ms in {line}"
+        );
+    }
+
+    /// Percentiles the sample cannot carry are withheld, not printed as a
+    /// number - and an empty sample is not a zero.
+    ///
+    /// This is the rule `benchmarks/aiecbench/stats.py` enforces with
+    /// `MIN_SAMPLES_FOR_PERCENTILE = 20`. With the default `--sandboxes 1` the
+    /// old helper printed the same observation as p50, p95 and p99, and
+    /// returned `0` for no samples at all.
+    #[test]
+    fn percentiles_are_withheld_below_the_minimum_sample_count() {
+        let one = vec![BenchmarkSample {
+            create_micros: 100_000,
+            teardown_micros: Some(100_000),
+            outcome: SampleOutcome::Destroyed,
+        }];
+        let line = BenchmarkReport::summarise(&one, 5.0).summary_line(1);
+        assert!(line.contains("create_p50_ms=unavailable"), "{line}");
+        assert!(line.contains("create_p95_ms=unavailable"), "{line}");
+        assert!(line.contains("create_p99_ms=unavailable"), "{line}");
+        assert!(
+            line.contains("1 samples is below the 20 needed for a p50/p95/p99"),
+            "{line}"
+        );
+
+        let empty = Latencies::from_micros(&[]);
+        assert_eq!(empty.samples, 0);
+        assert!(empty.p50_ms.is_none());
+        assert!(empty.p95_ms.is_none());
+        assert!(empty.p99_ms.is_none());
+        let fields = empty.fields("create");
+        assert!(fields.contains("create_p50_ms=unavailable"), "{fields}");
+        assert!(
+            fields.contains("no samples were observed"),
+            "no samples is not a zero: {fields}"
+        );
+    }
+
+    /// The nearest-rank percentile agrees with the Python harness, so a number
+    /// copied between the two reports is the same number.
+    #[test]
+    fn percentiles_are_nearest_rank_over_the_sorted_sample() {
+        let values: Vec<u64> = (1..=MIN_SAMPLES_FOR_PERCENTILE)
+            .map(|value| value as u64 * 1_000)
+            .collect();
+        let latencies = Latencies::from_micros(&values);
+        assert_eq!(latencies.p50_ms, Some(10.0));
+        assert_eq!(latencies.p95_ms, Some(19.0));
+        assert_eq!(latencies.p99_ms, Some(20.0));
+        assert!(latencies.withheld.is_none());
+        assert!(!latencies.fields("create").contains("withheld"));
+    }
 }
 
 async fn client(url: &str, api_key: Option<String>) -> Result<AIecClient> {
     let key = api_key
         .or_else(|| std::env::var("AIEC_API_KEY").ok())
-        .context("set --api-key or AIEC_API_KEY")?;
+        .context("set --api-key, --api-key-file or AIEC_API_KEY")?;
     AIecClient::new(url, key).context("create API client")
 }
 async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
+    // The worker emits structured logs all over - rejected operations, lease
+    // renewals, capacity decisions, sandbox teardown - and without a subscriber
+    // every one of them was discarded, so a worker that refused an operation or
+    // lost a lease produced no output at all. That is the same black box the
+    // control plane fixed for itself: a host whose worker fails silently looks
+    // exactly like a host with no work. `RUST_LOG` still overrides the default.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        "info,aiec_api=info,aiec_core=info,aiec_runtime=info,aiec_storage=info,sqlx=warn".to_owned()
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .init();
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
@@ -316,6 +876,9 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         None => durable_node_id(&args.state_dir)?,
     };
     let mut startup_report = None;
+    // The runtime places work against the same reserve the worker advertises,
+    // so a sandbox cannot be admitted into space the host held back.
+    let reserves = HostReserves::from_mib(args.memory_reserve_mib, args.disk_reserve_mib);
     let mut guest_profile = None;
     let (runtime, snapshots, runtime_kind): (
         Arc<dyn SandboxRuntime>,
@@ -334,8 +897,9 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             (backend.clone(), backend, RuntimeKind::Docker)
         }
         "firecracker" => {
-            let config = FirecrackerConfig::from_env()
+            let mut config = FirecrackerConfig::from_env()
                 .map_err(|error| anyhow::anyhow!("invalid Firecracker configuration: {error}"))?;
+            config.host_reserves = reserves;
             // The runtime already verified the artifact against the rootfs, so
             // the profile it resolved is what /health reports.
             guest_profile = config
@@ -374,6 +938,11 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             reqwest::Certificate::from_pem(&pem).with_context(|| format!("parse {path}"))?;
         client_builder = client_builder.add_root_certificate(certificate);
     }
+    // Whether an unmeasurable host is allowed to take work anyway. Only the
+    // development runtime gets that latitude: it runs the developer's own
+    // shell, not a tenant's job, and a worker that silently never claims
+    // anything is a worse failure than one that claims without a reading.
+    let production = runtime_kind != RuntimeKind::BwrapDev;
     let client = client_builder.build().context("build worker API client")?;
     let now = chrono::Utc::now();
     // One version base for this process, shared by the registration and every
@@ -381,54 +950,64 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // not outrank the stored version, so registration and heartbeat must never
     // derive their versions separately.
     let version_base = worker_version_base();
-    // Measured, not assumed.
+    // The ledger declares the allocation, and only the allocation.
     //
-    // These used to be `capacity x 1 GiB` and `capacity x 10 GiB`: arithmetic
-    // from the same flag that sets the vCPU count, with nothing on the host
-    // asked whether it agreed. A node on a host with four spare gigabytes would
-    // advertise eight and hand out eight, and the failure would arrive at boot -
-    // after the tenant's quota and the node's capacity had already been charged
-    // for work that could never start.
-    // The measurement is a ceiling, not a claim.
+    // `total_*` used to be `min(measurement, capacity x GiB)`, which made a
+    // momentary host reading rewrite a durable declaration: a worker that
+    // measured a busy host declared less than its operator allocated, the
+    // `available_*` seeded from it were smaller than the allocations they came
+    // from, and the shortfall could never be given back - the scheduler's
+    // debit and release are the only writers of those columns, and they were
+    // working from totals that had moved under them. A measurement that is not
+    // a declaration belongs somewhere else.
     //
-    // Reading the host and declaring what it found is only correct if one node
-    // owns the machine. Four workers on one host each read the same figures and
-    // each declared them, so the cluster came to believe 35 GiB of memory existed
-    // where the host had 26 - overcommitted by a third, which is the failure this
-    // was meant to remove, not an improvement on it.
-    //
-    // The flag is the operator's allocation to *this* node. The host is reality.
-    // The safe declaration is the smaller of the two: measurement can only ever
-    // tighten what a node claims, so a host filling up stops offering work, and
-    // a generous flag can never conjure capacity the machine does not have.
+    // So the totals stay exactly what the operator allocated, and the
+    // measurement is published alongside them as pressure. Pressure is what
+    // answers "may this host take another sandbox", it moves every heartbeat,
+    // and it recovers: a host that was full yesterday can admit today without
+    // any ledger row having been rewritten to say so.
     let allocated_memory = u64::from(args.capacity) * GIB;
     let allocated_disk = u64::from(args.capacity) * 10 * GIB;
-    let (measured_memory, measured_disk) = host_capacity(&args.state_dir);
-    let total_memory_bytes = measured_memory.map_or(allocated_memory, |measured| {
-        if measured < allocated_memory {
-            tracing::warn!(
-                allocated_bytes = allocated_memory,
-                measured_bytes = measured,
-                "the host has less available than this node was allocated; \
-                 declaring the measurement"
-            );
-            measured
-        } else {
-            allocated_memory
-        }
-    });
-    let total_disk_bytes = measured_disk.map_or(allocated_disk, |measured| {
-        if measured < allocated_disk {
-            tracing::warn!(
-                allocated_bytes = allocated_disk,
-                measured_bytes = measured,
-                "the host has less free disk than this node was allocated; \
-                 declaring the measurement"
-            );
-            measured
-        } else {
-            allocated_disk
-        }
+    let reserves = HostReserves::from_mib(args.memory_reserve_mib, args.disk_reserve_mib);
+    let pressure = HostPressure::measure(&args.state_dir, reserves);
+    report_pressure(&pressure, "registration");
+    let short = |measured: Option<u64>, allocated: u64| {
+        measured.is_some_and(|available| available < allocated)
+    };
+    if short(pressure.memory_available_bytes, allocated_memory)
+        || short(pressure.disk_available_bytes, allocated_disk)
+    {
+        tracing::warn!(
+            host_id = %pressure.host_id,
+            allocated_memory_bytes = allocated_memory,
+            allocated_disk_bytes = allocated_disk,
+            "the host has less headroom than this node was allocated; admission will refuse \
+             placements that do not fit until it recovers"
+        );
+    }
+    // A worker that cannot measure its host must not claim that the host has
+    // room. It says so in the metadata it registers, publishes on every
+    // heartbeat, and stops claiming new work until a reading succeeds - rather
+    // than falling back to the arithmetic allocation, which is how an
+    // unmeasured machine ends up scheduled to zero.
+    if !pressure.complete() {
+        tracing::error!(
+            host_id = %pressure.host_id,
+            state_dir = %args.state_dir.display(),
+            "host pressure could not be measured; this worker takes no new work until a \
+             reading succeeds"
+        );
+    }
+    // The metadata this worker registers with, kept so every heartbeat can
+    // republish it. `heartbeat_worker` replaces the stored object wholesale
+    // rather than merging, so a heartbeat carrying only its own fields would
+    // delete `state_dir` and the startup reconciliation report within five
+    // seconds of the worker starting - which is exactly the record an operator
+    // wants when a host starts refusing work.
+    let registration_metadata = serde_json::json!({
+        "state_dir": args.state_dir,
+        "startup_reconciliation": startup_report,
+        "pressure": pressure.to_metadata(),
     });
     let registration = WorkerRegistration {
         node_id,
@@ -437,17 +1016,16 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         capabilities: capabilities.clone(),
         control_endpoint: advertise_url.clone(),
         total_vcpus: args.capacity,
-        total_memory_bytes,
-        total_disk_bytes,
+        total_memory_bytes: allocated_memory,
+        total_disk_bytes: allocated_disk,
         available_vcpus: args.capacity,
-        available_memory_bytes: total_memory_bytes,
-        available_disk_bytes: total_disk_bytes,
+        available_memory_bytes: allocated_memory,
+        available_disk_bytes: allocated_disk,
+        // The worker's own health, never its host's. Pressure gates new work;
+        // health means the worker is serving what it already holds.
         healthy: true,
         version: version_base,
-        metadata: serde_json::json!({
-            "state_dir": args.state_dir,
-            "startup_reconciliation": startup_report,
-        }),
+        metadata: registration_metadata.clone(),
         started_at: now,
         last_heartbeat: now,
     };
@@ -504,13 +1082,19 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         .error_for_status()
         .context("initial worker reconciliation rejected")?;
     let owned_leases: Arc<Mutex<HashMap<Uuid, OwnedLease>>> = Arc::new(Mutex::new(HashMap::new()));
-    match claim_assignments(&client, &control, &token, node_id, args.capacity).await {
-        Ok(leases) => {
-            tracing::info!(leases = leases.len(), "claimed worker assignments");
-            owned_leases.lock().await.extend(leases);
-        }
-        Err(error) => {
-            tracing::warn!(%error, "worker assignment claim failed; retrying with the heartbeat")
+    // The same gate the maintenance loop applies: this is the first chance to
+    // take on new work, and a host that could not be measured has not earned
+    // it. The maintenance loop retries, so declining here costs nothing but
+    // one cycle.
+    if admits_new_work(&args.state_dir, reserves, production) {
+        match claim_assignments(&client, &control, &token, node_id, args.capacity).await {
+            Ok(leases) => {
+                tracing::info!(leases = leases.len(), "claimed worker assignments");
+                owned_leases.lock().await.extend(leases);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "worker assignment claim failed; retrying with the heartbeat")
+            }
         }
     }
     let loop_leases = owned_leases.clone();
@@ -531,6 +1115,11 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     let liveness_client = client.clone();
     let liveness_url = control.clone();
     let liveness_health_url = format!("{}/health", advertise_url);
+    let liveness_state_dir = args.state_dir.clone();
+    let liveness_reserves = reserves;
+    // Moved into the liveness task, which republishes it with a fresh reading
+    // on every beat rather than sending a partial object.
+    let liveness_metadata = registration_metadata;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
@@ -547,12 +1136,40 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 continue;
             };
             let active = status.sandbox_count as u32;
+            // Measured again on every beat, because the answer that mattered
+            // when this worker registered is the answer now: a host that filled
+            // up in the last five seconds has to be able to say so, and one
+            // that emptied has to be able to say that too.
+            //
+            // The reading replaces the `pressure` key of the metadata this
+            // worker registered with, and nothing else. The store assigns the
+            // whole object rather than merging it, so sending only the reading
+            // would delete the state directory and the startup reconciliation
+            // report from the node record five seconds after startup.
+            //
+            // The reading still goes nowhere near `available_*`. That is the
+            // scheduler's ledger, maintained only by debit and release;
+            // writing a measurement over it would erase the per-placement
+            // accounting and make two writers of one column disagree.
+            let pressure = HostPressure::measure(&liveness_state_dir, liveness_reserves);
+            report_pressure(&pressure, "heartbeat");
+            let mut metadata = liveness_metadata.clone();
+            metadata["pressure"] = pressure.to_metadata();
             let heartbeat = WorkerHeartbeat {
                 node_id: liveness_node,
                 sandbox_count: active,
+                // Health is the worker's own answer about itself, and pressure
+                // is not allowed to overwrite it. A host that cannot be
+                // measured is not a broken worker, and reporting it as one
+                // conflates two conditions an operator treats differently: one
+                // needs a reboot, the other needs a bigger disk.
+                //
+                // What an unmeasured or full host does is decline *new* work,
+                // through the pressure in this metadata and the claim gate
+                // below. The sandboxes already running are untouched.
                 healthy: status.healthy,
                 version: liveness_version.fetch_add(1, Ordering::Relaxed) + 1,
-                metadata: serde_json::json!({}),
+                metadata,
                 last_error: None,
             };
             if let Err(error) = liveness_client
@@ -570,6 +1187,9 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         }
     });
 
+    let loop_state_dir = args.state_dir.clone();
+    let loop_reserves = reserves;
+    let loop_production = production;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
@@ -579,21 +1199,35 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 .bearer_auth(&heartbeat_token)
                 .send()
                 .await;
-            match claim_assignments(
-                &heartbeat_client,
-                &heartbeat_url,
-                &heartbeat_token,
-                node_id,
-                loop_capacity,
-            )
-            .await
-            {
-                Ok(leases) if !leases.is_empty() => {
-                    tracing::info!(leases = leases.len(), "claimed worker assignments");
-                    loop_leases.lock().await.extend(leases);
+            // Claiming is taking on *new* work, so it is what pressure gets to
+            // refuse. The renewal below is deliberately outside this gate: a
+            // full or unmeasurable host must keep the leases on the sandboxes
+            // it is already running. Dropping them would hand running work
+            // back for reassignment on a host that is still perfectly able to
+            // finish it.
+            //
+            // No warning is logged here. `report_pressure` already logs a
+            // reading when it changes, which covers the transition in and out
+            // of a blocked state; a line every ten seconds for as long as a
+            // host stays full is noise on precisely the incident where the log
+            // needs to stay readable.
+            if admits_new_work(&loop_state_dir, loop_reserves, loop_production) {
+                match claim_assignments(
+                    &heartbeat_client,
+                    &heartbeat_url,
+                    &heartbeat_token,
+                    node_id,
+                    loop_capacity,
+                )
+                .await
+                {
+                    Ok(leases) if !leases.is_empty() => {
+                        tracing::info!(leases = leases.len(), "claimed worker assignments");
+                        loop_leases.lock().await.extend(leases);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "worker assignment claim failed"),
                 }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "worker assignment claim failed"),
             }
             let leases: Vec<OwnedLease> = loop_leases.lock().await.values().cloned().collect();
             let renewal = renew_leases(
@@ -761,78 +1395,92 @@ async fn renew_leases(
     outcome
 }
 
+/// Whether this host will take on another sandbox right now.
+///
+/// The demand tested is one vCPU, one byte of memory and one byte of disk, not
+/// the size of a particular sandbox. This is the local half of admission: it
+/// answers "is there any headroom at all", and the scheduler's aggregate answers
+/// the per-sandbox question with the real demand and every sibling worker's
+/// reservations. Testing a real size here would refuse small work on a host
+/// that has plenty of room for it, and the error would name this worker rather
+/// than the placement that did not fit.
+///
+/// `production` decides what an unmeasurable host does. It is true for the
+/// runtimes that hold a tenant's job and must never claim capacity they did
+/// not measure, and false for `bwrap-dev`, where refusing every claim on a
+/// host that will not expose `/proc/meminfo` would leave a developer with a
+/// worker that starts, registers, and silently never runs anything.
+fn admits_new_work(state_dir: &Path, reserves: HostReserves, production: bool) -> bool {
+    let pressure = HostPressure::measure(state_dir, reserves);
+    if !pressure.complete() {
+        // Unmeasured. Production refuses; development proceeds, because a dev
+        // sandbox is the developer's own shell and blocking it on a kernel
+        // interface that happens to be unavailable helps nobody.
+        return !production;
+    }
+    // Measured, so this is arithmetic either way: a full host takes nothing,
+    // whatever it happens to be running.
+    pressure.admits(1, 1, 1).is_ok()
+}
+
+/// Bytes in a gibibyte, shared with the host-pressure measurement so the
+/// allocation arithmetic and the measured headroom are in the same unit.
+const GIB: u64 = aiec_core::host_pressure::GIB;
+
+/// Logs one host reading, so an operator can see pressure move without
+/// burying every other worker log under a heartbeat that repeats itself.
+///
+/// A reading whose figures changed since the last one is worth a line; a host
+/// sitting at the same numbers five seconds apart is not.
+fn report_pressure(pressure: &HostPressure, phase: &'static str) {
+    static LAST: std::sync::Mutex<Option<PressureReading>> = std::sync::Mutex::new(None);
+    let reading = (
+        pressure.host_id.clone(),
+        pressure.memory_available_bytes,
+        pressure.disk_available_bytes,
+    );
+    let changed = match LAST.lock() {
+        Ok(last) if *last == Some(reading.clone()) => false,
+        Ok(mut last) => {
+            *last = Some(reading.clone());
+            true
+        }
+        Err(_) => true,
+    };
+    if !changed {
+        return;
+    }
+    if pressure.complete() {
+        tracing::info!(
+            host_id = %pressure.host_id,
+            memory_available_bytes = pressure.memory_available_bytes.unwrap_or_default(),
+            disk_available_bytes = pressure.disk_available_bytes.unwrap_or_default(),
+            memory_reserve_bytes = pressure.reserves.memory_bytes,
+            disk_reserve_bytes = pressure.reserves.disk_bytes,
+            phase,
+            "host pressure measured"
+        );
+    } else {
+        tracing::warn!(
+            host_id = %pressure.host_id,
+            total_memory_bytes = ?pressure.total_memory_bytes,
+            memory_available_bytes = ?pressure.memory_available_bytes,
+            total_disk_bytes = ?pressure.total_disk_bytes,
+            disk_available_bytes = ?pressure.disk_available_bytes,
+            phase,
+            "host pressure is incomplete; new placements are refused until a reading succeeds"
+        );
+    }
+}
+
+/// The three figures worth comparing between readings.
+type PressureReading = (String, Option<u64>, Option<u64>);
+
 /// Base value for this process's node version.
 ///
 /// Derived from the process start time so a restarted worker always outranks
 /// the version it last reported, which the control plane requires before it
 /// will accept the re-registration.
-/// Bytes in a gibibyte.
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// Held back from every node so the host itself is never scheduled to zero.
-///
-/// Memory: the operating system, page cache, and this worker's own processes.
-/// Disk: room for logs, images, and the workspace archives a snapshot writes.
-/// Scheduling a node to its last byte is how a host starts refusing I/O in the
-/// middle of running somebody's job.
-const MEMORY_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
-const DISK_RESERVE_BYTES: u64 = 2 * GIB;
-
-/// What the host actually has, minus the reserve.
-///
-/// Disk is measured on the filesystem backing `workspace` rather than on `/`.
-/// They are the same filesystem on an ordinary host and emphatically not the
-/// same in a container, where `/` is the image's overlay and the workspaces live
-/// on a mounted volume. Measuring `/` there would describe storage the
-/// workloads cannot use, and a node would keep accepting sandboxes while the
-/// volume they actually need was full.
-///
-/// Returns `None` for either measurement it cannot take, and the caller decides
-/// what to do about it. Guessing is the failure this replaces, so a missing
-/// measurement is reported as missing rather than silently replaced with
-/// arithmetic - the fallback exists and says so in the log.
-fn host_capacity(workspace: &std::path::Path) -> (Option<u64>, Option<u64>) {
-    (measure_available_memory(), measure_free_disk(workspace))
-}
-
-/// Memory the kernel says is available, not `MemFree`.
-///
-/// `MemFree` is memory nothing happens to be using, which on a healthy host is
-/// near zero precisely because the page cache is doing its job. `MemAvailable`
-/// is the estimate of what a new allocation can actually get.
-fn measure_available_memory() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let available_kb: u64 = meminfo.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemAvailable:")?;
-        rest.split_whitespace().next()?.parse().ok()
-    })?;
-    available_kb
-        .checked_mul(1024)?
-        .checked_sub(MEMORY_RESERVE_BYTES)
-}
-
-/// Free bytes on the filesystem holding `path`, minus the reserve.
-fn measure_free_disk(path: &std::path::Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes().to_vec()).ok()?;
-    // SAFETY: `stat` is zeroed before the call and `c_path` is a valid,
-    // NUL-terminated string that outlives it. `statvfs` only writes through the
-    // pointer we hand it.
-    unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-            return None;
-        }
-        // `f_bavail` rather than `f_bfree`: blocks reserved for root are not
-        // available to a workload.
-        let block = stat.f_frsize;
-        let free = stat.f_bavail.checked_mul(block)?;
-        free.checked_sub(DISK_RESERVE_BYTES)
-    }
-}
-
 fn worker_version_base() -> u64 {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -913,6 +1561,10 @@ async fn doctor() -> Result<()> {
                             .unwrap_or_else(|| "missing".into())
                     );
                     println!("firecracker guest agent: {}", artifact.guest_agent_version);
+                    println!(
+                        "firecracker guest wire protocol: {}",
+                        artifact.guest_protocol_version
+                    );
                 }
                 None => println!(
                     "firecracker guest image: no guest artifact metadata (set AIEC_GUEST_ARTIFACT_DIR)"
@@ -941,6 +1593,7 @@ fn guest_profile_from(
         capabilities: artifact.capabilities.clone(),
         git_version: artifact.git_version.clone(),
         guest_agent_version: artifact.guest_agent_version.clone(),
+        guest_protocol_version: artifact.guest_protocol_version,
     }
 }
 async fn migrate() -> Result<()> {
@@ -1137,6 +1790,500 @@ async fn snapshot_command(url: &str, key: Option<String>, command: SnapshotComma
     }
     Ok(())
 }
+
+/// Reads a run request from a file, then applies whatever flags were stated.
+///
+/// A document is the reviewable form and the flags are the shorthand, so the
+/// two compose: a checked-in request with a different timeout is the same
+/// request, and `--dry-run` prints exactly what would have gone out.
+fn run_request_from(args: &RunSubmitArgs) -> Result<CreateRunRequest> {
+    let mut request = match &args.file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("read run request {}", path.display()))?;
+            serde_json::from_str(&raw)
+                .with_context(|| format!("parse run request {}", path.display()))?
+        }
+        None => CreateRunRequest::default(),
+    };
+    if let Some(image) = &args.image {
+        request.workload.image = Some(image.clone());
+    }
+    if let Some(repo) = &args.repo {
+        request.workload.repo = Some(RepoSpec {
+            url: repo.clone(),
+            reference: args.git_ref.clone(),
+            ..Default::default()
+        });
+    }
+    if let Some(git_ref) = &args.git_ref {
+        // The repository may have come from the document rather than the flag,
+        // so this is resolved against the request rather than against the flag.
+        let repo = request.workload.repo.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("--ref needs a repository: pass --repo, or state one in the request")
+        })?;
+        repo.reference = Some(git_ref.clone());
+    }
+    if !args.setup.is_empty() {
+        request.workload.setup = args.setup.clone();
+    }
+    if !args.validate.is_empty() {
+        request.workload.validations = args.validate.clone();
+    }
+    if !args.artifact.is_empty() {
+        request.workload.artifacts = args.artifact.clone();
+    }
+    for (key, value) in &args.env {
+        request
+            .workload
+            .environment
+            .insert(key.clone(), value.clone());
+    }
+    if !args.secret.is_empty() {
+        request.workload.secrets = args.secret.clone();
+    }
+    if !args.command.is_empty() {
+        request.workload.command = args.command.clone();
+    }
+    if let Some(timeout) = args.timeout_seconds {
+        request.workload.timeout_seconds = Some(timeout);
+    }
+    if let Some(cpu) = args.cpu {
+        request.resources.cpu = cpu;
+    }
+    if let Some(memory_mb) = args.memory_mb {
+        request.resources.memory_mb = memory_mb;
+    }
+    if let Some(disk_mb) = args.disk_mb {
+        request.resources.disk_mb = disk_mb;
+    }
+    if args.network {
+        request.resources.network = NetworkPolicy::Internet;
+    }
+    if let Some(template) = args.guard {
+        request.resources.guard = Some(aiec_guard::policy::GuardConfig {
+            topology: aiec_guard::policy::Topology::default(),
+            policy_template: PolicyTemplate::from(template),
+            policy: None,
+            model_endpoint: None,
+            allowlist: Vec::new(),
+        });
+        // Guard owns the egress, so the ordinary network policy beside it would
+        // be a second and wider path to the internet.
+        request.resources.network = NetworkPolicy::Disabled;
+    }
+    if args.full_kernel_isolation {
+        request.requirements.full_kernel_isolation = true;
+    }
+    if let Some(retention) = args.retention {
+        request.retention = retention.into();
+    }
+    if let Some(runtime) = &args.requested_runtime {
+        request.requested_runtime = Some(runtime.clone());
+    }
+    if let Some(key) = &args.idempotency_key {
+        request.idempotency_key = Some(key.clone());
+    }
+    // Checked here so a caller is told what is missing before a machine is
+    // placed, rather than after one is.
+    request
+        .workload
+        .validate()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(request)
+}
+
+async fn run_command(url: &str, key: Option<String>, command: RunCommand) -> Result<()> {
+    // The request is built before the client so a `--dry-run` review needs no
+    // credentials: being able to read what you are about to submit without
+    // holding a key is the point of the document form.
+    let submit = match &command {
+        RunCommand::Submit(args) => Some((run_request_from(args)?, args.dry_run)),
+        _ => None,
+    };
+    if let Some((request, true)) = &submit {
+        println!("{}", serde_json::to_string_pretty(request)?);
+        return Ok(());
+    }
+    let c = client(url, key).await?;
+    match (command, submit) {
+        (RunCommand::Submit(_), submit) => {
+            let (request, _) =
+                submit.ok_or_else(|| anyhow::anyhow!("missing Run submission request"))?;
+            let run = c.create_run(&request).await?;
+            println!("{}", serde_json::to_string_pretty(&run)?);
+        }
+        (RunCommand::Show { run_id }, _) => {
+            let run = c.get_run(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&run)?);
+        }
+        (RunCommand::List { state, limit }, _) => {
+            // Parsed here so a typo is a message rather than a query the
+            // control plane answers with an empty page.
+            let state = state
+                .map(|raw| {
+                    RunState::parse(raw.trim())
+                        .ok_or_else(|| anyhow::anyhow!("unknown run state `{raw}`"))
+                })
+                .transpose()?;
+            let runs = c.list_runs(state, Some(limit)).await?;
+            println!("{}", serde_json::to_string_pretty(&runs)?);
+        }
+        (RunCommand::Cancel { run_id }, _) => {
+            let run = c.cancel_run(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&run)?);
+        }
+        (RunCommand::Results { run_id }, _) => {
+            // The run's own results, not the whole record: this is what a
+            // caller pipes into something that reads command outcomes.
+            let run = c.get_run(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&run.results)?);
+        }
+        (RunCommand::Events { run_id }, _) => {
+            let events = c.run_events(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+        (RunCommand::Artifacts { run_id }, _) => {
+            let artifacts = c.run_artifacts(run_id).await?;
+            println!("{}", serde_json::to_string_pretty(&artifacts)?);
+        }
+    }
+    Ok(())
+}
+
+fn read_run_request(path: &Path) -> Result<CreateRunRequest> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read run request {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse run request {}", path.display()))
+}
+
+/// Expands a suite into the matrix the generic route already runs.
+///
+/// The expansion is the control plane's, so a suite means the same thing here
+/// as it does to every other caller; only the submission crosses the wire.
+fn suite_to_spec(
+    path: &Path,
+    image: Option<String>,
+    max_parallel: usize,
+) -> Result<EvalMatrixSpec> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read suite {}", path.display()))?;
+    let suite =
+        aiec_api::eval_matrix::Suite::parse(&raw).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let spec = suite.to_matrix(image, max_parallel);
+    // The two types are the same document with the same field names, so this
+    // is a re-typing rather than a translation: nothing is renamed, defaulted
+    // or dropped on the way.
+    serde_json::from_value(serde_json::to_value(spec)?)
+        .context("the suite expanded into a matrix the client cannot express")
+}
+
+/// The body one of the evaluation routes takes.
+///
+/// Held as one type so `--dry-run` prints exactly what would have been sent,
+/// rather than a second rendering of the same flags that could disagree with
+/// it.
+enum EvalSubmission {
+    Batch(Box<EvalBatchRequest>),
+    Repetitions(Box<EvalRepetitionRequest>),
+    Matrix(Box<EvalMatrixSpec>),
+}
+
+impl EvalSubmission {
+    fn body(&self) -> Result<String> {
+        Ok(match self {
+            Self::Batch(request) => serde_json::to_string_pretty(request)?,
+            Self::Repetitions(request) => serde_json::to_string_pretty(request)?,
+            Self::Matrix(spec) => serde_json::to_string_pretty(spec)?,
+        })
+    }
+}
+
+async fn eval_command(url: &str, key: Option<String>, command: EvalCommand) -> Result<()> {
+    let (submission, dry_run) = match &command {
+        EvalCommand::Batch {
+            request,
+            max_parallel,
+            dry_run,
+        } => (
+            EvalSubmission::Batch(Box::new(EvalBatchRequest {
+                requests: request
+                    .iter()
+                    .map(|path| read_run_request(path))
+                    .collect::<Result<Vec<_>>>()?,
+                options: BatchOptions {
+                    max_parallel: *max_parallel,
+                },
+            })),
+            *dry_run,
+        ),
+        EvalCommand::Repetitions {
+            request,
+            repetitions,
+            max_parallel,
+            dry_run,
+        } => (
+            EvalSubmission::Repetitions(Box::new(EvalRepetitionRequest {
+                request: read_run_request(request)?,
+                repetitions: *repetitions,
+                options: BatchOptions {
+                    max_parallel: *max_parallel,
+                },
+            })),
+            *dry_run,
+        ),
+        EvalCommand::Matrix {
+            spec,
+            max_parallel,
+            dry_run,
+        } => (
+            EvalSubmission::Matrix(Box::new(matrix_spec(spec, *max_parallel)?)),
+            *dry_run,
+        ),
+        EvalCommand::Suite {
+            suite,
+            image,
+            max_parallel,
+            dry_run,
+        } => (
+            EvalSubmission::Matrix(Box::new(suite_to_spec(
+                suite,
+                image.clone(),
+                *max_parallel,
+            )?)),
+            *dry_run,
+        ),
+    };
+    if dry_run {
+        println!("{}", submission.body()?);
+        return Ok(());
+    }
+
+    let c = client(url, key).await?;
+    let printed = match submission {
+        EvalSubmission::Batch(request) => {
+            let result = c.eval_batch(&request).await?;
+            serde_json::to_string_pretty(&result)?
+        }
+        EvalSubmission::Repetitions(request) => {
+            let result = c.eval_repetitions(&request).await?;
+            serde_json::to_string_pretty(&result)?
+        }
+        EvalSubmission::Matrix(spec) => {
+            let result = c.eval_matrix(&spec).await?;
+            serde_json::to_string_pretty(&result)?
+        }
+    };
+    println!("{printed}");
+    Ok(())
+}
+
+/// Reads a matrix document, applying `--max-parallel` only when it was stated.
+fn matrix_spec(path: &Path, max_parallel: Option<usize>) -> Result<EvalMatrixSpec> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read matrix {}", path.display()))?;
+    let mut spec: EvalMatrixSpec =
+        serde_json::from_str(&raw).with_context(|| format!("parse matrix {}", path.display()))?;
+    if let Some(max_parallel) = max_parallel {
+        spec.options.max_parallel = max_parallel;
+    }
+    Ok(spec)
+}
+
+/// Below this many samples a p95 or p99 is noise, so the CLI withholds it and
+/// says why rather than printing a number the sample cannot carry.
+///
+/// This is the same threshold the Python harness enforces in
+/// `benchmarks/aiecbench/stats.py` (`MIN_SAMPLES_FOR_PERCENTILE`). With the
+/// default `--sandboxes 1`, every percentile would otherwise collapse onto one
+/// observation and be presented as three independent measurements.
+const MIN_SAMPLES_FOR_PERCENTILE: usize = 20;
+
+/// How one sandbox attempt ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampleOutcome {
+    /// Created and then torn down cleanly.
+    Destroyed,
+    /// Created, but the teardown failed. The machine may still be running and
+    /// still holding capacity, so this is a failed sample.
+    TeardownFailed,
+    /// Never created.
+    CreateFailed,
+}
+
+impl SampleOutcome {
+    /// Only a sandbox that was both created and torn down is a success.
+    ///
+    /// A discarded `delete_sandbox` error used to report `success_rate=1.000`
+    /// while N machines kept running; that is the number an operator watching a
+    /// cluster fill up is reading.
+    fn is_success(self) -> bool {
+        matches!(self, Self::Destroyed)
+    }
+}
+
+/// One attempt: how long each half of it took, and how it ended.
+#[derive(Clone, Copy)]
+struct BenchmarkSample {
+    create_micros: u64,
+    teardown_micros: Option<u64>,
+    outcome: SampleOutcome,
+}
+
+/// A distribution that may be too small to carry percentiles.
+#[derive(Debug)]
+struct Latencies {
+    samples: usize,
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    p99_ms: Option<f64>,
+    /// Why the percentiles are absent, in the operator's words.
+    withheld: Option<String>,
+}
+
+impl Latencies {
+    fn from_micros(values: &[u64]) -> Self {
+        let samples = values.len();
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        // Nearest-rank, matching `aiecbench.stats.percentile`: an interpolated
+        // percentile is a number between two observations that nobody measured.
+        let at = |fraction: f64| -> Option<f64> {
+            if sorted.is_empty() {
+                return None;
+            }
+            let rank = (fraction * samples as f64)
+                .ceil()
+                .clamp(1.0, samples as f64) as usize;
+            Some(sorted[rank - 1] as f64 / 1000.0)
+        };
+        let withheld = if samples == 0 {
+            Some("no samples were observed".to_owned())
+        } else if samples < MIN_SAMPLES_FOR_PERCENTILE {
+            Some(format!(
+                "{samples} samples is below the {MIN_SAMPLES_FOR_PERCENTILE} needed for a p50/p95/p99"
+            ))
+        } else {
+            None
+        };
+        // Withheld means withheld: the number is not computed at all, so there
+        // is no path by which it reaches the output.
+        let percentile =
+            |fraction: f64| withheld.is_none().then(|| at(fraction).unwrap_or_default());
+        Self {
+            samples,
+            p50_ms: percentile(0.50),
+            p95_ms: percentile(0.95),
+            p99_ms: percentile(0.99),
+            withheld,
+        }
+    }
+
+    /// The percentile keys, always present. A withheld percentile prints
+    /// `unavailable` - not `0.000`, which is a measurement.
+    fn fields(&self, prefix: &str) -> String {
+        let render = |value: Option<f64>| {
+            value.map_or_else(|| "unavailable".to_owned(), |value| format!("{value:.3}"))
+        };
+        let mut fields = format!(
+            "{prefix}_samples={} {prefix}_p50_ms={} {prefix}_p95_ms={} {prefix}_p99_ms={}",
+            self.samples,
+            render(self.p50_ms),
+            render(self.p95_ms),
+            render(self.p99_ms),
+        );
+        if let Some(reason) = &self.withheld {
+            fields.push_str(&format!(" {prefix}_percentiles_withheld={reason}"));
+        }
+        fields
+    }
+}
+
+/// What a benchmark run did, and whether that counts as a pass.
+#[derive(Debug)]
+struct BenchmarkReport {
+    samples: usize,
+    success: usize,
+    created: usize,
+    teardown_failed: usize,
+    create_failed: usize,
+    create: Latencies,
+    teardown: Latencies,
+    total_ms: f64,
+}
+
+impl BenchmarkReport {
+    fn summarise(samples: &[BenchmarkSample], total_ms: f64) -> Self {
+        let created = samples
+            .iter()
+            .filter(|sample| !matches!(sample.outcome, SampleOutcome::CreateFailed))
+            .count();
+        Self {
+            samples: samples.len(),
+            success: samples
+                .iter()
+                .filter(|sample| sample.outcome.is_success())
+                .count(),
+            created,
+            teardown_failed: samples
+                .iter()
+                .filter(|sample| sample.outcome == SampleOutcome::TeardownFailed)
+                .count(),
+            create_failed: samples
+                .iter()
+                .filter(|sample| sample.outcome == SampleOutcome::CreateFailed)
+                .count(),
+            create: Latencies::from_micros(
+                &samples.iter().map(|s| s.create_micros).collect::<Vec<_>>(),
+            ),
+            teardown: Latencies::from_micros(
+                &samples
+                    .iter()
+                    .filter_map(|s| s.teardown_micros)
+                    .collect::<Vec<_>>(),
+            ),
+            total_ms,
+        }
+    }
+
+    /// Whether the run deserves exit code 0.
+    ///
+    /// A teardown that failed leaves a machine running and holding capacity
+    /// until its lease expires, so a run that leaves sandboxes behind has not
+    /// passed, whatever the create rate says.
+    fn is_clean(&self) -> bool {
+        self.samples > 0 && self.success == self.samples
+    }
+
+    fn summary_line(&self, concurrency: usize) -> String {
+        format!(
+            "samples={} concurrency={} success={} success_rate={:.3} created={} create_failed={} teardown_failed={} {} {} total_ms={:.3}",
+            self.samples,
+            concurrency,
+            self.success,
+            self.success as f64 / self.samples.max(1) as f64,
+            self.created,
+            self.create_failed,
+            self.teardown_failed,
+            self.create.fields("create"),
+            self.teardown.fields("teardown"),
+            self.total_ms,
+        )
+    }
+
+    /// The non-zero-exit message, naming the sandboxes this run may have left
+    /// running.
+    fn failure_reason(&self) -> String {
+        format!(
+            "{} of {} benchmark samples failed: {} never created, {} whose teardown failed and may still be running",
+            self.samples - self.success,
+            self.samples,
+            self.create_failed,
+            self.teardown_failed,
+        )
+    }
+}
+
 async fn benchmark(url: &str, key: Option<String>, args: BenchmarkArgs) -> Result<()> {
     if args.sandboxes == 0 || args.concurrency == 0 {
         anyhow::bail!("sandboxes and concurrency must be positive")
@@ -1147,7 +2294,7 @@ async fn benchmark(url: &str, key: Option<String>, args: BenchmarkArgs) -> Resul
     let client = client(url, key).await?;
     let started = Instant::now();
     let permits = Arc::new(Semaphore::new(args.concurrency));
-    let mut tasks: JoinSet<Result<(u64, bool)>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<BenchmarkSample>> = JoinSet::new();
     for _ in 0..args.sandboxes {
         let client = client.clone();
         let permits = permits.clone();
@@ -1165,42 +2312,43 @@ async fn benchmark(url: &str, key: Option<String>, args: BenchmarkArgs) -> Resul
                 network: NetworkPolicy::default(),
                 environment: Default::default(),
             };
-            let started = Instant::now();
-            match client.create_sandbox(&request).await {
-                Ok(sandbox) => {
-                    let _ = client.delete_sandbox(sandbox.id).await;
-                    Ok((started.elapsed().as_micros() as u64, true))
+            // Creation and teardown are timed separately: the caller's
+            // `started` used to span both, so every percentile it printed was a
+            // create+destroy sum reported as if it were creation latency.
+            let create_started = Instant::now();
+            let sandbox = match client.create_sandbox(&request).await {
+                Ok(sandbox) => sandbox,
+                Err(_) => {
+                    return Ok(BenchmarkSample {
+                        create_micros: create_started.elapsed().as_micros() as u64,
+                        teardown_micros: None,
+                        outcome: SampleOutcome::CreateFailed,
+                    });
                 }
-                Err(_) => Ok((started.elapsed().as_micros() as u64, false)),
-            }
+            };
+            let create_micros = create_started.elapsed().as_micros() as u64;
+            let teardown_started = Instant::now();
+            let outcome = match client.delete_sandbox(sandbox.id).await {
+                Ok(_) => SampleOutcome::Destroyed,
+                Err(_) => SampleOutcome::TeardownFailed,
+            };
+            let teardown_micros = teardown_started.elapsed().as_micros() as u64;
+            Ok(BenchmarkSample {
+                create_micros,
+                teardown_micros: Some(teardown_micros),
+                outcome,
+            })
         });
     }
-    let mut durations = Vec::with_capacity(args.sandboxes);
-    let mut success = 0usize;
+    let mut samples = Vec::with_capacity(args.sandboxes);
     while let Some(result) = tasks.join_next().await {
-        let (duration, created) = result??;
-        durations.push(duration);
-        success += usize::from(created);
+        samples.push(result??);
     }
-    durations.sort_unstable();
-    let p = |q: f64| {
-        if durations.is_empty() {
-            0
-        } else {
-            durations[((durations.len() - 1) as f64 * q).round() as usize]
-        }
-    };
-    println!(
-        "samples={} concurrency={} success={} success_rate={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} total_ms={:.3}",
-        durations.len(),
-        args.concurrency,
-        success,
-        success as f64 / durations.len().max(1) as f64,
-        p(0.50) as f64 / 1000.0,
-        p(0.95) as f64 / 1000.0,
-        p(0.99) as f64 / 1000.0,
-        started.elapsed().as_secs_f64() * 1000.0
-    );
+    let report = BenchmarkReport::summarise(&samples, started.elapsed().as_secs_f64() * 1000.0);
+    println!("{}", report.summary_line(args.concurrency));
+    if !report.is_clean() {
+        anyhow::bail!(report.failure_reason())
+    }
     Ok(())
 }
 fn base64_encode(bytes: &[u8]) -> String {

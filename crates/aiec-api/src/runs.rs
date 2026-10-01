@@ -17,16 +17,21 @@ use std::time::Instant;
 use aiec_core::RuntimeKind;
 use aiec_core::network::NetworkPolicy;
 use aiec_core::run::{
-    CapabilityRequirements, CleanupReport, CommandOutcome, Placement, RepoSpec,
+    CapabilityRequirements, CleanupReport, CommandOutcome, MAX_SETUP_COMMAND_PREVIEW_BYTES,
+    MAX_SETUP_PREVIEW_BYTES, MAX_TASK_PREVIEW_BYTES, MAX_VALIDATION_COMMAND_PREVIEW_BYTES,
+    MAX_VALIDATION_PREVIEW_BYTES, MatrixCellIdentity, Placement, PreviewBudget, RepoSpec,
     ResourceRequirements, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
-    RunSandbox, RunState, WorkloadSpec,
+    RunState, WorkloadSpec, bound_git_evidence,
 };
-use aiec_core::runtime::{RuntimeCapabilities, RuntimeIsolation, SandboxRuntime};
+use aiec_core::runtime::{FileChunk, RuntimeCapabilities, RuntimeIsolation, SandboxRuntime};
+use aiec_core::storage::ArtifactStore;
 use aiec_core::{ExecRequest, Sandbox, TenantId, WorkspaceSpec, new_id};
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::run_secrets::SecretRedactor;
 use crate::{AppState, CoreError};
 
 /// A default retention window for a machine kept for debugging.
@@ -41,7 +46,7 @@ const DEFAULT_RETENTION_SECONDS: i64 = 3600;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 
 /// Everything a caller supplies to start a run.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunRequest {
     #[serde(default)]
     pub workload: WorkloadSpec,
@@ -59,6 +64,15 @@ pub struct RunRequest {
     pub parent_run_id: Option<Uuid>,
     #[serde(default)]
     pub matrix_id: Option<Uuid>,
+    /// Which cell of a matrix this request is, when it is one.
+    ///
+    /// Carried onto the Run at build time so the axis values are stored with
+    /// the run's own insert rather than attached to it afterwards: a matrix
+    /// whose labels are written only once every cell has finished loses every
+    /// label belonging to a cell that failed, or to a submission whose
+    /// response was lost.
+    #[serde(default)]
+    pub matrix_cell: Option<MatrixCellIdentity>,
     /// Advanced use only. A caller stating requirements does not pick a runtime.
     #[serde(default)]
     pub requested_runtime: Option<String>,
@@ -74,14 +88,27 @@ pub struct RunRequest {
     pub max_attempts: u32,
 }
 
-/// One. A second attempt is not free: the run's wall-clock budget is sliced
-/// across attempts, so asking for two halves the time a workload legitimately
-/// has, and a task that needed its full stated timeout would time out, retry on
-/// a second machine, time out again, and fail having paid for both. Placement
-/// races get their own retry instead, because nothing has run yet when they
-/// happen.
+/// Retry attempts share the run's deadline; the default does not repeat work.
 fn default_max_attempts() -> u32 {
     1
+}
+
+impl Default for RunRequest {
+    fn default() -> Self {
+        Self {
+            workload: Default::default(),
+            resources: Default::default(),
+            requirements: Default::default(),
+            retention: Default::default(),
+            idempotency_key: None,
+            parent_run_id: None,
+            matrix_id: None,
+            matrix_cell: None,
+            requested_runtime: None,
+            retained_seconds: None,
+            max_attempts: default_max_attempts(),
+        }
+    }
 }
 
 /// The run's own view of its progress, for a caller polling or streaming.
@@ -92,7 +119,7 @@ pub struct RunProgress {
     pub percent: u8,
 }
 
-/// Creates a run and drives it to a terminal state.
+/// Validates a request, reserves the run, then lets the queue execute it.
 ///
 /// Returns the settled run. Failures inside the run are reported through the
 /// run's own state and `failure_reason` rather than as an error, because "the
@@ -103,181 +130,221 @@ pub async fn submit_and_execute(
     tenant: TenantId,
     request: RunRequest,
 ) -> Result<Run, CoreError> {
+    validate(state, tenant, &request).await?;
+    // A durable store admits a Run and its queue row in one transaction, so
+    // the Run must not be inserted here first: a second insert of the same id
+    // is a unique violation, and a Run admitted but never queued would be
+    // invisible to the dispatcher. The direct path below still reserves it
+    // itself, because it executes in this request and owns the write.
+    if state.repository().supports_run_queue() {
+        let proposed = build_run(tenant, &request);
+        return crate::run_queue::enqueue_and_wait(
+            state,
+            proposed,
+            request,
+            state.run_queue_limits(),
+        )
+        .await;
+    }
+    let (run, is_new) = create_run(state, tenant, &request).await?;
+    if !is_new {
+        return Ok(run);
+    }
+    execute_created(state, tenant, run, request).await
+}
+
+/// Rejects a request that could never be executed, before anything is reserved.
+///
+/// The secret references are resolved here rather than at the first exec, even
+/// though the values are handed out again per command. A name the tenant does
+/// not hold, a name the store has no file for, or a name the workload also
+/// spells out as a literal are all knowable now, and finding out after a
+/// machine has been placed means the caller pays for a sandbox to be told their
+/// own request was malformed. The resolution here is dropped immediately; the
+/// values that reach the guest are the ones resolved again at exec time.
+async fn validate(
+    state: &AppState,
+    tenant: TenantId,
+    request: &RunRequest,
+) -> Result<(), CoreError> {
     request
         .workload
         .validate()
         .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
+    request
+        .resources
+        .validate()
+        .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
+    if request
+        .retained_seconds
+        .is_some_and(|seconds| !(1..=86_400).contains(&seconds))
+    {
+        return Err(CoreError::InvalidRequest(
+            "retained_seconds must be between 1 and 86400".into(),
+        ));
+    }
+    if !(1..=MAX_RUN_ATTEMPTS).contains(&request.max_attempts) {
+        return Err(CoreError::InvalidRequest(format!(
+            "max_attempts must be between 1 and {MAX_RUN_ATTEMPTS}"
+        )));
+    }
+    let resolved = state
+        .run_secrets()
+        .resolve(tenant, &request.workload.secrets)
+        .await?;
+    resolved.merge(&request.workload.environment)?;
+    Ok(())
+}
 
-    let (run, is_new) = create_run(state, tenant, &request).await?;
-
-    // An idempotent hit is an existing run, not an error, and definitely not a
-    // second execution.
-    //
-    // Keyed on whether this call created the row rather than on the run being
-    // finished. A client retrying while the first request is still in flight
-    // gets that in-flight row back, and a terminal check waves it through: the
-    // workload runs again on a second machine, both placements are billed, and
-    // the two executions then fight over one row - the loser's terminal write
-    // is rejected and its final `fail` overwrites the winner's outcome.
-    if !is_new {
+/// Drives an already-reserved run to a terminal state.
+///
+/// Takes ownership of execution rather than admitting it, which is why it is
+/// separated from the queue: the dispatcher calls this for a claimed run, and
+/// the direct path calls it for a run nobody queued. A run that reached a
+/// terminal state before this was called is returned untouched, so a stale
+/// future can never resurrect settled work.
+pub(crate) async fn execute_created(
+    state: &AppState,
+    tenant: TenantId,
+    mut run: Run,
+    request: RunRequest,
+) -> Result<Run, CoreError> {
+    let store = state.repository();
+    if run.state.is_terminal() {
         return Ok(run);
     }
-
-    // A run has a deadline, not just a command timeout.
-    //
-    // Without this a run whose worker became unreachable - a restart, a drained
-    // node - never settles: it sits in `running` holding a sandbox that never
-    // started, and the tenant's capacity stays consumed until that sandbox's own
-    // TTL runs out. That is a cleanup failure, not a slow run, and it is
-    // precisely what three abandoned runs on a live cluster turned out to be.
-    let deadline = request
-        .workload
-        .timeout_seconds
-        .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
-        .saturating_add(PLACEMENT_GRACE_SECONDS);
-    // A retry gets a fresh machine, and every attempt is recorded rather than
-    // overwritten: "it failed twice then passed" and "it passed" are different
-    // facts, and collapsing them is how a flaky agent looks reliable.
-    // Capped, and not for politeness. A placement refusal returns in
-    // milliseconds, so the per-attempt deadline never fires and an unbounded
-    // `max_attempts` becomes a tight loop: every iteration is a scheduling
-    // transaction that takes the tenant quota row `FOR UPDATE`, scans nodes,
-    // inserts a row and rolls back, and every iteration writes an attempt row.
-    // One request could drive thousands of those for the whole run budget.
-    // Repeating a task is a legitimate ask; doing it thousands of times per
-    // second is not, and the caller does not get to decide the difference.
-    let max_attempts = request.max_attempts.clamp(1, MAX_RUN_ATTEMPTS);
-    let store = state.repository();
-    let mut last_error: Option<CoreError> = None;
-
-    // One budget for the whole run, sliced across attempts.
-    //
-    // A per-attempt deadline would multiply: five attempts of a ten-minute task
-    // is fifty minutes of wall time, and the run would stop being bounded -
-    // which is the one property the deadline exists to provide. A run that wants
-    // more wall time asks for a longer timeout, not more attempts.
-    let run_budget = std::time::Duration::from_secs(deadline);
-    // A caller who asks for one attempt - the default - gets the whole budget:
-    // dividing it by one is dividing by one, and the point is that a *retry*
-    // must not silently halve the time the workload legitimately has.
-    //
-    // A caller who explicitly asks for several is asking for several attempts,
-    // and the budget is still shared between them. That is the property the
-    // deadline exists to provide: three attempts of a ten-minute task is not
-    // thirty minutes of wall time, or the run stops being bounded. The floor
-    // keeps a very short run from slicing itself into nothing.
-    let per_attempt = if max_attempts <= 1 {
-        run_budget
-    } else {
-        (run_budget / max_attempts).max(std::time::Duration::from_secs(30))
-    };
-    let started = std::time::Instant::now();
-    // Placement attempts that never reached a machine. A lease resync or an
-    // exhausted cluster is decided in milliseconds and costs no compute, so
-    // these are retried inside the run's existing budget rather than by
-    // splitting it - a second full attempt would be the expensive kind.
-    let mut placement_retries = PLACEMENT_RETRIES;
-
-    for attempt in 1..=max_attempts {
-        // Never hand an attempt more than the run has left.
-        let remaining = run_budget.saturating_sub(started.elapsed());
+    let budget = std::time::Duration::from_secs(
+        request
+            .workload
+            .timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
+            .saturating_add(PLACEMENT_GRACE_SECONDS),
+    );
+    let started = Instant::now();
+    let mut last_error = None;
+    for number in 1..=request.max_attempts {
+        run = store.get_run(tenant, run.id).await?;
+        if run.state.is_terminal() {
+            return Ok(run);
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            last_error = Some(CoreError::Unavailable(format!(
-                "the run exhausted its {deadline}s budget"
-            )));
+            last_error = Some(CoreError::Unavailable("run deadline exhausted".into()));
             break;
         }
-        let slice = per_attempt.min(remaining);
-
-        let outcome =
-            tokio::time::timeout(slice, execute(state, tenant, run.clone(), request.clone())).await;
-
-        let attempt_error = match outcome {
-            Ok(Ok(finished)) => {
-                let _ = store
-                    .record_run_attempt(RunAttempt {
-                        id: Uuid::now_v7(),
-                        run_id: run.id,
-                        attempt_number: attempt as i32,
-                        sandbox_id: finished.retained_sandbox_id,
-                        state: finished.state,
-                        failure_reason: finished.failure_reason.clone(),
-                        started_at: Utc::now(),
-                        completed_at: Some(Utc::now()),
-                    })
-                    .await;
-                return Ok(finished);
-            }
-            Ok(Err(error)) => error,
-            Err(_elapsed) => {
-                CoreError::Unavailable(format!("the run exceeded its {deadline}s deadline"))
-            }
+        let mut evidence = RunAttempt {
+            id: new_id(),
+            run_id: run.id,
+            attempt_number: number as i32,
+            sandbox_id: None,
+            state: RunState::Running,
+            failure_reason: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            placement: Placement::default(),
+            results: RunResults::default(),
         };
-
-        let retryable = is_retryable(&attempt_error);
-        let _ = store
-            .record_run_attempt(RunAttempt {
-                id: Uuid::now_v7(),
-                run_id: run.id,
-                attempt_number: attempt as i32,
-                sandbox_id: None,
-                state: RunState::Failed,
-                failure_reason: Some(attempt_error.to_string()),
-                started_at: Utc::now(),
-                completed_at: Some(Utc::now()),
-            })
-            .await;
-        last_error = Some(attempt_error);
-
-        // Free retry: the attempt placed nothing, so there is no work to repeat
-        // and no bill to pay twice. Only for the case where the run never got a
-        // machine - checked against what the run actually holds, not inferred
-        // from the error type.
-        let placed_nothing = store
-            .list_run_sandboxes(tenant, run.id)
-            .await
-            .map(|linked| linked.is_empty())
-            .unwrap_or(false);
-        if retryable && placed_nothing && placement_retries > 0 {
-            placement_retries -= 1;
-            tracing::info!(
-                run_id = %run.id,
-                attempt,
-                remaining = placement_retries,
-                "retrying placement; no work has run yet"
-            );
-            let pause = std::time::Duration::from_millis(150 * (attempt as u64 + 1)).min(remaining);
-            tokio::time::sleep(pause).await;
-            continue;
+        // Scheduling links this existing attempt before slow provisioning starts.
+        store.record_run_attempt(evidence.clone()).await?;
+        let result = tokio::time::timeout(
+            remaining,
+            execute(
+                state,
+                tenant,
+                run,
+                &request,
+                evidence.id,
+                number == request.max_attempts,
+            ),
+        )
+        .await;
+        let (mut current, error, succeeded, expired) = match result {
+            Ok(Ok(outcome)) => (outcome.run, None, outcome.succeeded, false),
+            Ok(Err(error)) => (
+                store.get_run(tenant, evidence.run_id).await?,
+                Some(error),
+                false,
+                false,
+            ),
+            Err(_) => (
+                store.get_run(tenant, evidence.run_id).await?,
+                Some(CoreError::Unavailable(
+                    "run execution deadline exceeded".into(),
+                )),
+                false,
+                true,
+            ),
+        };
+        // Outside the timed future: timeout/cancellation cannot skip reclamation.
+        // Also covers partial provisioning and failed teardown before another try.
+        if error.is_some() || current.state == RunState::Cancelled {
+            let links = store.list_run_sandboxes(tenant, current.id).await?;
+            let ids: Vec<_> = links
+                .iter()
+                .filter(|link| {
+                    expired
+                        || current.state == RunState::Cancelled
+                        || current.retained_sandbox_id != Some(link.sandbox_id)
+                })
+                .map(|link| link.sandbox_id)
+                .collect();
+            let mut results = std::mem::take(&mut current.results);
+            cleanup(state, tenant, &mut current, &ids, &mut results, None).await;
+            current = store
+                .record_run_results(tenant, current.id, results, current.state)
+                .await?;
         }
-
-        if !retryable || attempt == max_attempts {
+        evidence.state = if current.state == RunState::Cancelled {
+            RunState::Cancelled
+        } else if succeeded {
+            RunState::Succeeded
+        } else {
+            RunState::Failed
+        };
+        evidence.failure_reason = error
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| current.failure_reason.clone());
+        evidence.completed_at = Some(Utc::now());
+        evidence.placement = current.placement.clone();
+        evidence.results = current.results.clone();
+        store.complete_run_attempt(tenant, evidence).await?;
+        if current.state == RunState::Cancelled {
+            return Ok(current);
+        }
+        if error.is_none() {
+            let mut results = std::mem::take(&mut current.results);
+            let mut phases = results.phase_ms.clone();
+            if succeeded {
+                settle(state, tenant, &mut current, &mut results, &mut phases).await?;
+            } else {
+                let reason = current.failure_reason.take();
+                fail(
+                    state,
+                    tenant,
+                    &mut current,
+                    reason,
+                    &mut results,
+                    &mut phases,
+                )
+                .await?;
+            }
+            return store.get_run(tenant, current.id).await;
+        }
+        let retryable = error.as_ref().is_some_and(is_retryable)
+            && !expired
+            && current.results.cleanup_failed.is_none();
+        last_error = error;
+        run = current;
+        if !retryable || number == request.max_attempts {
             break;
         }
-        tracing::info!(
-            run_id = %run.id,
-            attempt,
-            max_attempts,
-            "retrying a run on a fresh machine"
-        );
-        // Backing off matters most for exactly the case that retries fastest.
-        // A placement refusal is immediate, so without a pause the loop spins
-        // at the speed of the database while the cluster is full - hammering
-        // the same locks it is waiting on to be released. Bounded by the
-        // remaining budget so the backoff can never extend a run past its
-        // deadline.
-        let backoff =
-            std::time::Duration::from_millis((100u64 * 2u64.pow(attempt.min(6) - 1)).min(5_000))
-                .min(remaining);
-        tokio::time::sleep(backoff).await;
+        let pause = std::time::Duration::from_millis(100 * (1u64 << number.min(6)))
+            .min(budget.saturating_sub(started.elapsed()));
+        tokio::time::sleep(pause).await;
     }
-
-    // Everything the attempts could not explain becomes the run's reason, and
-    // the run is settled through the same path as any other failure.
-    let mut run = run;
-    let mut results = RunResults::default();
-    let mut phases = BTreeMap::new();
-    phases.insert("attempts".to_owned(), max_attempts as u64);
+    let mut results = std::mem::take(&mut run.results);
+    let mut phases = results.phase_ms.clone();
     fail(
         state,
         tenant,
@@ -287,18 +354,27 @@ pub async fn submit_and_execute(
         &mut phases,
     )
     .await?;
-    state.repository().get_run(tenant, run.id).await
+    store.get_run(tenant, run.id).await
+}
+
+/// The image a Run boots when it named none.
+///
+/// Per runtime, because the names are not interchangeable: `aiec-coding:latest`
+/// is the reference the Firecracker guest image is admitted and signed under,
+/// and no container registry has ever heard of it.
+pub(crate) fn default_image_for(runtime: RuntimeKind) -> &'static str {
+    match runtime {
+        // The guest image, admitted and signed under this reference.
+        RuntimeKind::Firecracker => "aiec-coding:latest",
+        // The development container and a hosted provider both boot a normal
+        // container image, and the guest is built from this same Debian base, so
+        // a Run moved between runtimes lands on a comparable userland.
+        RuntimeKind::Docker | RuntimeKind::BwrapDev | RuntimeKind::Hosted => "debian:bookworm-slim",
+    }
 }
 
 /// Ceiling on a single run's attempts, whatever the caller asks for.
 const MAX_RUN_ATTEMPTS: u32 = 10;
-
-/// How many times a run may retry *placement* when it never reached a machine.
-///
-/// Separate from `max_attempts` because it costs nothing: no sandbox is created,
-/// no command runs, and the run's wall-clock budget is untouched. What it is
-/// not is a second full attempt.
-const PLACEMENT_RETRIES: u32 = 2;
 
 /// Grace on top of the command timeout for placement and teardown.
 const PLACEMENT_GRACE_SECONDS: u64 = 120;
@@ -330,8 +406,26 @@ async fn create_run(
     tenant: TenantId,
     request: &RunRequest,
 ) -> Result<(Run, bool), CoreError> {
+    let run = build_run(tenant, request);
+    let store = state.repository();
+    let created = store.create_run(run.clone()).await?;
+
+    let is_new = created.id == run.id;
+    if is_new {
+        announce_created(state, &created, request).await;
+    }
+    Ok((created, is_new))
+}
+
+/// The Run a request asks for, before any store has seen it.
+///
+/// Building and persisting are separate steps because the durable queue commits
+/// the Run and its queue row together, while the direct path writes the Run on
+/// its own. Both start from exactly this value, so a queued Run and an
+/// immediately-executed one are the same object.
+fn build_run(tenant: TenantId, request: &RunRequest) -> Run {
     let now = Utc::now();
-    let run = Run {
+    Run {
         id: new_id(),
         tenant_id: tenant,
         state: RunState::Queued,
@@ -351,26 +445,24 @@ async fn create_run(
         idempotency_key: request.idempotency_key.clone(),
         parent_run_id: request.parent_run_id,
         matrix_id: request.matrix_id,
-    };
-    let store = state.repository();
-    let created = store.create_run(run.clone()).await?;
-
-    let is_new = created.id == run.id;
-    if is_new {
-        event(
-            state,
-            &created,
-            "run.created",
-            serde_json::json!({
-                "image": request.workload.image,
-                "has_repo": request.workload.repo.is_some(),
-                "retention": created.retention.as_str(),
-                "requirements": request.requirements.reasons(),
-            }),
-        )
-        .await;
+        matrix_cell: request.matrix_cell.clone(),
     }
-    Ok((created, is_new))
+}
+
+/// Records that a Run exists, with the shape of the work and nothing else.
+pub(crate) async fn announce_created(state: &AppState, created: &Run, request: &RunRequest) {
+    event(
+        state,
+        created,
+        "run.created",
+        serde_json::json!({
+            "image": request.workload.image,
+            "has_repo": request.workload.repo.is_some(),
+            "retention": created.retention.as_str(),
+            "requirements": request.requirements.reasons(),
+        }),
+    )
+    .await;
 }
 
 /// Records a run event. Detail is shapes and names; a value that could be a
@@ -403,22 +495,32 @@ async fn advance(state: &AppState, run: &mut Run, next: RunState) -> Result<(), 
         // fighting, because a run has one truth and two writers is a bug
         // elsewhere, not a reason to overwrite.
         Err(CoreError::Conflict(_)) | Err(CoreError::NotFound(_)) => {
-            if let Ok(current) = store.get_run(run.tenant_id, run.id).await {
-                *run = current;
+            *run = store.get_run(run.tenant_id, run.id).await?;
+            if run.state == next {
+                Ok(())
+            } else {
+                Err(CoreError::Conflict(
+                    "run progression stopped because its durable state changed".to_owned(),
+                ))
             }
-            Ok(())
         }
         Err(other) => Err(other),
     }
 }
 
+struct AttemptOutcome {
+    run: Run,
+    succeeded: bool,
+}
 /// Drives one run from queued to a terminal state.
 async fn execute(
     state: &AppState,
     tenant: TenantId,
     run: Run,
-    request: RunRequest,
-) -> Result<Run, CoreError> {
+    request: &RunRequest,
+    attempt_id: Uuid,
+    final_attempt: bool,
+) -> Result<AttemptOutcome, CoreError> {
     let store = state.repository();
     let mut run = run;
     let mut results = RunResults::default();
@@ -428,28 +530,29 @@ async fn execute(
 
     // -- placement -----------------------------------------------------------
     let placement_started = Instant::now();
-    let (sandbox, placement) = match acquire_sandbox(state, tenant, &run, &request).await {
-        Ok(pair) => pair,
-        Err((error, reasons)) => {
-            run.placement.reasons = reasons;
-            // Refusing to place is a real outcome, not an internal error: the
-            // requirement could not be met and the run is not going to happen.
-            fail(
-                state,
-                tenant,
-                &mut run,
-                Some(error.to_string()),
-                &mut results,
-                &mut phases,
-            )
-            .await?;
-            return store.get_run(tenant, run.id).await;
-        }
-    };
+    let (sandbox, placement, timings) =
+        match acquire_sandbox(state, tenant, &run, request, attempt_id).await {
+            Ok(pair) => pair,
+            Err((error, reasons)) => {
+                run.placement.reasons = reasons;
+                store
+                    .set_run_placement(tenant, run.id, run.placement)
+                    .await?;
+                return Err(error);
+            }
+        };
     phases.insert(
         "placement".to_owned(),
         placement_started.elapsed().as_millis() as u64,
     );
+    for (phase, duration) in [
+        ("placement.scheduler", timings.scheduler_ms),
+        ("placement.allocation", timings.allocation_ms),
+        ("placement.boot", timings.boot_ms),
+        ("placement.workspace", timings.workspace_ms),
+    ] {
+        phases.insert(phase.to_owned(), duration);
+    }
     run.placement = placement.clone();
     // Written on its own rather than smuggled into the results: placement is
     // decided before any work runs, and a later write of results must not be
@@ -464,20 +567,12 @@ async fn execute(
         tracing::warn!(run_id = %run.id, error = %error, "could not record a run's results");
     }
 
-    let sandbox_id = sandbox.id;
-    let _ = store
-        .link_run_sandbox(RunSandbox {
-            run_id: run.id,
-            sandbox_id,
-            role: "primary".to_owned(),
-        })
-        .await;
     event(
         state,
         &run,
         "sandbox.assigned",
         serde_json::json!({
-            "sandbox_id": sandbox_id,
+            "sandbox_id": sandbox.id,
             "runtime": sandbox.runtime.as_str(),
             "worker": sandbox.node_id,
             "reasons": run.placement.reasons,
@@ -494,62 +589,75 @@ async fn execute(
         state,
         tenant,
         &mut run,
-        &request,
+        request,
         &sandbox,
         &mut results,
         &mut phases,
     )
     .await;
-    if let Err(error) = &attempt {
-        // Decided before cleanup, because retention is judged on it. A caller
-        // that asked to keep a failed machine should not have it destroyed
-        // because the failure arrived as an error rather than a non-zero exit.
-        run.failure_reason = Some(error.to_string());
-    }
+    let succeeded = attempt.is_ok()
+        && results.task.as_ref().is_some_and(|task| task.ok)
+        && results.validations.iter().all(|validation| validation.ok);
+    // Retention must see task and validation failures, not just transport errors.
+    run.failure_reason = match &attempt {
+        Err(error) => Some(error.to_string()),
+        Ok(()) if !succeeded => Some(
+            if results.task.as_ref().is_some_and(|task| !task.ok) {
+                "the task did not succeed"
+            } else {
+                "a validation failed"
+            }
+            .to_owned(),
+        ),
+        Ok(()) => None,
+    };
     let cleanup_started = Instant::now();
-    cleanup(state, tenant, &mut run, &[sandbox.id], &mut results).await;
+    let allow_retention = results.setup.iter().any(|command| !command.ok)
+        || attempt
+            .as_ref()
+            .err()
+            .is_none_or(|error| !is_retryable(error) || final_attempt);
+    cleanup(
+        state,
+        tenant,
+        &mut run,
+        &[sandbox.id],
+        &mut results,
+        allow_retention.then_some(
+            request
+                .retained_seconds
+                .unwrap_or(DEFAULT_RETENTION_SECONDS),
+        ),
+    )
+    .await;
     phases.insert(
         "cleanup".to_owned(),
         cleanup_started.elapsed().as_millis() as u64,
     );
-
-    let succeeded = results.task.as_ref().is_some_and(|task| task.ok)
-        && results.validations.iter().all(|validation| validation.ok);
-    let reason = (!succeeded).then(|| {
-        results
-            .task
-            .as_ref()
-            .filter(|task| !task.ok)
-            .map(|_| "the task did not succeed".to_owned())
-            .unwrap_or_else(|| "a validation failed".to_owned())
-    });
-
+    results.phase_ms = phases;
+    let reason = run.failure_reason.take();
+    run = store
+        .record_run_results(tenant, run.id, results, run.state)
+        .await?;
+    run.failure_reason = reason;
+    // Cleanup above ran on every path that reached a machine, so every outcome
+    // here has already released it - including the error arm, which propagates
+    // for retry classification rather than because anything is still held.
     match attempt {
-        Ok(()) => {
-            if succeeded {
-                settle(state, tenant, &mut run, &mut results, &mut phases).await?;
-            } else {
-                fail(state, tenant, &mut run, reason, &mut results, &mut phases).await?;
-            }
+        Ok(()) => Ok(AttemptOutcome { run, succeeded }),
+        Err(_) if run.state == RunState::Cancelled => Ok(AttemptOutcome {
+            run,
+            succeeded: false,
+        }),
+        Err(error) if run.results.setup.iter().any(|command| !command.ok) => {
+            let _ = error;
+            Ok(AttemptOutcome {
+                run,
+                succeeded: false,
+            })
         }
-        Err(error) => {
-            // The machine is already released above; this records why the run
-            // stopped, and re-raises so the attempt loop can decide about a
-            // retry with the caller's budget.
-            fail(
-                state,
-                tenant,
-                &mut run,
-                Some(error.to_string()),
-                &mut results,
-                &mut phases,
-            )
-            .await?;
-            return Err(error);
-        }
+        Err(error) => Err(error),
     }
-
-    store.get_run(tenant, run.id).await
 }
 
 /// Everything a run does once it holds a machine.
@@ -569,12 +677,25 @@ async fn post_placement(
 ) -> Result<(), CoreError> {
     let runtime = state.runtime_for(sandbox)?;
 
+    // Every phase's stored output is bounded as it is produced, not on the way
+    // into the database. The machine already clips at a megabyte per stream,
+    // which bounds one command; what it does not bound is the run document,
+    // which is the sum of every phase and is read back by every list, poll and
+    // matrix aggregation in the control plane.
+    //
     // -- setup ---------------------------------------------------------------
     if !request.workload.setup.is_empty() {
         advance(state, run, RunState::Running).await?;
         let phase_started = Instant::now();
+        let mut setup_budget = PreviewBudget::new(MAX_SETUP_PREVIEW_BYTES);
         for command in &request.workload.setup {
-            let outcome = run_command(state, tenant, run, sandbox, command, None).await?;
+            let mut outcome = run_command(state, tenant, run, sandbox, command, None).await?;
+            // Clipped here rather than on the way into the database, so the
+            // large copy is never written and then thrown away. `ok` is
+            // untouched: a step whose output did not fit is still a step that
+            // ran, and reporting it otherwise would turn a working setup into a
+            // failure the moment the install log grew past a kilobyte.
+            setup_budget.clip(&mut outcome, MAX_SETUP_COMMAND_PREVIEW_BYTES);
             let ok = outcome.ok;
             results.setup.push(outcome);
             if !ok {
@@ -588,15 +709,19 @@ async fn post_placement(
                 return Err(CoreError::Backend("a setup command failed".into()));
             }
         }
+        phases.insert(
+            "setup".to_owned(),
+            phase_started.elapsed().as_millis() as u64,
+        );
     }
 
-    if run.started_at.is_none() {
+    if run.state == RunState::Preparing {
         advance(state, run, RunState::Running).await?;
     }
 
     // -- the task ------------------------------------------------------------
     let task_started = Instant::now();
-    let task = run_command(
+    let mut task = run_command(
         state,
         tenant,
         run,
@@ -606,6 +731,10 @@ async fn post_placement(
     )
     .await?;
     phases.insert("task".to_owned(), task_started.elapsed().as_millis() as u64);
+    // The task gets the bulk of the budget rather than a share of a per-command
+    // one: it is the output the caller came for, and the one part of a run they
+    // cannot recompute by running the sandbox again.
+    PreviewBudget::new(MAX_TASK_PREVIEW_BYTES).clip(&mut task, MAX_TASK_PREVIEW_BYTES);
     event(
         state,
         run,
@@ -614,6 +743,12 @@ async fn post_placement(
             "exit_code": task.exit_code,
             "duration_ms": task.duration_ms,
             "truncated": task.truncated,
+            // Reported in the event, not only in the stored document: a caller
+            // streaming a run's progress reads events, and being handed a
+            // clipped preview with no mention of it is how a partial log gets
+            // quoted as the whole one.
+            "output_preview_truncated": task.output_preview_truncated,
+            "output_preview_bytes": task.stdout.len() + task.stderr.len(),
         }),
     )
     .await;
@@ -623,10 +758,12 @@ async fn post_placement(
     if !request.workload.validations.is_empty() {
         advance(state, run, RunState::Validating).await?;
         let validate_started = Instant::now();
+        let mut budget = PreviewBudget::new(MAX_VALIDATION_PREVIEW_BYTES);
         for command in &request.workload.validations {
             // Every validation runs even after one fails, so a caller can tell a
             // loud failure from a silent one.
-            let outcome = run_command(state, tenant, run, sandbox, command, None).await?;
+            let mut outcome = run_command(state, tenant, run, sandbox, command, None).await?;
+            budget.clip(&mut outcome, MAX_VALIDATION_COMMAND_PREVIEW_BYTES);
             results.validations.push(outcome);
         }
         phases.insert(
@@ -639,19 +776,49 @@ async fn post_placement(
     advance(state, run, RunState::Collecting).await?;
     let collect_started = Instant::now();
     if request.workload.git_evidence {
-        let evidence =
-            git_evidence(runtime.as_ref(), sandbox, request.workload.repo.as_ref()).await;
+        // Resolved once for the collection phase, and the redactor is built
+        // from that resolution rather than from a re-read: the task wrote these
+        // files with the values it was given, so the values to scrub with are
+        // the ones it was given, not whatever the file says a moment later.
+        let redactor = state
+            .run_secrets()
+            .resolve(tenant, &request.workload.secrets)
+            .await?
+            .redactor();
+        let evidence = git_evidence(
+            runtime.as_ref(),
+            sandbox,
+            request.workload.repo.as_ref(),
+            &redactor,
+        )
+        .await;
         results.commit = evidence.head;
-        results.git_status = evidence.status;
-        results.git_diff = evidence.diff;
-        results.changed_files = evidence.changed_files;
+        let bounded = bound_git_evidence(&evidence.status, &evidence.diff, &evidence.changed_files);
+        results.git_status = bounded.status;
+        results.git_diff = bounded.diff;
+        results.changed_files = bounded.changed_files;
+        // One flag for all three, because they share one budget: telling a
+        // caller which of three fields was cut, when any of them being cut is
+        // the fact that matters, is three states nobody acts on differently.
+        results.git_evidence_truncated = bounded.truncated;
     }
-    let artifacts = collect_artifacts(state, tenant, run, sandbox, &request.workload).await;
-    results.artifacts = artifacts;
+    // The phase is recorded whether or not collection worked, and the failure is
+    // raised afterwards: a failed collection that also lost its timing tells a
+    // caller debugging a slow run less than it could have. Artifacts collected
+    // before the failure are kept in the run document, so it and the artifact
+    // listing agree about what was stored.
+    let collected = collect_artifacts(state, tenant, run, sandbox, &request.workload).await;
     phases.insert(
         "collection".to_owned(),
         collect_started.elapsed().as_millis() as u64,
     );
+    results.artifacts = match collected {
+        Ok(artifacts) => artifacts,
+        Err(failure) => {
+            results.artifacts = failure.collected;
+            return Err(failure.error);
+        }
+    };
 
     Ok(())
 }
@@ -747,6 +914,7 @@ fn placement_error(failure: &crate::ApiFailure) -> CoreError {
     match failure.code {
         "quota_exceeded" => CoreError::QuotaExceeded(failure.message.clone()),
         "invalid_request" | "unsupported" => CoreError::InvalidRequest(failure.message.clone()),
+        "runtime_not_permitted" => CoreError::Forbidden(failure.message.clone()),
         // A scheduler that cannot answer right now, or a lease lost to a
         // resync, is worth another machine.
         _ => CoreError::Unavailable(failure.message.clone()),
@@ -758,10 +926,16 @@ async fn acquire_sandbox(
     tenant: TenantId,
     run: &Run,
     request: &RunRequest,
-) -> Result<(Sandbox, Placement), (CoreError, Vec<String>)> {
+    attempt_id: Uuid,
+) -> Result<(Sandbox, Placement, crate::ProvisionTimings), (CoreError, Vec<String>)> {
     let reasons = run.requirements.reasons();
     let required = required_capabilities(&run.requirements);
-    let minimum = if run.requirements.full_kernel_isolation {
+    // A Guard selection is enforced by the runtime that owns the guest's
+    // network attachment, and there is no weaker fallback: asking for Guard and
+    // landing on a runtime that cannot install the rules would be a sandbox
+    // that believes it is governed and is not. Demand the isolation level
+    // rather than discovering the mismatch at boot.
+    let minimum = if run.requirements.full_kernel_isolation || run.resources.guard.is_some() {
         Some(RuntimeIsolation::MicroVm)
     } else {
         None
@@ -782,6 +956,18 @@ async fn acquire_sandbox(
         }
         None => {
             let kind = state.runtime_kind;
+            let actual = state.runtime().capabilities();
+            if requested.is_some_and(|requested| requested != kind)
+                || !aiec_core::runtime::capabilities_satisfy(&actual, &required, minimum)
+            {
+                return Err((
+                    CoreError::Unsupported(
+                        "configured runtime does not satisfy requested runtime or capabilities"
+                            .to_owned(),
+                    ),
+                    reasons,
+                ));
+            }
             (
                 kind,
                 format!("single runtime deployment: {}", kind.as_str()),
@@ -791,13 +977,11 @@ async fn acquire_sandbox(
 
     // The workload's network policy is the sandbox's; a run that asks for
     // isolation must not be handed a machine with a wider one than it expects.
-    let network = if run.resources.network.is_enabled() {
-        run.resources.network.clone()
-    } else {
-        NetworkPolicy::Disabled
-    };
-
-    let environment = match &request.workload.repo {
+    //
+    // A Guard selection replaces that policy rather than sitting beside it. Two
+    // descriptions of the same egress would be two ways to reach the internet,
+    // and the wider one would be the one that applied.
+    let mut environment = match &request.workload.repo {
         Some(repo) => aiec_core::EnvironmentSpec {
             workspace: WorkspaceSpec::Git {
                 repo: repo.url.clone(),
@@ -808,16 +992,34 @@ async fn acquire_sandbox(
         },
         None => aiec_core::EnvironmentSpec::default(),
     };
+    let network = if run.resources.guard.is_some() {
+        // Guard owns the attachment and decides what may be reached; the
+        // ordinary policy would be an ungoverned second path.
+        environment.guard = run.resources.guard.clone();
+        NetworkPolicy::Disabled
+    } else if run.resources.network.is_enabled() {
+        run.resources.network.clone()
+    } else {
+        NetworkPolicy::Disabled
+    };
 
     let sandbox = Sandbox {
         id: new_id(),
         tenant_id: tenant,
         node_id: None,
+        // The default image depends on the runtime it will be booted on.
+        // `aiec-coding:latest` names the Firecracker guest image and is not a
+        // container image at all, so a Run that named no image and was placed on
+        // a container runtime asked the registry for an image that does not
+        // exist there - and the failure arrived as an opaque pull error long
+        // after the Run had been admitted. The container default is the same
+        // Debian base the guest image is built from, so a Run that is moved
+        // between runtimes lands on a comparable userland.
         image_id: request
             .workload
             .image
             .clone()
-            .unwrap_or_else(|| "aiec-coding:latest".to_owned()),
+            .unwrap_or_else(|| default_image_for(runtime_kind).to_owned()),
         state: aiec_core::SandboxState::Creating,
         runtime: runtime_kind,
         cpu: run.resources.cpu.max(1),
@@ -839,9 +1041,17 @@ async fn acquire_sandbox(
     // workspace and lease. Going straight to the repository took the development
     // route, which takes no worker lease, so every command afterwards failed
     // with "active sandbox lease not found".
-    let placed = crate::provision_sandbox(state, tenant, run.id, sandbox)
-        .await
-        .map_err(|failure| (placement_error(&failure), reasons.clone()))?;
+    let placed = crate::provision_sandbox(
+        state,
+        tenant,
+        attempt_id,
+        sandbox,
+        required,
+        Some(run.id),
+        !request.workload.secrets.is_empty() || !request.workload.environment.is_empty(),
+    )
+    .await
+    .map_err(|failure| (placement_error(&failure), reasons.clone()))?;
 
     // The reasons are kept on the run: a refused placement is otherwise the
     // hardest thing to answer without re-running the scheduler by hand.
@@ -850,26 +1060,36 @@ async fn acquire_sandbox(
     if request.workload.repo.is_some() {
         placement_reasons.push("repository workspace required".to_owned());
     }
-    let worker = placed.node_id.map(|id| id.to_string());
+    let worker = placed.sandbox.node_id.map(|id| id.to_string());
     Ok((
-        placed,
+        placed.sandbox,
         Placement {
             runtime: Some(runtime_kind.as_str().to_owned()),
             worker,
             reasons: placement_reasons,
         },
+        placed.timings,
     ))
 }
 
 /// Maps requirements onto the capabilities the registry understands.
-fn required_capabilities(requirements: &CapabilityRequirements) -> RuntimeCapabilities {
+pub(crate) fn required_capabilities(requirements: &CapabilityRequirements) -> RuntimeCapabilities {
     RuntimeCapabilities {
+        // Only an explicitly requested isolation class is part of the demand.
+        // JSON containment is exact-match, so naming a class nobody asked for
+        // refuses every worker advertising a different one - including a
+        // stronger one. `Process` is the "unspecified" default and is omitted
+        // for the same reason.
+        isolation: match requirements.full_kernel_isolation {
+            true => RuntimeIsolation::MicroVm,
+            false => RuntimeIsolation::Process,
+        },
         exec: true,
         files: true,
         full_kernel_isolation: requirements.full_kernel_isolation,
         coding_guest: requirements.coding_guest,
         network_policy: requirements.network_policy,
-        vm_snapshot: requirements.workspace_snapshot,
+        workspace_snapshot: requirements.workspace_snapshot,
         portable_workspace: requirements.portable_workspace,
         memory_resume: requirements.memory_resume,
         pty: requirements.pty,
@@ -878,7 +1098,12 @@ fn required_capabilities(requirements: &CapabilityRequirements) -> RuntimeCapabi
     }
 }
 
-fn parse_runtime(raw: &str) -> Result<RuntimeKind, CoreError> {
+/// The runtime a run asked for by name, or an error naming the one it did.
+///
+/// Shared with batch sizing, which has to resolve the same runtime the
+/// placement path will: reading the name a second way is how a batch ends up
+/// sized against workers the run can never be placed on.
+pub(crate) fn parse_runtime(raw: &str) -> Result<RuntimeKind, CoreError> {
     match raw {
         "firecracker" => Ok(RuntimeKind::Firecracker),
         "docker" => Ok(RuntimeKind::Docker),
@@ -910,10 +1135,22 @@ async fn run_command(
     .await;
 
     let runtime = state.runtime_for(sandbox)?;
-    // Secrets are resolved here and injected into the guest, never stored on
-    // the run, so they never reach the event log or a results document.
-    let mut environment = state.secret_values(tenant, sandbox.id).await;
-    environment.extend(run.workload.environment.clone());
+    // Resolved once, here, and the redactor below is built from the very same
+    // set. Building it by re-reading the file afterwards would scrub against a
+    // second read of a file the operator can change under the run: the value
+    // that ran would not be the value replaced, and the one that ran is the one
+    // in the output.
+    let resolved = state
+        .run_secrets()
+        .resolve(tenant, &run.workload.secrets)
+        .await?;
+    let mut base = state.secret_values(tenant, sandbox.id).await;
+    base.extend(run.workload.environment.clone());
+    // Refuses rather than picks a winner: a literal in the run document is
+    // exactly what must not be stored, and a sandbox secret losing to a run
+    // secret is a race nobody can debug.
+    let environment = resolved.merge(&base)?;
+    let redactor = resolved.redactor();
 
     let result = runtime
         .exec(
@@ -926,18 +1163,38 @@ async fn run_command(
                 stdin: None,
             },
         )
-        .await?;
+        // A transport error can quote the environment it was handed, so it is
+        // scrubbed on the way out too. The variant is preserved, because that
+        // is what the retry policy branches on.
+        .await
+        .map_err(|error| redactor.redact_error(&error))?;
+
+    let exit_code = result.exit_code;
+    let duration_ms = result.duration_ms;
+    let timed_out = result.timed_out;
+    // Nothing resolved, so nothing to replace: moving the streams rather than
+    // copying a megabyte each, per command, is the difference between free and
+    // not for every workload that asks for no secrets.
+    let (stdout, stderr) = if redactor.is_empty() {
+        (result.stdout, result.stderr)
+    } else {
+        redactor.redact_output_uncapped(&result.stdout, &result.stderr)
+    };
 
     Ok(CommandOutcome {
         command: command.to_vec(),
-        exit_code: result.exit_code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        duration_ms: result.duration_ms,
+        exit_code,
+        stdout,
+        stderr,
+        duration_ms,
         truncated: false,
+        // Set by the phase budget, which is what knows how much of this the
+        // run's row can hold. Redaction is not truncation: a replaced
+        // credential makes a smaller result, not an incomplete one.
+        output_preview_truncated: false,
         // A clipped run is evidence of a truncated command, so it never counts
         // as a pass.
-        ok: result.exit_code == 0 && !result.timed_out,
+        ok: exit_code == 0 && !timed_out,
     })
 }
 
@@ -956,6 +1213,7 @@ async fn git_evidence(
     runtime: &dyn SandboxRuntime,
     sandbox: &Sandbox,
     repo: Option<&RepoSpec>,
+    redactor: &SecretRedactor,
 ) -> GitEvidence {
     let Some(repo) = repo else {
         return GitEvidence {
@@ -965,27 +1223,36 @@ async fn git_evidence(
             changed_files: Vec::new(),
         };
     };
-    let path = repo.path.replace('\'', "'\\''");
     let mut evidence = GitEvidence {
         head: None,
         status: String::new(),
         diff: String::new(),
         changed_files: Vec::new(),
     };
-    for (key, script) in [
-        ("head", format!("cd {path} && git rev-parse HEAD")),
+    // The repository path is the exec's working directory, not a word spliced
+    // into a shell command. It used to be `cd {escaped} && git ...` with the
+    // apostrophes escaped but the value itself unquoted, which broke in two
+    // ways at once: any path containing a space made git fail to start and the
+    // run silently recorded no evidence at all, and any caller-chosen path was
+    // a command line. `run_command` already hands the same field over this way.
+    for (key, argv) in [
+        ("head", vec!["git", "rev-parse", "HEAD"]),
         (
             "status",
-            format!("cd {path} && git --no-pager status --porcelain=v1"),
+            // `-z`: NUL-separated and unquoted, so a path is reported exactly
+            // as it exists. Without it git C-quotes any path holding a space, a
+            // backslash or a non-ASCII byte, and a caller copying that back out
+            // of `changed_files` gets a name that was never touched.
+            vec!["git", "--no-pager", "status", "--porcelain=v1", "-z"],
         ),
-        ("diff", format!("cd {path} && git --no-pager diff")),
+        ("diff", vec!["git", "--no-pager", "diff"]),
     ] {
         let Ok(result) = runtime
             .exec(
                 sandbox,
                 ExecRequest {
-                    command: vec!["/bin/sh".into(), "-lc".into(), script],
-                    working_directory: None,
+                    command: argv.into_iter().map(str::to_owned).collect(),
+                    working_directory: Some(repo.path.clone()),
                     environment: BTreeMap::new(),
                     timeout_seconds: 60,
                     stdin: None,
@@ -1001,65 +1268,316 @@ async fn git_evidence(
         match key {
             "head" => evidence.head = Some(result.stdout.trim().to_owned()),
             "status" => {
-                evidence.changed_files = result
-                    .stdout
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| {
-                        line.split_once(' ')
-                            .map(|(_, rest)| rest.trim().to_owned())
-                            .unwrap_or_else(|| line.trim().to_owned())
-                    })
-                    .collect()
+                // Redacted before it is parsed, not after: a task that writes
+                // its token into a filename puts the value in the status, and a
+                // path is exactly what a caller later feeds back into a copy.
+                let stdout = redactor.redact_text_uncapped(&result.stdout);
+                evidence.changed_files = porcelain_paths(&stdout);
+                // NUL written as a newline, because that is what separates the
+                // records anyway. `changed_files` above holds the exact paths;
+                // this is the same stream rendered for a human reading a stored
+                // preview.
+                evidence.status = stdout.replace('\0', "\n");
             }
-            _ => evidence.diff = result.stdout,
+            _ => evidence.diff = redactor.redact_text_uncapped(&result.stdout),
         }
     }
     evidence
 }
 
+/// The paths `git status --porcelain=v1 -z` reported, exactly as it printed them.
+///
+/// Each record is two status characters, a space, then the path - and for a
+/// rename or a copy the *original* path follows as its own NUL-terminated
+/// field. Splitting the ordinary way and trimming the remainder turned both
+/// cases into something that is not a path: a rename came back as `old -> new`,
+/// and a path with a space in it came back with its tail lopped off, so
+/// `changed_files` disagreed with the repository about what the run touched.
+///
+/// Only the destination is kept. That is the path the run left behind; the
+/// original is what was there when it started, which the caller already has
+/// from the commit.
+fn porcelain_paths(porcelain: &str) -> Vec<String> {
+    let mut fields = porcelain.split('\0');
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        let bytes = record.as_bytes();
+        // The shortest possible record is `XY ` plus one byte of path.
+        if bytes.len() < 4 || bytes[2] != b' ' {
+            continue;
+        }
+        // `bytes[2]` is ASCII, so index 3 is a character boundary and this
+        // slice can never split one.
+        paths.push(record[3..].to_owned());
+        if matches!(bytes[0], b'R' | b'C') {
+            let _ = fields.next();
+        }
+    }
+    paths
+}
+
 /// Collects the requested artifacts into object storage.
+///
+/// Errors are returned, not swallowed. A run that asked for `/workspace/report.txt`
+/// and reported success with no artifact is the same answer as a run that never ran,
+/// and the caller has no way to tell them apart - which is what happened on a live
+/// cluster: the task wrote the file, the run exited 0, and both `results.artifacts`
+/// and `GET /v1/runs/{id}/artifacts` were empty because one `put` failed and was
+/// skipped like the rest.
 async fn collect_artifacts(
     state: &AppState,
     tenant: TenantId,
     run: &Run,
     sandbox: &Sandbox,
     workload: &WorkloadSpec,
-) -> Vec<RunArtifactRef> {
+) -> Result<Vec<RunArtifactRef>, ArtifactCollectionError> {
     if workload.artifacts.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Some(store) = state.artifact_store() else {
-        return Vec::new();
-    };
-    let runtime = match state.runtime_for(sandbox) {
-        Ok(runtime) => runtime,
-        Err(_) => return Vec::new(),
-    };
+    let store = state
+        .artifact_store()
+        .ok_or_else(|| ArtifactCollectionError {
+            collected: Vec::new(),
+            // Not `Backend`: a deployment without artifact storage will not grow one
+            // between attempts, and `is_retryable` would send every attempt to a fresh
+            // machine to re-run a workload that already succeeded.
+            error: CoreError::Unsupported(format!(
+                "the run asked for {} artifact(s) but artifact storage is not configured",
+                workload.artifacts.len()
+            )),
+        })?;
+    let runtime = state
+        .runtime_for(sandbox)
+        .map_err(|error| ArtifactCollectionError {
+            collected: Vec::new(),
+            error,
+        })?;
     let mut collected = Vec::new();
+    let mut failure = None;
     for path in &workload.artifacts {
-        let Ok(file) = runtime.get_file(sandbox, path).await else {
-            continue;
-        };
-        let object_key = format!("tenants/{tenant}/runs/{}/{path}", run.id);
-        let bytes = file.content_base64.as_bytes().to_vec();
-        let size = bytes.len() as i64;
-        if store.put(&object_key, &bytes).await.is_err() {
-            continue;
+        match collect_one(state, &*runtime, &*store, sandbox, tenant, run.id, path).await {
+            Ok(artifact) => collected.push(artifact),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
         }
-        collected.push(RunArtifactRef {
-            name: path.clone(),
-            object_key,
-            size_bytes: size,
-            checksum_sha256: None,
-            content_type: Some("application/octet-stream".to_owned()),
-        });
     }
-    let _ = state
+    // Whatever did get collected is recorded before the failure is raised, and
+    // handed back with it. The run is about to be marked failed, and a failed run
+    // is exactly the one whose evidence somebody is going to open: dropping the
+    // artifacts that were stored because a later path failed would lose the only
+    // copy of them, and reporting them in the listing but not in the run document
+    // would make the two disagree about what happened.
+    state
         .repository()
         .put_run_artifacts(tenant, run.id, collected.clone())
-        .await;
-    collected
+        .await
+        .map_err(|error| ArtifactCollectionError {
+            collected: collected.clone(),
+            error,
+        })?;
+    match failure {
+        Some(error) => Err(ArtifactCollectionError { collected, error }),
+        None => Ok(collected),
+    }
+}
+
+/// A collection that stored some of what it was asked for and then failed.
+///
+/// The partial list travels with the error so the caller can put it in the run
+/// document. A failed run is exactly the one whose evidence somebody opens, and
+/// reporting the stored artifacts in the listing but not in the run would make the
+/// two disagree about what happened.
+struct ArtifactCollectionError {
+    collected: Vec<RunArtifactRef>,
+    error: CoreError,
+}
+
+/// The object key one collected artifact is stored under.
+///
+/// Derived from a digest of the artifact's name rather than from the name's path
+/// components. An absolute name used verbatim produced
+/// `tenants/{t}/runs/{r}//workspace/report.txt`, whose empty component the object
+/// store rejects. A digest isolates the name; a UUID isolates each upload so
+/// retries cannot overwrite evidence or resurrect a deletion tombstone.
+pub(crate) fn run_artifact_key(tenant: TenantId, run: Uuid, name: &str) -> String {
+    let digest = hex::encode(Sha256::digest(name.as_bytes()));
+    format!(
+        "tenants/{tenant}/runs/{run}/artifacts/{digest}/{}",
+        new_id()
+    )
+}
+
+/// Pulls binary chunks only when the object store is ready for another chunk.
+/// Each read is independently fenced by the runtime/worker; a version token
+/// prevents a changing sandbox file from becoming a mixed-version artifact.
+async fn collect_one(
+    state: &AppState,
+    runtime: &dyn SandboxRuntime,
+    store: &dyn ArtifactStore,
+    sandbox: &Sandbox,
+    tenant: TenantId,
+    run: Uuid,
+    name: &str,
+) -> Result<RunArtifactRef, CoreError> {
+    let _permit = state
+        .upload_slots
+        .acquire()
+        .await
+        .map_err(|_| CoreError::Unavailable("artifact uploads closed".into()))?;
+    let mut source = RunArtifactSource {
+        runtime,
+        sandbox,
+        name,
+        offset: 0,
+        size_bytes: None,
+        version: None,
+        pending: std::collections::VecDeque::new(),
+        done: false,
+        read_failed: false,
+    };
+    let object_key = run_artifact_key(tenant, run, name);
+    let repository = state.repository();
+    repository
+        .reserve_artifact_upload(tenant, Some(run), &object_key)
+        .await?;
+    // What the store reports it wrote, not a second opinion computed here: the
+    // size and digest that come back describe the bytes that are actually on the
+    // object store, which is the only thing a later download can be checked
+    // against.
+    let stored = tokio::time::timeout(
+        std::time::Duration::from_secs(crate::artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS),
+        store.put_stream(&object_key, &mut source, aiec_core::MAX_FILE as u64),
+    )
+    .await
+    .map_err(|_| CoreError::Unsupported(format!("artifact upload timed out for {name}")))?
+    .map_err(|error| {
+        if source.read_failed {
+            error
+        } else {
+            // A storage refusal cannot be repaired by re-running this workload.
+            CoreError::Unsupported(format!("artifact storage rejected {name}: {error}"))
+        }
+    })?;
+    repository
+        .complete_artifact_upload(tenant, Some(run), &object_key)
+        .await?;
+    Ok(RunArtifactRef {
+        name: name.to_owned(),
+        object_key,
+        size_bytes: stored.size_bytes as i64,
+        checksum_sha256: Some(stored.checksum_sha256),
+        content_type: Some("application/octet-stream".to_owned()),
+    })
+}
+
+struct RunArtifactSource<'a> {
+    runtime: &'a dyn SandboxRuntime,
+    sandbox: &'a Sandbox,
+    name: &'a str,
+    offset: u64,
+    size_bytes: Option<u64>,
+    version: Option<String>,
+    /// Chunks already read and validated but not yet handed to the store. The
+    /// store pulls one at a time, so a group is fetched once and drained here
+    /// rather than re-requested per chunk.
+    pending: std::collections::VecDeque<FileChunk>,
+    done: bool,
+    read_failed: bool,
+}
+
+#[async_trait::async_trait]
+impl aiec_core::storage::ArtifactSource for RunArtifactSource<'_> {
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, CoreError> {
+        use aiec_core::runtime::{FILE_CHUNK_BURST, FILE_CHUNK_BYTES, FileChunkRequest};
+        if self.done {
+            return Ok(None);
+        }
+        // Drain what the last group already read before asking for more: the
+        // store decides when the next chunk is wanted, and a group is only
+        // worth fetching if the store still wants one.
+        if let Some(chunk) = self.pending.pop_front() {
+            return self.accept(chunk);
+        }
+        let request = FileChunkRequest {
+            path: self.name.to_owned(),
+            offset: self.offset,
+            length: FILE_CHUNK_BYTES,
+            expected_version: self.version.clone(),
+        };
+        let read = self
+            .runtime
+            .get_file_chunks(self.sandbox, request, FILE_CHUNK_BURST)
+            .await;
+        let chunks = match read {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                self.read_failed = true;
+                return Err(match error {
+                    CoreError::NotFound(message) => CoreError::NotFound(format!(
+                        "could not read artifact {}: {message}",
+                        self.name
+                    )),
+                    CoreError::LimitExceeded(message) => {
+                        CoreError::LimitExceeded(format!("artifact {}: {message}", self.name))
+                    }
+                    error => error,
+                });
+            }
+        };
+        for chunk in chunks.into_iter().rev() {
+            self.pending.push_front(chunk);
+        }
+        match self.pending.pop_front() {
+            Some(chunk) => self.accept(chunk),
+            None => Ok(None),
+        }
+    }
+}
+
+impl RunArtifactSource<'_> {
+    /// Folds one validated chunk into the run's view of the file and returns
+    /// the bytes the store asked for. Every consistency rule the single-chunk
+    /// version enforced is here unchanged: the size must not move, the version
+    /// must match, and the offset advances by exactly what was read.
+    fn accept(&mut self, chunk: FileChunk) -> Result<Option<bytes::Bytes>, CoreError> {
+        use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunkRequest};
+        let step = FileChunkRequest {
+            path: self.name.to_owned(),
+            offset: self.offset,
+            length: FILE_CHUNK_BYTES,
+            expected_version: self.version.clone(),
+        };
+        if let Err(error) = step.validate_chunk(&chunk) {
+            self.read_failed = true;
+            return Err(match error {
+                CoreError::LimitExceeded(message) => {
+                    CoreError::LimitExceeded(format!("artifact {}: {message}", self.name))
+                }
+                CoreError::Conflict(message) => {
+                    CoreError::Conflict(format!("artifact {}: {message}", self.name))
+                }
+                error => error,
+            });
+        }
+        if self.size_bytes.is_some_and(|size| size != chunk.size_bytes) {
+            self.read_failed = true;
+            return Err(CoreError::Conflict(format!(
+                "runtime returned inconsistent artifact chunks for {}",
+                self.name
+            )));
+        }
+        self.offset += chunk.bytes.len() as u64;
+        self.size_bytes = Some(chunk.size_bytes);
+        self.version = Some(chunk.version);
+        self.done = chunk.eof;
+        if chunk.bytes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(chunk.bytes))
+        }
+    }
 }
 
 /// Destroys the machine, or retains it under the policy when it failed.
@@ -1069,13 +1587,42 @@ async fn collect_artifacts(
 /// assume its capacity is free.
 /// Whether a failed destroy is worth another attempt.
 ///
-/// Two things go wrong transiently here. A sandbox whose worker is resyncing
-/// its lease refuses the first destroy and accepts the second. And the storage
-/// layer can deadlock or fail to serialise, which clears as soon as the other
-/// transaction commits. Treating either as terminal is how a finished run ends
-/// up outliving the machine it was supposed to release.
+/// Three things go wrong transiently here. A sandbox whose worker is resyncing
+/// its lease refuses the first destroy and accepts the second - and that race
+/// arrives as a `Conflict`, not a `Transient`, because the store is reporting a
+/// fencing mismatch rather than a backend failure. The storage layer can also
+/// deadlock or fail to serialise, which clears as soon as the other transaction
+/// commits. Treating any of them as terminal is how a finished run ends up
+/// outliving the machine it was supposed to release, and how a caller is told
+/// their cleanup failed when the machine is already gone.
 fn is_transient_destroy_error(error: &CoreError) -> bool {
-    matches!(error, CoreError::Transient(_))
+    match error {
+        CoreError::Transient(_) => true,
+        CoreError::Conflict(message) if is_lease_resync(message) => true,
+        // A runtime that cannot be reached at all. Every non-`Core` runtime
+        // error is mapped to `Io`, so this is what a Docker socket hiccup, a
+        // Firecracker process that vanished, or a TLS failure arrives as. It is
+        // the one case the doc above names and the only one that was missing:
+        // without it a single transport failure became a permanent
+        // `cleanup_failed`, which is what keeps a queue row in `reclaiming` and
+        // holds its slot, so a hiccup cost the run its machine for good.
+        CoreError::Io(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether a `Conflict` on destroy is the lease resync race rather than a
+/// refusal. Matched against the exact sentences the store and the worker emit:
+/// treating every conflict as fatal reports a cleanup failure for a machine
+/// that is already gone, and treating every conflict as transient would retry
+/// a genuine refusal forever.
+fn is_lease_resync(message: &str) -> bool {
+    matches!(
+        message,
+        "worker lease generation or status changed"
+            | "sandbox lease generation does not match the control plane"
+            | "stale sandbox lease generation"
+    )
 }
 
 /// Destroys a sandbox, retrying the lease race.
@@ -1099,16 +1646,31 @@ pub(crate) async fn tear_down_sandbox(
     sandbox_id: Uuid,
     sandbox: &Sandbox,
 ) -> Result<(), CoreError> {
+    let started = Instant::now();
     state.runtime_for(sandbox)?.destroy(sandbox).await?;
+    let runtime_destroy_ms = started.elapsed().as_millis() as u64;
+    let release_started = Instant::now();
     // Hosted capacity is never leased from a worker, so there is no lease to
     // release; asking the scheduler would fail for a lease that never existed.
     if state.is_production() && sandbox.runtime != RuntimeKind::Hosted {
         state.scheduler().release(tenant, sandbox_id).await?;
     }
+    let lease_release_ms = release_started.elapsed().as_millis() as u64;
+    let metadata_started = Instant::now();
     state
         .repository()
         .delete_sandbox(tenant, sandbox_id)
         .await?;
+    tracing::info!(
+        %sandbox_id,
+        node_id = ?sandbox.node_id,
+        runtime = sandbox.runtime.as_str(),
+        runtime_destroy_ms,
+        lease_release_ms,
+        metadata_delete_ms = metadata_started.elapsed().as_millis() as u64,
+        teardown_ms = started.elapsed().as_millis() as u64,
+        "sandbox teardown completed"
+    );
     Ok(())
 }
 
@@ -1146,7 +1708,7 @@ pub(crate) async fn abandon_sandbox(
     Ok(())
 }
 
-async fn destroy_with_retry(
+pub(crate) async fn destroy_with_retry(
     state: &AppState,
     tenant: TenantId,
     sandbox_id: Uuid,
@@ -1158,6 +1720,7 @@ async fn destroy_with_retry(
         // repository directly marked the sandbox destroyed while its container
         // or microVM kept running on the worker.
         let outcome = match state.repository().get_sandbox(tenant, sandbox_id).await {
+            Ok(sandbox) if sandbox.state == aiec_core::SandboxState::Destroyed => return Ok(()),
             Ok(sandbox) => tear_down_sandbox(state, tenant, sandbox_id, &sandbox).await,
             // Already gone, which is the outcome the caller wanted.
             Err(CoreError::NotFound(_)) => return Ok(()),
@@ -1186,6 +1749,95 @@ async fn destroy_with_retry(
     Err(last)
 }
 
+/// Destroys everything a run still holds, without executing it again.
+///
+/// This is the recovery path, not the execution path. When an executor's lease
+/// expires the run is already terminal in the database; all that is left is to
+/// release the compute it was holding. Calling it for a run that is still
+/// queued would destroy nothing, because no machine has been placed yet, and
+/// it never touches the sandbox a caller asked to keep until its TTL expires.
+pub(crate) async fn reclaim_run(state: &AppState, run: &Run) -> Result<Run, CoreError> {
+    if !run.state.is_terminal() {
+        return Ok(run.clone());
+    }
+    let store = state.repository();
+    let links = store.list_run_sandboxes(run.tenant_id, run.id).await?;
+    let ids: Vec<Uuid> = links
+        .iter()
+        .map(|link| link.sandbox_id)
+        .filter(|id| run.retained_sandbox_id != Some(*id))
+        .collect();
+    let mut current = run.clone();
+    let mut results = std::mem::take(&mut current.results);
+    // The report of a *previous* failed teardown is not evidence about this one.
+    // Carrying it forward means a run whose machines are all gone still answers
+    // "cleanup failed" forever, so the dispatcher re-leases it on every
+    // recovery tick, never finishes the queue row, and starves queued work -
+    // three runs whose sandboxes were destroyed weeks apart wedged the queue
+    // this way. The earlier failure stays in the event log and the attempt
+    // record; only the teardown being attempted now may repopulate it.
+    results.cleanup_failed = None;
+    cleanup(state, run.tenant_id, &mut current, &ids, &mut results, None).await;
+    store
+        .record_run_results(run.tenant_id, run.id, results, current.state)
+        .await
+}
+
+/// Reclaims one expired debugging machine; failure leaves ownership retryable.
+pub(crate) async fn expire_retention(state: &AppState, run: &Run) -> Result<(), CoreError> {
+    let Some(sandbox_id) = run.retained_sandbox_id else {
+        return Ok(());
+    };
+    // Retention is recorded before the run settles, because `cleanup()` runs
+    // first. A run that is still executing therefore carries an expiring
+    // `retained_until` for a machine its executor is still using, and expiring
+    // it would destroy that machine and clear the fields: the caller who asked
+    // to keep a debugging machine would be told there is none. The store's own
+    // query filters the same way; this is the second gate, so a caller holding a
+    // stale read cannot reach the destroy either.
+    if !run.state.is_terminal() {
+        return Ok(());
+    }
+    if run.retained_until.is_none_or(|until| until > Utc::now()) {
+        return Ok(());
+    }
+    if let Err(error) = destroy_with_retry(state, run.tenant_id, sandbox_id).await {
+        let mut results = run.results.clone();
+        results.cleanup_failed = Some(CleanupReport {
+            sandbox_id,
+            error: error.clone(),
+        });
+        state
+            .repository()
+            .record_run_results(run.tenant_id, run.id, results, run.state)
+            .await?;
+        return Err(CoreError::Unavailable(error));
+    }
+    state
+        .repository()
+        .clear_run_retention(run.tenant_id, run.id, sandbox_id)
+        .await?;
+    // A destroy that has now succeeded clears the earlier report of one that
+    // did not. Leaving it would tell the caller their machine outlived the run
+    // after the evidence says the opposite.
+    if run.results.cleanup_failed.is_some() {
+        let mut results = run.results.clone();
+        results.cleanup_failed = None;
+        state
+            .repository()
+            .record_run_results(run.tenant_id, run.id, results, run.state)
+            .await?;
+    }
+    event(
+        state,
+        run,
+        "sandbox.retention_expired",
+        serde_json::json!({ "sandbox_id": sandbox_id }),
+    )
+    .await;
+    Ok(())
+}
+
 /// Reclaims every machine a run holds, on every exit path.
 ///
 /// One function, deliberately. A cleanup path that only some exits take is how a
@@ -1201,13 +1853,23 @@ async fn cleanup(
     run: &mut Run,
     sandbox_ids: &[Uuid],
     results: &mut RunResults,
+    retention_seconds: Option<i64>,
 ) {
     if sandbox_ids.is_empty() {
         return;
     }
     let succeeded = run.failure_reason.is_none();
-    if run.retention.should_retain(succeeded) {
-        let until = Utc::now() + Duration::seconds(DEFAULT_RETENTION_SECONDS);
+    let mut retained = None;
+    if let Ok(current) = state.repository().get_run(tenant, run.id).await
+        && current.state == RunState::Cancelled
+    {
+        run.state = RunState::Cancelled;
+    }
+    if let Some(retained_seconds) = retention_seconds
+        && run.state != RunState::Cancelled
+        && run.retention.should_retain(succeeded)
+    {
+        let until = Utc::now() + Duration::seconds(retained_seconds);
         let kept = sandbox_ids.first().copied();
         // Persisted, not just set on the in-memory run. `record_run_results`
         // writes only results and state, so before this the fields stayed null
@@ -1224,15 +1886,23 @@ async fn cleanup(
                 Ok(updated) => {
                     run.retained_sandbox_id = updated.retained_sandbox_id;
                     run.retained_until = updated.retained_until;
+                    retained = Some(kept);
+                    event(
+                        state,
+                        run,
+                        "sandbox.retained",
+                        serde_json::json!({ "sandbox_ids": [kept], "until": until }),
+                    )
+                    .await;
                 }
                 Err(error) => {
-                    // The machine is held on the caller's behalf and nothing
-                    // will find it later, so say so rather than losing it.
+                    // Without durable retention ownership, reclaim this machine
+                    // along with the other attempts rather than leaking it.
                     tracing::warn!(
                         run_id = %run.id,
                         sandbox_id = %kept,
                         error = %error,
-                        "could not record a retained sandbox, so nothing will reclaim it"
+                        "could not record retention; reclaiming the sandbox"
                     );
                     results.cleanup_failed = Some(CleanupReport {
                         sandbox_id: kept,
@@ -1241,17 +1911,27 @@ async fn cleanup(
                 }
             }
         }
-        event(
-            state,
-            run,
-            "sandbox.retained",
-            serde_json::json!({ "sandbox_ids": sandbox_ids, "until": until }),
-        )
-        .await;
-        return;
     }
 
     for sandbox_id in sandbox_ids {
+        if retained == Some(*sandbox_id) {
+            continue;
+        }
+        // A machine that is already gone was not torn down by this pass.
+        // `destroy_with_retry` reports that case as success, so without this
+        // check a second cleanup - the outer per-attempt pass re-entering after
+        // `execute` already released the machine - recorded a `sandbox.destroyed`
+        // event for a teardown that never happened. The event log is the
+        // evidence a caller reads to decide whether a run released its
+        // machines, so it must not overstate what was released.
+        // Absent counts too: `destroy_with_retry` answers success when the row
+        // is gone as well as when it is already destroyed, and neither is a
+        // teardown this pass performed.
+        match state.repository().get_sandbox(tenant, *sandbox_id).await {
+            Ok(sandbox) if sandbox.state == aiec_core::SandboxState::Destroyed => continue,
+            Err(CoreError::NotFound(_)) => continue,
+            _ => {}
+        }
         match destroy_with_retry(state, tenant, *sandbox_id).await {
             Ok(()) => {
                 event(
@@ -1269,10 +1949,18 @@ async fn cleanup(
                     error = %error,
                     "could not destroy a run's sandbox"
                 );
-                results.cleanup_failed = Some(CleanupReport {
-                    sandbox_id: *sandbox_id,
-                    error: error.to_string(),
-                });
+                if let Some(report) = &mut results.cleanup_failed {
+                    use std::fmt::Write;
+                    let _ = write!(
+                        report.error,
+                        "; sandbox {sandbox_id} teardown failed: {error}"
+                    );
+                } else {
+                    results.cleanup_failed = Some(CleanupReport {
+                        sandbox_id: *sandbox_id,
+                        error,
+                    });
+                }
             }
         }
     }
@@ -1280,10 +1968,9 @@ async fn cleanup(
 
 #[cfg(test)]
 mod retry_policy {
-    use super::{is_retryable, is_transient_destroy_error};
-    use aiec_core::CoreError;
+    use super::{default_image_for, is_retryable, is_transient_destroy_error};
+    use aiec_core::{CoreError, RuntimeKind};
 
-    /// A finished run whose destroy hit a database deadlock kept its machine
     /// A finished run whose destroy hit a database deadlock kept its machine
     /// alive, because the retry treated a deadlock as terminal. A deadlock is
     /// the textbook transient failure: it clears when the other transaction
@@ -1308,6 +1995,63 @@ mod retry_policy {
         }
     }
 
+    /// A worker rebuilding its lease races a teardown that is already under
+    /// way. The store reports that as a `Conflict`, because it is fencing and
+    /// not failing, and treating it as fatal made a run whose machine was
+    /// already gone report a cleanup failure - twice, on a retention expiry and
+    /// on an ordinary setup failure. The retry is what makes both honest.
+    #[test]
+    fn a_lease_resync_during_teardown_is_worth_retrying() {
+        for message in [
+            "worker lease generation or status changed",
+            "sandbox lease generation does not match the control plane",
+            "stale sandbox lease generation",
+        ] {
+            let resync = CoreError::Conflict(message.into());
+            assert!(
+                is_transient_destroy_error(&resync),
+                "{message} must be retried"
+            );
+        }
+    }
+
+    /// A refusal that is not the resync race is still fatal, so widening the
+    /// match cannot turn a real refusal into an endless retry.
+    #[test]
+    fn an_unrelated_conflict_stays_fatal_on_destroy() {
+        for refusal in [
+            CoreError::Conflict("sandbox is not running".into()),
+            CoreError::Conflict("run is no longer active".into()),
+            CoreError::Conflict("record already exists".into()),
+        ] {
+            assert!(
+                !is_transient_destroy_error(&refusal),
+                "{refusal} must not be retried"
+            );
+        }
+    }
+
+    /// An object store that will not take an artifact must not cost a machine.
+    ///
+    /// The workload has already succeeded by the time artifacts are collected,
+    /// so classifying the store's refusal as `Backend` - which `is_retryable`
+    /// sends to a fresh machine - re-ran finished work and re-collected the
+    /// same bytes to arrive at the same refusal. Observed live: a run whose
+    /// bucket did not exist recorded exactly one attempt, because that run
+    /// used the default `max_attempts: 1`; with a higher bound the old
+    /// classification would re-run finished work on a fresh machine for each
+    /// remaining attempt. The run still fails; it just fails once.
+    #[test]
+    fn a_rejected_artifact_is_not_worth_another_machine() {
+        let rejected = CoreError::Unsupported(
+            "artifact storage rejected proof.txt: S3 request returned 404 Not Found".into(),
+        );
+        assert!(
+            !is_retryable(&rejected),
+            "a rejected artifact must not re-run a workload that already succeeded"
+        );
+    }
+
     /// The set is closed. Anything not explicitly transient is fatal, so a new
     /// kind of failure cannot be quietly added to the retry list by whoever
     /// happens to be reading a log that day.
@@ -1318,6 +2062,74 @@ mod retry_policy {
             CoreError::Conflict("sandbox is not running".into()),
             CoreError::QuotaExceeded("disk quota exceeded".into()),
             CoreError::InvalidRequest("bad id".into()),
+        ] {
+            // `Io` is deliberately absent: it is the runtime-unreachable case
+            // and it is retried. A genuine refusal from a runtime arrives as
+            // `Backend`, `Conflict` or `NotFound`, all of which are here.
+            assert!(
+                !is_transient_destroy_error(&permanent),
+                "{permanent} must not be retried"
+            );
+        }
+    }
+
+    /// A runtime that cannot be reached is the case this function exists for,
+    /// and it is the one the original implementation forgot: every non-`Core`
+    /// runtime error becomes `Io`, so a Docker socket hiccup during teardown
+    /// arrived as `Io` and was treated as terminal. The run then settled with a
+    /// permanent `cleanup_failed`, which is precisely what keeps its queue row
+    /// out of `finished` and holds an active slot for the life of the deployment.
+    /// The default image is a property of the runtime, not one name for all of
+    /// them.
+    ///
+    /// Found by running a Run against a live Docker worker that named no image:
+    /// the Run asked the registry for `aiec-coding:latest`, which is the
+    /// Firecracker guest image and is not a container image, and failed with an
+    /// opaque pull error long after admission. Every Run on that runtime that
+    /// omitted an image did the same - 242 of them.
+    #[test]
+    fn a_run_that_names_no_image_gets_one_the_runtime_can_boot() {
+        assert_eq!(
+            default_image_for(RuntimeKind::Firecracker),
+            "aiec-coding:latest",
+            "the microVM guest image is the reference it is admitted under"
+        );
+        for runtime in [
+            RuntimeKind::Docker,
+            RuntimeKind::BwrapDev,
+            RuntimeKind::Hosted,
+        ] {
+            assert_eq!(
+                default_image_for(runtime),
+                "debian:bookworm-slim",
+                "{} boots a container image, and a guest image reference is \
+                 not one",
+                runtime.as_str()
+            );
+        }
+        // The two must not collide, or the distinction is not doing anything.
+        assert_ne!(
+            default_image_for(RuntimeKind::Firecracker),
+            default_image_for(RuntimeKind::Docker)
+        );
+    }
+
+    #[test]
+    fn a_runtime_that_cannot_be_reached_is_worth_another_try() {
+        for transport in [
+            CoreError::Io(std::io::Error::other("docker socket closed")),
+            CoreError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ] {
+            assert!(
+                is_transient_destroy_error(&transport),
+                "{transport} must be retried: the machine may well be gone"
+            );
+        }
+        // And the permanent cases stay permanent.
+        for permanent in [
+            CoreError::NotFound("no such sandbox".into()),
+            CoreError::Conflict("sandbox is not running".into()),
+            CoreError::Backend("guest agent refused the command".into()),
         ] {
             assert!(
                 !is_transient_destroy_error(&permanent),
@@ -1348,5 +2160,45 @@ mod retry_policy {
             "too many sandboxes".into()
         )));
         assert!(!is_retryable(&CoreError::Unsupported("nope".into())));
+    }
+}
+
+#[cfg(test)]
+mod changed_paths {
+    use super::porcelain_paths;
+
+    /// `changed_files` is what a caller acts on: it copies a path back into a
+    /// workspace, compares it against a diff, reports it as touched. Splitting
+    /// porcelain the ordinary way and trimming the remainder turned a rename
+    /// into `old -> new` and cut the tail off any path with a space in it, so
+    /// the list named files that do not exist and missed ones that do.
+    #[test]
+    fn a_renamed_path_comes_back_as_the_path_that_exists_now() {
+        let porcelain = "R  new name.txt\0old name.txt\0 M kept/unchanged.rs\0?? added file.rs\0";
+        assert_eq!(
+            porcelain_paths(porcelain),
+            vec!["new name.txt", "kept/unchanged.rs", "added file.rs"]
+        );
+    }
+
+    /// Without `-z` git C-quotes any path holding a backslash or a non-ASCII
+    /// byte. The control plane asks for `-z`, so what arrives is the path
+    /// itself - no unescaping, and no chance of reporting an escaped name as
+    /// though the repository contained it.
+    #[test]
+    fn a_path_is_reported_exactly_as_it_exists() {
+        let porcelain = " M src/caf\u{e9}/na\u{ef}ve.rs\0A  src/tab\there.rs\0";
+        assert_eq!(
+            porcelain_paths(porcelain),
+            vec!["src/caf\u{e9}/na\u{ef}ve.rs", "src/tab\there.rs"]
+        );
+    }
+
+    /// A record too short to be `XY <path>` is not a path, and guessing one out
+    /// of it is how a caller ends up operating on a file the run never touched.
+    #[test]
+    fn a_record_that_is_not_a_path_yields_no_path() {
+        assert!(porcelain_paths("\0\n\0").is_empty());
+        assert!(porcelain_paths("").is_empty());
     }
 }

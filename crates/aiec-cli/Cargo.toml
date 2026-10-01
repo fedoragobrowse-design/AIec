@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 aiec-api.workspace = true
+aiec-guard.workspace = true
 aiec-client.workspace = true
 aiec-core.workspace = true
 aiec-runtime.workspace = true

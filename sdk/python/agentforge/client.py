@@ -7,6 +7,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from .runs import Runs
+from .evals import Evals
 
 class AIecError(RuntimeError):
     """An error returned by the AIec API.
@@ -60,8 +61,12 @@ class AIec:
             )
         self.sandboxes = _Sandboxes(self)
         self.runs = Runs(self)
+        self.evals = Evals(self)
 
-    def _request(self, method: str, path: str, payload: dict | None = None) -> Any:
+    def _request(
+        self, method: str, path: str, payload: dict | None = None, *,
+        timeout: float = 120,
+    ) -> Any:
         data = None if payload is None else json.dumps(payload).encode()
         request = Request(
             self.base_url + path,
@@ -73,7 +78,7 @@ class AIec:
             },
         )
         try:
-            with urlopen(request, timeout=120) as response:
+            with urlopen(request, timeout=timeout) as response:
                 body = response.read()
                 return json.loads(body) if body else None
         except HTTPError as error:
