@@ -40,6 +40,10 @@ pub(crate) const COUNTER_IPV6: &str = "cnt_ipv6";
 /// established: the drop is unconditional and does not consult connection
 /// state, so a stale or spoofed established entry cannot restore a path.
 pub(crate) const CHAIN_PRIORITY: i32 = -10;
+/// Destination-side forwarding drops run after every source-side Guard chain.
+/// Equal priorities let a peer's table count another guest's blocked attempt,
+/// hiding the attempt from the originating guest's watchdog.
+const DESTINATION_PRIORITY: i32 = CHAIN_PRIORITY + 1;
 /// The counter for permitted DNS traffic from the assigned guest source.
 pub(crate) const COUNTER_DNS_PERMITTED: &str = "cnt_dns_permitted";
 /// The counter for permitted model broker traffic from the assigned guest source.
@@ -335,6 +339,9 @@ impl RuleModel {
         lines.push(format!(
             "add chain {FAMILY_V4} {table} forward {{ type filter hook forward priority {CHAIN_PRIORITY}; policy accept; }}"
         ));
+        lines.push(format!(
+            "add chain {FAMILY_V4} {table} forward_to_guest {{ type filter hook forward priority {DESTINATION_PRIORITY}; policy accept; }}"
+        ));
 
         // Permitted flows first: the gateway address is a host address and is
         // frequently inside an operator blocked range, and the gateway is the
@@ -397,7 +404,7 @@ impl RuleModel {
             "add rule {FAMILY_V4} {table} forward iifname \"{iface}\" counter name \"{COUNTER_OTHER_DENIED}\" drop"
         ));
         lines.push(format!(
-            "add rule {FAMILY_V4} {table} forward oifname \"{iface}\" counter name \"{COUNTER_OTHER_DENIED}\" drop"
+            "add rule {FAMILY_V4} {table} forward_to_guest oifname \"{iface}\" counter name \"{COUNTER_OTHER_DENIED}\" drop"
         ));
     }
 
@@ -417,13 +424,16 @@ impl RuleModel {
             "add chain {FAMILY_V6} {table} forward {{ type filter hook forward priority {CHAIN_PRIORITY}; policy accept; }}"
         ));
         lines.push(format!(
+            "add chain {FAMILY_V6} {table} forward_to_guest {{ type filter hook forward priority {DESTINATION_PRIORITY}; policy accept; }}"
+        ));
+        lines.push(format!(
             "add rule {FAMILY_V6} {table} input iifname \"{iface}\" counter name \"{COUNTER_IPV6}\" drop"
         ));
         lines.push(format!(
             "add rule {FAMILY_V6} {table} forward iifname \"{iface}\" counter name \"{COUNTER_IPV6}\" drop"
         ));
         lines.push(format!(
-            "add rule {FAMILY_V6} {table} forward oifname \"{iface}\" counter name \"{COUNTER_IPV6}\" drop"
+            "add rule {FAMILY_V6} {table} forward_to_guest oifname \"{iface}\" counter name \"{COUNTER_IPV6}\" drop"
         ));
     }
 }

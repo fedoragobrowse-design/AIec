@@ -94,7 +94,10 @@ Run by the parent, on the integrated tree:
 Run on 2026-10-01 against the deployment host (`Linux 7.2.7-200.fc44.x86_64`,
 x86_64, KVM available), with the driver built from this tree and run by
 `scripts/guard-core-acceptance.sh` inside a disposable user+network namespace.
-**18 of 19 cases pass; the 19th fails for a reason stated below.**
+**40 of 40 cases pass on the release build, with `cleanup_errors: []`.**
+The complete machine-readable evidence is
+[`benchmarks/guard-core-acceptance.json`](../benchmarks/guard-core-acceptance.json).
+This is one full acceptance run, not a throughput or multi-host security claim.
 
 Observed passing, each on a real Firecracker microVM under a real Guard
 attachment:
@@ -115,22 +118,40 @@ attachment:
   was installed - so a denied packet is a denial, not a missing route;
 - `cleanup_errors: []`.
 
-### The failing case, and why it was not made to pass
+### The image prerequisite, now resolved
 
-`ipv6-route-preparation` asserts that a guest *which has an IPv6 route* still
-cannot bypass the unconditional IPv6 drop. The deployed guest image ships no
-`ip` binary, so the guest cannot install that route and the case reports
-`{"configured": false, "reason": "no ip binary on the guest"}` - correctly, as a
-failure.
+The earlier run stopped at `ipv6-route-preparation`: the deployed guest lacked
+`ip`, so it could not install the IPv6 route needed to test the bypass. That
+failure also meant the cases after it had not run, not that they had passed.
 
-The image fix is `iproute2` in the guest package list, which is now in
-`scripts/build-firecracker-guest.sh`. Rebuilding the image here is not possible:
-the guest agent is a static musl binary by design, the deployment host has no
-`musl-tools` and no root to install it, and the ext4 image cannot be mounted
-unprivileged. So this case is **not exercised**, and it is recorded as such
-rather than redefined into a pass - weakening the assertion to accept a guest
-that could not run it would have made the report say something the evidence
-does not support.
+A separate acceptance rootfs was built without host root or a musl compiler:
+`debugfs` extracted the already-deployed static guest agent; a disposable Debian
+container supplied the packages including `iproute2`; `mke2fs -d` built the
+filesystem in a root-mapped user namespace. No mount was required. The live
+worker's image was not modified. The acceptance rootfs SHA-256 is
+`62d77174adddec4e22f5566fff0ac22cfe7817e5d53c4d0dc2592e9f0aff1958`.
+
+The guest installed its IPv6 address, permanent neighbor and default route.
+The bypass then incremented the authoritative IPv6 deny counter and reached no
+sentinel. The full memory/state/disk snapshot was created and scanned with both
+VM disks, event journals and logs: **13,421,855,103 bytes, zero matches** for the
+synthetic model secret. Eight model requests authenticated at the bound local
+mock; none used a wrong credential.
+
+Acceptance state used a short disk-backed `TMPDIR` (`/home/gobrowse/aiec/g`):
+the host's quota-enabled `/tmp` tmpfs could not hold the full snapshot, and a
+longer disk-backed path exceeded Linux's Unix socket path limit. Neither
+constraint was bypassed by omitting a check.
+
+The standard build script now includes `iproute2`. On an operator build host:
+
+```sh
+cargo build --release -p aiec-runtime --example guard_core_acceptance
+# Load the Firecracker environment and point AIEC_ROOTFS at the built image.
+# Select a short disk-backed scratch directory with room for full VM snapshots.
+TMPDIR=/path/to/short/scratch \
+  bash scripts/guard-core-acceptance.sh target/release/examples/guard_core_acceptance
+```
 
 ### What the run found that the tests did not
 
@@ -169,6 +190,23 @@ Guard's own failure messages were also a bare errno at every layer that could
 refuse; those sites now name the operation, the address, and the reason. Finding
 all four above depended on that, and no test asserts the labelling.
 
+Two additional defects appeared only after the image prerequisite was removed:
+
+- The raw ICMP probe constructed an odd-length packet but unpacked it as an
+  even-length checksum input. The checksum now zero-pads only its summation
+  input; the transmitted packet is unchanged. The live raw-socket bypass case
+  then ran and was denied.
+- Peer forwarding drops at equal hook priorities could charge the destination
+  sandbox's counter rather than the originating sandbox's. Destination-side
+  drops now run after all source-side Guard chains, for IPv4 and IPv6. The
+  existing live peer-access case failed with a zero source deny delta before
+  this change and passed with a source `blocked_range` increment afterward.
+  No access permission or acceptance assertion was weakened.
+
+Verification for these fixes: `scripts/gate.sh` passed, including all-feature
+clippy and workspace tests and 44 Python SDK tests;
+`cargo check --workspace --all-targets --all-features` passed separately.
+
 ### A note on commit `f530393`
 
 That commit's message describes an experiment with configuring the guest's IPv6
@@ -185,13 +223,10 @@ on the guest"}`, and the image prerequisite is unchanged.
 
 ## What is still not proven
 
-`ipv6-route-preparation`, above, and everything phase 2 onward. The phase 2
-watchdog, phases 3 to 5, and the phase 6 production acceptance are unimplemented
-by design: the plan gates them on the phase 1 run, and the phase 1 run is not
-clean.
-
-**No later phase may start before that case passes.** Phase 2's design is
-settled in `local://guard-phase2-contract.md` and deliberately not implemented.
+Phase 1's real-sandbox acceptance gate is now clear. Phase 2 onward remains
+unimplemented and unproven; the core result does not stand in for watchdog,
+quarantine, L7, image-identity, harness or production acceptance evidence.
+The next active phase is watchdog and quarantine.
 
 ## Phases 2 to 6, and what gates each
 

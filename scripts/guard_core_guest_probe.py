@@ -133,7 +133,10 @@ def main(c):
         payload = b'guard-raw-attempt'
         ident = 0xAEC1
         packet = struct.pack('!BBHHH', 8, 0, 0, ident, 1) + payload
-        words = struct.unpack('!' + 'H' * (len(packet) // 2), packet)
+        # Internet checksum pads an odd final byte with zero for summation,
+        # without adding that padding to the packet transmitted on the wire.
+        checksum_bytes = packet + b'\0' if len(packet) % 2 else packet
+        words = struct.unpack('!' + 'H' * (len(checksum_bytes) // 2), checksum_bytes)
         total = sum(words)
         total = (total & 0xffff) + (total >> 16)
         total = (total & 0xffff) + (total >> 16)
