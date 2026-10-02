@@ -110,6 +110,55 @@ impl PostgresRepository {
     /// self-decision both no-ops here rather than something a later route
     /// forgets to re-check. The database trigger refuses the same pair again as
     /// a backstop, so neither layer is load-bearing alone.
+    ///
+    /// `ON CONFLICT ... WHERE state = 'pending'` resolves to the partial unique
+    /// index on the live-request key, so a retry of the same ask returns the
+    /// request already open instead of a second row for a human to wade
+    /// through. `DO UPDATE` rather than `DO NOTHING` so the existing row is
+    /// returned; with `DO NOTHING` the caller would get no row and would have
+    /// to go looking for one it had just written.
+    ///
+    /// The trigger still forbids rewriting what was asked, so the conflict
+    /// branch cannot quietly restate the request: the update is a no-op
+    /// against a row whose immutable fields are already equal.
+    pub(crate) async fn get_or_put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        let row = sqlx::query(&format!(
+            "INSERT INTO guard_tool_approvals \
+             (id, tenant_id, sandbox_id, tool, request_digest, detail, requested_by_key_id, \
+              requested_by_label, state, decided_by_key_id, decided_by_label, decided_at, \
+              expires_at, consumed_at, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',NULL,NULL,NULL,$9,NULL,$10) \
+             ON CONFLICT (tenant_id, sandbox_id, requested_by_key_id, tool, request_digest) \
+             WHERE state = 'pending' \
+             DO UPDATE SET request_digest = EXCLUDED.request_digest \
+             RETURNING {COLUMNS}"
+        ))
+        .bind(approval.id)
+        .bind(approval.tenant_id)
+        .bind(approval.sandbox_id)
+        .bind(&approval.tool)
+        .bind(&approval.request_digest)
+        .bind(&approval.detail)
+        .bind(approval.requested_by_key_id)
+        .bind(&approval.requested_by_label)
+        .bind(approval.expires_at)
+        .bind(approval.created_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(refused)?;
+        approval_from_row(&row).map_err(map)
+    }
+
+    /// Applies an operator's decision to one pending request.
+    ///
+    /// The conditions are in the `WHERE` clause, not in Rust: `state = 'pending'`
+    /// and `requested_by <> $3` are what make a second decision and a
+    /// self-decision both no-ops here rather than something a later route
+    /// forgets to re-check. The database trigger refuses the same pair again as
+    /// a backstop, so neither layer is load-bearing alone.
     pub(crate) async fn decide_guard_tool_approval(
         &self,
         request: ApprovalDecisionRequest<'_>,
@@ -122,11 +171,17 @@ impl PostgresRepository {
         // `requested_by_key_id <> $3` is the self-approval refusal, on the
         // key id rather than the label: a label like `key:<uuid>/oncall` would
         // otherwise make the same key compare unequal to itself.
+        //
+        // `expires_at > $4` refuses to decide a request that has already timed
+        // out. Without it an operator can grant an expired ask, and the grant
+        // is then dead on arrival: `consume_guard_tool_approval` will never
+        // spend it, so the queue would show a decision that can never be used
+        // and the asker would have to ask again from scratch.
         let row = sqlx::query(&format!(
             "UPDATE guard_tool_approvals \
              SET state = $5, decided_by_key_id = $3, decided_by_label = $7, decided_at = $4 \
              WHERE id = $1 AND tenant_id = $2 AND sandbox_id = $6 \
-               AND state = 'pending' AND requested_by_key_id <> $3 \
+               AND state = 'pending' AND requested_by_key_id <> $3 AND expires_at > $4 \
              RETURNING {COLUMNS}"
         ))
         .bind(request.request_id)
@@ -312,6 +367,180 @@ mod tests {
             .unwrap();
         assert!(again.is_none(), "a spent approval is not a capability");
 
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// Two identical asks are one request.
+    ///
+    /// A refused call is retried, so the retry path is not hypothetical. If
+    /// each retry added a row, an operator opening the queue would find a
+    /// hundred identical pending requests and the one decision they are being
+    /// asked for buried underneath them.
+    #[tokio::test]
+    async fn a_retry_of_the_same_ask_joins_the_request_already_open() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        let now = Utc::now();
+        let mut first = pending(sandbox_id, requester, DIGEST, now);
+        first.tenant_id = tenant;
+        let mut retry = pending(sandbox_id, requester, DIGEST, now);
+        retry.tenant_id = tenant;
+        // Distinct ids, because the retry is a fresh call, not a replay of the
+        // same row.
+        assert_ne!(first.id, retry.id);
+
+        let stored = repository
+            .get_or_put_guard_tool_approval(first)
+            .await
+            .unwrap();
+        let again = repository
+            .get_or_put_guard_tool_approval(retry)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.id, again.id,
+            "a retry must return the request already open, not mint a second one"
+        );
+
+        let rows: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {schema}.guard_tool_approvals \
+             WHERE sandbox_id = $1 AND state = 'pending'"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "exactly one live request may exist for an ask");
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A different argument digest is a different question, so it must not be
+    /// folded into the request already open — that would silently widen one
+    /// human decision to cover a call they never saw.
+    #[tokio::test]
+    async fn a_different_call_is_not_joined_to_an_open_request() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        let now = Utc::now();
+        let mut first = pending(sandbox_id, requester, DIGEST, now);
+        first.tenant_id = tenant;
+        let mut other = pending(sandbox_id, requester, OTHER_DIGEST, now);
+        other.tenant_id = tenant;
+
+        let stored = repository
+            .get_or_put_guard_tool_approval(first)
+            .await
+            .unwrap();
+        let separate = repository
+            .get_or_put_guard_tool_approval(other)
+            .await
+            .unwrap();
+        assert_ne!(
+            stored.id, separate.id,
+            "an approval binds one call's arguments, so a different digest is a new ask"
+        );
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// After a denial, asking again is a new ask rather than a replay of the
+    /// one somebody already turned down.
+    #[tokio::test]
+    async fn asking_again_after_a_denial_is_a_new_request() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        let decider = new_id();
+        let now = Utc::now();
+        let mut first = pending(sandbox_id, requester, DIGEST, now);
+        first.tenant_id = tenant;
+        let stored = repository
+            .get_or_put_guard_tool_approval(first)
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .decide_guard_tool_approval(ApprovalDecisionRequest {
+                    tenant,
+                    sandbox: sandbox_id,
+                    request_id: stored.id,
+                    decision: ApprovalState::Denied,
+                    decided_by_key_id: decider,
+                    decided_by_label: "key:operator",
+                    at: now + chrono::Duration::seconds(1),
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mut again = pending(sandbox_id, requester, DIGEST, now);
+        again.tenant_id = tenant;
+        let second = repository
+            .get_or_put_guard_tool_approval(again)
+            .await
+            .unwrap();
+        assert_ne!(
+            stored.id, second.id,
+            "a denied ask must not be resurrected by a retry"
+        );
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// An operator cannot grant a request that has already timed out.
+    ///
+    /// It would be refused later anyway — `consume` requires an unexpired
+    /// grant — but recording it as granted puts a decision in the operator
+    /// queue that can never be used, and tells the asker a human said yes.
+    #[tokio::test]
+    async fn an_expired_request_cannot_be_decided() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        let decider = new_id();
+        let created = Utc::now();
+        let mut approval = pending(sandbox_id, requester, DIGEST, created);
+        approval.tenant_id = tenant;
+        approval.expires_at = created + chrono::Duration::seconds(30);
+        let stored = repository.put_guard_tool_approval(approval).await.unwrap();
+        let expired_at = stored.expires_at + chrono::Duration::seconds(1);
+
+        let decided = repository
+            .decide_guard_tool_approval(ApprovalDecisionRequest {
+                tenant,
+                sandbox: sandbox_id,
+                request_id: stored.id,
+                decision: ApprovalState::Granted,
+                decided_by_key_id: decider,
+                decided_by_label: "key:operator",
+                at: expired_at,
+            })
+            .await
+            .unwrap();
+        assert!(
+            decided.is_none(),
+            "an expired request must stay undecided rather than be granted"
+        );
+        let after = repository
+            .list_guard_tool_approvals(tenant, sandbox_id)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].state, ApprovalState::Pending);
+        assert!(after[0].decided_at.is_none());
         drop_test_schema(&repository, admin, schema).await;
     }
 

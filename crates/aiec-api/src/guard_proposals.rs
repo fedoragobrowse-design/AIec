@@ -438,7 +438,7 @@ async fn approve_tool(
     // an approval the harness supplied.
     state
         .repository()
-        .put_guard_tool_approval(GuardToolApproval {
+        .get_or_put_guard_tool_approval(GuardToolApproval {
             id: new_id(),
             sandbox_id: id,
             tenant_id: principal.tenant_id,

@@ -3882,6 +3882,13 @@ impl MetadataStore for PostgresRepository {
         Self::put_guard_tool_approval(self, approval).await
     }
 
+    async fn get_or_put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Self::get_or_put_guard_tool_approval(self, approval).await
+    }
+
     async fn decide_guard_tool_approval(
         &self,
         request: ApprovalDecisionRequest<'_>,

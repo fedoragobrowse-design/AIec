@@ -617,6 +617,22 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<GuardToolApproval, CoreError> {
         Err(CoreError::Unsupported("put_guard_tool_approval".into()))
     }
+    /// Records the asker's request, or returns the one already open for the
+    /// same sandbox, requester, tool and argument digest.
+    ///
+    /// A refused call is retried, and each retry is the same question. Without
+    /// this, every retry adds another `pending` row: the operator queue fills
+    /// with copies of one decision and the table grows with the retry rate.
+    /// Implementations must match on the undecided request only, so asking
+    /// again after a `denied` decision is a genuinely new ask.
+    async fn get_or_put_guard_tool_approval(
+        &self,
+        _approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Err(CoreError::Unsupported(
+            "get_or_put_guard_tool_approval".into(),
+        ))
+    }
     /// Applies an operator's decision to one pending request.
     ///
     /// Returns `None` when there was nothing to decide: unknown, already

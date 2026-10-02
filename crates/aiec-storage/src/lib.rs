@@ -498,6 +498,25 @@ impl MemoryRepository {
                 "approval request already exists".into(),
             ));
         }
+        // The in-memory half of the partial unique index on the live-request
+        // key. A retry of the same ask joins the request already open rather
+        // than adding a second identical row to the operator queue; a decided
+        // row is not reused, so asking again after a refusal is a new ask.
+        if let Some(existing) = data
+            .guard_tool_approvals
+            .values()
+            .find(|row| {
+                row.tenant_id == approval.tenant_id
+                    && row.sandbox_id == approval.sandbox_id
+                    && row.requested_by_key_id == approval.requested_by_key_id
+                    && row.tool == approval.tool
+                    && row.request_digest == approval.request_digest
+                    && row.state == ApprovalState::Pending
+            })
+            .cloned()
+        {
+            return Ok(existing);
+        }
         data.guard_tool_approvals
             .insert(approval.id, approval.clone());
         Ok(approval)
@@ -526,6 +545,10 @@ impl MemoryRepository {
             || approval.state != ApprovalState::Pending
             || approval.requested_by_key_id == request.decided_by_key_id
             || request.at < approval.created_at
+            // The same refusal PostgreSQL makes in its `WHERE`: a request that
+            // has timed out is no longer something a human is being asked
+            // about, and a grant decided now could never be spent.
+            || request.at >= approval.expires_at
         {
             return Ok(None);
         }
@@ -659,6 +682,15 @@ impl MetadataStore for MemoryRepository {
     }
 
     async fn put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Self::put_guard_tool_approval(self, approval)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn get_or_put_guard_tool_approval(
         &self,
         approval: GuardToolApproval,
     ) -> Result<GuardToolApproval, CoreError> {
