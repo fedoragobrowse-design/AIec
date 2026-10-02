@@ -126,6 +126,20 @@ aiec guard verify <policy>         # compile and verify without applying
 aiec guard import-openshell <file>
 ```
 
+## Guest images and per-sandbox identities
+
+A guarded sandbox authenticates its control channel with a per-sandbox identity
+that the worker issues when the machine is created and plants in the sandbox's
+own disk. The guest reads it from `/etc/aiec-guest-secret`; an image built
+before that file existed falls back to the build-time `AIEC_GUEST_SECRET`.
+
+The two sides must agree. A guest image that predates the planted identity will
+authenticate with the shared build-time secret while the host uses the
+per-sandbox one, and the machine will fail to boot with an unexplained
+handshake error. **Rebuild the guest image after this change** (`scripts/build-firecracker-guest.sh`);
+`benchmarks/guard-core-acceptance.json` was produced against images that do not
+yet read the planted file.
+
 ## What to read next
 
 `docs/GUARD_POLICY.md` for the policy format and what each field means, and

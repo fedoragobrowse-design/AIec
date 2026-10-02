@@ -388,11 +388,55 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// The control secret this guest authenticates with.
+///
+/// A per-sandbox identity is planted at `/etc/aiec-guest-secret` before the
+/// machine boots, and that is what is used when it is there: the host
+/// authenticates with the same per-sandbox value, so the shared
+/// `AIEC_GUEST_SECRET` only covers images built before per-sandbox identities
+/// existed.
+fn control_secret() -> Vec<u8> {
+    const PLANTED: &str = "/etc/aiec-guest-secret";
+    if let Ok(text) = std::fs::read_to_string(PLANTED) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty()
+            && let Some(bytes) = hex_decode(trimmed)
+        {
+            return bytes;
+        }
+    }
+    match std::env::var("AIEC_GUEST_SECRET") {
+        Ok(value) => value.into_bytes(),
+        Err(_) => {
+            eprintln!("refusing to start without a control identity");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Decodes lowercase hex, which is how the host writes the planted identity.
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks(2) {
+        let digit = |value: u8| -> Option<u8> {
+            match value {
+                b'0'..=b'9' => Some(value - b'0'),
+                b'a'..=b'f' => Some(value - b'a' + 10),
+                b'A'..=b'F' => Some(value - b'A' + 10),
+                _ => None,
+            }
+        };
+        out.push((digit(pair[0])? << 4) | digit(pair[1])?);
+    }
+    Some(out)
+}
+
 fn main() {
-    let secret = std::env::var("AIEC_GUEST_SECRET").unwrap_or_else(|_| {
-        eprintln!("refusing to start without AIEC_GUEST_SECRET");
-        std::process::exit(2);
-    });
+    let secret = control_secret();
     fs::create_dir_all("/workspace").ok();
     let listener = vsock_listener().unwrap_or_else(|error| {
         eprintln!("vsock listener failed: {error}");
@@ -406,10 +450,38 @@ fn main() {
                 continue;
             }
         };
-        match serve_connection(stream, secret.as_bytes()) {
+        match serve_connection(stream, &secret) {
             Ok(true) => return,
             Ok(false) => continue,
             Err(error) => eprintln!("connection failed: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decodes_the_shape_the_host_writes() {
+        assert_eq!(hex_decode("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(hex_decode(""), Some(Vec::new()));
+        assert_eq!(hex_decode("abc"), None, "an odd length is not a value");
+        assert_eq!(hex_decode("zz"), None, "a non-hex byte is not a value");
+    }
+
+    #[test]
+    fn a_planted_identity_is_the_bytes_the_host_authenticates_with() {
+        // The host writes the secret hex-encoded with a trailing newline, and
+        // the guest must recover exactly those bytes.
+        let secret = [0xa1u8, 0xb2, 0xc3];
+        let encoded = format!(
+            "{}\n",
+            secret
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(hex_decode(encoded.trim()), Some(secret.to_vec()));
     }
 }
