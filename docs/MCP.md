@@ -132,7 +132,12 @@ These are enforced in code, with tests, not just documented:
 `SANDBOX_NOT_FOUND`, `SANDBOX_NOT_RUNNING`, `LOCAL_CAPACITY_UNAVAILABLE`,
 `COMMAND_TIMEOUT`, `OUTPUT_LIMIT_EXCEEDED`, `FILE_TOO_LARGE`,
 `UNSUPPORTED_OPERATION`, `AIEC_API_UNAVAILABLE`, `LOCAL_RUNTIME_UNAVAILABLE`,
-`AUTH_FAILED`, `INVALID_ARGUMENT`.
+`AUTH_FAILED`, `INVALID_ARGUMENT`, `APPROVAL_REFUSED`.
+
+`APPROVAL_REFUSED` is returned only when `AIEC_MCP_APPROVAL_REQUIRED=1` and the
+control plane did not approve the call. Its details carry
+`unreachable: true` when nobody answered, which is not the same as a refusal
+and is not retryable.
 
 ---
 
@@ -149,6 +154,7 @@ These are enforced in code, with tests, not just documented:
 | `AIEC_MCP_DEFAULT_TTL` | `1800` | Sandbox lifetime in seconds |
 | `AIEC_MCP_MAX_OUTPUT_BYTES` | `1048576` | Output and file size bound |
 | `AIEC_MCP_ALLOW_PRIVATE_NETWORK` | off | Permit a control plane on your LAN |
+| `AIEC_MCP_APPROVAL_REQUIRED` | off | Ask the control plane before a high-risk tool runs |
 
 ---
 

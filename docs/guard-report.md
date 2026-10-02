@@ -76,6 +76,16 @@ states what this does and does not defend.
   refusing boot before the VM starts.
 - **Per-VM identity.** Every sandbox gets its own short-lived control secret,
   planted in its own disk and never stored in a portable snapshot.
+- **Pre-tool approvals.** A deployment that sets `AIEC_MCP_APPROVAL_REQUIRED=1`
+  routes the high-risk tools through the control plane before they run: the
+  MCP server asks `POST /v1/sandboxes/{id}/guard/approval` and honours the
+  answer. The gate is fail-closed - an approval service that cannot be
+  reached refuses, and the refusal is reported as `APPROVAL_REFUSED` with
+  `unreachable: true`, so an unanswered ask is distinguishable from a
+  decision. The harness cannot supply the answer: the approver is a client of
+  the control plane, and the control plane only relays an operator's recorded
+  decision. Off by default, because a deployment with no recorded approvals
+  would otherwise refuse every destructive tool.
 
 ## Evidence
 
@@ -95,8 +105,10 @@ a repeat quarantine returning the same incident; a worker restart leaving the
 quarantine in force; and the sandbox held rather than orphaned.
 
 **Static gates.** `scripts/gate.sh` passes: `fmt`, clippy with `-D warnings`,
-the full workspace test suite including the Postgres paths, the SDK import
-contract and 44 Python SDK tests.
+the full workspace test suite (875 tests) including the Postgres paths, the SDK
+import contract, 44 Python SDK tests, and an `aarch64-unknown-linux-gnu`
+cross-check of every target. A step that cannot run reports `SKIPPED` rather
+than `ok`.
 
 ## Defects the acceptance work found and fixed
 
@@ -145,11 +157,19 @@ inverted so that subdomains did not match and unrelated domains did.
 5. **Layer 7 rules need interception to see a request.** In the default SNI
    mode Guard matches the requested name and forwards the tunnel; a CONNECT
    tunnel to a governed host is refused rather than forwarded ungoverned.
-6. **No approval flow issues human decisions yet.** The control plane refuses
-   high-risk tools by default and says so; there is no queue for a human to
-   answer.
+6. **The approval hook is wired; no approval is ever granted.** The gate is
+   now in the production dispatch path, fail-closed, and its refusal is
+   distinguishable from an unanswered ask. What does not exist is the other
+   half: the control plane has no queue for a human to answer, so every
+   high-risk tool is refused. The hook is proven to deny, not to admit.
 7. **Multi-host deployment modes are documented, not validated.** The hardening
    decision for a separate gateway host is untested.
+8. **aarch64 is compile-verified, not run-verified.** The gate cross-checks the
+   whole workspace for `aarch64-unknown-linux-gnu` and it is clean; that found
+   and fixed a real bug, a `gethostname` buffer typed `i8` where aarch64's
+   `c_char` is `u8`. No aarch64 machine is part of the evidence: nothing was
+   executed there, no performance number was taken there, and the guest image
+   has only ever been built for x86_64.
 
 ## Environment findings for the operator
 
@@ -227,10 +247,10 @@ their acceptance exercised against local mocks rather than real machines. Two
 green artifacts do not make that whole surface proven, and the two are kept
 apart on purpose.
 
-Still outstanding, from the limitations above: items 2 to 7 - the lifetime
+Still outstanding, from the limitations above: items 2 to 8 - the lifetime
 reaper has never fired in a live run, `CAP_NET_ADMIN` is absent from the
 production worker on this host, layer 7 needs interception to govern a
-tunnelled request, no approval flow issues human decisions, and multi-host
-deployment modes are documented but unvalidated. Two of those are operator
-actions rather than code: deploying the rebuilt image, and granting the worker
-`CAP_NET_ADMIN`.
+tunnelled request, the approval hook denies but has never admitted, multi-host
+deployment modes are documented but unvalidated, and aarch64 is compiled but
+never run. Two of those are operator actions rather than code: deploying the
+rebuilt image, and granting the worker `CAP_NET_ADMIN`.

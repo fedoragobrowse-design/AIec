@@ -37,7 +37,11 @@ resources:
 
 `no_network`, `model_only`, `model_plus_allowlist` and `read_only_api` are the
 built-in templates. An explicit `policy` replaces the template. Guard requires
-the Firecracker runtime; a weaker runtime is refused rather than downgraded.
+the Firecracker runtime and refuses a guarded sandbox on a weaker one by
+default. Setting `AIEC_ALLOW_REDUCED_ISOLATION=1` on the control plane accepts
+the weaker boundary deliberately; the creation response then carries an
+`x-aiec-isolation` header naming what was given up, so the downgrade is visible
+to whoever reads the sandbox rather than buried in a log.
 
 The guest receives `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (both cases) and an
 empty `NO_PROXY`, plus an `AIEC_AGENT_API_KEY` placeholder. Nothing else in the
@@ -100,6 +104,27 @@ aiec doctor --json | grep network_policy
 nft list tables | grep aiec_guard
 ```
 
+## Hardware
+
+The gate compiles the whole workspace for `aarch64-unknown-linux-gnu` as well
+as the host architecture, so an x86_64 build cannot hide an aarch64-only type
+error. That check found one: a `gethostname` buffer typed `i8`, which is
+correct on x86_64 and wrong on aarch64, where `c_char` is `u8`. It is now
+typed as `c_char` and the workspace cross-checks clean.
+
+**What this is and is not.** It is a compile check of every target, including
+tests and examples. It is not a run: no aarch64 machine, emulator or
+Firecracker-on-aarch64 run is part of the evidence, and no performance number
+here was taken on aarch64. The guest image build is a separate matter and
+still has only been produced for x86_64; `scripts/build-firecracker-guest.sh`
+builds whatever host it runs on and has not been run on aarch64.
+
+The cross-check needs a C toolchain for the target, which the host does not
+have and cannot install without root, so it runs in
+`ghcr.io/cross-rs/aarch64-unknown-linux-gnu`. Where Docker is unavailable the
+step reports `SKIPPED` rather than `ok`; `AIEC_SKIP_CROSS=1` skips it
+deliberately.
+
 ## Deployment modes
 
 - **Worker-host hardened process** (default). The gateway and the rules live on
@@ -111,6 +136,13 @@ nft list tables | grep aiec_guard
   Higher operational cost, narrower blast radius.
 
 The modes are not equivalent and are not claimed to be.
+
+**Only the first is implemented.** The worker allocates the gateway's `/30`
+from its own host address space and runs the gateway in-process on that
+address, so there is no setting that points a guest's gateway at another
+machine. Modes B and C are the deployment shapes this design supports and the
+trust properties they would change; neither has a code path or has been
+validated. Treat them as design intent, not as a feature.
 
 ## Operating checks
 

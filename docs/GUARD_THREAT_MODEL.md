@@ -15,8 +15,10 @@ guest               ── the agent's computer; not trusted
 ```
 
 The sandbox may be compromised. The harness inside it may be compromised. The
-repository contents may be malicious. Guard's guarantee is that the network and
-credential boundary is enforced by processes the guest cannot reach or modify.
+repository contents may be malicious. What still holds is that the network and
+credential boundary is enforced by processes the guest cannot reach or modify -
+and only that. It is a statement about where enforcement runs, not about what a
+host-level attacker can do afterwards; see 'What Guard does not defend' below.
 
 ## Assets
 

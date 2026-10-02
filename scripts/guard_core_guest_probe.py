@@ -84,27 +84,36 @@ def main(c):
             samples.append((time.monotonic() - start) * 1000)
         return {'addresses': sorted(addresses), 'latency_ms': samples, 'samples': len(samples)}
     if kind == 'dns_wire':
-        packet = dns_packet(c['name'], c['qtype'])
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM if c.get('tcp') else socket.SOCK_DGRAM) as sock:
-            sock.settimeout(2)
-            if c.get('tcp'):
-                sock.connect((c['host'], 53))
-                sock.sendall(struct.pack('!H', len(packet)) + packet)
-                size = sock.recv(2)
-                if len(size) != 2:
-                    raise RuntimeError('truncated DNS TCP length')
-                reply = b''
-                wanted = struct.unpack('!H', size)[0]
-                while len(reply) < wanted:
-                    chunk = sock.recv(wanted - len(reply))
-                    if not chunk:
-                        raise RuntimeError('truncated DNS TCP response')
-                    reply += chunk
-            else:
-                sock.sendto(packet, (c['host'], 53))
-                reply, _ = sock.recvfrom(4096)
-            ident, flags, _, answers, _, _ = struct.unpack('!HHHHHH', reply[:12])
-            return {'rcode': flags & 15, 'answers': answers, 'matching_id': ident == 0xAEC1}
+        # `samples` repeats the same query so a cost can be compared against
+        # another path rather than reported as one number with no reference.
+        samples = []
+        rcode = answers = matching_id = None
+        for _ in range(max(1, int(c.get('samples', 1)))):
+            packet = dns_packet(c['name'], c['qtype'])
+            started = time.monotonic()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM if c.get('tcp') else socket.SOCK_DGRAM) as sock:
+                sock.settimeout(2)
+                if c.get('tcp'):
+                    sock.connect((c['host'], 53))
+                    sock.sendall(struct.pack('!H', len(packet)) + packet)
+                    size = sock.recv(2)
+                    if len(size) != 2:
+                        raise RuntimeError('truncated DNS TCP length')
+                    reply = b''
+                    wanted = struct.unpack('!H', size)[0]
+                    while len(reply) < wanted:
+                        chunk = sock.recv(wanted - len(reply))
+                        if not chunk:
+                            raise RuntimeError('truncated DNS TCP response')
+                        reply += chunk
+                else:
+                    sock.sendto(packet, (c['host'], 53))
+                    reply, _ = sock.recvfrom(4096)
+            samples.append((time.monotonic() - started) * 1000)
+            ident, flags, _, count, _, _ = struct.unpack('!HHHHHH', reply[:12])
+            rcode, answers, matching_id = flags & 15, count, ident == 0xAEC1
+        return {'rcode': rcode, 'answers': answers, 'matching_id': matching_id,
+                'latency_ms': samples, 'samples': len(samples)}
     if kind in ('tcp', 'udp', 'placeholder_direct'):
         family = socket.AF_INET6 if ':' in c['host'] else socket.AF_INET
         with socket.socket(family, socket.SOCK_DGRAM if kind == 'udp' else socket.SOCK_STREAM) as sock:

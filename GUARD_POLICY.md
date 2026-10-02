@@ -80,6 +80,7 @@ network, live DNS answers, or the guest kernel.
 | `AIEC_GUARD_BOUNDARY_FILE` | Operator boundary: extra blocked ranges, protected addresses, blocked hosts, and operator test destinations. |
 | `AIEC_ALLOW_LEGACY_NETWORK` | `1` permits the pre-Guard network backend. Without it, an unguarded sandbox that asks for a network is refused rather than silently unfiltered. |
 | `AIEC_GUARD_TEST_MODE` | `1` enables local mock destinations, and only inside an isolated network namespace using `198.18.0.0/15` addresses. |
+| `AIEC_ALLOW_REDUCED_ISOLATION` | Control-plane only. `1` permits a guarded sandbox on a runtime weaker than a microVM. Default off, and the creation response reports the downgrade in `x-aiec-isolation`. Guard's network guarantees are stated for microVMs; this is the setting that stops them applying, so it belongs in the same table as the other ways to weaken a boundary. |
 
 Credentials are never arguments, never part of a sandbox or run document, and
 never written into a guest image, environment, or snapshot. The broker

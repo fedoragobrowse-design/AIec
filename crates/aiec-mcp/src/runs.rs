@@ -903,6 +903,7 @@ mod tests {
             default_ttl_seconds: 1800,
             max_output_bytes: 1_048_576,
             cleanup_on_shutdown: false,
+            approval_required: false,
         };
         AiecMcp::new(&config).expect("a server")
     }

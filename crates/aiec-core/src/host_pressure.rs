@@ -610,7 +610,9 @@ fn hostname() -> Option<String> {
     // SAFETY: `buf` is a live, correctly sized buffer and `gethostname` only
     // writes through it, NUL-terminating within its length.
     unsafe {
-        let mut buf = [0i8; 256];
+        // `c_char` is `i8` on x86_64 and `u8` on aarch64, so a hardcoded `i8`
+        // buffer only compiles on the architecture that was built on.
+        let mut buf = [0 as libc::c_char; 256];
         if libc::gethostname(buf.as_mut_ptr(), buf.len()) != 0 {
             return None;
         }

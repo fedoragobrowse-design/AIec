@@ -40,6 +40,12 @@ pub struct AiecMcp {
     pub default_runtime: String,
     pub default_ttl_seconds: u64,
     pub max_parallel: usize,
+    /// The pre-tool approval gate, consulted before a high-risk tool runs.
+    ///
+    /// `None` means the deployment has not opted in. When it is `Some` the
+    /// gate is fail-closed: an approval service that cannot answer refuses
+    /// rather than allows.
+    pub approval: Option<Arc<crate::approval::ApprovalGate>>,
     /// Sandboxes this server created, used by the ownership resources.
     pub started_at: chrono::DateTime<chrono::Utc>,
 }
@@ -53,15 +59,31 @@ impl AiecMcp {
             config.max_output_bytes,
             config.max_parallel,
         )?;
+        let approval = config.approval_required.then(|| {
+            // The approver talks to the same control plane, on the same key,
+            // as everything else this server does. It has no way to answer
+            // for itself, so it can only relay a decision.
+            Arc::new(crate::approval::ApprovalGate::new(
+                std::sync::Arc::new(crate::approval::ControlPlaneApprover::new(
+                    aiec.client().clone(),
+                    // The default policy is the fail-closed one: the
+                    // operations an operator would not want done to them
+                    // without asking.
+                    crate::approval::ApprovalPolicy::default(),
+                )),
+                true,
+            ))
+        });
         Ok(Self {
             aiec,
             default_image: "python:3.13".to_owned(),
-            // Firecracker is the local microVM runtime; it is preferred whenever
-            // the worker offers it.
+            // Firecracker is the local microVM runtime; it is preferred
+            // whenever the worker offers it.
             default_runtime: "firecracker".to_owned(),
             default_ttl_seconds: config.default_ttl_seconds,
             max_parallel: config.max_parallel,
             started_at: chrono::Utc::now(),
+            approval,
         })
     }
 
@@ -71,6 +93,38 @@ impl AiecMcp {
             McpError::invalid(format!("`{raw}` is not a sandbox id"))
                 .with_details(json!({ "sandbox_id": raw }))
         })
+    }
+
+    /// Asks the control plane for permission before a high-risk tool runs.
+    ///
+    /// The tool is named in the policy's own vocabulary (`sandbox.destroy`,
+    /// not `aiec_destroy_sandbox`) because that is what the control plane
+    /// compares against. A deployment with no gate is unaffected; a
+    /// deployment with one gets a refusal, not a retry, when the service
+    /// cannot answer.
+    async fn approve(&self, tool: &str, sandbox: Uuid, detail: Option<&str>) -> ToolResult<()> {
+        let Some(gate) = self.approval.as_ref() else {
+            return Ok(());
+        };
+        gate.check(sandbox, tool, detail)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| {
+                McpError::new(
+                    ErrorCode::ApprovalRefused,
+                    format!("{tool} was not approved: {refusal}"),
+                )
+                .with_sandbox(sandbox)
+                .with_details(json!({
+                    "tool": tool,
+                    // `Unavailable` means nobody answered. That is the case an
+                    // operator needs to see distinguished from a decision.
+                    "unreachable": matches!(
+                        refusal,
+                        crate::approval::ApprovalRefusal::Unavailable
+                    ),
+                }))
+            })
     }
 }
 
@@ -369,6 +423,8 @@ confirmed. Safe to call on an already-destroyed sandbox.",
         Parameters(args): Parameters<SandboxIdArgs>,
     ) -> Result<CallToolResult, McpErrorData> {
         let id = self.sandbox_id(&args.sandbox_id)?;
+        // Asked before anything is torn down, not after.
+        self.approve("sandbox.destroy", id, None).await?;
         self.report("aiec_destroy_sandbox", async {
             Ok(json!({ "sandbox_id": id.to_string(), "state": self.aiec.destroy_sandbox(id).await? }))
         })
@@ -452,6 +508,10 @@ needed. Paths are confined to the sandbox filesystem.",
         Parameters(args): Parameters<WriteFileArgs>,
     ) -> Result<CallToolResult, McpErrorData> {
         let id = self.sandbox_id(&args.sandbox_id)?;
+        // The path is the detail an operator needs to judge the call, and it is
+        // a path inside a disposable sandbox, not a credential.
+        self.approve("sandbox.write_file", id, Some(&args.path))
+            .await?;
         self.report("aiec_write_file", async {
             self.aiec.write_file(id, &args.path, &args.content).await?;
             Ok(json!({ "path": args.path, "written": true }))
@@ -937,6 +997,7 @@ mod tests {
             default_ttl_seconds: 1800,
             max_output_bytes: 1_048_576,
             cleanup_on_shutdown: false,
+            approval_required: false,
         };
         AiecMcp::new(&config).expect("a local endpoint builds a client")
     }
@@ -1018,5 +1079,99 @@ mod tests {
             details.get("sandbox_id").is_none(),
             "an empty sandbox id was invented: {details}"
         );
+    }
+
+    /// A server with the gate on, pointed at a control plane that is not
+    /// there. This is the case that matters: the approval service is
+    /// unavailable, and the high-risk tool must not run anyway.
+    fn gated_server() -> AiecMcp {
+        let mut server = server();
+        server.approval = Some(Arc::new(crate::approval::ApprovalGate::new(
+            std::sync::Arc::new(Unreachable),
+            true,
+        )));
+        server
+    }
+
+    /// Refuses when nothing can answer, before the tool body runs at all.
+    /// The endpoint is a dead port, so a body that ran would fail with
+    /// `AiecApiUnavailable` instead - a different code, and the whole point.
+    #[tokio::test]
+    async fn a_destructive_tool_is_refused_when_approval_is_unavailable() {
+        let id = Uuid::now_v7();
+        let error = gated_server()
+            .destroy_sandbox(Parameters(SandboxIdArgs {
+                sandbox_id: id.to_string(),
+            }))
+            .await
+            .expect_err("an unreachable approval service is not an approval");
+
+        let details = error.data.expect("the refusal carries details");
+        assert_eq!(
+            details["code"].as_str(),
+            Some(ErrorCode::ApprovalRefused.as_str()),
+            "a refusal must be its own code, not the generic unavailable one: {details}"
+        );
+        assert_eq!(
+            details["unreachable"].as_bool(),
+            Some(true),
+            "an unanswered approval must be distinguishable from a decision: {details}"
+        );
+    }
+
+    /// A read is not high risk, so it is never asked about. If it were, a
+    /// deployment with the gate on would be unusable - the test is that the
+    /// gate does not fire for tools the policy does not list.
+    #[tokio::test]
+    async fn a_tool_the_policy_does_not_list_is_never_asked_about() {
+        // The control plane is unreachable, so an ask would surface as a
+        // refusal. Not getting one proves the ask did not happen.
+        let outcome = gated_server()
+            .approve("sandbox.get", Uuid::now_v7(), None)
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "a read should not need approval: {outcome:?}"
+        );
+    }
+
+    /// The tools the default policy names are exactly the destructive ones
+    /// this server exposes, and the two names agree.
+    #[test]
+    fn the_gate_covers_the_destructive_tools_this_server_exposes() {
+        let policy = crate::approval::ApprovalPolicy::default();
+        for tool in ["sandbox.destroy", "sandbox.write_file"] {
+            assert!(
+                policy.requires_approval(tool),
+                "{tool} is exposed as destructive and is not gated"
+            );
+        }
+        for tool in ["sandbox.get", "sandbox.list_owned", "sandbox.read_file"] {
+            assert!(
+                !policy.requires_approval(tool),
+                "{tool} is a read and would be escalated by mistake"
+            );
+        }
+    }
+
+    /// An approver that never answers, standing in for a control plane that
+    /// is not reachable.
+    struct Unreachable;
+
+    #[async_trait::async_trait]
+    impl crate::approval::Approver for Unreachable {
+        // The real policy, so which tools are asked about is not decided by
+        // the test double.
+        fn requires_approval(&self, tool: &str) -> bool {
+            crate::approval::ApprovalPolicy::default().requires_approval(tool)
+        }
+        async fn approve(
+            &self,
+            _sandbox: Uuid,
+            _tool: &str,
+            _detail: Option<&str>,
+        ) -> Option<crate::approval::ApprovalDecision> {
+            None
+        }
     }
 }

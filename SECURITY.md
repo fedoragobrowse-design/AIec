@@ -257,8 +257,11 @@ yet using per-VM mutual TLS identity.
 
 Guard enforces a sandbox's network and credential boundary from outside the
 guest, so that a compromised guest or a manipulated model cannot widen its own
-authority. It is optional per sandbox and requires the Firecracker runtime; a
-weaker runtime is refused rather than silently downgraded.
+authority. It is optional per sandbox and requires the Firecracker runtime. A
+guarded sandbox on a weaker runtime is refused by default. A deployment may set
+`AIEC_ALLOW_REDUCED_ISOLATION=1` to accept the weaker boundary deliberately; the
+creation response then carries an `x-aiec-isolation` header naming what was
+given up, so the downgrade is declared rather than silent.
 
 ### What Guard enforces, and what proves it
 
@@ -303,6 +306,12 @@ weaker runtime is refused rather than silently downgraded.
   and forwards the tunnel. Method and path policy exists only where an operator
   has explicitly enabled TLS interception, which means Guard holds a key that
   can read the traffic it governs.
+- **The guest's own account of what it did.** Harness events - tool calls,
+  exec, messages, turn boundaries, errors - are emitted by the agent under
+  test and are advisory only. A compromised agent can omit them, invent them,
+  or replay them. Guard's counters, rules and journal are read from outside the
+  guest and are the authoritative record; a guest log is never evidence that a
+  boundary held.
 - **The guest's own data**, and anything the guest sends to a destination the
   policy permits.
 - **A watcher's judgement.** The optional watcher is a second reviewer that can
@@ -312,6 +321,12 @@ weaker runtime is refused rather than silently downgraded.
   no TPM-backed attestation and none is claimed.
 - **Multi-host security.** Guard's assumptions are about one worker host and its
   guest.
+- **An approval that is never granted.** The pre-tool gate is fail-closed and
+  wired into the MCP dispatch path, so a high-risk tool cannot run without the
+  control plane's answer. The control plane has no queue for a human to answer,
+  so the answer today is always no. The gate is proven to deny; it is not
+  proven to admit, and a deployment that turns it on will refuse every
+  destructive tool until a human-approval path exists.
 
 Claims in this section are written to match the artifacts that back them. Where
 a property is implemented and tested but has not been observed end to end in a

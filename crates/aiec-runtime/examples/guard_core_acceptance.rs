@@ -121,6 +121,13 @@ const PROBE: &str = include_str!("../../../scripts/guard_core_guest_probe.py");
 const MODEL_HOST: &str = "model.guard.test";
 const MODEL_ADDR: &str = "198.18.0.10:18080";
 const STREAM_CHUNKS: usize = 128;
+/// A resolver bound directly to the namespace, with no policy in front of it.
+/// The comparison it exists for is Guard's cost, not the cost of a name.
+const BASELINE_DNS_ADDR: &str = "198.18.0.30:53";
+const BASELINE_DNS_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 30);
+/// How many times each path is asked the same question. Ten is enough to see
+/// a millisecond-scale difference and is stated rather than tuned.
+const DNS_SAMPLES: usize = 10;
 const STREAM_CHUNK_BYTES: usize = 32768;
 const SENTINELS: &[(&str, &str, u16)] = &[
     ("direct-public-ipv4", "93.184.216.34", 8080),
@@ -144,6 +151,7 @@ const MOCK_ADDRESSES: &[&str] = &[
     "93.184.216.34/32",
     "169.254.169.254/32",
     "10.123.0.10/32",
+    "198.18.0.30/32",
     "169.254.1.10/32",
 ];
 
@@ -158,6 +166,85 @@ fn deny_delta(a: &CounterSnapshot, b: &CounterSnapshot) -> u64 {
     b.blocked_range.saturating_sub(a.blocked_range)
         + b.other_denied.saturating_sub(a.other_denied)
         + b.ipv6.saturating_sub(a.ipv6)
+}
+
+/// Builds an A-record reply for a well-formed single-question query.
+///
+/// Enough DNS to be a resolver, and no more: the point is to answer the same
+/// question the gateway answers, not to be a name server.
+fn dns_a_reply(query: &[u8], address: std::net::Ipv4Addr) -> Option<Vec<u8>> {
+    if query.len() < 12 || u16::from_be_bytes([query[4], query[5]]) != 1 {
+        return None;
+    }
+    // Walk the QNAME to find where the question ends.
+    let mut offset = 12;
+    while offset < query.len() {
+        let length = query[offset] as usize;
+        offset += 1;
+        if length == 0 {
+            break;
+        }
+        if length > 63 {
+            return None;
+        }
+        offset += length;
+    }
+    let question_end = offset.checked_add(4)?;
+    if question_end > query.len() {
+        return None;
+    }
+    let mut reply = Vec::with_capacity(question_end + 16);
+    reply.extend_from_slice(&query[..2]); // id
+    reply.extend_from_slice(&0x8180u16.to_be_bytes()); // response, recursion available
+    reply.extend_from_slice(&1u16.to_be_bytes()); // one question
+    reply.extend_from_slice(&1u16.to_be_bytes()); // one answer
+    reply.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // authority and additional
+    reply.extend_from_slice(&query[12..question_end]); // the question, verbatim
+    reply.extend_from_slice(&[0xc0, 0x0c]); // answer name: pointer to the question
+    reply.extend_from_slice(&1u16.to_be_bytes()); // type A
+    reply.extend_from_slice(&1u16.to_be_bytes()); // class IN
+    reply.extend_from_slice(&30u32.to_be_bytes()); // TTL
+    reply.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+    reply.extend_from_slice(&address.octets());
+    Some(reply)
+}
+
+/// A minimal A query, used to time both paths on the same question.
+fn dns_a_query(name: &str) -> Vec<u8> {
+    let mut packet = vec![
+        0xAE, 0xC1, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    for label in name.split('.') {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    packet.extend_from_slice(&1u16.to_be_bytes()); // A
+    packet.extend_from_slice(&1u16.to_be_bytes()); // IN
+    packet
+}
+
+/// Times `samples` identical queries from this host and returns the median.
+///
+/// The median rather than the mean, because the first query of a batch pays
+/// for a cold path and the question being asked is what the steady state
+/// costs.
+async fn median_dns_round_trip(server: &str, query: &[u8], samples: usize) -> Result<f64> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let mut timings = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let started = Instant::now();
+        socket.send_to(query, server).await?;
+        let mut buffer = [0; 4096];
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)).await??;
+        if n < 12 {
+            return Err(failure("short DNS reply"));
+        }
+        timings.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    timings.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+    Ok(timings[timings.len() / 2])
 }
 fn target(host: &str, port: u16) -> String {
     if host.contains(':') {
@@ -368,6 +455,19 @@ impl Mocks {
                     udp_guest_hits.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = udp.send_to(&buffer[..n], peer).await;
+            }
+        }));
+        // A resolver with no policy in front of it, so the same query can be
+        // asked of both and the difference attributed to Guard rather than to
+        // the name, the record type or the machine.
+        let baseline = UdpSocket::bind(BASELINE_DNS_ADDR).await?;
+        let baseline_ip = BASELINE_DNS_IP;
+        handles.push(tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            while let Ok((n, peer)) = baseline.recv_from(&mut buffer).await {
+                if let Some(reply) = dns_a_reply(&buffer[..n], baseline_ip) {
+                    let _ = baseline.send_to(&reply, peer).await;
+                }
             }
         }));
         Ok(Self {
@@ -870,6 +970,34 @@ async fn run(driver: &mut Driver) -> Result<()> {
         "real-guest-model-dns",
         dns["addresses"] == json!([attachment.gateway_ip.to_string()]),
         dns,
+    )?;
+
+    // What Guard costs, measured as a difference rather than asserted from
+    // an absolute. Both queries are the same question sent from this host to
+    // the same namespace: one to the gateway, which applies policy, and one
+    // to a resolver that does not. The guest is not involved, so this is the
+    // gateway's own cost and not the vsock round trip on top of it.
+    driver.current = "guard-dns-overhead-measured-against-an-ungoverned-resolver".into();
+    let query = dns_a_query(MODEL_HOST);
+    let unguarded = median_dns_round_trip(BASELINE_DNS_ADDR, &query, DNS_SAMPLES).await?;
+    let guarded = median_dns_round_trip(
+        &format!("{}:53", attachment.gateway_ip),
+        &query,
+        DNS_SAMPLES,
+    )
+    .await?;
+    driver.case(
+        "guard-dns-overhead-measured-against-an-ungoverned-resolver",
+        guarded > 0.0 && unguarded > 0.0,
+        json!({
+            "guarded_median_ms": guarded,
+            "unguarded_median_ms": unguarded,
+            "overhead_ms": guarded - unguarded,
+            "samples_per_path": DNS_SAMPLES,
+            "query": MODEL_HOST,
+            "method": "identical A query, same host, same namespace, median of the batch; \
+        the guest path is excluded so the number is the gateway's cost alone",
+        }),
     )?;
     for (name, qname, qtype, tcp) in [
         ("unrelated-hostname", "unrelated.guard.test", 1, false),

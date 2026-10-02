@@ -23,6 +23,11 @@ pub enum ErrorCode {
     LocalRuntimeUnavailable,
     AuthFailed,
     InvalidArgument,
+    /// A high-risk tool reached the pre-tool gate and was not approved.
+    ///
+    /// Distinct from `AiecApiUnavailable` because the caller must not retry
+    /// it: nothing was decided, and the honest response to that is to stop.
+    ApprovalRefused,
 }
 
 impl ErrorCode {
@@ -40,6 +45,7 @@ impl ErrorCode {
             Self::LocalRuntimeUnavailable => "LOCAL_RUNTIME_UNAVAILABLE",
             Self::AuthFailed => "AUTH_FAILED",
             Self::InvalidArgument => "INVALID_ARGUMENT",
+            Self::ApprovalRefused => "APPROVAL_REFUSED",
         }
     }
 }

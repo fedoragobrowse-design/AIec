@@ -20,6 +20,13 @@ pub struct Config {
     pub default_ttl_seconds: u64,
     pub max_output_bytes: usize,
     pub cleanup_on_shutdown: bool,
+    /// Whether high-risk tools must ask the control plane before they run.
+    ///
+    /// Off by default so an existing client keeps working unchanged: with the
+    /// gate on and no operator approvals configured, every destructive tool
+    /// would be refused. When it is on, a refusal is the answer - an approval
+    /// service that cannot be reached is not an approval.
+    pub approval_required: bool,
 }
 
 impl Config {
@@ -69,6 +76,7 @@ impl Config {
             max_output_bytes: env_usize("AIEC_MCP_MAX_OUTPUT_BYTES", 1_048_576)
                 .clamp(1024, 16_777_216),
             cleanup_on_shutdown: env_flag_or("AIEC_MCP_CLEANUP_ON_SHUTDOWN", true),
+            approval_required: env_flag("AIEC_MCP_APPROVAL_REQUIRED"),
         })
     }
 }
