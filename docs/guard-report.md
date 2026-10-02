@@ -96,28 +96,21 @@ secret-scan (13.4 GB of memory, state and disk with no copy of the real model
 credential) and a case proving an attachment carries traffic only after a
 watchdog heartbeat.
 
-**What Guard costs a DNS lookup.** Ten identical A queries, medians of the
-batch, measured in the same run on the same host:
+**What Guard costs a DNS lookup.** The published core artifact records ten
+identical A queries per side. Its driver sorts and selects index `n/2`, so the
+values are **upper-middle order statistics**, not conventional even-sample
+medians:
 
-| | median |
+| | upper-middle value |
 |---|---:|
-| guarded — the guest's system resolver, in the guest, through the gateway | 4.022 ms |
-| unguarded — the same A query to a policy-free resolver in the same namespace | 0.034 ms |
-| **difference** | **3.987 ms** |
+| guarded — the guest's system resolver, in the guest, through the gateway | 2.963 ms |
+| unguarded — the same A query to a policy-free resolver in the same namespace | 0.024 ms |
+| **difference** | **2.939 ms** |
 
 **This is an upper bound, not a policy-engine measurement.** The guarded side
-includes the vsock hop and the guest's own resolver stack on top of the policy
-check, and the two sides are not the same code path: the unguarded query is a
-raw UDP packet from the host, while the guarded one is a real guest resolver
-lookup. It bounds Guard's total contribution and does not isolate it, so the
-figure should not be quoted as "the cost of enforcement". Two samples in the
-guarded batch (26.9 ms and 23.8 ms) are cold first-lookups; the steady state is
-the 3.5-4.5 ms cluster the median sits in.
-
-The direct host-to-gateway comparison that would have isolated the gateway's
-own cost is not possible: the gateway deliberately answers DNS only for its own
-guest, and bypassing that to time it from the host would have meant measuring a
-configuration Guard does not offer.
+includes the vsock hop and the guest's resolver stack; the unguarded side is a
+raw UDP query from the host. The comparison does not isolate enforcement CPU
+or latency.
 
 **The incident reproduction.** The sentinel cases above show destinations being
 blocked, which on its own cannot separate enforcement from a route that never
@@ -376,14 +369,70 @@ percentage overhead is established. The first-byte difference is 6.62 ms, but
 the guest and host clients use different stacks, so it is not an isolated
 policy-engine cost.
 
-**Aggregate process cost.** The §49 run reports 59.12 s of CPU and a 30 376 KiB
-peak RSS for the acceptance driver process. This covers the driver, gateway,
-and mocks during a 97.9 s run; Firecracker and guest processes are outside it.
-The model-only leg separately records 0.04 s CPU (0.03 s harness upload,
-0.01 s tool loop) and 32 KiB resident-set growth in that shared process.
-These are measured usage, not isolated gateway overhead versus a baseline.
-The 0.01 s loop sample has coarse CPU-clock resolution; it establishes no
-per-request cost distribution.
+### Isolated gateway CPU/RSS (§51)
+
+[`benchmarks/guard-resource-benchmark.json`](../benchmarks/guard-resource-benchmark.json)
+records **seven matched pairs** on the Intel Core 7 240H, Linux
+7.0.0-34-generic, x86_64, with 16 logical CPUs available and two Tokio worker
+threads. Each side makes 64 sequential requests returning **1 MiB each**:
+448 measured requests per side. Each response is length- and SHA-256-verified.
+The provider emits 16 KiB HTTP chunks and accepts the gateway's chunked
+uploads; the guarded path substitutes the real host-held credential.
+
+Each pair starts a fresh release-built `guard_resource_gateway` acceptance
+process running the production `GuardGateway` library, HTTP budget client,
+credential store, and file-event sink. Both sides get two warmup requests.
+Direct and guarded order alternates. A private SQLite budget authority commits
+each debit before acknowledgment; every guarded sample verifies exactly 64
+admissions, 64 MiB received, and the uploaded request bytes. Direct samples
+leave its ledger unchanged.
+
+| conventional median, n=7 per side | direct provider path | guarded path |
+|---|---:|---:|
+| gateway CPU per 64-request window | 0.00 s (idle gateway) | **0.48 s** |
+| sampled peak gateway RSS | 8 008 KiB | **8 884 KiB** |
+| client wall time per 64 requests | 0.210 s | 1.722 s |
+
+The separate warmed-idle RSS baseline has median **7 996 KiB**. The median
+**paired** guarded peak minus that pair's idle RSS is **916 KiB** (range
+816–1 128 KiB); it is not the subtraction of the two independently aggregated
+RSS medians. Gateway CPU minus the pair's one-second idle CPU rate, normalized
+to the guarded accounting window, also has median **0.48 s**. Gross gateway CPU
+ranges 0.38–0.55 s: the median corresponds to **7.5 ms CPU per request for this
+workload**, not a general request cost or an end-to-end CPU delta.
+
+CPU comes from `/proc/PID/stat` across gateway threads at 100 ticks/s, with
+before/after snapshots enclosing each client invocation. RSS comes from
+`VmRSS` sampled every 5 ms; lifetime `VmHWM` is also retained. Sampling is not
+an absolute peak-memory guarantee, and RSS includes shared resident pages.
+A positive control allocated 32 MiB and burned CPU: the same instrument saw
+31 CPU ticks and 32 772 KiB RSS growth. A second control reached the authority,
+observed its HTTP 403 and the gateway's HTTP 503, and verified no provider call
+or durable debit. Failed runs do not replace the published artifact; a failed
+gateway-start smoke verified that behavior. Cleanup errors: none.
+
+**Scope.** Gateway process accounting includes forwarding, durable-budget HTTP
+requests, credential substitution, audit writes, the DNS listener, and the
+acceptance owner's activation/heartbeat task. Provider, client, SQLite
+authority, external watchdog, control-plane server, Firecracker, guest, and
+nftables are excluded. The direct path bypasses an otherwise idle gateway
+process retained only for baseline observation. Both paths run in a disposable
+user/network namespace using a benchmark-only provider address, without WAN or
+TLS, guest-image changes, or production-daemon validator changes. The fixture
+authority is not a production control-plane deployment benchmark. These
+measurements establish isolated gateway cost for this bounded workload, not
+total platform overhead, a confidence interval, or a percentile.
+
+### Earlier live-run resource observations
+
+**Aggregate process cost (n=1 run).** The §49 run reports 59.12 s of CPU and a
+30 376 KiB peak RSS for the acceptance driver process. This covers the driver,
+gateway, and mocks during a 97.9 s run; Firecracker and guest processes are
+outside it. The model-only leg (n=1) separately records 0.04 s CPU (0.03 s
+harness upload, 0.01 s tool loop) and 32 KiB resident-set growth in that shared
+process. These are measured usage, not isolated gateway overhead versus a
+baseline. The 0.01 s loop sample has coarse CPU-clock resolution; it establishes
+no per-request cost distribution.
 
 **Model-only leg (§49).** One real four-turn tool loop ran in a real VM
 (`read` → `write` → `bash` → final), observed as 4 authenticated model requests
@@ -398,16 +447,18 @@ guest's own TAP in the positive-control window, and `cnt_other_denied` moving by
 exactly 6 packets on the same stimulus, while every counter read 0 across the
 agent loop.
 
-**Quarantine latency.** 23.656 ms is the interval in which the rule had fired
-and egress was still up — the exposure window, from the two timestamps the
-incident record already carries. One sample, this hardware, real watchdog
-holding the attachment live. It is not a distribution and no percentile is
-claimed from it.
+**Quarantine latency (n=1).** The
+`alert-to-network-cut-latency-is-bounded` case in
+`benchmarks/guard-phase2-acceptance.json` records 23.656 ms from
+`triggered_at` to `network_cut_at`: the exposure window in which the rule had
+fired but egress was still up. Same hardware, real watchdog holding the
+attachment live. It is not a distribution and establishes no percentile.
 
-**Not measured.** The gateway's CPU and memory cost in isolation against a
-host-served path, and any aarch64 runtime/performance figure. Only
-cross-compilation to aarch64 has been exercised. §51 therefore has bounded
-partial evidence, not a complete overhead characterization.
+**Not measured.** No aarch64 runtime/performance figure exists; only
+cross-compilation has been exercised. The controlled x86_64 resource benchmark
+above closes the previously missing isolated CPU/RSS evidence. Deployment-wide
+resource overhead and quarantine-latency distributions remain outside these
+bounded measurements.
 
 ## Known limitations
 
@@ -514,6 +565,11 @@ cargo build --release -p aiec-api --bin aiec-server -p aiec-cli --bin aiec \
 P2_DRIVER=$PWD/scripts/guard-phase2-acceptance.py \
   bash scripts/guard-phase2-acceptance.sh
 
+# §51: isolated CPU/RSS; no guest image or deployed process changes
+cargo build --release -p aiec-guard --example guard_resource_gateway
+python3 scripts/guard-resource-benchmark.py \
+  --output benchmarks/guard-resource-benchmark.json
+
 # After any guest-image change, before booting a guarded sandbox
 bash scripts/build-firecracker-guest.sh
 ```
@@ -523,13 +579,13 @@ bash scripts/build-firecracker-guest.sh
 | required area | evidence and disposition |
 |---|---|
 | Phase 1 enforcement, DNS, model credentials, telemetry | Live core suite: 48/48. Includes §49's model-only in-guest tool loop. Local mock providers only. |
-| Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29. The durable lifetime reaper itself has not been observed firing. |
+| Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29; alert→network-cut latency 23.656 ms (n=1), from the incident timestamps. The durable lifetime reaper itself has not been observed firing. |
 | Phase 3 MCP/GraphQL policy, proposals, human approval | Implemented and test-covered; §44 additionally proves the live approval API lifecycle. This is not a complete live MCP/GraphQL policy acceptance. |
 | Optional Phase 4 watcher | Implemented and test-covered; no complete live optional-watcher acceptance is claimed. |
 | Phase 5 canaries, image trust, identity, red-team CI | Implemented and test-covered; image verification and per-VM identity participate in the live VM suites. Full Phase 5 live acceptance remains absent. |
 | Topologies A and B | §49 completes a real in-guest tool loop; §50 completes an external loop with positive-control-validated host capture and counters (15/15). |
 | Existing lifecycle, snapshots, fencing, MCP, eval | Workspace regressions passed in the serial gate; compatibility suite passes 8/8 within its documented coverage. Untested legacy branches and strict response deserializers remain excluded. |
-| §51 performance | DNS, streaming, and shared-process CPU/RSS are recorded with hardware, kernel, architecture, and bounded sample sizes. Controlled gateway resource overhead remains absent. |
+| §51 performance | DNS upper-middle order statistics (n=10 per side), conventional streaming medians (n=3 per side), quarantine alert→network-cut latency (n=1), and isolated gateway CPU/RSS (n=7 matched pairs) have published artifacts, hardware/kernel/architecture, explicit baselines, and scope. No aarch64 runtime/performance or deployment-wide resource claim. |
 | Static quality gate | Serial gate passes. Parallel storage-test reliability remains unresolved; serial success does not prove the failure's cause. |
 
 This audit separates implementation and regression coverage from live proof.
