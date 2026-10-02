@@ -101,10 +101,35 @@ guarded sandbox reaches exactly one path - its own gateway - and model traffic
 carries a `placeholder://<binding>` that the gateway swaps for a real credential
 the guest never holds. No policy selected means no network.
 
+Around that:
+
+| | |
+|---|---|
+| **No egress without a witness** | A guarded attachment carries no network at all until an out-of-guest watchdog reports an observation it has verified. Stop reporting and the network is cut and stays cut. |
+| **Quarantine, not just refusal** | Repeated denials quarantine a machine: network cut, pause, forensic capture that never resumes it, durable quarantine state, an incident report and a notification. Repeating it returns the same incident. |
+| **Budgets a restart cannot reset** | Lifetime and model request and byte ceilings are control-plane state, reserved before a byte is forwarded. |
+| **Agent authority, not only destinations** | Where Guard can see a request it governs MCP method and tool names, GraphQL operations and root fields, and HTTP method and path. Anything unnamed is denied. |
+| **Propose, never approve** | An agent can ask for a policy change. Only a human can approve one, the verifier runs first, and only a separate human capability releases a held machine. |
+
+```bash
+aiec guard show <sandbox>         # policy hash, attachment, budgets, incident
+aiec guard events <sandbox>       # verified journal entries
+aiec guard quarantine <sandbox>   # operator-initiated
+aiec guard release <sandbox>      # human release of a held machine
+aiec guard proposals <sandbox>    # pending and decided policy proposals
+aiec guard verify policy.yaml     # compile and verify, apply nothing
+```
+
+The watchdog is a separate process, deliberately: it runs where the guest cannot
+reach it, and it can ask for a quarantine but never approve a policy or release
+one.
+
 Guard's relationship to OpenShell's policy schema, and the fields it refuses
 rather than approximates, is in
-[`docs/openshell-compatibility.md`](docs/openshell-compatibility.md). How to run
-and verify it: [`GUARD_POLICY.md`](GUARD_POLICY.md).
+[`docs/openshell-compatibility.md`](docs/openshell-compatibility.md). The
+policy format is [`docs/GUARD_POLICY.md`](docs/GUARD_POLICY.md), operating it is
+[`docs/GUARD.md`](docs/GUARD.md), and what it does and does not defend is
+[`docs/GUARD_THREAT_MODEL.md`](docs/GUARD_THREAT_MODEL.md).
 
 Details, including the limits we have not solved: [`SECURITY.md`](SECURITY.md).
 
@@ -335,6 +360,10 @@ aiec doctor                        # check every prerequisite
 its digest, the database, object storage, networking and TLS, and tells you
 exactly what is missing. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
+If you want Guard, the worker also needs `CAP_NET_ADMIN` for nftables and TUN/TAP.
+Without it a worker reports `network_policy: false` and refuses every governed
+placement, which is the honest outcome rather than a silent downgrade.
+
 ---
 
 ## Documentation
@@ -351,6 +380,9 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [`docs/API.md`](docs/API.md) | Every endpoint, with request and response shapes |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
 | [`SECURITY.md`](SECURITY.md) | Threat model, isolation boundaries, reporting a vulnerability |
+| [`docs/GUARD.md`](docs/GUARD.md) | Operating Guard: the watchdog, budgets, quarantine and release |
+| [`docs/GUARD_POLICY.md`](docs/GUARD_POLICY.md) | The Guard policy format, templates and verifier |
+| [`docs/GUARD_THREAT_MODEL.md`](docs/GUARD_THREAT_MODEL.md) | What Guard defends, and what it does not |
 | [`docs/MCP.md`](docs/MCP.md) | The local-only MCP server: giving an agent a disposable machine |
 | [`docs/known-defects.md`](docs/known-defects.md) | Open defects, resolved findings, and the cluster notes that cost time |
 | [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
@@ -366,7 +398,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | `crates/aiec-api` | The control plane, worker service and HTTP API |
 | `crates/aiec-storage` | PostgreSQL and S3-compatible persistence |
 | `crates/aiec-network-linux` | TAP and nftables isolation |
-| `crates/aiec-guard` | Out-of-guest policy, gateway, enforcement and evidence journal |
+| `crates/aiec-guard` | Out-of-guest policy, gateway, enforcement, watchdog, canaries and evidence journal |
 | `crates/aiec-client` | Rust SDK |
 | `sdk/python` | Python SDK (`pip install agentforge-sdk`) |
 | `policies/guard` | Shipped Guard policy templates, selection examples and boundaries |

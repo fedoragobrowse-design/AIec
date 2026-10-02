@@ -83,11 +83,14 @@ tenant B sandbox  ─┘
        exposed to the workload at all.</p>
   </div>
   <div class="block">
-    <h3>Filtered egress</h3>
-    <p>A sandbox cannot reach the host LAN, RFC1918 ranges, link-local and cloud
-       metadata addresses, the control plane, worker management endpoints, or
-       another tenant. Restricted network mode fails closed rather than silently
-       allowing traffic.</p>
+    <h3>Deny-all by default</h3>
+    <p>A sandbox reaches exactly one path, its own gateway. The host LAN,
+       RFC1918 ranges, link-local and cloud metadata addresses, the control
+       plane, worker management endpoints, other tenants, all IPv6 and all
+       forwarding are dropped, with no NAT and no accept on connection state.
+       A sandbox that asks for a network without selecting a policy is refused
+       rather than quietly filtered or quietly granted; the unguarded backend
+       exists only if the operator names it.</p>
   </div>
   <div class="block">
     <h3>Governance outside the guest</h3>
@@ -96,8 +99,9 @@ tenant B sandbox  ─┘
        reaches exactly one path, its own gateway; model traffic carries a
        placeholder that the gateway swaps for a real credential the guest never
        holds, and no policy selected means no network. Encrypted tunnels are not
-       inspected, so a rule needing method or path visibility is refused rather
-       than quietly unenforced.</p>
+       inspected by default, so a rule needing method or path visibility is
+       refused unless the operator turns on interception and acknowledges that
+       Guard will then hold a key able to read the traffic it governs.</p>
   </div>
   <div class="block">
     <h3>Tenancy is enforced server-side</h3>
@@ -106,6 +110,88 @@ tenant B sandbox  ─┘
        tenant's ID returns <code>404</code>, not their data.</p>
   </div>
 </div>
+
+<h2>Guard</h2>
+<p>
+  Guard is the part of AIec that governs a sandbox from outside it. The guest may
+  be compromised; the harness inside it may be compromised; the code it runs may
+  be hostile. What still holds is the network and credential boundary, because
+  the things enforcing it are not in the guest.
+</p>
+<div class="grid-2">
+  <div class="block">
+    <h3>Nothing is trusted from inside</h3>
+    <p>A guarded attachment carries no egress until an out-of-guest watchdog
+       reports an observation it has verified. Only verified observations earn a
+       heartbeat, and the heartbeat is what keeps the network up.</p>
+  </div>
+  <div class="block">
+    <h3>Silence is not health</h3>
+    <p>If the watchdog stops reporting, the gateway and the kernel rules cut the
+       attachment and the cut latches. The machine is not destroyed, so an
+       operator can still pause it and take a forensic capture.</p>
+  </div>
+  <div class="block">
+    <h3>Quarantine is one path</h3>
+    <p>Repeated denials request a quarantine. The control plane cuts the network,
+       pauses the machine, captures it without resuming, records durable
+       quarantine state, appends an authoritative event, writes an incident
+       report and notifies. Calling it twice returns the same incident rather
+       than acting again; only a human release reopens a held machine.</p>
+  </div>
+  <div class="block">
+    <h3>Budgets are durable</h3>
+    <p>Lifetime and model request and byte ceilings live in the control plane,
+       and every request and byte is reserved there before it is forwarded. A
+       worker restart cannot hand a machine a fresh allowance, and an authority
+       that cannot be reached refuses traffic rather than falling back to
+       memory.</p>
+  </div>
+  <div class="block">
+    <h3>Agent authority, not just destinations</h3>
+    <p>Where Guard can see a request it governs more than the destination: MCP
+       method and tool names, GraphQL operation kind, name and root fields, and
+       HTTP method and path. Anything not named is denied, and a tunnel Guard
+       cannot read is refused rather than forwarded ungoverned.</p>
+  </div>
+  <div class="block">
+    <h3>An agent may ask; only a human may approve</h3>
+    <p>A policy change arrives as a proposal. Approval is a separate capability,
+       the verifier runs before anything is applied, and the apply itself
+       happens on the worker that owns the rules. The release capability is
+       separate again: the key that can cause a quarantine is not the key that
+       undoes one.</p>
+  </div>
+  <div class="block">
+    <h3>Evidence that cannot be rewritten</h3>
+    <p>Every decision is a hash-chained record outside the guest, anchored in
+       the control plane. A guest that reports what happened is treated as
+       advice; only what Guard observed counts.</p>
+  </div>
+  <div class="block">
+    <h3>A second reviewer that can only tighten</h3>
+    <p>The optional watcher returns one of four verdicts and maps them onto
+       actions that already exist and are all restrictive. It has no path to an
+       allow, an approval or a release, it is off by default, and it never sees
+       anything private chain-of-thought.</p>
+  </div>
+  <div class="block">
+    <h3>Tripwires, signed images, per-machine identity</h3>
+    <p>Synthetic canaries mark a fake file, hostname or credential so touching one
+       is caught outside the guest. Guarded workloads can require a signed image
+       manifest with verified kernel and rootfs digests and refuse to boot
+       without it, and each machine gets its own short-lived control identity
+       that no other sandbox can use and no snapshot carries.</p>
+  </div>
+</div>
+<p>
+  The full statements, including everything Guard does <em>not</em> enforce, are
+  in <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD_THREAT_MODEL.md">docs/GUARD_THREAT_MODEL.md</a>,
+  with the policy format in
+  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD_POLICY.md">docs/GUARD_POLICY.md</a>
+  and the operator guide in
+  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD.md">docs/GUARD.md</a>.
+</p>
 
 <h2>Credentials</h2>
 <ul class="tight">

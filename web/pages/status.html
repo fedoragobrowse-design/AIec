@@ -20,6 +20,11 @@
   <tr><td>PostgreSQL state, leases, quotas</td><td>Working</td></tr>
   <tr><td>S3-compatible object storage</td><td>Working</td></tr>
   <tr><td>Worker recovery and fencing</td><td>Working — reassignment at a higher generation, stale workers rejected</td></tr>
+  <tr><td>Guard packet enforcement, DNS and model gateway</td><td>Working — verified on real microVMs with real nftables, including a full-snapshot scan for the model credential</td></tr>
+  <tr><td>Watchdog and dead-man switch</td><td>Working — a guarded attachment carries no egress until an out-of-guest watchdog reports, and is cut when reporting stops</td></tr>
+  <tr><td>Quarantine, incident report, human release</td><td>Working — cut, pause, forensic capture, durable state and report, verified end to end on a real microVM</td></tr>
+  <tr><td>Durable lifetime and model budgets</td><td>Working — reserved in the control plane before traffic is forwarded</td></tr>
+  <tr><td>Layer 7 governance, proposals, canaries, signed images</td><td>Working — covered by unit and integration tests against local mocks</td></tr>
 </table>
 
 <h2>Limited</h2>
@@ -37,7 +42,8 @@
 <p>Stated plainly so nobody plans around them:</p>
 <ul class="tight">
   <li>Per-tenant <strong>snapshot and persistent-storage byte quotas</strong>. Per-request size ceilings exist; aggregate accounting does not yet.</li>
-  <li>A control-plane <strong>sandbox lifetime reaper</strong>. Lifetime is enforced by the runtime; a worker restart resets the in-process timer.</li>
+  <li>A control-plane <strong>lifetime reaper observed firing in a live run</strong>. For guarded sandboxes the ceilings and expiry are durable control-plane state and a worker restart cannot reset them; the reaper that acts on an expired budget is implemented and database-tested, but we have not watched it fire end to end.</li>
+  <li><strong>Method and path policy without TLS interception.</strong> In the default SNI mode Guard sees the hostname and forwards the tunnel; method and path rules require the operator to enable interception and acknowledge that Guard then holds a key able to read what it forwards.</li>
   <li><strong>Multi-host</strong> validation with separate control and worker machines. Same-host multi-worker recovery is proven; genuinely distributed operation is not yet.</li>
   <li>An <strong>audit log viewer</strong> in the dashboard. Events are recorded, the UI is not built.</li>
   <li><strong>Usage is recorded but not billed.</strong> Every metric is exported for your own capacity planning; there is no payment path.</li>

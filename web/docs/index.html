@@ -141,10 +141,45 @@ it. No policy selected means no network.</p>
 run = af.runs.create(command=["pytest", "-q"], guard="model-only")</code></pre>
 <p>A Guard selection replaces <code>network</code> rather than sitting beside it:
 two descriptions of one egress would be two paths to the internet, and the
-wider one would be the one that applied. Encrypted tunnels are not inspected,
-so a rule that needs method or path visibility is refused rather than quietly
-unenforced. <code>GUARD_POLICY.md</code> in the repository has the templates,
-the operator boundary, and how to verify a policy without deploying it.</p>
+wider one would be the one that applied. Encrypted tunnels are not inspected in
+the default mode, so a rule that needs method or path visibility is refused
+rather than quietly unenforced — unless you turn interception on and accept
+that Guard will then hold a key able to read what it forwards.
+<code>GUARD_POLICY.md</code> in the repository has the templates, the operator
+boundary, and how to verify a policy without deploying it.</p>
+
+<h3>What runs alongside it</h3>
+<ul class="tight">
+  <li><strong>A watchdog.</strong> One process per guarded sandbox, outside the
+      guest. An attachment carries no egress until it reports a verified
+      observation; if it stops reporting, the network is cut and stays cut. Run
+      one with <code>aiec-guard-watchdog</code>, using a key that holds only
+      <code>guard:read</code>, <code>guard:heartbeat</code> and
+      <code>guard:quarantine</code>.</li>
+  <li><strong>Durable budgets.</strong> Lifetime and model request and byte
+      ceilings are control-plane state, reserved before traffic is forwarded, so
+      a worker restart cannot reset them.</li>
+  <li><strong>Quarantine and release.</strong> Repeated denials quarantine a
+      machine; releasing one is a separate human capability.</li>
+  <li><strong>Layer 7 rules where visible.</strong> MCP tool names, GraphQL
+      operations and root fields, and HTTP method and path, with anything unnamed
+      denied.</li>
+  <li><strong>Policy proposals.</strong> An agent may ask for a change; only a
+      human may approve one, and the verifier runs first.</li>
+</ul>
+
+<h3>Operating a guarded sandbox</h3>
+<pre><code>aiec guard show &lt;sandbox&gt;         # policy hash, attachment, budgets, incident
+aiec guard events &lt;sandbox&gt;       # verified journal entries
+aiec guard quarantine &lt;sandbox&gt;   # operator-initiated
+aiec guard release &lt;sandbox&gt;      # reopen a held machine
+aiec guard proposals &lt;sandbox&gt;    # pending and decided
+aiec guard verify policy.yaml       # compile and verify, apply nothing
+aiec guard import-openshell policy.yaml --out guard.yaml</code></pre>
+<p>The watchdog and the gateway need <code>CAP_NET_ADMIN</code>: without it a
+worker reports <code>network_policy: false</code> and refuses every governed
+placement rather than pretending to enforce. Check it with
+<code>aiec doctor</code>.</p>
 
 <h2 id="mcp">Driving it from an agent</h2>
 <p>The <a href="/mcp">local MCP server</a> exposes the same lifecycle as tools:
