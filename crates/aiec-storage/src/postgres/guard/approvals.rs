@@ -126,6 +126,25 @@ impl PostgresRepository {
     /// for a pending row whose window has already closed — see migration
     /// `0022_guard_tool_approval_expired_reopen.sql`.
     ///
+    /// On the relationship to migration 0021, which keeps the *oldest* pending
+    /// row of each duplicate group. The two are complementary rather than in
+    /// tension. 0021 picks the row whose expiry is earliest so collapsing
+    /// duplicates cannot leave an operator holding a request whose window has
+    /// already closed — it chooses which row closes soonest. The reopen makes
+    /// that imminent closing recoverable instead of terminal; without it,
+    /// "closes soonest" would quietly become "becomes undecidable and
+    /// permanently unaskable".
+    ///
+    /// The alternative — leaving the closed row stale and minting a fresh one
+    /// beside it — was rejected. `state` admits only `pending`, `granted` and
+    /// `denied`, so retiring the old row out of the live index means writing it
+    /// as `denied`. That fabricates an operator refusal nobody made and tells
+    /// the asker "a human said no" for a request that merely timed out; 0021
+    /// additionally requires a non-null reviewer label on any non-pending row,
+    /// so it would have to invent an approver identity to satisfy the
+    /// constraint. Refreshing in place asks the same question again with a
+    /// real window, which is what the retry actually means.
+    ///
     /// The reopen is a conditional `CASE` rather than a `DO UPDATE ... WHERE`.
     /// A conditional `WHERE` returns *no row* when the condition is false, so a
     /// retry of a still-open request would come back with nothing and the

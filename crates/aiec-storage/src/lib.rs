@@ -8,6 +8,9 @@ mod postgres;
 mod run_queue;
 mod snapshots;
 
+#[cfg(test)]
+mod tests;
+
 use aiec_core::{
     ApiKeyRecord, ApprovalDecisionRequest, ApprovalState, CoreError, GuardProposal,
     GuardToolApproval, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
@@ -521,7 +524,11 @@ impl MemoryRepository {
             // the conditional `CASE` in the Postgres upsert. An unexpired row
             // is returned as-is, so a retry joins the request an operator may
             // already be looking at without extending its deadline.
-            if existing.expires_at <= approval.created_at {
+            // `Utc::now()` rather than the caller's `created_at`, so this
+            // matches the Postgres branch reading the server clock. Comparing
+            // against caller-supplied time would reopen here but not there for
+            // a replayed request carrying its original timestamps.
+            if existing.expires_at <= Utc::now() {
                 let reopened = data
                     .guard_tool_approvals
                     .get_mut(&existing.id)
