@@ -509,6 +509,23 @@ def main() -> int:
     ok_report = "#" in ((final or {}).get("report") or "")
     ok_complete = bool((final or {}).get("completed_at"))
     case("quarantine-cuts-the-network", ok_cut, {"network_cut_at": (final or {}).get("network_cut_at")})
+    # Alert -> network cut, measured on the two timestamps the incident record
+    # already carries. `triggered_at` is when the watchdog's rule fired and the
+    # alert existed; `network_cut_at` is when egress was actually gone. The
+    # interval between them is the window in which a denied guest still had a
+    # network, so it is reported rather than left to be inferred from the pair.
+    triggered_at = (final or {}).get("triggered_at")
+    cut_at = (final or {}).get("network_cut_at")
+    cut_latency_ms = None
+    if triggered_at and cut_at:
+        cut_latency_ms = (
+            datetime.fromisoformat(cut_at.replace("Z", "+00:00"))
+            - datetime.fromisoformat(triggered_at.replace("Z", "+00:00"))
+        ).total_seconds() * 1000.0
+    case("alert-to-network-cut-latency-is-bounded", cut_latency_ms is not None and 0 <= cut_latency_ms <= 30000,
+         {"triggered_at": triggered_at, "network_cut_at": cut_at,
+          "alert_to_cut_ms": cut_latency_ms,
+          "meaning": "the interval in which the alert existed and egress was not yet gone"})
     case("quarantine-pauses-the-vm", ok_paused, {"paused_at": (final or {}).get("paused_at")})
     case("quarantine-captures-forensics", ok_snapshot, {"snapshot_id": (final or {}).get("snapshot_id")})
     case("quarantine-writes-an-incident-report", ok_report,

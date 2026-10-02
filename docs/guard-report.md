@@ -158,6 +158,12 @@ counter, and the chatbot counter did not move. Asked through the gateway instead
 of through its own resolver, it got `rcode: 5` (`REFUSED`) with zero answers, and
 the gateway wrote a chain-linked denial naming `chatbot.example.test`.
 
+The reproduction deliberately produces one denial, not a burst, so it does not
+cross a rule threshold and no quarantine is raised. That path is covered by the
+phase 2 run above, where a triggered rule is taken all the way to
+`completed_at`; the reproduction's job is to establish that the request is
+blocked at all, which is the precondition the threshold logic sits behind.
+
 **Phase 2 — `benchmarks/guard-phase2-acceptance.json`: PASS, 28 cases, no
 cleanup errors, 77 seconds.** Real control plane, worker, guest, watchdog
 process, database and kernel tables. Observed: guarded start; a narrowly-scoped
