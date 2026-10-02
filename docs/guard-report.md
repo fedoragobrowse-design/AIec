@@ -113,10 +113,10 @@ inverted so that subdomains did not match and unrelated domains did.
 
 ## Known limitations
 
-1. **Resolved: the deployed guest image was rebuilt and both phases re-proved
-   on it.** The deployed `agentforge-rootfs.ext4` carries a guest agent that
-   predates the per-sandbox control identity, so a guarded machine failed to
-   boot with `early eof` against the new host. A new image was built with
+1. **Resolved as a blocker; the rebuilt image is not yet deployed.** The
+   deployed `agentforge-rootfs.ext4` carries a guest agent that predates the
+   per-sandbox control identity, so a guarded machine failed to boot with
+   `early eof` against the new host. A new image was built with
    `scripts/build-firecracker-guest.sh` - the script remains the only writer of
    the recorded digests - using `AIEC_GUEST_BINARY` for a guest agent compiled by
    `scripts/guest-musl-build.Dockerfile`, because this workstation has the musl
