@@ -96,11 +96,15 @@ mkdir -p "$state"
 
 key=$(python3 -c 'import secrets;print(secrets.token_hex(24))')
 
-export P2_CP="https://127.0.0.1:18444"
-export P2_CP_BIND=127.0.0.1:18444
-export P2_WORKER="https://127.0.0.1:19444"
-export P2_WORKER_BIND=127.0.0.1:19444
-export P2_WORKER_BIND2=127.0.0.1:19445
+# Ports are overridable so a second acceptance suite can run against the same
+# binaries on the same host without colliding with a suite already in flight.
+cp_port=${P2_CP_PORT:-18444}
+worker_port=${P2_WORKER_PORT:-19444}
+export P2_CP="https://127.0.0.1:$cp_port"
+export P2_CP_BIND=127.0.0.1:$cp_port
+export P2_WORKER="https://127.0.0.1:$worker_port"
+export P2_WORKER_BIND=127.0.0.1:$worker_port
+export P2_WORKER_BIND2=127.0.0.1:$((worker_port + 1))
 export P2_TENANT=$(cat /proc/sys/kernel/random/uuid)
 export P2_API_KEY="af_live_$key"
 export P2_WORKER_TOKEN="af_live_$key"

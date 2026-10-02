@@ -1,0 +1,158 @@
+{
+  "schema": "aiec.guard.compat-acceptance.v1",
+  "status": "PASS",
+  "passed": 8,
+  "cases": 8,
+  "cases_detail": [
+    {
+      "case": "pre-guard-create-body-is-accepted",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "body": {
+          "id": "01a0fb16-ac7c-752e-b00c-00d1097b1ae1",
+          "tenant_id": "afb04615-72be-4fa8-b68d-71c5714d7e04",
+          "node_id": "01a0fb16-4abb-703b-8cf3-1cb2fdd3369b",
+          "image_id": "afimg1_57b5b9aef43c7efac07f802ecf6ae320f57fe12e44581f34b234871a82cdbd3c",
+          "state": "running",
+          "runtime": "firecracker",
+          "cpu": 1,
+          "memory_mb": 512,
+          "disk_mb": 4096,
+          "timeout_seconds": 900,
+          "network": {
+            "enabled": false
+          },
+          "environment": {
+            "workspace": {
+              "type": "empty"
+            },
+            "toolkits": [],
+            "layers": [],
+            "guard": {
+              "topology": "outside",
+              "policy_template": "no-network",
+              "policy": null,
+              "model_endpoint": null,
+              "allowlist": [],
+              "watchdog_timeout_ms": 10000,
+              "max_model_requests": 10000,
+              "watcher": {
+                "enabled": false,
+                "failure_mode": "continue_with_rules",
+                "sample_rate": 10,
+                "batch_size": 20,
+                "token_budget": 200000,
+                "cost_budget_micros": 0
+              },
+              "canaries": {
+                "files": [],
+                "hostnames": [],
+                "credentials": []
+              },
+              "require_signed_image": false
+            },
+            "guard_policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+          },
+          "created_at": "2026-10-02T05:29:22.300922Z",
+          "updated_at": "2026-10-02T05:29:22.308878234Z",
+          "runtime_path": null
+        }
+      }
+    },
+    {
+      "case": "pre-guard-response-fields-are-present-and-typed",
+      "status": "PASS",
+      "evidence": {
+        "missing": [],
+        "mistyped": [],
+        "observed_types": {
+          "created_at": "str",
+          "environment": "dict",
+          "id": "str",
+          "network": "dict",
+          "runtime": "str",
+          "state": "str",
+          "tenant_id": "str"
+        },
+        "state": "running"
+      }
+    },
+    {
+      "case": "guard-is-injected-by-default-and-the-cutover-is-recorded",
+      "status": "PASS",
+      "evidence": {
+        "top_level_guard_keys": [],
+        "environment_guard_present": true,
+        "policy_template": "no-network",
+        "note": "a pre-Guard Firecracker client is now guarded by default; this is the intentional security cutover, not a silent change"
+      }
+    },
+    {
+      "case": "legacy-runtime-spellings-resolve-to-one-runtime",
+      "status": "PASS",
+      "evidence": {
+        "by_spelling": {
+          "bwrap-dev": {
+            "status": 400,
+            "code": "runtime_unavailable",
+            "message": "runtime BwrapDev is not registered"
+          },
+          "bwrap_dev": {
+            "status": 400,
+            "code": "runtime_unavailable",
+            "message": "runtime BwrapDev is not registered"
+          }
+        },
+        "note": "unavailable on this deployment (no BwrapDev worker); the claim is that both spellings resolve to the same runtime, not that the runtime is available"
+      }
+    },
+    {
+      "case": "exec-works-on-a-pre-guard-sandbox",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "stdout": "compat-ok",
+        "exit_code": 0
+      }
+    },
+    {
+      "case": "file-round-trip-works",
+      "status": "PASS",
+      "evidence": {
+        "write_status": true,
+        "read_status": 200,
+        "content": "pre-guard bytes\n"
+      }
+    },
+    {
+      "case": "pre-guard-destroy-reaches-a-terminal-state",
+      "status": "PASS",
+      "evidence": {
+        "final_state": "destroyed"
+      }
+    },
+    {
+      "case": "legacy-network-opt-in-cannot-unguard-a-firecracker-sandbox",
+      "status": "PASS",
+      "evidence": {
+        "worker_flag": "AIEC_ALLOW_LEGACY_NETWORK=1",
+        "state": "running",
+        "guard_present": true,
+        "policy_template": "no-network",
+        "network": {
+          "enabled": true
+        },
+        "note": "the opt-in is unreachable on Firecracker because Guard is injected for every such request; this asserts it grants nothing here"
+      }
+    }
+  ],
+  "failing": [],
+  "cleanup_errors": [],
+  "opt_ins_at_start": {
+    "AIEC_ALLOW_LEGACY_NETWORK": "",
+    "AIEC_ALLOW_REDUCED_ISOLATION": ""
+  },
+  "elapsed_seconds": 58.982,
+  "finished_at": "2026-10-02T05:29:55.686373+00:00"
+}

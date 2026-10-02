@@ -173,11 +173,64 @@ triggered rule; the full quarantine chain to `completed_at`; resume refused;
 a repeat quarantine returning the same incident; a worker restart leaving the
 quarantine in force; and the sandbox held rather than orphaned.
 
+**Backward compatibility —
+`benchmarks/guard-compat-acceptance.json`: PASS, 8 cases, 59.0 seconds, no
+cleanup errors.** A third live suite, run the same way against the same deployed
+binaries, exercising only what was true of the product before Guard existed:
+the create body a pre-Guard client sends, the legacy response fields and their
+types, exec, the file round trip, destroy, the two spellings of the dev runtime,
+and the fact that `AIEC_ALLOW_LEGACY_NETWORK=1` cannot unguard a Firecracker
+sandbox. The launcher is the phase 2 one with different ports, so the two suites
+can run on one host.
+
+Two properties are deliberately *not* claimed by that suite.
+`AIEC_ALLOW_LEGACY_NETWORK` is only asserted to grant nothing on Firecracker,
+where Guard is injected into every request; the branch it actually guards —
+`environment.guard.is_none()` — is unreachable on this deployment, so the flag
+is not exercised where it takes effect. And `AIEC_ALLOW_REDUCED_ISOLATION` is
+not tested here at all.
+
 **Static gates.** `scripts/gate.sh` passes: `fmt`, clippy with `-D warnings`,
 the full workspace test suite (875 tests) including the Postgres paths, the SDK
 import contract, 44 Python SDK tests, and an `aarch64-unknown-linux-gnu`
 cross-check of every target. A step that cannot run reports `SKIPPED` rather
 than `ok`.
+
+### What is not backward compatible, stated plainly
+
+One thing changed for a client that asked for nothing, and it is a security
+change rather than an oversight: **a Firecracker sandbox is now guarded by
+default.** `crates/aiec-api/src/lib.rs:1884` injects `environment.guard` with
+the default `no-network` template into every Firecracker request that omits it.
+A pre-Guard client therefore gets a sandbox with no egress, whether or not it
+knows Guard exists. The request shape, the response shape, and the exec and
+file operations are unchanged; what changed is the default posture, and it is
+recorded on the wire under `environment.guard` rather than applied silently.
+
+The consequence worth stating plainly: **`AIEC_ALLOW_LEGACY_NETWORK` cannot
+restore the old behaviour for Firecracker.** The flag is consulted in
+`GuardNetworkManager::prepare` behind `sandbox.environment.guard.is_none()`,
+and on Firecracker that is never true. There is no supported configuration in
+which a Firecracker sandbox runs with unguarded network — which is the intended
+outcome, but it means the flag is not the escape hatch an operator upgrading
+from a pre-Guard deployment would expect it to be.
+
+Everything else held: the create body a pre-Guard client sends is still
+accepted, the legacy response fields are still present and still have the types
+a pre-Guard parser expects, exec works, the file round trip works, and destroy
+reaches a terminal state. The dev-runtime spellings `bwrap-dev` and `bwrap_dev`
+still parse to the same runtime — both are refused identically, naming
+`BwrapDev` — which is what distinguishes a parser that understands the
+underscore form from one that silently stopped accepting it. That runtime is not
+available on this deployment and nothing here claims that it is.
+
+One qualification on that, because "additive" is doing work it should not be
+asked to do: the sandbox response is **not** byte-identical to a pre-Guard one.
+It gained a nested `environment.guard`. Every field a pre-Guard client read is
+unchanged, but a client built on a strict deserializer that rejects unknown
+fields will fail on it. The Rust SDK and the Python SDK both tolerate the extra
+field; a stricter third-party client may not, and this suite does not claim to
+have tested one.
 
 ## Defects the acceptance work found and fixed
 
@@ -197,6 +250,37 @@ phase 2 launcher's second `trap ... EXIT` silently replaced the first, so every
 run leaked its lock and the next one refused while nothing was running; and the
 same launcher stopped postgres but never reaped the control plane and worker it
 had launched, so every interrupted run left servers bound to that run's ports.
+
+The compatibility suite found two false passes and one case pointed at the wrong
+point in the lifecycle. Both kinds are worth recording, because a false pass is
+worse than a broken assertion — it is a claim about the product that nothing
+observed:
+
+- **Guard defaulting reported as "no Guard".** A case asserting that a
+  pre-Guard client saw no policy scanned only top-level response keys. Guard is
+  injected under `environment.guard`, so the sandbox was guarded the whole time
+  and the case passed on what it had failed to look at.
+- **Types recorded but never checked.** The response case wrote the observed
+  type of each field into its evidence and asserted only that the field was
+  present. It now asserts `isinstance` for every field it names.
+- **The legacy-network case asking a question the runtime cannot answer.** This
+  one failed loudly rather than passing falsely, which is why it was found. The
+  case had asserted that create returns 4xx without the opt-in; it returned 200
+  and the suite reported a failure. Reading the source to explain the 200 turned
+  up the finding recorded above: `crates/aiec-api/src/lib.rs:1884` injects
+  `environment.guard` into every Firecracker request, so
+  `GuardNetworkManager::prepare`'s `guard.is_none()` branch is never entered
+  and the flag is never consulted on that runtime. No delayed refusal was
+  observed, and none is claimed.
+
+  The case was rewritten to assert what is actually observable here: with
+  `AIEC_ALLOW_LEGACY_NETWORK=1` set on the worker, a Firecracker sandbox still
+  reaches `running` with its Guard metadata intact. The template is recorded in
+  the evidence rather than asserted, and no egress probe is made, so this makes
+  no claim to have watched traffic or proved the network is cut — the
+  enforcement evidence for that is in the phase 1 and phase 2 runs above. The
+  flag is not exercised where it takes effect, because no reachable path in
+  this deployment reaches it.
 
 ## What Guard costs
 
