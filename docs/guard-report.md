@@ -174,10 +174,12 @@ docker cp af-guest:/out-aiec-guest ./aiec-guest
 docker rm af-guest
 file ./aiec-guest        # must say static(-pie) linked
 
-# 2. Build the image with the script that owns the recorded digests. It
-#    refuses a binary that is not statically linked, and one that cannot read
-#    the planted control identity, so a stale agent cannot be baked into an
-#    image whose digest is about to be trusted.
+# 2. Build the image with the script that owns the recorded digests. On a host
+#    with no Rust toolchain, step 1's binary is all it needs: `cargo` is only
+#    required when the script compiles the guest itself. It refuses a binary
+#    that is not statically linked, and one that cannot read the planted
+#    control identity, so a stale agent cannot be baked into an image whose
+#    digest is about to be trusted.
 AIEC_GUEST_BINARY=$PWD/aiec-guest \
 AIEC_GUEST_SECRET=$(openssl rand -hex 32) \
 AIEC_KERNEL=/path/to/vmlinux \
@@ -212,12 +214,23 @@ bash scripts/build-firecracker-guest.sh
 
 ## Verdict
 
-**AIEC GUARD: INCOMPLETE**
+**AIEC GUARD: PHASES 1-2 PROVEN LIVE; PHASES 3-5 IMPLEMENTED, NOT YET PROVEN LIVE**
 
-Phases 1 and 2 are implemented and proven on real machines: 41/41 and 28/28,
-with the artifacts above. Phases 3 to 5 are implemented and covered by
-unit and integration tests, with their acceptance exercised against local
-mocks. What is not done is the deployment step that makes per-VM identities
-real on this host, and the unresolved guest-packet path in the phase-2
-namespace. The remaining blockers are the seven listed above, and the first
-is a rebuild of the guest image.
+Phases 1 and 2 run on real Firecracker machines against one image whose digest
+is a consequence of the build that wrote it: 41/41 and 28/28, no cleanup
+errors. That includes the packet path that was previously undecided - a guest
+packet reaches `GuardNetworkManager::create_guard`'s own attachment and is
+denied there - and the guest identity path that was previously unbootable.
+
+Phases 3 to 5 are implemented and covered by unit and integration tests, with
+their acceptance exercised against local mocks rather than real machines. Two
+green artifacts do not make that whole surface proven, and the two are kept
+apart on purpose.
+
+Still outstanding, from the limitations above: items 2 to 7 - the lifetime
+reaper has never fired in a live run, `CAP_NET_ADMIN` is absent from the
+production worker on this host, layer 7 needs interception to govern a
+tunnelled request, no approval flow issues human decisions, and multi-host
+deployment modes are documented but unvalidated. Two of those are operator
+actions rather than code: deploying the rebuilt image, and granting the worker
+`CAP_NET_ADMIN`.

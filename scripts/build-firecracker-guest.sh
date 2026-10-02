@@ -21,7 +21,13 @@ fi
 BASE_IMAGE=${AIEC_GUEST_BASE_IMAGE:-debian:bookworm-slim}
 KERNEL=${AIEC_KERNEL:-$ROOT/.aiec/images/vmlinux}
 ROOTFS_SIZE=${AIEC_GUEST_ROOTFS_SIZE:-4G}
-for cmd in cargo mke2fs e2fsck resize2fs tar sha256sum awk date; do command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 1; }; done
+# `cargo` is only needed when this script compiles the guest itself. The whole
+# point of AIEC_GUEST_BINARY is a host that has no Rust toolchain at all, so
+# demanding cargo before consulting the override makes the escape hatch
+# unreachable on exactly the machine it exists for.
+TOOLS="mke2fs e2fsck resize2fs tar sha256sum awk date"
+[ -n "${AIEC_GUEST_BINARY:-}" ] || TOOLS="cargo $TOOLS"
+for cmd in $TOOLS; do command -v "$cmd" >/dev/null || { echo "missing $cmd" >&2; exit 1; }; done
 
 step() { printf '==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
