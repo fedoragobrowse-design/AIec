@@ -152,48 +152,10 @@ export AIEC_STATE_DIR=$root/state-vms
 # The control plane resolves every sandbox image reference through a signed
 # manifest and checks the rootfs digest in it, so the run needs a manifest that
 # names this run's rootfs. An operator-supplied one is used as given and must
-# exist - a manifest that is named and absent is a misconfiguration, and the
-# control plane otherwise reports it as an opaque file-not-found. With none
-# supplied the launcher mints one per run, signed with a per-run secret in the
-# scratch directory, so nothing is written into the deployment's image
-# directory and no run can inherit another's key. The digest is read from the
-# artifact metadata the guest build wrote, never recomputed here.
-if [[ -z ${AIEC_IMAGE_MANIFEST:-${AGENTFORGE_IMAGE_MANIFEST:-}} ]]; then
-  p5_image_manifest_dir=$root/image-manifest
-  mkdir -p "$p5_image_manifest_dir"
-  chmod 700 "$p5_image_manifest_dir"
-  if [[ ! -f $p5_image_manifest_dir/manifest.json || ! -f $p5_image_manifest_dir/secret ]]; then
-    python3 - "$p5_image_manifest_dir" "${P5_IMAGE:-python:3.13}" \
-      "$(dirname "$AIEC_ROOTFS")/guest-capabilities.json" <<'PY'
-import hashlib, hmac, json, os, secrets, sys
-
-directory, reference, capabilities = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(capabilities) as handle:
-    digest = json.load(handle)["rootfs_sha256"]
-secret = secrets.token_hex(32)
-signature = hmac.new(
-    secret.encode(), reference.encode() + b"\0" + digest.encode(), hashlib.sha256
-).hexdigest()
-with open(os.path.join(directory, "manifest.json"), "w") as handle:
-    json.dump({"reference": reference, "rootfs_sha256": digest, "signature": signature}, handle)
-# Owner-only from the first byte: this file is the deployment signing secret
-# for the lifetime of the run, not something to create readable and tighten.
-fd = os.open(os.path.join(directory, "secret"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as handle:
-    handle.write(secret)
-PY
-    chmod 600 "$p5_image_manifest_dir"/*
-  fi
-  export AIEC_IMAGE_MANIFEST=$p5_image_manifest_dir/manifest.json
-  export AIEC_IMAGE_MANIFEST_SECRET=$(cat "$p5_image_manifest_dir/secret")
-else
-  export AIEC_IMAGE_MANIFEST=${AIEC_IMAGE_MANIFEST:-$AGENTFORGE_IMAGE_MANIFEST}
-  export AIEC_IMAGE_MANIFEST_SECRET=${AIEC_IMAGE_MANIFEST_SECRET:-${AGENTFORGE_IMAGE_MANIFEST_SECRET:-}}
-  [[ -f $AIEC_IMAGE_MANIFEST ]] || {
-    printf 'image manifest %s does not exist\n' "$AIEC_IMAGE_MANIFEST" >&2
-    exit 2
-  }
-fi
+# exist; with none supplied the run mints its own, signed with a per-run secret
+# in the scratch directory.
+acceptance_prepare_image_manifest "$root" "${P5_IMAGE:-python:3.13}" \
+  "$(dirname "$(realpath "$AIEC_ROOTFS")")/guest-capabilities.json"
 # A distinct key per run for the image harness's own scratch trust store; it
 # never leaves the scratch directory and is not the deployment signing key.
 export P5_IDENTITY_SIGNING_KEY=$key
@@ -204,7 +166,7 @@ export P5_IDENTITY_SIGNING_KEY=$key
 # written into the deployment's image directory, and no run can inherit
 # another's key. The metadata the runtime verifies the guest against travels
 # with the manifest, because both are read from the artifact directory.
-p5_artifact=${AIEC_GUEST_ARTIFACT_DIR:-$(dirname "$AIEC_ROOTFS")}
+p5_artifact=${AIEC_GUEST_ARTIFACT_DIR:-$(dirname "$(realpath "$AIEC_ROOTFS")")}
 p5_trust=$root/image-trust
 mkdir -p "$p5_trust"
 cp "$p5_artifact/guest-capabilities.json" "$p5_trust/" \

@@ -695,3 +695,129 @@ P3_PG_ADMIN_URL=postgresql://user:password@127.0.0.1:5432/aiec \
 The report is written to `benchmarks/guard-phase3-acceptance.json`, with
 per-case detail, the provider request count, and the observation provenance
 that distinguishes host-observed evidence from a guest's own claim.
+
+
+## What Phase 4 changed in the product
+
+The Phase 4 harness runs a real watcher and a real watchdog against a real
+attachment. Two defects in the quarantine path were found by running it, both
+of them invisible to unit coverage because both depend on a *sequence* rather
+than on a single call.
+
+**A forensic capture of an already-paused VM waited thirty seconds for a guest
+that could not answer.** `capture_forensics` asks the guest to
+`PrepareSnapshot` - which fsyncs the workspace inside the guest - before it
+issues the pause itself, because a paused guest has no agent scheduled to
+respond. Quarantine routinely reaches a machine that is *already* paused: an
+operator pause, or an earlier incident. On that path nothing was running to
+answer, and `guest_call_timeout` floors every operation at
+`config.readiness_timeout`, which is 30 s. The write sat on the vsock for that
+entire window, and the capture holds the sandbox lifecycle gate throughout, so
+every other operation on that sandbox - the watcher's telemetry, the quarantine
+orchestration's own `observe()` - queued behind it. That is the thirty-second
+stall, and it is why one incident showed a cut, a pause and a snapshot but no
+report: the report step was waiting on a guest call that had nowhere to go.
+
+The runtime now asks Firecracker for the VM's state and makes the guest call
+only when the answer is `Running`. The state is asked for rather than
+remembered, because the failure mode of guessing wrong is a blocked channel
+rather than an error. The endpoint is `GET /` — this was established against the
+1.17.0 binary on this host, not assumed: `GET /` answers `200` with
+`{"state": ...}`, while `GET /instance-info` and `GET /vm` are both refused with
+`Invalid request method and/or path`. A fake server in the tests recognises only
+the root request too, so a wrong endpoint cannot pass in either.
+
+**A refused delete destroyed the sandbox on its way to answering 409.**
+`tear_down_sandbox` called `runtime.destroy()` before the repository decided
+whether the row could be deleted, but `delete_sandbox` refuses a quarantined
+row. So a DELETE against a quarantined sandbox destroyed the microVM and
+released the Guard attachment - writing `released: true` into the attachment
+record - and *then* returned 409. A request that failed had the side effects of
+one that succeeded, and it discarded the machine and the evidence the
+quarantine exists to preserve. The refusal is now decided from durable state
+before anything is torn down, so a rejected delete changes nothing.
+
+Both are covered by regression tests that fail if the fix is removed: one
+asserts a paused-VM capture completes without attempting a guest call, the
+other asserts a refused delete reaches `destroy` zero times.
+
+**The watcher waited for the cut to finish by asking whether the cut had
+started.** The deterministic-floor rule posts a quarantine and then polls. It
+decided the cut was done from `observation.budget.quarantined`, which is stage
+three of five: the network is down, the machine is not yet paused, there is no
+snapshot and there is no report. The moment that mark appeared, the loop skipped
+the only line that refreshed completion and went back to the top of the tick —
+so it held the window correctly and forever, and the case timed out with the
+incident already complete on the server. The response to the POST is no better
+evidence: the stages run on the control plane's own task, so that body
+describes the incident as it stood when the request was accepted.
+
+Completion is now read from the incident record itself, on every pass, until
+`completed_at`, `network_cut_at`, `paused_at`, a `snapshot_id` and a nonempty
+report are all present. The mark is still what tells the watcher *not* to post a
+second quarantine. Those passes do not count as ticks: a window is owed only
+once the window's own cut has finished, so a run bounded in iterations is bounded
+in windows reviewed, and the harness timeout remains the outer bound.
+
+**The release path had no sanctioned exit and reached for the wrong one.** The
+quarantine latch on `sandboxes` and the monotone rule on `guard_budgets` are
+each correct on their own: an operator release is the only thing that may clear
+a quarantine. Until now the budget had no sanctioned exit at all, and the release
+did two things that were both wrong. It ran `ALTER TABLE sandboxes DISABLE
+TRIGGER guard_quarantine_latched` — catalog state, permanent, and never
+re-enabled anywhere in the tree, so one release weakened the table for the life
+of the deployment. And it issued `UPDATE guard_budgets SET quarantined = false`,
+against a column that was never created, so the statement failed and took the
+whole transaction with it: the network came back and the quarantine did not,
+which is the worst of both worlds and left the sandbox undeletable.
+
+Migration `0024` gives the budget the same escape `0018` gave the sandbox:
+`guard_released_at`/`guard_released_by`, required in the same statement as the
+clearing, and checked against the sandbox being already released in the same
+transaction. The release now moves the sandbox to `paused` with the marker and
+clears the budget's payload mark with `jsonb_set` in one transaction, scoped by
+`tenant_id`, and disables nothing. The regression test asserts the outcome
+that matters (a later read reports no quarantine) and the catalog fact that no
+row assertion can see (both triggers still enabled) — and it fails if the
+`DISABLE TRIGGER` is put back.
+
+**A quarantine's cut was reopened by the next healthy heartbeat.** The gateway
+cleared its cut on every authenticated heartbeat, unconditionally. A heartbeat
+is the watchdog reporting liveness, and a quarantine is a containment decision
+that knows nothing about the watchdog: the watchdog was alive and healthy
+throughout, so the first heartbeat after the quarantine re-armed egress while
+the incident's own telemetry reported the attachment as cut. The dead-man's
+`held` field already existed for exactly this — a cut that reporting must not
+undo — but only the dead-man wrote it and only the dead-man read it, so the
+quarantine path posted an ordinary cut into a gate that reopened on the next
+tick. `GatewayControl::hold_cut` is now the containment entry point, and
+`heartbeat` clears the cut only when nothing holds it. An ordinary cut still
+reopens, because that is the watchdog's cut to reclaim, and holding every one
+of them would make a healthy attachment unusable for the life of its lease. Two
+regression tests pin both halves; the held one fails if the `held.is_none()`
+check is removed.
+
+**A verdict's quarantine reported the reviewer's decision and nothing else.**
+When the watcher's model returned `quarantine`, the watcher posted it, read the
+reply, and moved on. The reply is the incident as it stood when the request was
+accepted — the pause and the snapshot run afterwards, on the control plane's own
+task — so the reply read `status: incomplete` with every completion field null,
+and the watcher took it at face value: it recorded no outcome for the window at
+all and exited zero with the cut it had just started still running. The
+harness caught it as an empty window rather than a wrong one. The deterministic
+path already polled the incident to completion, and the verdict path now does
+the same, inside the window that requested it: the post-action observation is
+issued after the incident reports all five completion fields, so the recorded
+outcome names an action the host has actually taken. The window is not
+reviewed twice, which would otherwise spend a second reviewer request on
+evidence that had already been judged.
+
+### Reading the logs when a request seems to vanish
+
+`tracing::info!("api request")` is emitted after the handler returns, so a
+request's logged timestamp is its *completion* time. A missing log line during
+a window does not mean no request was in flight - it means no request
+*finished*. A stalled request is invisible in that log by construction, which
+is why both blocked callers above had to be identified from the control plane's
+own stage timestamps and the worker's continued `ownership` polls rather than
+from the API access log.

@@ -2704,3 +2704,262 @@ async fn the_queue_records_the_authenticated_requester() {
         "the requester is a key id, not free text: {label}"
     );
 }
+
+/// A refused delete must not have the side effects of a successful one.
+///
+/// A quarantined sandbox cannot be deleted - it is evidence, and the way out
+/// is an explicit human release, not a DELETE. The refusal used to be reached
+/// only after `runtime.destroy()`, so the microVM was already gone and the
+/// Guard attachment already released by the time the caller was told 409: a
+/// request that failed had destroyed the machine and discarded the evidence
+/// the quarantine exists to preserve.
+///
+/// The runtime below records its `destroy` calls, because the ordering is the
+/// whole claim. A response code alone would pass either way.
+#[tokio::test]
+async fn a_refused_quarantined_delete_leaves_the_sandbox_intact() {
+    struct RecordingRuntime {
+        destroys: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl aiec_core::runtime::SandboxRuntime for RecordingRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: aiec_core::runtime::FileChunkRequest,
+        ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.destroys
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                exec: true,
+                files: true,
+                ..RuntimeCapabilities::default()
+            }
+        }
+    }
+
+    let repo = Arc::new(MemoryRepository::new());
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let destroys = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = Arc::new(RecordingRuntime {
+        destroys: destroys.clone(),
+    });
+    let registry = Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+        RuntimeKind::Docker,
+        runtime.clone(),
+    ));
+    let platform = Platform::builder()
+        .runtime(runtime)
+        .runtime_registry(registry)
+        .metadata_store(repo.as_ref().clone())
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy))
+        .build()
+        .unwrap();
+    let router = app(AppState::development(platform).with_runtime_kind(RuntimeKind::Docker));
+
+    // The row is written straight into the store already quarantined rather
+    // than created and then quarantined through the API. Both would exercise
+    // the same delete refusal; only this one avoids needing a worker lease to
+    // put the sandbox into that state, and it keeps the refusal itself under
+    // test - `delete_sandbox` still sees a quarantined row and refuses it.
+    let sandbox = Uuid::now_v7();
+    let now = chrono::Utc::now();
+    futures::executor::block_on(repo.create_sandbox(Sandbox {
+        id: sandbox,
+        tenant_id: tenant,
+        node_id: Some(Uuid::now_v7()),
+        image_id: "python:3.13".into(),
+        state: aiec_core::SandboxState::Quarantined,
+        runtime: RuntimeKind::Docker,
+        cpu: 1,
+        memory_mb: 512,
+        disk_mb: 2048,
+        timeout_seconds: 600,
+        network: Default::default(),
+        environment: Default::default(),
+        created_at: now,
+        updated_at: now,
+        runtime_path: None,
+    }))
+    .expect("the quarantined sandbox exists");
+
+    let (status, body) = call(
+        &router,
+        &key,
+        axum::http::Method::DELETE,
+        &format!("/v1/sandboxes/{sandbox}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a quarantined sandbox is not deletable: {body}"
+    );
+    assert_eq!(
+        destroys.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the refusal must be decided before anything is torn down, so a \
+         rejected delete does not destroy the machine or release its Guard \
+         attachment on its way to answering 409"
+    );
+    // And the record still says what it said: a refused delete changed nothing.
+    let still = futures::executor::block_on(repo.get_sandbox(tenant, sandbox)).expect("the row");
+    assert_eq!(still.state, aiec_core::SandboxState::Quarantined);
+}
+
+/// A release note is prose, and prose contains spaces.
+///
+/// The note and reviewer-label validators compared every character against
+/// `is_ascii_graphic()`, which excludes `0x20`. A human writing "isolated
+/// acceptance teardown" - the most ordinary thing in the field - got HTTP 400
+/// `reviewer label/note is empty, oversized or not printable`, and the Guard
+/// release that is the documented way out of a quarantine could not be
+/// recorded at all. The predicate that was wanted is the one the Guard crate
+/// already uses: no control characters, ASCII only.
+///
+/// The sandbox below is quarantined and has no recorded policy hash, so a note
+/// that survives validation reaches the *policy hash* refusal and answers 409.
+/// That makes the ordering observable: 400 means the text was rejected, and
+/// anything else means it was accepted.
+#[tokio::test]
+async fn a_release_note_may_contain_spaces() {
+    let repo = Arc::new(MemoryRepository::new());
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::GuardRelease],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let runtime = Arc::new(MockRuntime);
+    let platform = Platform::builder()
+        .runtime(runtime.clone())
+        .metadata_store(repo.as_ref().clone())
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy))
+        .build()
+        .unwrap();
+    let router = app(AppState::development(platform).with_runtime_kind(RuntimeKind::Docker));
+
+    let sandbox = Uuid::now_v7();
+    let now = chrono::Utc::now();
+    futures::executor::block_on(repo.create_sandbox(Sandbox {
+        id: sandbox,
+        tenant_id: tenant,
+        node_id: Some(Uuid::now_v7()),
+        image_id: "python:3.13".into(),
+        state: aiec_core::SandboxState::Quarantined,
+        runtime: RuntimeKind::Docker,
+        cpu: 1,
+        memory_mb: 512,
+        disk_mb: 2048,
+        timeout_seconds: 600,
+        network: Default::default(),
+        environment: Default::default(),
+        created_at: now,
+        updated_at: now,
+        runtime_path: None,
+    }))
+    .expect("the quarantined sandbox exists");
+
+    let release = |note: serde_json::Value| async {
+        call(
+            &router,
+            &key,
+            axum::http::Method::POST,
+            &format!("/v1/sandboxes/{sandbox}/guard/release"),
+            note,
+        )
+        .await
+    };
+
+    let (status, body) = release(serde_json::json!({
+        "note": "isolated acceptance teardown"
+    }))
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a note made of ordinary words is printable: {body}"
+    );
+
+    // Control characters are still refused. The fix was to stop rejecting
+    // spaces, not to stop refusing text that splits a record.
+    let (status, body) = release(serde_json::json!({"note": "two\nlines"})).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an embedded newline is still refused: {body}"
+    );
+}

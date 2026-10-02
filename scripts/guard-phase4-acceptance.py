@@ -6,6 +6,7 @@ process results and reviewer hit counts decide acceptance, never guest claims.
 Run with guard-phase4-acceptance.sh; no provider credentials are inherited.
 """
 from __future__ import annotations
+import base64
 import importlib.util
 import json
 import os
@@ -158,16 +159,35 @@ def main():
     ROOT.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     error = None
-    # Per-run TLS with IP SAN, independent from operator/deployment certificates.
+    # Per-run TLS, independent from operator/deployment certificates. The
+    # certificate the servers present is an end-entity certificate, so it
+    # cannot also be the trust anchor: a self-signed leaf used as its own CA is
+    # rejected by every client that checks basic constraints, which reads as an
+    # untrustworthy server rather than as a misconfigured trust anchor. A real
+    # CA is minted per run and signs the leaf.
     tls = ROOT / "tls"
     tls.mkdir(mode=0o700, exist_ok=True)
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=phase4-acceptance", "-addext", "subjectAltName=IP:127.0.0.1",
-                    "-keyout", str(tls / "key.pem"), "-out", str(tls / "cert.pem")],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    (tls / "key.pem").chmod(0o600)
-    p2.CA = tls / "cert.pem"
-    os.environ.update(P2_CA=str(p2.CA), P2_TLS_CERT=str(p2.CA), P2_TLS_KEY=str(tls / "key.pem"))
+    openssl = lambda *args: subprocess.run(
+        ["openssl", *args], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=phase4-acceptance-ca",
+            "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+            "-keyout", str(tls / "ca.key"), "-out", str(tls / "ca.crt"))
+    (tls / "leaf.ext").write_text(
+        "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=IP:127.0.0.1\n")
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=phase4-acceptance",
+            "-keyout", str(tls / "key.pem"), "-out", str(tls / "leaf.csr"))
+    openssl("x509", "-req", "-in", str(tls / "leaf.csr"), "-CA", str(tls / "ca.crt"),
+            "-CAkey", str(tls / "ca.key"), "-CAcreateserial", "-days", "1",
+            "-extfile", str(tls / "leaf.ext"), "-out", str(tls / "cert.pem"))
+    for name in ("ca.key", "key.pem"):
+        (tls / name).chmod(0o600)
+    p2.CA = tls / "ca.crt"
+    # Servers present the leaf; clients trust only the per-run CA.
+    os.environ.update(P2_CA=str(p2.CA), P2_TLS_CERT=str(tls / "cert.pem"),
+                      P2_TLS_KEY=str(tls / "key.pem"))
     SAFE_ENV = {**p2.base_env(), "AIEC_S3_PREFIX": "phase4/", "AIEC_STATE_DIR": str(ROOT / "state-vms")}
     (ROOT / "state").mkdir(exist_ok=True)
     (ROOT / "evidence.json").write_text(json.dumps({"task_description": INJECTION, "agent_claims": [INJECTION]}))
@@ -179,7 +199,10 @@ def main():
         REVIEWER = Reviewer()
         threading.Thread(target=REVIEWER.serve_forever, daemon=True).start()
         server = p2.spawn("control-plane", [str(BIN / "aiec-server")], {**SAFE_ENV, "AIEC_BIND": os.environ["P2_CP_BIND"]})
-        case("real-control-plane-over-private-tls", p2.wait_for_health(server), {"endpoint": p2.CP, "tls": "per-run verified self-signed CA"})
+        healthy, health_reason = p2.wait_for_health(server)
+        case("real-control-plane-over-private-tls", healthy,
+             {"endpoint": p2.CP, "tls": "per-run CA signing the served leaf",
+              **({} if healthy else {"reason": health_reason})})
         worker = p2.spawn("worker", [str(BIN / "aiec"), "--url", p2.CP, "worker", "--runtime", "firecracker",
                          "--state-dir", str(ROOT / "state"), "--advertise-url", p2.WORKER, "--bind", os.environ["P2_WORKER_BIND"],
                          "--name", "phase4", "--capacity", "2", "--memory-reserve-mib", "256", "--disk-reserve-mib", "512"], SAFE_ENV)
@@ -254,19 +277,35 @@ def main():
              and rows[0]["outcome"]["verdict"] == "ok" and not marker.exists(),
              {"schema": schema, "models": [request["model"]], "task_is_untrusted_data": True, "tools_present": "tools" in request,
               "outcome": rows[0]["outcome"], "host_marker_exists": marker.exists()})
-        # Four windows at sample_rate 2 with batch_size 2: indices 0 and 2 are
-        # sampled, index 2 fills the batch and reviews both in one call, and the
-        # window still held when the bounded run ends is flushed, not dropped.
-        _, rows, hits = watch(sid, "sampling-batching", {**CONFIG, "sample_rate": 2, "batch_size": 2}, iterations=4)
+        # Six windows at sample_rate 2 with batch_size 2. Indices 0, 2 and 4
+        # are sampled: 0 and 2 fill the batch and are reviewed together in one
+        # call, and 4 is still buffered when the bounded run ends, so it is
+        # flushed and reviewed in a second. Six windows, not four, because four
+        # would fill the batch exactly and flush nothing - which would leave the
+        # flush path unexercised while still looking like a pass.
+        _, rows, hits = watch(sid, "sampling-batching", {**CONFIG, "sample_rate": 2, "batch_size": 2}, iterations=6)
         states = [r["outcome"]["state"] for r in rows if not r.get("flushed")]
+        flushed_rows = [r for r in rows if r.get("flushed")]
+        # The evidence envelope is read through a helper so a shape this harness
+        # did not expect is reported as evidence rather than raised as a bare
+        # KeyError that names only the missing key.
+        def envelope(request):
+            try:
+                evidence = request["messages"][1]["content"]["untrusted_evidence"]
+                return evidence["untrusted_evidence"]["task_description"]
+            except (KeyError, IndexError, TypeError) as exc:
+                return f"<unreadable: {type(exc).__name__}>"
         batched, flushed = REVIEWER.requests[-2], REVIEWER.requests[-1]
+        batched_text, flushed_text = envelope(batched), envelope(flushed)
         case("sampling-and-batching-bound-provider-calls", hits == 2
-             and states == ["buffered", "skipped", "verdict", "skipped"]
-             and rows[-1].get("flushed") is True and rows[-1]["pending"] == 0
-             and batched["messages"][1]["content"]["untrusted_evidence"]["task_description"].count("\n") == 1
-             and flushed["messages"][1]["content"]["untrusted_evidence"]["task_description"].count("\n") == 0,
-             {"states": states, "reviewer_hits": hits, "pending": rows[-1]["pending"],
-              "batched_windows": 2, "flushed_windows": 1})
+             and states == ["buffered", "skipped", "verdict", "skipped", "buffered", "skipped"]
+             and len(flushed_rows) == 1 and flushed_rows[0]["pending"] == 0
+             and batched_text.count("\n") == 1 and flushed_text.count("\n") == 0,
+             {"states": states, "reviewer_hits": hits, "flushed_rows": len(flushed_rows),
+              "pending_after_flush": flushed_rows[0]["pending"] if flushed_rows else None,
+              "batched_evidence_lines": batched_text.count("\n") + 1,
+              "flushed_evidence_lines": flushed_text.count("\n") + 1,
+              "reviewer_requests_observed": len(REVIEWER.requests)})
         for name, config, price, expected, reason in [
                 ("token-admission", {**CONFIG, "token_budget": 1}, None, 0, "token_budget"),
                 ("token-spend", {**CONFIG, "token_budget": 5000}, None, 1, "token_budget"),
@@ -300,14 +339,52 @@ def main():
         case("valid-pause-is-host-applied-not-model-claim", hits == 2 and snapshot(sid)["paused"] and rows[0]["outcome"]["action"] == "pause",
              {"reviewer_hits": hits, "outcome": rows[0]["outcome"], "host": snapshot(sid)})
         require(*p2.http("POST", f"/v1/sandboxes/{sid}/resume", {}))
-        # Produce real denied packets before rule evaluation; claims are not evidence.
+        # Real denied packets, produced with the shared probe rather than a
+        # shell one-liner: a one-liner cannot tell "Guard denied this" apart
+        # from "the guest had no route", and the second would pass a suite that
+        # proved nothing.
+        #
+        # The destination is the Guard gateway's own DNS port, not an off-link
+        # address. A guarded guest has an address and a default route, but an
+        # off-link connect fails inside the guest with ENETUNREACH before any
+        # packet reaches the attachment, so it measures routing rather than
+        # enforcement - confirmed live: four attempts to 1.1.1.1:443 returned
+        # errno 101 and moved no counter at all. A query for a name the operator
+        # boundary does not permit is denied by the gateway on the same code
+        # path and is counted by the host table; this is the instrument phase 2
+        # established for this namespace.
+        probe_path = "/workspace/p4-probe.py"
+        require(*p2.http("PUT", f"/v1/sandboxes/{sid}/files",
+                         {"path": probe_path,
+                          "content_base64": base64.b64encode(
+                              Path(__file__).resolve().parent.joinpath(
+                                  "guard_core_guest_probe.py").read_bytes()).decode()}))
+        attachment = json.loads(
+            (ROOT / "state-vms" / "guard" / sid / "attachment.json").read_text())["attachment"]
+        gateway = attachment["gateway_ip"]
         before = observe(sid)
-        require(*p2.http("POST", f"/v1/sandboxes/{sid}/exec", {"command": ["/usr/bin/python3", "-c",
-            "import socket\nfor _ in range(4):\n s=socket.socket();s.settimeout(.4)\n try:s.connect(('1.1.1.1',443))\n except OSError:pass\n s.close()"], "timeout_seconds": 10}))
+        attempts = []
+        for _ in range(4):
+            status, result = p2.http(
+                "POST", f"/v1/sandboxes/{sid}/exec",
+                {"command": ["/usr/bin/python3", probe_path,
+                             json.dumps({"kind": "dns_wire", "host": gateway,
+                                         "name": "unrelated.guard.test", "qtype": 1, "tcp": False})],
+                 "working_directory": "/workspace", "timeout_seconds": 20}, timeout=40.0)
+            if status != 200:
+                attempts.append({"exec_status": status, "error": (result or {}).get("error")})
+                continue
+            try:
+                attempts.append(json.loads((result or {}).get("stdout") or "{}"))
+            except json.JSONDecodeError:
+                attempts.append({"raw": ((result or {}).get("stdout") or "")[:200]})
+        time.sleep(1.5)
         denied = observe(sid)
         delta = sum(denied["counters"][k] - before["counters"][k] for k in ("blocked_range", "other_denied", "ipv6"))
         case("actual-denied-guest-packets-reach-host-counter", delta >= 4,
-             {"before": before["counters"], "after": denied["counters"], "denied_packet_delta": delta, "attempts": 4})
+             {"destination": "guard gateway dns port", "gateway": gateway,
+              "before": before["counters"], "after": denied["counters"],
+              "denied_packet_delta": delta, "attempts": attempts})
         rules = ROOT / "strict-rules.json"
         rules.write_text(json.dumps({**quiet, "denied_threshold": 3}))
         logs, rows, hits = watch(sid, "deterministic-floor", CONFIG, replies=['{"verdict":"ok"}'], rules=rules)
@@ -366,6 +443,24 @@ def main():
         error = str(exc)
         print("FAIL " + error, flush=True)
     finally:
+        # The watchdog heartbeats every poll, so deleting its sandbox out from
+        # under it produces a 503 that the watchdog correctly treats as an
+        # unreachable control plane: it fails closed, cuts the network, and
+        # exits 1. That is right behavior on the wrong order. The companion is
+        # stopped first, and its own termination is expected rather than a
+        # cleanup failure - the suite has already read everything it observes.
+        watchdog = globals().get("watchdog")
+        if watchdog is not None and watchdog.poll() is None:
+            try:
+                os.killpg(os.getpgid(watchdog.pid), signal.SIGTERM)
+                watchdog.wait(timeout=15)
+            except Exception as exc:
+                CLEANUP.append("watchdog stop: " + str(exc))
+            else:
+                # Declared rather than assumed, so cleanup still reports a
+                # watchdog that died on its own during the run.
+                os.environ["P2_STOPPED"] = " ".join(
+                    sorted(set(os.environ.get("P2_STOPPED", "").split()) | {"watchdog"}))
         # Human-only release is teardown, deliberately outside the watcher path.
         for sid in SANDBOXES:
             if not OBSERVER:

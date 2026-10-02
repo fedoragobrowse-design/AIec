@@ -106,12 +106,16 @@ export P2_WATCHDOG_TIMEOUT_MS=${P2_WATCHDOG_TIMEOUT_MS:-3000}
 # It is set explicitly here so a loaded operator environment cannot put
 # acceptance machines next to a running deployment's own.
 export AIEC_STATE_DIR=$root/state-vms
-# The image manifest carries the recorded digests the guest is verified
-# against. Defaulted to the build directory so a run does not depend on the
-# operator having exported them, while still allowing an explicit override.
-export AIEC_IMAGE_MANIFEST=${AIEC_IMAGE_MANIFEST:-${AGENTFORGE_IMAGE_MANIFEST:-$HOME/aiec/imgbuild/.aiec/images/manifest.json}}
-# The secret is the signing key's material, not a path to it.
-export AIEC_IMAGE_MANIFEST_SECRET=${AIEC_IMAGE_MANIFEST_SECRET:-${AGENTFORGE_IMAGE_MANIFEST_SECRET:-}}
+# The guest capability metadata the runtime verifies a guest against travels
+# with the artifact directory the image was built into, which is not necessarily
+# the directory the rootfs is named in - a symlinked rootfs is not next to it.
+artifact_dir=${AIEC_GUEST_ARTIFACT_DIR:-$(dirname "$(realpath "$AIEC_ROOTFS")")}
+# The image manifest carries the recorded digest the guest is verified against.
+# An operator-supplied manifest is used as given; with none supplied the run
+# mints its own, so a suite never depends on a deployment path it does not own.
+acceptance_prepare_image_manifest "$root" aiec/firecracker-acceptance \
+  "$artifact_dir/guest-capabilities.json"
+export AIEC_GUEST_ARTIFACT_DIR=$artifact_dir
 
 ip link set lo up
 # Namespace-scoped forwarding. A fresh network namespace has this off, and a

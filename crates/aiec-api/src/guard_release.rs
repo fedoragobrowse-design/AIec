@@ -8,7 +8,7 @@
 //! released, however willing the control plane is to say otherwise.
 
 use aiec_core::{SandboxState, Scope};
-use aiec_guard::control::GuardControlCommand;
+use aiec_guard::{control::GuardControlCommand, proposals::printable};
 use axum::{
     Json,
     extract::{Extension, Path, State},
@@ -64,7 +64,7 @@ pub async fn release_sandbox(
         ));
     }
     if let Some(label) = body.operator_label.as_deref()
-        && (label.is_empty() || label.len() > 64 || !label.chars().all(|c| c.is_ascii_graphic()))
+        && (label.is_empty() || label.len() > 64 || !printable(label))
     {
         return Err(ApiFailure::new(
             StatusCode::BAD_REQUEST,
@@ -73,7 +73,7 @@ pub async fn release_sandbox(
         ));
     }
     if let Some(note) = body.note.as_deref()
-        && (note.is_empty() || note.len() > 512 || !note.chars().all(|c| c.is_ascii_graphic()))
+        && (note.is_empty() || note.len() > 512 || !printable(note))
     {
         return Err(ApiFailure::new(
             StatusCode::BAD_REQUEST,

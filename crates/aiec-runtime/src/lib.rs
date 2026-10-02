@@ -1953,6 +1953,23 @@ impl FirecrackerRuntime {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(), RuntimeError> {
+        self.api_response(socket, method, path, body)
+            .await
+            .map(|_| ())
+    }
+
+    /// The same exchange, returning the response body.
+    ///
+    /// Exists for the one question `api` cannot answer: what state Firecracker
+    /// says this VM is in. Every other caller wants the status only, and
+    /// parsing a body nobody reads would be work for its own sake.
+    async fn api_response(
+        &self,
+        socket: &Path,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Vec<u8>, RuntimeError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut stream = loop {
             match tokio::net::UnixStream::connect(socket).await {
@@ -2024,7 +2041,34 @@ impl FirecrackerRuntime {
                 String::from_utf8_lossy(&response_body)
             )));
         }
-        Ok(())
+        Ok(response_body)
+    }
+
+    /// The state Firecracker reports for this VM, in its own API's words.
+    ///
+    /// Asked rather than remembered. A guest call issued against a VM that is
+    /// already paused has no guest agent left to answer it, and the failure
+    /// mode of guessing wrong is a blocked channel rather than an error.
+    ///
+    /// Read from `GET /`, which is where this Firecracker keeps it: the root
+    /// document answers `{"id","state","app_name","vmm_version"}`.
+    ///
+    /// Neither of the two paths that look right is. `GET /vm` is refused with
+    /// `Invalid request method and/or path: GET vm.` because `/vm` accepts
+    /// only `PUT` and `PATCH`, and `GET /instance-info` is refused with
+    /// `Invalid request method and/or path: GET instance-info.` on 1.17.0.
+    /// Both were tried live against this exact binary; the error is the only
+    /// thing that distinguishes them from a working call in the source.
+    async fn vm_state(&self, socket: &Path) -> Result<String, RuntimeError> {
+        let body = self.api_response(socket, "GET", "/", None).await?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+            RuntimeError::FirecrackerApi(format!("GET / returned malformed JSON: {error}"))
+        })?;
+        value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| RuntimeError::FirecrackerApi("GET / did not report a state".into()))
     }
 
     async fn connect_guest(&self, id: Uuid) -> Result<tokio::net::UnixStream, RuntimeError> {
@@ -2857,8 +2901,19 @@ impl FirecrackerRuntime {
                 .ok_or_else(|| RuntimeError::Unavailable("sandbox VM is not running".into()))?;
             (vm.api_socket.clone(), vm.rootfs.clone())
         };
-        self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
-            .await?;
+        // Only a running guest can prepare a snapshot: the operation fsyncs the
+        // workspace inside the guest, and a paused VM has no agent scheduled to
+        // answer. Asking anyway does not fail fast - the write sits on the
+        // vsock until `guest_call_timeout`, which floors every operation at the
+        // readiness timeout, so it blocks that whole window while this function
+        // holds the lifecycle gate and every other operation on the sandbox
+        // queues behind it. Quarantine routinely reaches an already paused
+        // machine (an operator pause, or an earlier incident), so this is the
+        // ordinary path rather than an edge case.
+        if self.vm_state(&socket).await? == "Running" {
+            self.guest_call(sandbox.id, Operation::PrepareSnapshot, RequestPayload::None)
+                .await?;
+        }
         // Final pause and capture are one fenced step: after this returns the
         // only remaining transitions are an operator's, or destruction.
         self.api(
@@ -4949,6 +5004,151 @@ mod tests {
             "the state a completed destroy promised nobody would boot survived it"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A forensic capture of a VM that is already paused must not wait for a
+    /// guest that will never answer.
+    ///
+    /// The defect this pins down cost thirty seconds per incident and blocked
+    /// every other operation on the sandbox while it did: `PrepareSnapshot`
+    /// needs a running guest agent, and against a paused VM the vsock write
+    /// simply sits there until `guest_call_timeout` floors it at the readiness
+    /// timeout. Quarantine reaches already-paused machines routinely - an
+    /// operator pause, or an earlier incident - so this is a live path, and the
+    /// capture is held under the sandbox lifecycle gate the whole time.
+    ///
+    /// A real VM is not needed to prove it. What matters is that the runtime
+    /// asks Firecracker for the state and skips the guest call when the answer
+    /// is not `Running`, so the fake API below reports `Paused` and the vsock
+    /// path is left deliberately absent: a guest call would fail immediately
+    /// here rather than hang, so the assertion is that no such call is made and
+    /// the capture reaches its snapshot stage at all.
+    #[tokio::test]
+    async fn a_capture_of_an_already_paused_vm_does_not_call_the_guest() {
+        let mut config = config();
+        let root = std::env::temp_dir().join(format!("aiec-fc-cap-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).expect("scratch state dir");
+        config.state_dir = root.clone();
+        let runtime = FirecrackerRuntime::new(config.clone());
+
+        let socket = root.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("fake api socket");
+        let server = tokio::spawn(async move {
+            // One connection per Firecracker API exchange this capture makes:
+            // the state read, then the pause, then the snapshot creation.
+            for _ in 0..3 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut header = Vec::new();
+                let mut byte = [0u8; 1];
+                while !header.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    header.push(byte[0]);
+                }
+                // Answer only what this Firecracker actually serves. State is
+                // on `GET /`; `GET /vm` and `GET /instance-info` are both
+                // refused by the real API - `Invalid request method and/or
+                // path: GET vm.` and `... GET instance-info.` - so a fake that
+                // answered any GET would have hidden a wrong endpoint behind a
+                // passing test. Both wrong paths were live-confirmed against
+                // Firecracker 1.17.0 before being ruled out.
+                let request_line = String::from_utf8_lossy(&header);
+                let is_root = request_line.starts_with("GET http://localhost/ ");
+                // Read the request body so the snapshot request can be
+                // answered the way Firecracker answers it: by writing the two
+                // files it names. Without them the capture's own size accounting
+                // would fail on a missing path, which says nothing about whether
+                // the guest was called.
+                let length: usize = String::from_utf8_lossy(&header)
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut request_body = vec![0u8; length];
+                stream.read_exact(&mut request_body).await.ok();
+                let (status_line, reply) = if is_root {
+                    ("200 OK", r#"{"state":"Paused"}"#.to_owned())
+                } else if request_line.starts_with("GET ") {
+                    // The real refusal, reproduced - with the path the caller
+                    // actually asked for, so a wrong endpoint fails here with
+                    // the message Firecracker would have given.
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|target| target.split_once("localhost/"))
+                        .map_or_else(String::new, |(_, path)| path.to_owned());
+                    (
+                        "400 Bad Request",
+                        serde_json::json!({
+                            "fault_message": format!(
+                                "Invalid request method and/or path: GET {path}."
+                            )
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    // Every other request is answered the way Firecracker
+                    // answers it: by writing the two files the snapshot request
+                    // names. The pause PATCH names none and so writes none.
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&request_body).unwrap_or_default();
+                    for key in ["snapshot_path", "mem_file_path"] {
+                        if let Some(path) = parsed.get(key).and_then(serde_json::Value::as_str) {
+                            let _ = tokio::fs::write(path, b"snapshot").await;
+                        }
+                    }
+                    ("204 No Content", String::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let id = Uuid::now_v7();
+        let disk = root.join("rootfs.ext4");
+        std::fs::write(&disk, b"disk").expect("disk image");
+        runtime.vms.lock().await.insert(
+            id,
+            FirecrackerVm {
+                child: tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("stand-in child"),
+                api_socket: socket,
+                network: None,
+                vsock_socket: root.join("no-such-vsock.sock"),
+                rootfs: disk,
+                start_token: Uuid::now_v7(),
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let size = runtime
+            .capture_forensics(&sandbox(id, 30), "incident-1")
+            .await
+            .expect("a paused machine is captured without a guest call");
+        assert!(size > 0, "the capture produced files");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "capture took {:?}; a paused guest cannot answer PrepareSnapshot, so \
+             the call must have been skipped rather than waited on",
+            started.elapsed()
+        );
+        server.abort();
+        runtime.vms.lock().await.remove(&id);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

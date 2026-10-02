@@ -1094,6 +1094,30 @@ impl ControlPlaneTransport {
         validate_incident(&incident)?;
         Ok(incident)
     }
+
+    /// Reads the authoritative incident record.
+    ///
+    /// The quarantine stages run on the control plane's own task, so the POST
+    /// that started them answers with the incident as it was when the request
+    /// was accepted. Completion is therefore observed from this, not inferred
+    /// from what the POST returned, and not from the budget's quarantine mark -
+    /// that mark is stage 3 of 5, and a watcher that treats it as "finished"
+    /// stops asking about the two stages after it.
+    pub async fn incident(&self) -> Result<GuardIncident> {
+        let response = self
+            .client
+            .get(self.endpoint("incident")?)
+            .bearer_auth(self.token.as_str())
+            .send()
+            .await
+            .map_err(|_| GuardError::Unavailable("authoritative incident lost".into()))?;
+        let incident: GuardIncident = bounded_json(response).await?;
+        if incident.identity != self.identity {
+            return Err(integrity("authoritative incident identity mismatch"));
+        }
+        validate_incident(&incident)?;
+        Ok(incident)
+    }
 }
 
 #[cfg(test)]
@@ -1384,6 +1408,119 @@ mod tests {
         incident.paused_at = Some(now);
         incident.events.clear();
         assert!(generate_incident_report(&incident).is_err());
+    }
+    /// The watcher's only evidence that a cut finished is this read, so what it
+    /// accepts has to be as strict as what the POST path accepts: the same
+    /// identity, the same incident grammar, the same bearer credential. A read
+    /// that trusted its own response would let any proxy answer "finished".
+    #[tokio::test]
+    async fn the_incident_read_authenticates_and_refuses_a_foreign_incident() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, RwLock};
+
+        #[derive(Clone)]
+        struct Recorded {
+            path: Arc<RwLock<String>>,
+            authorized: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+        }
+        async fn read(
+            AxumState(state): AxumState<Recorded>,
+            axum::extract::Path(sandbox): axum::extract::Path<String>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::Json<serde_json::Value> {
+            state.calls.fetch_add(1, Ordering::Relaxed);
+            *state.path.write().unwrap() = sandbox;
+            let authorized = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Bearer guard-"));
+            state.authorized.store(authorized, Ordering::Relaxed);
+            let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+            let id = identity();
+            // A real chained event, because the grammar that validates this
+            // body is the same one that validates the control plane's.
+            let entry = event(
+                "quarantine recorded",
+                Category::Quarantine,
+                GENESIS_HASH,
+                now,
+            );
+            axum::Json(serde_json::json!({
+                "id": Uuid::from_u128(4),
+                "identity": {
+                    "sandbox_id": id.sandbox_id,
+                    "tenant_id": id.tenant_id,
+                    "policy_hash": if authorized { id.policy_hash.clone() } else { "b".repeat(64) },
+                },
+                "fence": {"lease_id": Uuid::from_u128(3), "generation": 1},
+                "rules": [{"rule": "repeated_denied_connections", "first_event_sequence": 1,
+                           "evidence_references": [format!("event:1:{}", entry.current_hash)]}],
+                "triggered_at": now, "network_cut_at": now, "paused_at": now,
+                "snapshot_id": "snapshot_1", "completed_at": now,
+                "event_start_sequence": 1, "event_previous_hash": GENESIS_HASH,
+                "event_sequence": 1, "event_head": entry.current_hash,
+                "events": [entry], "errors": [], "notified_at": null, "report": ""
+            }))
+        }
+
+        let recorded = Recorded {
+            path: Arc::new(RwLock::new(String::new())),
+            authorized: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_recorded = recorded.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/sandboxes/{id}/guard/incident", get(read))
+                    .with_state(server_recorded),
+            )
+            .await
+            .unwrap();
+        });
+        let id = identity();
+        let transport = ControlPlaneTransport::new(
+            url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            Zeroizing::new("guard-test-token".into()),
+            id.clone(),
+            2_000,
+            true,
+        )
+        .unwrap();
+
+        // An authenticated read of this sandbox's incident is returned.
+        transport.incident().await.expect("authoritative incident");
+        assert_eq!(*recorded.path.read().unwrap(), id.sandbox_id.to_string());
+        assert!(recorded.authorized.load(Ordering::Relaxed));
+
+        // A body that does not belong to this identity is refused rather than
+        // believed, so a completion claimed for another sandbox cannot end this
+        // watcher's hold.
+        let foreign = GuardIdentity {
+            policy_hash: "c".repeat(64),
+            ..id
+        };
+        let other = ControlPlaneTransport::new(
+            url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+            Zeroizing::new("wrong".into()),
+            foreign,
+            2_000,
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(other.incident().await, Err(GuardError::Integrity(_))),
+            "an incident for another policy generation is not this incident"
+        );
+        assert!(!recorded.authorized.load(Ordering::Relaxed));
+        assert_eq!(recorded.calls.load(Ordering::Relaxed), 2);
     }
     #[test]
     fn detects_dns_and_model_rules_without_payloads() {

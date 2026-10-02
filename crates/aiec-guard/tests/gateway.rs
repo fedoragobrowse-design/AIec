@@ -981,6 +981,54 @@ async fn a_gateway_denies_until_the_first_authenticated_heartbeat_and_then_latch
     let _ = f.finish().await;
 }
 
+/// Liveness and containment are different questions. A watchdog that is
+/// healthy proves the watcher is there; it says nothing about a quarantine, and
+/// a heartbeat that reopened a held cut would hand the machine back to a party
+/// that never decided anything about it.
+#[tokio::test]
+async fn a_heartbeat_reports_liveness_without_reopening_a_held_cut() {
+    let f = Fixture::configured(|_| {}, |sink| sink, None, 1_000).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    f.control
+        .hold_cut("guard quarantine")
+        .expect("the containment decision is applied");
+    assert!(f.control.network_cut());
+
+    // Repeated healthy heartbeats, as a running watchdog produces them.
+    for _ in 0..3 {
+        f.gateway().heartbeat(&f.identity).expect("still reporting");
+        assert!(
+            f.control.network_cut(),
+            "a heartbeat must not clear a cut a containment decision holds"
+        );
+    }
+    // An ordinary release is an operator's convenience and cannot undo it
+    // either; only the authorized one can.
+    assert!(f.gateway().restore().await.is_err());
+    assert!(f.control.network_cut());
+    assert!(f.gateway().authorized_release().await.is_ok());
+    assert!(!f.control.network_cut());
+    let _ = f.finish().await;
+}
+
+/// The dead-man's cut is the other kind: the watchdog is the thing that went
+/// wrong, so a watchdog that comes back legitimately reopens it. Holding every
+/// cut would make a healthy attachment unusable for the life of its lease.
+#[tokio::test]
+async fn a_heartbeat_still_reopens_an_ordinary_cut() {
+    let f = Fixture::configured(|_| {}, |sink| sink, None, 1_000).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    f.gateway().control().cut().expect("cut");
+    assert!(f.control.network_cut());
+    f.gateway().heartbeat(&f.identity).expect("still reporting");
+    assert!(
+        !f.control.network_cut(),
+        "an ordinary cut is the watchdog's to reopen"
+    );
+    f.gateway().authorized_release().await.expect("release");
+    let _ = f.finish().await;
+}
+
 #[tokio::test]
 async fn a_model_request_reserves_durably_before_any_byte_reaches_upstream() {
     let authority = Arc::new(RecordingAuthority {

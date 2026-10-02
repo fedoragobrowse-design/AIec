@@ -13,7 +13,7 @@ use aiec_core::{
 };
 use aiec_guard::{
     control::{GuardControlCommand, GuardControlResponse, GuardFence},
-    proposals::{ProposalRequest, ProposalState},
+    proposals::{ProposalRequest, ProposalState, printable},
 };
 use axum::{
     Json,
@@ -53,7 +53,7 @@ pub struct ReviewProposalBody {
 fn reviewer(principal: &Principal, label: Option<&str>) -> Result<String, ApiFailure> {
     let mut identity = format!("key:{}", principal.key_id);
     if let Some(label) = label {
-        if label.is_empty() || label.len() > 64 || !label.chars().all(|c| c.is_ascii_graphic()) {
+        if label.is_empty() || label.len() > 64 || !printable(label) {
             return Err(ApiFailure::new(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",

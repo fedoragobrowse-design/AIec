@@ -95,6 +95,60 @@ acceptance_prepare_database() {
   export DATABASE_URL="postgresql://aiec@localhost/postgres?host=$sock"
 }
 
+# Sets AIEC_IMAGE_MANIFEST and AIEC_IMAGE_MANIFEST_SECRET for a run that has not
+# been given them. A manifest that is named and absent is a misconfiguration,
+# and the control plane otherwise reports it as an opaque file-not-found long
+# before the suite can say what was wrong. With none supplied the run mints one,
+# signed with a per-run secret in its own scratch directory, so nothing is
+# written into the deployment's image directory and no run can inherit
+# another's key. The digest is read from the artifact metadata the guest build
+# wrote, never recomputed here, so the manifest can only describe the image that
+# was actually built.
+#
+# $1 run root, $2 image reference, $3 path to guest-capabilities.json.
+acceptance_prepare_image_manifest() {
+  local root=$1 reference=$2 capabilities=$3 directory
+  [[ -f $capabilities ]] || {
+    printf 'guest capability metadata %s does not exist\n' "$capabilities" >&2
+    exit 2
+  }
+  if [[ -n ${AIEC_IMAGE_MANIFEST:-${AGENTFORGE_IMAGE_MANIFEST:-}} ]]; then
+    export AIEC_IMAGE_MANIFEST=${AIEC_IMAGE_MANIFEST:-$AGENTFORGE_IMAGE_MANIFEST}
+    export AIEC_IMAGE_MANIFEST_SECRET=${AIEC_IMAGE_MANIFEST_SECRET:-${AGENTFORGE_IMAGE_MANIFEST_SECRET:-}}
+    [[ -f $AIEC_IMAGE_MANIFEST ]] || {
+      printf 'image manifest %s does not exist\n' "$AIEC_IMAGE_MANIFEST" >&2
+      exit 2
+    }
+    return
+  fi
+  directory=$root/image-manifest
+  mkdir -p "$directory"
+  chmod 700 "$directory"
+  if [[ ! -f $directory/manifest.json || ! -f $directory/secret ]]; then
+    python3 - "$directory" "$reference" "$capabilities" <<'PY'
+import hashlib, hmac, json, os, secrets, sys
+
+directory, reference, capabilities = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(capabilities) as handle:
+    digest = json.load(handle)["rootfs_sha256"]
+secret = secrets.token_hex(32)
+signature = hmac.new(
+    secret.encode(), reference.encode() + b"\0" + digest.encode(), hashlib.sha256
+).hexdigest()
+with open(os.path.join(directory, "manifest.json"), "w") as handle:
+    json.dump({"reference": reference, "rootfs_sha256": digest, "signature": signature}, handle)
+# Owner-only from the first byte: this file is the deployment signing secret for
+# the lifetime of the run, not something to create readable and tighten.
+fd = os.open(os.path.join(directory, "secret"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as handle:
+    handle.write(secret)
+PY
+    chmod 600 "$directory"/*
+  fi
+  export AIEC_IMAGE_MANIFEST=$directory/manifest.json
+  export AIEC_IMAGE_MANIFEST_SECRET=$(cat "$directory/secret")
+}
+
 # Reaps anything this run started before stopping the database. The drivers
 # launch a control plane and a worker, and `unshare --kill-child` only kills the
 # direct child, so an interrupted run otherwise leaves servers bound to this

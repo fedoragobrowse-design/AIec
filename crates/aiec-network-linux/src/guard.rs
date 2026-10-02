@@ -588,6 +588,15 @@ impl GuardNetworkManager {
         Ok(())
     }
 
+    /// Holds the attachment cut until an authorized release.
+    ///
+    /// Every cut that reaches here was asked for by a control-plane containment
+    /// decision, not by the watchdog's own dead-man. A plain cut would be
+    /// reopened by the very next heartbeat from a watchdog that is healthy and
+    /// knows nothing about the quarantine, which is how a quarantined sandbox
+    /// gets its network back while its incident says it is cut. The release
+    /// that clears this one is `guard_restore`, which requires the operator's
+    /// authorization.
     pub async fn guard_cut(
         &self,
         sandbox: &Sandbox,
@@ -596,7 +605,10 @@ impl GuardNetworkManager {
     ) -> Result<(), CoreError> {
         let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
         // Cut the gateway before any kernel I/O. Audit failure never skips nft.
-        let gateway_result = guard.control.cut().map_err(guard_error);
+        let gateway_result = guard
+            .control
+            .hold_cut("guard quarantine")
+            .map_err(guard_error);
         let kernel_result = AttachmentCut {
             guard: Arc::downgrade(&guard),
             enforcement: self.enforcement.clone(),

@@ -2,7 +2,7 @@
 //! watchdog; this process has no heartbeat, approval, restore or release path.
 use aiec_guard::{
     GuardError, Result,
-    control::{GuardIdentity, RuleTrigger},
+    control::{GuardIdentity, GuardIncident, RuleTrigger},
     policy::WatcherConfig,
     watchdog::{ControlPlaneTransport, Watchdog, WatchdogConfig, load_operator_token},
     watcher::{
@@ -91,6 +91,19 @@ fn json_file<T: serde::de::DeserializeOwned + Default>(path: Option<&Path>) -> R
     serde_json::from_slice(&bytes)
         .map_err(|_| GuardError::Policy("invalid watcher input JSON".into()))
 }
+/// Whether the control plane has finished every stage of a cut.
+///
+/// All five, not any: `network_cut_at` alone is stage three, and an incident
+/// that has been cut and not yet paused, snapshotted or reported is a machine
+/// that is half stopped and not yet preserved.
+fn completed(incident: &GuardIncident) -> bool {
+    incident.completed_at.is_some()
+        && incident.network_cut_at.is_some()
+        && incident.paused_at.is_some()
+        && incident.snapshot_id.is_some()
+        && !incident.report.is_empty()
+}
+
 async fn run(args: Args) -> Result<()> {
     let configuration: WatcherConfig = json_file(args.config.as_deref())?;
     let rules: WatchdogConfig = json_file(args.rules_config.as_deref())?;
@@ -137,23 +150,62 @@ async fn run(args: Args) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! { _ = tokio::signal::ctrl_c() => return Ok(()), _ = interval.tick() => {} }
+        // While this window's own cut is outstanding the only question left is
+        // whether it finished, and the incident record is what answers it. The
+        // telemetry read is not consulted at all in that state: the control
+        // plane holds the sandbox lifecycle gate for the whole of the cut,
+        // because the pause and the snapshot are part of it, so a telemetry
+        // read issued while the cut runs queues behind the cut that the same
+        // watcher started. It then times out, and a watcher that exits on its
+        // own read timeout abandons the very cut it was holding - which is
+        // how a completed cut read as a failed one.
+        if !pending_rules.is_empty() && !quarantine_completed {
+            // Whether the cut is finished is answered by the incident record,
+            // not by the budget's quarantine mark and not by the response to
+            // the request that started the work. The mark is stage three of
+            // five, and the stages run on the control plane's own task, so a
+            // POST answers with the incident as it stood when the request was
+            // accepted.
+            let incident = transport.incident().await?;
+            quarantine_completed = completed(&incident);
+            println!(
+                "{}",
+                serde_json::json!({"watcher":"deterministic_quarantine","identity":identity,
+                "status":if quarantine_completed {"completed"} else {"incomplete"},
+                "incident_id":incident.id,"completed_at":incident.completed_at,
+                "network_cut_at":incident.network_cut_at,"paused_at":incident.paused_at,
+                "snapshot_id":incident.snapshot_id})
+            );
+            if quarantine_completed {
+                pending_rules.clear();
+            } else {
+                // Reviewer input is not offered while the deterministic cut is
+                // still outstanding; the rules own this window's authority.
+                // The tick is not counted: a window is only owed once the
+                // window's own cut has finished, so a run bounded in
+                // iterations is bounded in windows reviewed.
+                continue;
+            }
+        }
         let observation = transport.observe(deterministic.cursor()).await?;
         let decision = deterministic.observe(&observation, Utc::now())?;
         if pending_rules.is_empty() && !decision.quarantine_rules.is_empty() {
             pending_rules = decision.quarantine_rules.clone();
-        }
-        // Apply deterministic restrictions before any model socket is opened,
-        // and never call an incomplete cut done.
-        if !pending_rules.is_empty() {
-            if !quarantine_completed && !observation.budget.quarantined {
+            // A rule that has already cut this sandbox does not get to cut it
+            // again. The counters that raised it are still there after the cut
+            // - that is what evidence is - so the rule fires again on every
+            // later observation of the same window, and each firing would be
+            // another escalation of a machine that is already stopped,
+            // snapshotted and preserved. The incident is authoritative for
+            // whether a cut happened, so that is what is asked, and a rule
+            // whose cut is already in force is held rather than reissued.
+            if !quarantine_completed && !held && !observation.budget.quarantined {
+                // Apply deterministic restrictions before any model socket is
+                // opened, and never call an incomplete cut done.
                 let incident = transport
                     .quarantine(decision.fence, pending_rules.clone())
                     .await?;
-                quarantine_completed = incident.completed_at.is_some()
-                    && incident.network_cut_at.is_some()
-                    && incident.paused_at.is_some()
-                    && incident.snapshot_id.is_some()
-                    && !incident.report.is_empty();
+                quarantine_completed = completed(&incident);
                 println!(
                     "{}",
                     serde_json::json!({"watcher":"deterministic_quarantine","identity":identity,
@@ -162,15 +214,11 @@ async fn run(args: Args) -> Result<()> {
                     "network_cut_at":incident.network_cut_at,"paused_at":incident.paused_at,
                     "snapshot_id":incident.snapshot_id})
                 );
-                if quarantine_completed {
-                    pending_rules.clear();
+                if !quarantine_completed {
+                    continue;
                 }
             }
-            if !quarantine_completed {
-                // Reviewer input is not offered while the deterministic cut is
-                // still outstanding; the rules own this window's authority.
-                continue;
-            }
+            pending_rules.clear();
         }
         // The deterministic floor for a window the rules have already cut.
         let state = if held || quarantine_completed || observation.budget.quarantined {
@@ -226,12 +274,25 @@ async fn run(args: Args) -> Result<()> {
                             }],
                         )
                         .await?;
-                    let complete = incident.completed_at.is_some()
-                        && incident.network_cut_at.is_some()
-                        && incident.paused_at.is_some()
-                        && incident.snapshot_id.is_some()
-                        && !incident.report.is_empty();
-                    held = complete;
+                    let mut incident = incident;
+                    // The POST answers with the incident as it stood when the
+                    // request was accepted - the stages run on the control
+                    // plane's own task - so completion is read from the
+                    // authoritative record until it says so. The telemetry
+                    // endpoint is deliberately not used to answer this: the
+                    // control plane holds the sandbox lifecycle gate for the
+                    // whole cut, because the pause and the snapshot are part of
+                    // it, so a telemetry read issued while the cut runs queues
+                    // behind the cut this same window started.
+                    //
+                    // Polling stays inside this window rather than deferring to
+                    // the next tick, because a deferred window has already had
+                    // its reviewer called: the outcome below is printed against
+                    // the host state read after the action, and a window that
+                    // returned to the top of the loop to ask again would either
+                    // print an action that had not happened yet or re-review the
+                    // same window and spend a second reviewer request on it.
+                    let mut complete = completed(&incident);
                     println!(
                         "{}",
                         serde_json::json!({"watcher":"verdict_quarantine","identity":identity,
@@ -240,11 +301,20 @@ async fn run(args: Args) -> Result<()> {
                         "network_cut_at":incident.network_cut_at,"paused_at":incident.paused_at,
                         "snapshot_id":incident.snapshot_id})
                     );
-                    if !complete {
-                        // Retried on the next tick; an incomplete cut is never
-                        // reported as a completed one.
-                        break;
+                    while !complete {
+                        tokio::time::sleep(Duration::from_millis(rules.poll_interval_ms)).await;
+                        incident = transport.incident().await?;
+                        complete = completed(&incident);
+                        println!(
+                            "{}",
+                            serde_json::json!({"watcher":"verdict_quarantine","identity":identity,
+                            "status":if complete {"completed"} else {"incomplete"},
+                            "incident_id":incident.id,"completed_at":incident.completed_at,
+                            "network_cut_at":incident.network_cut_at,"paused_at":incident.paused_at,
+                            "snapshot_id":incident.snapshot_id})
+                        );
                     }
+                    held = true;
                 }
             }
             let host = transport.observe(deterministic.cursor()).await?;

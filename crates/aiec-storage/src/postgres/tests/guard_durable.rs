@@ -359,3 +359,80 @@ async fn postgres_guard_lifetime_quarantine_and_pending_progress_are_durable_and
     );
     drop_test_schema(&repository, admin, schema).await;
 }
+
+/// A release is the only exit from a quarantine, and it is the only exit that
+/// is meant to work: it has to move both latches, in one transaction, with the
+/// operator's name on both. What it must not become is a way to disable the
+/// latches, which is what the previous implementation did.
+#[tokio::test]
+async fn postgres_guard_release_clears_both_latches_and_leaves_them_armed() {
+    let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let worker = register_test_worker(&repository, tenant).await;
+    let (state, fence) = place(&repository, tenant, worker).await;
+    let id = state.identity.sandbox_id;
+    repository.put_guard_budget(state.clone()).await.unwrap();
+    repository
+        .mark_guard_quarantined(tenant, id, fence)
+        .await
+        .unwrap();
+
+    let released = repository
+        .release_guard_quarantine(tenant, id, "operator@example.com")
+        .await
+        .unwrap();
+    assert_eq!(released.state, SandboxState::Paused);
+    assert!(
+        !repository
+            .get_guard_budget(tenant, id)
+            .await
+            .unwrap()
+            .quarantined,
+        "the durable mark is what a later read reports, so a release that leaves it is not a release"
+    );
+    let (mark_at, mark_by): (Option<chrono::DateTime<Utc>>, Option<String>) = sqlx::query_as(
+        "SELECT guard_released_at, guard_released_by FROM guard_budgets WHERE sandbox_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&repository.pool)
+    .await
+    .unwrap();
+    assert!(mark_at.is_some() && mark_by.as_deref() == Some("operator@example.com"));
+
+    // The old implementation disabled the sandbox latch for the table, which is
+    // catalog state and permanent: nothing in the release path ever turned it
+    // back on. The catalog is the honest place to assert that it is still
+    // armed, and it is a property no assertion about rows can see.
+    for trigger in ["guard_quarantine_latched", "guard_budget_monotone"] {
+        let (enabled,): (String,) = sqlx::query_as(
+            "SELECT tgenabled::text FROM pg_trigger
+              WHERE tgrelid IN ('sandboxes'::regclass, 'guard_budgets'::regclass)
+                AND tgname = $1",
+        )
+        .bind(trigger)
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(enabled, "O", "{trigger} must not be left disabled");
+    }
+    // A release marker is the one thing an ordinary write cannot produce, and
+    // this budget is no longer quarantined, which is exactly the case the
+    // marker branch refuses.
+    assert!(
+        sqlx::query("UPDATE guard_budgets SET guard_released_at = now() WHERE sandbox_id=$1")
+            .bind(id)
+            .execute(&repository.pool)
+            .await
+            .is_err(),
+        "a release marker applies only to a quarantined budget"
+    );
+    assert!(
+        repository
+            .release_guard_quarantine(tenant, id, "operator@example.com")
+            .await
+            .is_err(),
+        "a release is not repeatable: the second one has nothing to release"
+    );
+    drop_test_schema(&repository, admin, schema).await;
+}

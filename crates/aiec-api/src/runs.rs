@@ -1665,6 +1665,20 @@ pub(crate) async fn tear_down_sandbox(
     sandbox: &Sandbox,
 ) -> Result<(), CoreError> {
     let started = Instant::now();
+    // Decided before anything is torn down, not after. `delete_sandbox` refuses
+    // a quarantined row below, and by then the microVM is already gone and the
+    // Guard attachment already released - so a refused deletion would have the
+    // side effects of a successful one, and the evidence the operator needs to
+    // decide is destroyed along with the machine. A quarantine is held by
+    // exactly one exit: the explicit release that has not happened yet. The
+    // fresh read is what makes this a decision rather than a guess; the `sandbox`
+    // handed in predates whatever the quarantine did.
+    let current = state.repository().get_sandbox(tenant, sandbox_id).await?;
+    if current.state == aiec_core::SandboxState::Quarantined {
+        return Err(CoreError::Conflict(
+            "quarantined sandbox requires explicit human release".into(),
+        ));
+    }
     state.runtime_for(sandbox)?.destroy(sandbox).await?;
     let runtime_destroy_ms = started.elapsed().as_millis() as u64;
     let release_started = Instant::now();

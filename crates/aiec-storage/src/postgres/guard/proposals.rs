@@ -68,30 +68,43 @@ impl PostgresRepository {
             .fetch_one(&mut *transaction)
             .await
             .map_err(|e| core_error(e.into()))?;
-        // The trigger refuses leaving the latched state, so the latch is
-        // dropped first and only then is the row moved.
-        sqlx::query("ALTER TABLE sandboxes DISABLE TRIGGER guard_quarantine_latched")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|e| core_error(e.into()))?;
+        // Both latches - the sandbox's and its budget's - recognise exactly one
+        // exit, an operator release, and both require the marker to arrive in
+        // the same statement as the state change. They are checked in that
+        // order on purpose: the sandbox moves first, so the budget trigger can
+        // see a released sandbox when it runs. Neither trigger is disabled;
+        // disabling one is catalog-scoped and permanent, so it cannot be a
+        // release mechanism.
         let result = sqlx::query(
-            "UPDATE sandboxes SET state = 'paused', updated_at = now()              WHERE id = $1 AND tenant_id = $2 AND state = 'quarantined' RETURNING id",
+            "UPDATE sandboxes
+                SET state = 'paused', guard_released_at = now(), guard_released_by = $3, updated_at = now()
+              WHERE id = $1 AND tenant_id = $2 AND state = 'quarantined'
+              RETURNING id",
         )
         .bind(sandbox)
         .bind(tenant)
+        .bind(released_by)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|e| core_error(database_error(e)))?;
-        sqlx::query(
-            "UPDATE guard_budgets SET quarantined = false, updated_at = now() WHERE sandbox_id = $1",
-        )
-        .bind(sandbox)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|e| core_error(e.into()))?;
         if result.is_none() {
             return Err(CoreError::Conflict("sandbox is not quarantined".into()));
         }
+        // Scoped by tenant like every other statement here: the budget row is
+        // keyed by sandbox alone, and a release must not be able to reach a
+        // row belonging to another tenant that a sandbox id could collide with.
+        sqlx::query(
+            "UPDATE guard_budgets
+                SET payload = jsonb_set(payload, '{quarantined}', 'false'::jsonb, true),
+                    guard_released_at = now(), guard_released_by = $3, updated_at = now()
+              WHERE sandbox_id = $1 AND tenant_id = $2",
+        )
+        .bind(sandbox)
+        .bind(tenant)
+        .bind(released_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| core_error(database_error(e)))?;
         transaction
             .commit()
             .await

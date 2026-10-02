@@ -616,6 +616,24 @@ impl Runtime {
         }
         Ok(addresses)
     }
+
+    fn queue_transition(&self, decision: Decision, reason: &str) -> Result<()> {
+        self.audit_tx
+            .try_send(AuditCommand::Record(self.measured_event(
+                Category::Lifecycle,
+                decision,
+                reason,
+                None,
+                0,
+                0,
+                Duration::ZERO,
+            )))
+            .map_err(|_| {
+                self.terminal_failure.store(true, Ordering::Release);
+                self.cut.store(true, Ordering::Release);
+                GuardError::Unavailable("guard audit queue full".into())
+            })
+    }
 }
 
 pub struct GuardGateway {
@@ -639,6 +657,22 @@ impl GatewayControl {
     }
     pub fn cut(&self) -> Result<()> {
         self.state.latch_cut(false).map(|_| ())
+    }
+
+    /// Holds the attachment cut until an authorized release.
+    ///
+    /// A quarantine is a containment decision, not a liveness event: the cut it
+    /// makes has to outlive the watchdog that happened to be reporting, because
+    /// the release that ends it is an operator's. [`Self::cut`] is the watchdog
+    /// dead-man's ordinary cut and the next heartbeat legitimately reopens it.
+    pub fn hold_cut(&self, reason: &'static str) -> Result<()> {
+        let first = self.state.latch_cut(false)?;
+        self.state.watchdog.lock().held = Some(reason);
+        if first {
+            self.state
+                .queue_transition(Decision::Cut, "guard attachment held cut")?;
+        }
+        Ok(())
     }
     pub fn identity(&self) -> GuardIdentity {
         self.state.identity()
@@ -926,12 +960,19 @@ impl GuardGateway {
         let first = !watchdog.activated;
         watchdog.activated = true;
         watchdog.deadline = tokio::time::Instant::now() + self.state.config.watchdog_timeout;
-        self.state.cut.store(false, Ordering::Release);
+        // Liveness is what a heartbeat answers; the cut is not. A cut held by a
+        // containment decision - a canary, a quarantine - survives reporting,
+        // because the release that ends it is a human one and clearing it here
+        // would hand the machine back to a party that only ever proved it was
+        // still there.
+        if watchdog.held.is_none() {
+            self.state.cut.store(false, Ordering::Release);
+        }
         drop(watchdog);
         drop(fence);
         self.state.watchdog_changed.notify_one();
         if first {
-            self.queue_transition(
+            self.state.queue_transition(
                 Decision::Allow,
                 "gateway activated by authenticated watchdog",
             )?;
@@ -957,12 +998,7 @@ impl GuardGateway {
     /// firing, or an operator holding a machine. Unlike an ordinary cut this is
     /// not something the next heartbeat can undo.
     pub fn hold_cut(&self, reason: &'static str) -> Result<()> {
-        let first = self.state.latch_cut(false)?;
-        self.state.watchdog.lock().held = Some(reason);
-        if first {
-            self.queue_transition(Decision::Cut, "guard attachment held cut")?;
-        }
-        Ok(())
+        self.control().hold_cut(reason)
     }
 
     pub fn cut(&self) -> Result<()> {
@@ -970,7 +1006,8 @@ impl GuardGateway {
         if !first {
             return Ok(());
         }
-        self.queue_transition(Decision::Cut, "gateway network cut")
+        self.state
+            .queue_transition(Decision::Cut, "gateway network cut")
     }
     /// A service/audit fault is terminal. Recovery requires a fresh gateway
     /// after verified journal replay, not an operator's ordinary network release.
@@ -1065,24 +1102,6 @@ impl GuardGateway {
                 authorized,
                 complete,
             })
-            .map_err(|_| {
-                self.state.terminal_failure.store(true, Ordering::Release);
-                self.state.cut.store(true, Ordering::Release);
-                GuardError::Unavailable("guard audit queue full".into())
-            })
-    }
-    fn queue_transition(&self, decision: Decision, reason: &str) -> Result<()> {
-        self.state
-            .audit_tx
-            .try_send(AuditCommand::Record(self.state.measured_event(
-                Category::Lifecycle,
-                decision,
-                reason,
-                None,
-                0,
-                0,
-                Duration::ZERO,
-            )))
             .map_err(|_| {
                 self.state.terminal_failure.store(true, Ordering::Release);
                 self.state.cut.store(true, Ordering::Release);

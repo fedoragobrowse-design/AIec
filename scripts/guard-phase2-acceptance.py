@@ -132,22 +132,32 @@ def base_env() -> dict:
     return env
 
 
-def wait_for_health(process: subprocess.Popen, seconds: float = 60.0) -> bool:
+def wait_for_health(process: subprocess.Popen, seconds: float = 60.0) -> tuple[bool, str]:
+    # The reason is returned rather than discarded: a probe that waits a full
+    # minute and then reports only "not ready" has thrown away the sole evidence
+    # of what was actually wrong, and every consumer here is a failure report.
     deadline = time.time() + seconds
+    reason = "no attempt completed before the deadline"
     while time.time() < deadline:
         if process.poll() is not None:
-            return False
+            return False, f"the process exited {process.returncode}"
         try:
             status, _ = http("GET", "/health", token="", timeout=3.0)
             if status == 200:
-                return True
-        except Exception:
-            pass
+                return True, ""
+            reason = f"the health endpoint answered {status}"
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
         time.sleep(0.5)
-    return False
+    return False, reason
 
 
 def stop_all() -> None:
+    # A process this run deliberately stopped is not a cleanup failure even if
+    # it exited badly on the way out: the suite read everything it observes
+    # before stopping it. The names are passed rather than inferred, because a
+    # process that died on its own is exactly what cleanup must report.
+    stopped = set(os.environ.get("P2_STOPPED", "").split())
     for name, process in reversed(_started):
         if process.poll() is None:
             try:
@@ -163,10 +173,7 @@ def stop_all() -> None:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        elif process.returncode not in (0, -signal.SIGTERM, -signal.SIGKILL):
-            # A process this run deliberately killed - the watchdog, for the
-            # dead-man case - is not a cleanup failure; anything else that exits
-            # badly is.
+        elif name not in stopped and process.returncode not in (0, -signal.SIGTERM, -signal.SIGKILL):
             CLEANUP_ERRORS.append(f"{name} exited {process.returncode}")
 
 
@@ -183,9 +190,11 @@ def main() -> int:
         [str(BIN / "aiec-server")],
         {**env, "AIEC_BIND": os.environ["P2_CP_BIND"]},
     )
-    if not wait_for_health(server):
+    healthy, reason = wait_for_health(server)
+    if not healthy:
         log("control plane did not become healthy")
-        print(json.dumps({"status": "FAIL", "error": "control plane did not start"}))
+        print(json.dumps({"status": "FAIL", "error": "control plane did not start",
+                          "reason": reason}))
         stop_all()
         return 1
 

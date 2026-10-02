@@ -832,7 +832,13 @@ fn single_destination(request: &ProposalRequest) -> Option<String> {
     }
 }
 
-fn printable(value: &str) -> bool {
+/// Whether agent- or operator-facing text is one line of printable ASCII.
+///
+/// Control characters are refused because they split a record into fields that
+/// do not exist, and non-ASCII because these fields are rendered at a fixed
+/// width. Space is deliberately allowed: an ordinary label or note is words,
+/// and a rule that rejects words rejects the field.
+pub fn printable(value: &str) -> bool {
     !value
         .chars()
         .any(|character| character.is_control() || !character.is_ascii())
