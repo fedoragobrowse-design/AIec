@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 aiec-core.workspace = true
+aiec-guard.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
@@ -26,4 +27,3 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-aiec-guard.workspace = true

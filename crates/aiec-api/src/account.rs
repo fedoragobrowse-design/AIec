@@ -115,6 +115,9 @@ fn scope_wire_name(scope: Scope) -> String {
         Scope::GuardRead => "guard:read",
         Scope::GuardHeartbeat => "guard:heartbeat",
         Scope::GuardQuarantine => "guard:quarantine",
+        Scope::GuardPropose => "guard:propose",
+        Scope::GuardApprove => "guard:approve",
+        Scope::GuardRelease => "guard:release",
         Scope::Admin => "admin",
     }
     .to_string()

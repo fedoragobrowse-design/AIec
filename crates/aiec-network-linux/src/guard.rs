@@ -6,14 +6,16 @@ use aiec_core::{
     network::{NetworkAttachment, NetworkBackend, NetworkCapabilities, NetworkPolicy},
 };
 use aiec_guard::{
-    compiler::{CompiledPolicy, OperatorBoundary, compile},
+    canaries::{CanaryEnforcer, CanaryMonitor},
+    compiler::{OperatorBoundary, compile},
     control::{
         BudgetAuthority, GuardControlCommand, GuardControlResponse, GuardFence, GuardIdentity,
-        GuardRuntimeObservation,
+        GuardRuntimeObservation, QuarantineRequest,
     },
     enforcement::{CounterSource, EnforcementBackend, GuardAttachment, NftablesBackend},
     events::{Category, Decision, EventInput, EventSink, FileEventSink, GuardEvent},
     gateway::{CredentialStore, GatewayConfig, GatewayControl, GatewayNetworkCut, GuardGateway},
+    proposals::{AtomicPolicy, ProposalStore, ProposalStoreConfig},
 };
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -42,7 +44,11 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 struct RunningGuard {
     attachment: GuardAttachment,
     node_id: Option<Uuid>,
-    compiled: CompiledPolicy,
+    /// The policy cell the gateway enforces, advanced by an approved proposal.
+    /// Nothing else may hold a copy: a stale copy would compare a live
+    /// telemetry call against a hash the guest no longer runs under, or
+    /// reinstall the previous ruleset on a restore.
+    policy: Arc<AtomicPolicy>,
     gateway: Mutex<Option<GuardGateway>>,
     control: GatewayControl,
     fence: std::sync::RwLock<GuardFence>,
@@ -50,6 +56,53 @@ struct RunningGuard {
     kernel: Mutex<()>,
     released: AtomicBool,
     kernel_cut: AtomicBool,
+    /// The operator boundary this attachment was compiled against, kept for
+    /// verifying a candidate policy before it is installed.
+    boundary: Option<OperatorBoundary>,
+    /// Built on first use, so an attachment nobody proposes against never pays
+    /// for a store.
+    proposals: Mutex<Option<Arc<ProposalStore>>>,
+}
+
+/// Enforces a canary tripwire with the actions this attachment already owns.
+///
+/// The port has exactly two methods. There is no method that could widen a
+/// policy, restore a cut, or release a quarantine, so a canary firing can only
+/// ever be more restrictive than what was already in force.
+struct AttachmentCanaryEnforcer {
+    guard: Weak<RunningGuard>,
+    cut: std::sync::Arc<dyn aiec_guard::enforcement::EnforcementBackend>,
+}
+
+#[async_trait]
+impl CanaryEnforcer for AttachmentCanaryEnforcer {
+    async fn cut(&self) -> Result<(), aiec_guard::GuardError> {
+        let Some(guard) = self.guard.upgrade() else {
+            return Ok(());
+        };
+        if let Some(gateway) = guard.gateway.lock().await.as_ref() {
+            // A canary firing is a containment decision, not a transient cut:
+            // the next heartbeat must not re-admit the machine that just
+            // touched a tripwire.
+            gateway.hold_cut("canary fired")?;
+        }
+        let _ = self.cut.cut_network(&guard.attachment).await;
+        guard
+            .kernel_cut
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    async fn quarantine(&self, request: QuarantineRequest) -> Result<(), aiec_guard::GuardError> {
+        // The quarantine itself is a control-plane decision - it marks durable
+        // state and dispatches a pause and a capture - so a worker-side canary
+        // cuts and reports, and the control plane's reaper path decides the
+        // rest. Reporting an unapplied quarantine as done would be a lie.
+        let _ = request;
+        Err(aiec_guard::GuardError::Unavailable(
+            "canary quarantine is applied by the control plane".into(),
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -315,7 +368,7 @@ impl GuardNetworkManager {
         if guard.attachment.sandbox_id != sandbox.id
             || guard.attachment.tenant_id != sandbox.tenant_id
             || guard.node_id != sandbox.node_id
-            || guard.compiled.policy_hash() != policy_hash
+            || guard.control.policy_hash() != policy_hash
             || guard.released.load(Ordering::Acquire)
         {
             return Err(CoreError::InvalidRequest(
@@ -363,7 +416,7 @@ impl GuardNetworkManager {
                 updated_at: chrono::Utc::now(),
                 runtime_path: None,
             };
-            let policy_hash = guard.compiled.policy_hash().to_owned();
+            let policy_hash = guard.control.policy_hash();
             let fence = context.fence;
             if let Err(error) = self.guard_heartbeat(&sandbox, &policy_hash, fence).await {
                 eprintln!("guard heartbeat refused for {sandbox_id}: {error}");
@@ -395,6 +448,54 @@ impl GuardNetworkManager {
         self.running.lock().await.len()
     }
 
+    /// The proposal store for a live attachment, built on the same policy cell
+    /// the gateway enforces.
+    ///
+    /// The store lives here rather than in the control plane on purpose: the
+    /// live policy and the kernel rules are this process's, so an approved
+    /// proposal can only take effect where it is enforced. The control plane
+    /// records the human decision and dispatches; this applies it.
+    pub async fn proposal_store(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+        fence: GuardFence,
+    ) -> Result<Arc<ProposalStore>, CoreError> {
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        if let Some(store) = guard.proposals.lock().await.as_ref() {
+            return Ok(store.clone());
+        }
+        // The policy cell is taken from the gateway and the store is built
+        // without holding the gateway lock, so an apply can never be blocked by
+        // a decision that is waiting on this store.
+        let policy = {
+            let gateway = guard.gateway.lock().await;
+            gateway
+                .as_ref()
+                .ok_or_else(|| CoreError::Unavailable("Guard gateway stopped".into()))?
+                .control()
+                .policy()
+        };
+        let boundary = guard
+            .boundary
+            .clone()
+            .ok_or_else(|| CoreError::Unavailable("operator boundary is not loaded".into()))?;
+        let store = Arc::new(
+            ProposalStore::new(ProposalStoreConfig {
+                sandbox_id: sandbox.id,
+                tenant_id: sandbox.tenant_id,
+                boundary,
+                policy,
+                enforcement: self.enforcement.clone(),
+                attachment: guard.attachment.clone(),
+                events: guard.events.clone(),
+            })
+            .map_err(guard_error)?,
+        );
+        *guard.proposals.lock().await = Some(store.clone());
+        Ok(store)
+    }
+
     pub async fn guard_heartbeat(
         &self,
         sandbox: &Sandbox,
@@ -420,7 +521,7 @@ impl GuardNetworkManager {
         if first {
             if let Err(error) = self
                 .enforcement
-                .restore_network(&guard.compiled, &guard.attachment)
+                .restore_network(guard.policy.load().compiled(), &guard.attachment)
                 .await
             {
                 let _ = gateway.cut();
@@ -485,7 +586,7 @@ impl GuardNetworkManager {
         }
         if let Err(error) = self
             .enforcement
-            .restore_network(&guard.compiled, &guard.attachment)
+            .restore_network(guard.policy.load().compiled(), &guard.attachment)
             .await
         {
             let _ = gateway.cut();
@@ -714,11 +815,19 @@ impl GuardNetworkManager {
                 .cut_network(&attachment)
                 .await
                 .map_err(|e| CoreError::Unavailable(format!("guard nftables apply: {e}")))?;
-            let gateway = GuardGateway::start(GatewayConfig {
+            // The layer 7 policy rides with the sandbox, not with the network
+            // policy: it changes what Guard may see, and the operator's
+            // acknowledgement for interception is checked again here.
+            let l7 = sandbox
+                .environment
+                .guard
+                .as_ref()
+                .and_then(|guard| guard.l7.clone());
+            let gateway = GuardGateway::start_with_l7(GatewayConfig {
+                compiled: compiled.clone(),
                 sandbox_id: sandbox.id,
                 tenant_id: sandbox.tenant_id,
                 fence: context.fence,
-                compiled: compiled.clone(),
                 bind_ip: gateway_ip,
                 guest_ip,
                 broker_port: BROKER_PORT,
@@ -727,7 +836,7 @@ impl GuardNetworkManager {
                 events: events.clone(),
                 budget_authority: authority,
                 watchdog_timeout: Duration::from_millis(config.watchdog_timeout_ms),
-            })
+            }, l7)
             .await
             .map_err(|e| CoreError::Unavailable(format!("guard gateway start: {e}")))?;
             private_json(
@@ -759,7 +868,7 @@ impl GuardNetworkManager {
             let guard = Arc::new(RunningGuard {
                 attachment: attachment.clone(),
                 node_id: sandbox.node_id,
-                compiled: compiled.clone(),
+                policy: gateway.control().policy(),
                 fence: std::sync::RwLock::new(context.fence),
                 control,
                 gateway: Mutex::new(Some(gateway)),
@@ -767,10 +876,42 @@ impl GuardNetworkManager {
                 kernel: Mutex::new(()),
                 released: AtomicBool::new(false),
                 kernel_cut: AtomicBool::new(true),
+                boundary: Some(boundary),
+                proposals: Mutex::new(None),
             });
-            guard.gateway.lock().await.as_ref().expect("new gateway").set_network_cut_handler(Arc::new(AttachmentCut {
-                guard: Arc::downgrade(&guard), enforcement: self.enforcement.clone(),
-            }));
+            {
+                let gateway = guard.gateway.lock().await;
+                let gateway = gateway.as_ref().expect("new gateway");
+                gateway.set_network_cut_handler(Arc::new(AttachmentCut {
+                    guard: Arc::downgrade(&guard),
+                    enforcement: self.enforcement.clone(),
+                }));
+                // Canaries are optional and are only constructed when the
+                // sandbox configures one. Only the two observations the host
+                // actually sees are wired: a resolved name and a presented
+                // credential. A file the guest reads is not visible outside the
+                // guest, so it is not wired to an authoritative action here.
+                if let Some(guard_config) = &sandbox.environment.guard {
+                    let monitor = CanaryMonitor::new(
+                        &guard_config.canaries,
+                        GuardIdentity {
+                            sandbox_id: sandbox.id,
+                            tenant_id: sandbox.tenant_id,
+                            policy_hash: compiled.policy_hash().to_owned(),
+                        },
+                        context.fence,
+                        events.clone(),
+                        Arc::new(AttachmentCanaryEnforcer {
+                            guard: Arc::downgrade(&guard),
+                            cut: self.enforcement.clone(),
+                        }),
+                    )
+                    .map_err(guard_error)?;
+                    if let Some(monitor) = monitor {
+                        gateway.control().set_canaries(monitor);
+                    }
+                }
+            }
             Ok::<_, CoreError>(guard)
         }
         .await;
@@ -823,6 +964,38 @@ impl NetworkBackend for GuardNetworkManager {
             GuardControlCommand::SetFence { fence } => {
                 self.guard_set_fence(sandbox, fence).await?;
                 Ok(GuardControlResponse::Unit)
+            }
+            GuardControlCommand::ApplyProposal {
+                proposal,
+                approved_by,
+            } => {
+                if proposal.sandbox_id != sandbox.id || proposal.tenant_id != sandbox.tenant_id {
+                    return Err(CoreError::InvalidRequest(
+                        "proposal belongs to another sandbox or tenant".into(),
+                    ));
+                }
+                let store = self
+                    .proposal_store(sandbox, &proposal.base_policy_hash, fence)
+                    .await?;
+                let outcome = store
+                    .apply_attested(proposal, &approved_by)
+                    .await
+                    .map_err(guard_error)?;
+                Ok(GuardControlResponse::PolicyApplied {
+                    proposal_id: outcome.proposal_id,
+                    previous_policy_hash: outcome.previous_policy_hash,
+                    policy_hash: outcome.policy_hash,
+                })
+            }
+            // A release is the same fenced restore an operator already uses:
+            // it clears the latch through the gateway's authorized path and
+            // reinstalls the rules before the control plane calls the sandbox
+            // released.
+            GuardControlCommand::Release { policy_hash } => {
+                self.guard_restore(sandbox, &policy_hash, fence).await?;
+                Ok(GuardControlResponse::Released {
+                    policy_hash: policy_hash.to_owned(),
+                })
             }
             GuardControlCommand::Heartbeat { policy_hash } => {
                 self.guard_heartbeat(sandbox, &policy_hash, fence).await?;

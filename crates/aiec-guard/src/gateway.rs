@@ -5,6 +5,9 @@ use crate::{
     compiler::CompiledPolicy,
     control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
     events::{Category, Decision, EventInput, EventSink, GuardEvent},
+    l7,
+    policy::L7Policy,
+    proposals::AtomicPolicy,
 };
 use axum::body::Body;
 use bytes::Bytes;
@@ -37,6 +40,9 @@ use zeroize::Zeroizing;
 
 const IDLE: Duration = Duration::from_secs(30);
 const LIFETIME: Duration = Duration::from_secs(900);
+/// The whole shutdown: every service, every tunnel and the final record.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(15);
+
 /// How long a release waits for its audit record to become durable before the
 /// gateway latches a fault and stays cut.
 ///
@@ -75,6 +81,28 @@ impl CredentialStore {
         }
         self.secrets.insert(name, secret);
         Ok(())
+    }
+    /// Whether `candidate` is the stored secret for `name`, without handing the
+    /// secret to the caller.
+    ///
+    /// Used by operator-side authority checks - a human approval, for one -
+    /// which need to prove possession of operator credential material that
+    /// never leaves this process. Comparison length is not hidden; its value
+    /// is not.
+    pub fn matches(&self, name: &str, candidate: &str) -> bool {
+        let Some(expected) = self.secrets.get(name) else {
+            return false;
+        };
+        let expected = expected.as_bytes();
+        let candidate = candidate.as_bytes();
+        if expected.len() != candidate.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (left, right) in expected.iter().zip(candidate.iter()) {
+            difference |= left ^ right;
+        }
+        difference == 0
     }
     pub fn from_file(path: &Path) -> Result<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -208,6 +236,13 @@ pub trait GatewayNetworkCut: Send + Sync {
 struct WatchdogState {
     deadline: tokio::time::Instant,
     activated: bool,
+    /// A cut a containment decision holds: a canary firing, an operator hold.
+    ///
+    /// It is distinct from a dead-man cut because the watchdog did nothing
+    /// wrong, and distinct from an operator cut because it is not the operator's
+    /// to undo. A heartbeat must never clear it: the containment is the point,
+    /// and the release that ends it is a human one.
+    held: Option<&'static str>,
     /// A cut is in force whose delivery to the kernel and the journal is still
     /// owed. Every cut sets this, whoever asked for it.
     pending: bool,
@@ -220,6 +255,10 @@ struct WatchdogState {
 }
 pub(crate) struct Runtime {
     pub(crate) config: GatewayConfig,
+    /// The policy in force. Every decision reads through this cell, so an
+    /// approved proposal takes effect without a restart and without a reader
+    /// ever seeing a policy that is half of two.
+    policy: Arc<AtomicPolicy>,
     pub(crate) broker: SocketAddr,
     identity: GuardIdentity,
     fence: std::sync::RwLock<GuardFence>,
@@ -227,6 +266,8 @@ pub(crate) struct Runtime {
     terminal_failure: AtomicBool,
     pub(crate) stop: watch::Sender<u64>,
     budget: Mutex<Budget>,
+    /// The canary monitor, when the sandbox configures one.
+    canary: parking_lot::Mutex<Option<std::sync::Arc<crate::canaries::CanaryMonitor>>>,
     transitions: Mutex<()>,
     requests: Arc<Semaphore>,
     pub(crate) connections: Arc<Semaphore>,
@@ -237,6 +278,16 @@ pub(crate) struct Runtime {
     network_cut: AuditMutex<Option<Arc<dyn GatewayNetworkCut>>>,
 }
 impl Runtime {
+    /// The policy in force right now.
+    pub(crate) fn compiled(&self) -> Arc<CompiledPolicy> {
+        self.policy.compiled()
+    }
+
+    /// The layer 7 rules in force, if the attachment has any.
+    pub(crate) fn l7(&self) -> Option<L7Policy> {
+        self.policy.l7()
+    }
+
     pub(crate) fn active(&self) -> bool {
         !self.cut.load(Ordering::Acquire) && !self.terminal_failure.load(Ordering::Acquire)
     }
@@ -256,7 +307,7 @@ impl Runtime {
         EventInput {
             sandbox_id: self.config.sandbox_id,
             tenant_id: self.config.tenant_id,
-            policy_hash: self.config.compiled.policy_hash().to_owned(),
+            policy_hash: self.compiled().policy_hash().to_owned(),
             category,
             decision,
             reason: reason.into(),
@@ -294,6 +345,11 @@ impl Runtime {
             },
         )
     }
+    /// The canary monitor, when the attachment has one.
+    pub(crate) fn canaries(&self) -> Option<std::sync::Arc<crate::canaries::CanaryMonitor>> {
+        self.canary.lock().clone()
+    }
+
     pub(crate) async fn record(&self, event: EventInput) -> Result<()> {
         match tokio::time::timeout(Duration::from_secs(5), self.config.events.append(event)).await {
             Ok(Ok(_)) => Ok(()),
@@ -343,9 +399,15 @@ impl Runtime {
                             "watchdog is not reporting; authorized release required".into(),
                         ));
                     }
+                    if watchdog.held.is_some() && !authorized {
+                        return Err(GuardError::Denied(
+                            "the attachment is held cut; authorized release required".into(),
+                        ));
+                    }
                     watchdog.deadline = tokio::time::Instant::now() + self.config.watchdog_timeout;
                     watchdog.activated = true;
                     watchdog.deadman = false;
+                    watchdog.held = None;
                     watchdog.pending = false;
                     self.cut.store(false, Ordering::Release);
                     self.watchdog_changed.notify_one();
@@ -404,9 +466,9 @@ impl Runtime {
             b.dns = 0;
         }
         let cap = if dns {
-            self.config.compiled.policy().limits.dns_queries_per_minute
+            self.compiled().policy().limits.dns_queries_per_minute
         } else {
-            self.config.compiled.policy().limits.requests_per_minute
+            self.compiled().policy().limits.requests_per_minute
         };
         let value = if dns { &mut b.dns } else { &mut b.requests };
         if *value >= cap {
@@ -434,9 +496,9 @@ impl Runtime {
     }
     pub(crate) async fn debit(&self, outgoing: bool, amount: u64) -> Result<()> {
         let cap = if outgoing {
-            self.config.compiled.policy().limits.bytes_out
+            self.compiled().policy().limits.bytes_out
         } else {
-            self.config.compiled.policy().limits.bytes_in
+            self.compiled().policy().limits.bytes_in
         };
         {
             let mut b = self
@@ -490,7 +552,8 @@ impl Runtime {
         Ok(first)
     }
     pub(crate) async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-        let test_addresses = self.config.compiled.boundary().test_addresses(host, port);
+        let compiled = self.compiled();
+        let test_addresses = compiled.boundary().test_addresses(host, port);
         let addresses = if !test_addresses.is_empty() {
             test_addresses
                 .iter()
@@ -511,7 +574,7 @@ impl Runtime {
             return Err(GuardError::Denied("destination resolution bound".into()));
         }
         for addr in &addresses {
-            self.config.compiled.check_destination(host, addr.ip())?;
+            self.compiled().check_destination(host, addr.ip())?;
         }
         Ok(addresses)
     }
@@ -519,7 +582,8 @@ impl Runtime {
 
 pub struct GuardGateway {
     state: Arc<Runtime>,
-    tasks: Vec<JoinHandle<Result<()>>>,
+    /// Named service tasks, drained by `shutdown`.
+    tasks: Vec<(&'static str, JoinHandle<Result<()>>)>,
     audit_task: Option<JoinHandle<Result<()>>>,
     audit_stop: watch::Sender<bool>,
     dns: SocketAddr,
@@ -541,9 +605,27 @@ impl GatewayControl {
     pub fn identity(&self) -> &GuardIdentity {
         &self.state.identity
     }
-    pub fn policy_hash(&self) -> &str {
-        &self.state.identity.policy_hash
+    /// The hash of the policy in force, which changes when an approved
+    /// proposal is applied and not before.
+    pub fn policy_hash(&self) -> String {
+        self.state.policy.policy_hash()
     }
+    /// The live policy cell, so a control plane can hand the same instance to
+    /// a [`crate::proposals::ProposalStore`] and have an approved proposal take
+    /// effect in this gateway.
+    pub fn policy(&self) -> Arc<AtomicPolicy> {
+        Arc::clone(&self.state.policy)
+    }
+    /// The canary monitor for this attachment, if one is configured.
+    pub fn canaries(&self) -> Option<std::sync::Arc<crate::canaries::CanaryMonitor>> {
+        self.state.canary.lock().clone()
+    }
+
+    /// Attaches the canary monitor. Only the attachment's owner calls this.
+    pub fn set_canaries(&self, monitor: crate::canaries::CanaryMonitor) {
+        *self.state.canary.lock() = Some(std::sync::Arc::new(monitor));
+    }
+
     /// Appends one authoritative lifecycle record through the shared journal.
     pub async fn append(&self, event: EventInput) -> Result<GuardEvent> {
         match tokio::time::timeout(
@@ -580,7 +662,22 @@ async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener,
 
 impl GuardGateway {
     pub async fn start(config: GatewayConfig) -> Result<Self> {
+        Self::start_with_l7(config, None).await
+    }
+    /// Starts a gateway that also governs the traffic it can see.
+    ///
+    /// The layer 7 policy is an argument rather than a configuration field so
+    /// that a deployment which does not use one is unchanged: destination
+    /// policy alone remains the default. An L7 policy that asks for TLS
+    /// interception without the operator's acknowledgement is refused here
+    /// rather than downgraded, and rules that could not be enforced as written
+    /// never reach a socket.
+    pub async fn start_with_l7(config: GatewayConfig, l7: Option<L7Policy>) -> Result<Self> {
         config.compiled.verify()?;
+        if let Some(policy) = &l7 {
+            crate::l7::validate(policy)?;
+        }
+        let policy = Arc::new(AtomicPolicy::new(config.compiled.clone(), l7)?);
         if !(Duration::from_secs(1)..=Duration::from_secs(60)).contains(&config.watchdog_timeout) {
             return Err(GuardError::Policy(
                 "watchdog timeout must be between 1 and 60 seconds".into(),
@@ -619,6 +716,7 @@ impl GuardGateway {
         let (audit_stop, mut audit_shutdown) = watch::channel(false);
         let request_limit = config.compiled.policy().limits.max_concurrent_requests as usize;
         let state = Arc::new(Runtime {
+            policy,
             identity: GuardIdentity {
                 sandbox_id: config.sandbox_id,
                 tenant_id: config.tenant_id,
@@ -630,6 +728,7 @@ impl GuardGateway {
                 activated: false,
                 pending: false,
                 deadman: false,
+                held: None,
             }),
             watchdog_changed: tokio::sync::Notify::new(),
             network_cut: AuditMutex::new(None),
@@ -638,6 +737,7 @@ impl GuardGateway {
             cut: AtomicBool::new(true),
             terminal_failure: AtomicBool::new(false),
             stop,
+            canary: parking_lot::Mutex::new(None),
             budget: Mutex::new(Budget {
                 minute: Instant::now(),
                 requests: 0,
@@ -682,11 +782,22 @@ impl GuardGateway {
             }
             Ok(())
         });
-        let tasks = vec![
-            tokio::spawn(run_watchdog(state.clone())),
-            spawn_service(state.clone(), serve_broker(broker, state.clone())),
-            spawn_service(state.clone(), crate::dns::serve_udp(dns_udp, state.clone())),
-            spawn_service(state.clone(), crate::dns::serve_tcp(dns_tcp, state.clone())),
+        // Named, because a shutdown that cannot finish has to say which
+        // service it was waiting for rather than hanging a build.
+        let tasks: Vec<(&'static str, JoinHandle<Result<()>>)> = vec![
+            ("watchdog", tokio::spawn(run_watchdog(state.clone()))),
+            (
+                "broker",
+                spawn_service(state.clone(), serve_broker(broker, state.clone())),
+            ),
+            (
+                "dns-udp",
+                spawn_service(state.clone(), crate::dns::serve_udp(dns_udp, state.clone())),
+            ),
+            (
+                "dns-tcp",
+                spawn_service(state.clone(), crate::dns::serve_tcp(dns_tcp, state.clone())),
+            ),
         ];
         Ok(Self {
             state,
@@ -773,6 +884,20 @@ impl GuardGateway {
         *bound = fence;
         Ok(())
     }
+    /// Holds the attachment cut until an authorized release.
+    ///
+    /// Used by containment decisions the watchdog did not make: a canary
+    /// firing, or an operator holding a machine. Unlike an ordinary cut this is
+    /// not something the next heartbeat can undo.
+    pub fn hold_cut(&self, reason: &'static str) -> Result<()> {
+        let first = self.state.latch_cut(false)?;
+        self.state.watchdog.lock().held = Some(reason);
+        if first {
+            self.queue_transition(Decision::Cut, "guard attachment held cut")?;
+        }
+        Ok(())
+    }
+
     pub fn cut(&self) -> Result<()> {
         let first = self.state.latch_cut(false)?;
         if !first {
@@ -897,17 +1022,41 @@ impl GuardGateway {
                 GuardError::Unavailable("guard audit queue full".into())
             })
     }
-    pub async fn shutdown(mut self) -> Result<()> {
+    /// Stops the gateway and waits for its services, bounded.
+    ///
+    /// The whole sequence has a deadline: an operator shutting a gateway down
+    /// learns more from a named refusal than from a build that never returns.
+    pub async fn shutdown(self) -> Result<()> {
+        match tokio::time::timeout(SHUTDOWN_DEADLINE, self.shutdown_inner()).await {
+            Ok(result) => result,
+            Err(_) => Err(GuardError::Unavailable(
+                "gateway did not shut down within its deadline".into(),
+            )),
+        }
+    }
+
+    async fn shutdown_inner(mut self) -> Result<()> {
         self.state.close();
         let mut failure = None;
-        for task in self.tasks.drain(..) {
-            match task.await {
-                Ok(Ok(())) => (),
-                Ok(Err(e)) => {
-                    failure = Some(e);
+        // Bounded and aborting: a service that will not stop is aborted and
+        // named, because a shutdown that never returns is a defect in its own
+        // right - and an operator waiting on it learns nothing from a hang.
+        for (name, mut task) in self.tasks.drain(..) {
+            let settled = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+            match settled {
+                Ok(Ok(Ok(()))) => (),
+                Ok(Ok(Err(error))) => failure = Some(error),
+                Ok(Err(_)) => {
+                    failure = Some(GuardError::Unavailable(format!(
+                        "gateway {name} task failed"
+                    )));
                 }
                 Err(_) => {
-                    failure = Some(GuardError::Unavailable("gateway task failed".into()));
+                    task.abort();
+                    let _ = task.await;
+                    failure = Some(GuardError::Unavailable(format!(
+                        "gateway {name} did not stop within its deadline"
+                    )));
                 }
             }
         }
@@ -917,8 +1066,13 @@ impl GuardGateway {
             .lock()
             .map(|mut tasks| std::mem::take(&mut *tasks))
             .unwrap_or_default();
-        for task in tunnels {
-            let _ = task.await;
+        for mut task in tunnels {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
         }
         self.audit_stop.send_replace(true);
         if let Some(task) = self.audit_task.take() {
@@ -957,7 +1111,7 @@ impl Drop for GuardGateway {
     fn drop(&mut self) {
         self.state.close();
         for task in &self.tasks {
-            task.abort();
+            task.1.abort();
         }
         if let Ok(tasks) = self.state.tunnels.lock() {
             for task in tasks.iter() {
@@ -1051,13 +1205,88 @@ async fn deny(state: &Runtime, reason: &'static str, status: StatusCode) -> Resp
         .await;
     response(status, reason)
 }
+/// One bounded-target definition, shared with the layer 7 rules so a path
+/// accepted here is the same path those rules compare against.
 fn safe_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() <= 2048
-        && !path.contains('%')
-        && !path.contains('\\')
-        && !path.split('/').any(|p| p == "." || p == "..")
-        && !path.bytes().any(|b| b <= 32 || b == 127)
+    l7::safe_path(path)
+}
+/// Records and answers a layer 7 refusal.
+///
+/// The reason is the static text [`crate::l7`] produced: no request content,
+/// method name, tool name or document reaches the journal from here.
+async fn deny_l7(
+    state: &Runtime,
+    reason: &'static str,
+    refusal: l7::Refusal,
+    destination: Option<String>,
+) -> Response<Body> {
+    let status = match refusal {
+        l7::Refusal::Forbidden => StatusCode::FORBIDDEN,
+        l7::Refusal::Malformed => StatusCode::BAD_REQUEST,
+        l7::Refusal::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+    };
+    let _ = state
+        .record(state.measured_event(
+            Category::Network,
+            Decision::Deny,
+            reason,
+            destination,
+            0,
+            0,
+            Duration::ZERO,
+        ))
+        .await;
+    response(status, reason)
+}
+/// Whether the policy has anything to say about a request body.
+fn governs_bodies(policy: &L7Policy) -> bool {
+    !policy.mcp.allowed_methods.is_empty()
+        || policy.graphql.allow_mutations
+        || !policy.graphql.operations.is_empty()
+        || !policy.graphql.root_fields.is_empty()
+}
+/// Buffers a bounded request body so the body rules can read it.
+///
+/// A body whose length is not declared is refused rather than partially
+/// inspected: the rules would then be applied to a prefix of what the upstream
+/// actually receives.
+async fn visible_body(
+    request: &mut Request<Body>,
+    limit: usize,
+) -> std::result::Result<Option<Bytes>, (&'static str, l7::Refusal)> {
+    let declared = match request.headers().get("content-length") {
+        None => {
+            return Err((
+                "l7: request body length is not declared and cannot be inspected",
+                l7::Refusal::Malformed,
+            ));
+        }
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or((
+                "l7: request body length is not declared and cannot be inspected",
+                l7::Refusal::Malformed,
+            ))?,
+    };
+    if declared > limit {
+        return Err((
+            "l7: request body exceeds the inspection bound",
+            l7::Refusal::TooLarge,
+        ));
+    }
+    let buffered =
+        axum::body::to_bytes(std::mem::replace(request.body_mut(), Body::empty()), limit)
+            .await
+            .map_err(|_| {
+                (
+                    "l7: request body could not be read for inspection",
+                    l7::Refusal::Malformed,
+                )
+            })?;
+    *request.body_mut() = Body::from(buffered.clone());
+    Ok(Some(buffered))
 }
 fn path_allowed(path: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|p| {
@@ -1155,7 +1384,8 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
             {
                 return deny(&state, "broker authority mismatch", StatusCode::FORBIDDEN).await;
             }
-            let Some(model) = &state.config.compiled.policy().model else {
+            let broker = state.compiled();
+            let Some(model) = &broker.policy().model else {
                 return deny(&state, "model route denied", StatusCode::FORBIDDEN).await;
             };
             let prefix = format!("/model/{}", model.credential);
@@ -1171,7 +1401,22 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
             {
                 return deny(&state, "model method or path denied", StatusCode::FORBIDDEN).await;
             }
-            let Some(binding) = state.config.compiled.policy().credentials.iter().find(|b| {
+            // A canary credential is presented by name, so the host sees the
+            // presentation even though it never sees the secret.
+            if let Some(canary) = state.canaries()
+                && let Ok(outcome) = canary.observe_credential(&model.credential).await
+                && outcome.trip.is_some()
+            {
+                // Firing has already cut or quarantined; the request does not
+                // proceed either way.
+                return deny(
+                    &state,
+                    "presentation of a canary credential refused",
+                    StatusCode::FORBIDDEN,
+                )
+                .await;
+            }
+            let Some(binding) = broker.policy().credentials.iter().find(|b| {
                 b.name == model.credential && b.host == model.host && b.port == model.port
             }) else {
                 return deny(
@@ -1277,8 +1522,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 .await;
             }
             if state
-                .config
-                .compiled
+                .compiled()
                 .policy()
                 .model
                 .as_ref()
@@ -1291,7 +1535,8 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 )
                 .await;
             }
-            let Some(rule) = state.config.compiled.endpoint(&host, port) else {
+            let compiled = state.compiled();
+            let Some(rule) = compiled.endpoint(&host, port) else {
                 return deny(&state, "proxy destination denied", StatusCode::FORBIDDEN).await;
             };
             if !safe_path(uri.path())
@@ -1315,8 +1560,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
         };
     if scheme != "https"
         && state
-            .config
-            .compiled
+            .compiled()
             .boundary()
             .test_addresses(&host, port)
             .is_empty()
@@ -1328,7 +1572,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
         )
         .await;
     }
-    let max = state.config.compiled.policy().limits.max_request_bytes;
+    let max = state.compiled().policy().limits.max_request_bytes;
     if request.headers().get("content-length").is_some_and(|v| {
         v.to_str()
             .ok()
@@ -1341,6 +1585,44 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
             StatusCode::PAYLOAD_TOO_LARGE,
         )
         .await;
+    }
+    // Layer 7. The request line is visible on every proxy request, including an
+    // absolute-form HTTPS one, so method and path are governed in both modes.
+    // The body is governed only where Guard reads it in the clear: an HTTPS
+    // request reaches the upstream inside TLS, and a rule applied to a body
+    // Guard never saw would be a rule that was never enforced.
+    if let Some(policy) = state.l7() {
+        let content_type = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let mut body = None;
+        let method = request.method().clone();
+        let may_carry_body =
+            method == Method::POST || method == Method::PUT || method == Method::PATCH;
+        if governs_bodies(&policy) && scheme == "http" && may_carry_body {
+            match visible_body(&mut request, l7::MAX_INSPECTED_BODY_BYTES).await {
+                Ok(buffered) => body = buffered,
+                Err((reason, refusal)) => {
+                    return deny_l7(&state, reason, refusal, Some(format!("{host}:{port}"))).await;
+                }
+            }
+        }
+        let verdict = l7::request_verdict(
+            Some(&policy),
+            &l7::VisibleRequest {
+                host: &host,
+                method: method.as_str(),
+                path: &path,
+                content_type,
+                body: body.as_deref(),
+            },
+        );
+        if let l7::Verdict::Deny {
+            refusal, reason, ..
+        } = verdict
+        {
+            return deny_l7(&state, reason, refusal, Some(format!("{host}:{port}"))).await;
+        }
     }
     let addresses = match state.resolve(&host, port).await {
         Ok(a) => a,
@@ -1356,8 +1638,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
     if scheme != "https"
         && !addresses.iter().all(|address| {
             state
-                .config
-                .compiled
+                .compiled()
                 .allows_plain_http_upstream(&host, port, address.ip())
         })
     {
@@ -1447,14 +1728,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 upload.audit.lock().reason = "outbound byte budget exhausted";
                 std::io::Error::other("request budget exceeded")
             })?;
-        if upload.count
-            > upload
-                .state
-                .config
-                .compiled
-                .policy()
-                .limits
-                .max_request_bytes
+        if upload.count > upload.state.compiled().policy().limits.max_request_bytes
             || !upload.state.active()
         {
             upload.audit.lock().reason = "request body limit exceeded or gateway cut";
@@ -1488,7 +1762,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
     }
     if upstream
         .content_length()
-        .is_some_and(|n| n > state.config.compiled.policy().limits.max_response_bytes)
+        .is_some_and(|n| n > state.compiled().policy().limits.max_response_bytes)
     {
         return deny(&state, "response body too large", StatusCode::BAD_GATEWAY).await;
     }
@@ -1520,14 +1794,7 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 item.map_err(|_| std::io::Error::other("upstream response failed"))?;
             download.count = download.count.saturating_add(download.pending.len() as u64);
             download.audit.lock().incoming = download.count;
-            if download.count
-                > download
-                    .state
-                    .config
-                    .compiled
-                    .policy()
-                    .limits
-                    .max_response_bytes
+            if download.count > download.state.compiled().policy().limits.max_response_bytes
                 || !download.state.active()
             {
                 download.audit.lock().reason = "response body limit exceeded or gateway cut";

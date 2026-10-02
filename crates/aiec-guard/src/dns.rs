@@ -131,6 +131,16 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
     } else if bytes.len() > DNS_FRAME || bytes.len() < 12 || !raw_question_valid(bytes) {
         reply.set_response_code(ResponseCode::FormErr);
     } else if let Ok(query) = Message::from_vec(bytes) {
+        // A canary hostname is resolved only by this resolver, so this is the
+        // authoritative place to see the attempt.
+        if let (Some(canary), Some(answer)) = (state.canaries(), query.queries().first())
+            && let Ok(outcome) = canary.observe_dns_query(&answer.name().to_utf8()).await
+            && outcome.trip.is_some()
+        {
+            reply.set_response_code(ResponseCode::Refused);
+            reason = "canary hostname refused";
+            decision = Decision::Deny;
+        }
         // Prevent parser differential attacks: parse/reencode alone is not sufficient; reject
         // question compression (unnecessary for one question), trailing wire data and all additions.
         let shape_valid = query.message_type() == MessageType::Query
@@ -163,8 +173,7 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
                 });
             reply.add_query(q.clone());
             let port = state
-                .config
-                .compiled
+                .compiled()
                 .policy()
                 .network
                 .egress
@@ -181,8 +190,7 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
                 reply.set_response_code(ResponseCode::FormErr);
             } else if !matches!(kind, RecordType::A | RecordType::AAAA)
                 || !state
-                    .config
-                    .compiled
+                    .compiled()
                     .policy()
                     .network
                     .dns
@@ -192,17 +200,12 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
             {
                 reply.set_response_code(ResponseCode::Refused);
                 reason = "DNS record type denied";
-            } else if port.is_none() || !state.config.compiled.allows_dns(&name, u16::from(kind)) {
+            } else if port.is_none() || !state.compiled().allows_dns(&name, u16::from(kind)) {
                 reply.set_response_code(ResponseCode::Refused);
                 reason = "DNS name denied";
             } else {
-                let model = state
-                    .config
-                    .compiled
-                    .policy()
-                    .model
-                    .as_ref()
-                    .filter(|m| m.host == name);
+                let compiled = state.compiled();
+                let model = compiled.policy().model.as_ref().filter(|m| m.host == name);
                 let addresses = if model.is_some() {
                     Ok(vec![SocketAddr::new(IpAddr::V4(state.config.bind_ip), 0)])
                 } else {

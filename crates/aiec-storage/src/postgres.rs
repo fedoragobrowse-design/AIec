@@ -3,8 +3,8 @@ use crate::{
 };
 mod guard;
 use aiec_core::{
-    ApiKeyRecord, CoreError, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope,
-    Snapshot, UsageEvent, UsageSummary, new_id,
+    ApiKeyRecord, CoreError, GuardProposal, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState,
+    Scope, Snapshot, UsageEvent, UsageSummary, new_id,
     run::{
         Placement, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
         RunSandbox, RunState, WorkloadSpec,
@@ -77,7 +77,7 @@ fn runtime_from_str(value: &str) -> Result<RuntimeKind, StoreError> {
     }
 }
 
-fn sandbox_from_row(row: &sqlx::postgres::PgRow) -> Result<Sandbox, StoreError> {
+pub(crate) fn sandbox_from_row(row: &sqlx::postgres::PgRow) -> Result<Sandbox, StoreError> {
     let state: String = row.try_get("state")?;
     let runtime: String = row.try_get("runtime")?;
     Ok(Sandbox {
@@ -3832,6 +3832,48 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn update_guard_policy_hash(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        policy_hash: &str,
+    ) -> Result<(), CoreError> {
+        Self::update_guard_policy_hash(self, tenant, sandbox, policy_hash).await
+    }
+
+    async fn release_guard_quarantine(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        released_by: &str,
+    ) -> Result<Sandbox, CoreError> {
+        Self::release_guard_quarantine(self, tenant, sandbox, released_by).await
+    }
+
+    async fn put_guard_proposal(
+        &self,
+        proposal: GuardProposal,
+    ) -> Result<GuardProposal, CoreError> {
+        Self::put_guard_proposal(self, proposal).await
+    }
+
+    async fn list_guard_proposals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardProposal>, CoreError> {
+        Self::list_guard_proposals(self, tenant, sandbox).await
+    }
+
+    async fn get_guard_proposal(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        id: Uuid,
+    ) -> Result<GuardProposal, CoreError> {
+        Self::get_guard_proposal(self, tenant, sandbox, id).await
+    }
+
     async fn get_guard_budget(
         &self,
         tenant: Uuid,

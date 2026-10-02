@@ -38,8 +38,7 @@ pub(super) async fn connect(
         .await;
     }
     if state
-        .config
-        .compiled
+        .compiled()
         .policy()
         .model
         .as_ref()
@@ -52,7 +51,8 @@ pub(super) async fn connect(
         )
         .await;
     }
-    let Some(rule) = state.config.compiled.endpoint(&host, port) else {
+    let compiled = state.compiled();
+    let Some(rule) = compiled.endpoint(&host, port) else {
         return deny(&state, "CONNECT destination denied", StatusCode::FORBIDDEN).await;
     };
     if !rule.allowed_methods.is_empty() || !rule.allowed_paths.is_empty() {
@@ -62,6 +62,15 @@ pub(super) async fn connect(
             StatusCode::FORBIDDEN,
         )
         .await;
+    }
+    // A tunnel is never inspected as if it were a plain request. Guard cannot
+    // see a method or a path inside it, so a host the layer 7 policy governs is
+    // refused here rather than forwarded ungoverned.
+    if let l7::Verdict::Deny {
+        refusal, reason, ..
+    } = l7::tunnel_verdict(state.l7().as_ref(), &host)
+    {
+        return deny_l7(&state, reason, refusal, Some(format!("{host}:{port}"))).await;
     }
     let addresses = match state.resolve(&host, port).await {
         Ok(a) => a,
@@ -109,7 +118,7 @@ pub(super) async fn connect(
                 .await
                 .map_err(|_| ())?;
             audit.lock().out = hello.len() as u64;
-            if hello.len() as u64 > task_state.config.compiled.policy().limits.max_request_bytes {
+            if hello.len() as u64 > task_state.compiled().policy().limits.max_request_bytes {
                 return Err(());
             }
             task_state
@@ -208,9 +217,9 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
         }
         state.debit(outgoing, size as u64).await.map_err(|_| ())?;
         let cap = if outgoing {
-            state.config.compiled.policy().limits.max_request_bytes
+            state.compiled().policy().limits.max_request_bytes
         } else {
-            state.config.compiled.policy().limits.max_response_bytes
+            state.compiled().policy().limits.max_response_bytes
         };
         if count > cap || !state.active() {
             return Err(());

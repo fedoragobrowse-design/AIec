@@ -37,6 +37,7 @@ fn firecracker_fails_closed_without_prerequisites() {
         readiness_timeout: Duration::from_millis(1),
         guest_artifact_dir: None,
         guest_artifact: None,
+        image_trust: None,
         require_coding_guest: false,
         host_reserves: aiec_core::host_pressure::HostReserves::default(),
     };

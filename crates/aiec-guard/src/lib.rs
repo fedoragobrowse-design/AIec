@@ -2,6 +2,7 @@
 //! This crate deliberately has no dependency on the sandbox control plane.
 
 pub mod budget_client;
+pub mod canaries;
 pub mod compiler;
 pub mod control;
 pub mod deployment;
@@ -9,8 +10,12 @@ pub mod dns;
 pub mod enforcement;
 pub mod events;
 pub mod gateway;
+pub mod l7;
+pub mod openshell;
 pub mod policy;
+pub mod proposals;
 pub mod watchdog;
+pub mod watcher;
 
 pub type Result<T, E = GuardError> = std::result::Result<T, E>;
 

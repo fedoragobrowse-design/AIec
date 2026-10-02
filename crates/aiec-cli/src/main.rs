@@ -1,3 +1,6 @@
+mod guard;
+use guard::{GuardCommand, guard_command};
+
 use aiec_api::{
     HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
     WorkerStatus, serve_worker_tls,
@@ -74,6 +77,11 @@ enum Command {
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommand,
+    },
+    /// Guard: policy, proposals, incidents and quarantine for a sandbox.
+    Guard {
+        #[command(subcommand)]
+        command: GuardCommand,
     },
     /// A run: a workload the control plane places, drives and reclaims.
     Run {
@@ -435,6 +443,7 @@ async fn main() -> Result<()> {
         Command::Sandbox { command } => sandbox_command(&url, api_key.clone(), command).await,
         Command::File { command } => file_command(&url, api_key.clone(), command).await,
         Command::Snapshot { command } => snapshot_command(&url, api_key.clone(), command).await,
+        Command::Guard { command } => guard_command(&url, api_key.clone(), command).await,
         Command::Run { command } => run_command(&url, api_key.clone(), command).await,
         Command::Eval { command } => eval_command(&url, api_key.clone(), command).await,
         Command::Benchmark(args) => benchmark(&url, api_key, args).await,

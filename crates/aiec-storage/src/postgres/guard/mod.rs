@@ -1,3 +1,4 @@
+pub(crate) mod proposals;
 use super::{
     PostgresRepository, StoreError, database_error, insert_sandbox_event, lease_from_row,
     lock_sandbox, sandbox_from_row,

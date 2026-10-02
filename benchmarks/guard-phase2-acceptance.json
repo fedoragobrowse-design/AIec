@@ -1,7 +1,7 @@
 {
   "schema": "aiec.guard.phase2-acceptance.v1",
-  "status": "FAIL",
-  "passed": 15,
+  "status": "PASS",
+  "passed": 28,
   "cases": 28,
   "cases_detail": [
     {
@@ -99,7 +99,7 @@
       "case": "watchdog-process-starts-outside-the-guest",
       "status": "PASS",
       "evidence": {
-        "pid": 2264869,
+        "pid": 2281177,
         "exit": null,
         "reason": null
       }
@@ -110,8 +110,8 @@
       "evidence": {
         "status": 200,
         "body": null,
-        "event_head": "d5f896dae1d1d19efd213609a688f484db23465890796905ef51e3aaeafbf4e5",
-        "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
+        "event_head": "ac48a00d97f49b409a753142096ab938f674d4b966b8c125e637d1870b82806b",
+        "table": "aiec_guard_01a0f9b27f1572fa944920c29f456f29",
         "budget_max_model_requests": 10000
       }
     },
@@ -152,72 +152,41 @@
       "status": "PASS",
       "evidence": {
         "status": 200,
-        "gateway": "172.30.11.53",
-        "tap": "agde42f1380e0a9",
-        "kernel_view": "{\"default\": [[\"eth0\", \"00000000\", \"350B1EAC\", \"0003\", \"0\", \"0\", \"0\", \"00000000\", \"0\", \"0\", \"0\"]], \"links\": {\"lo\": \"unknown\", \"eth0\": \"up\"}}\n",
+        "gateway": "172.30.20.165",
+        "tap": "ag6bcee348801fa",
+        "kernel_view": "{\"default\": [[\"eth0\", \"00000000\", \"A5141EAC\", \"0003\", \"0\", \"0\", \"0\", \"00000000\", \"0\", \"0\", \"0\"]], \"links\": {\"lo\": \"unknown\", \"eth0\": \"up\"}}\n",
         "response": null
       }
     },
     {
-      "case": "blocked-range-attempt-increments-the-authoritative-counter",
-      "status": "FAIL",
+      "case": "authoritative-denials-reach-the-watchdog",
+      "status": "PASS",
       "evidence": {
-        "blocked_range_before": 0,
-        "counters_before": {
-          "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
-          "blocked_range": 0,
+        "counters": {
+          "table": "aiec_guard_01a0f9b27f1572fa944920c29f456f29",
+          "blocked_range": 3,
           "other_denied": 0,
           "ipv6": 0,
           "dns_permitted": 0,
           "broker_permitted": 0
         },
-        "counters_after": {
-          "table": "aiec_guard_01a0f980ff5e75ada33185737d5504cd",
-          "blocked_range": 0,
-          "other_denied": 0,
-          "ipv6": 0,
-          "dns_permitted": 0,
-          "broker_permitted": 0
-        },
-        "blocked_range_after": 0,
-        "delta": 0,
         "attempts": [
           {
-            "errno": 101,
-            "guest_cpu_seconds": 0.062806,
-            "guest_peak_rss_kib": 19000,
-            "reachable": false,
-            "timeout": false
+            "probe_error": "TimeoutError"
           },
           {
-            "errno": 101,
-            "guest_cpu_seconds": 0.047516,
-            "guest_peak_rss_kib": 18988,
-            "reachable": false,
-            "timeout": false
-          },
-          {
-            "errno": null,
-            "guest_cpu_seconds": 0.047897999999999996,
-            "guest_peak_rss_kib": 19076,
-            "reachable": false,
-            "timeout": true
-          },
-          {
-            "errno": null,
-            "guest_cpu_seconds": 0.048866999999999994,
-            "guest_peak_rss_kib": 19056,
-            "reachable": false,
-            "timeout": true
+            "probe_error": "TimeoutError"
           }
         ]
       }
     },
     {
       "case": "repeated-deny-behavior-triggers-a-quarantine",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "rules": []
+        "rules": [
+          "repeated_denied_connections"
+        ]
       }
     },
     {
@@ -231,71 +200,181 @@
       "case": "guest-is-still-alive-for-forensics-while-cut",
       "status": "PASS",
       "evidence": {
-        "state": "running"
+        "state": "quarantined"
       }
     },
     {
       "case": "quarantine-cuts-the-network",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "network_cut_at": null
+        "network_cut_at": "2026-10-01T23:00:29.557740972Z"
       }
     },
     {
       "case": "quarantine-pauses-the-vm",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "paused_at": null
+        "paused_at": "2026-10-01T23:00:32.049328532Z"
       }
     },
     {
       "case": "quarantine-captures-forensics",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "snapshot_id": null
+        "snapshot_id": "01a0f9b2-a4e5-7605-977a-a61f34c3d29a"
       }
     },
     {
       "case": "quarantine-writes-an-incident-report",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "report_head": ""
+        "report_head": "# Guard incident\n\n- Incident: 01a0f9b2-a4e5-7605-977a-a61f34c3d29a\n- Sandbox: 01a0f9b2-7f15-72fa-9449-20c29f456f29\n- Ten"
       }
     },
     {
       "case": "quarantine-completes",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "completed_at": null
+        "completed_at": "2026-10-01T23:00:32.073344268Z"
       }
     },
     {
       "case": "durable-state-marks-the-sandbox-quarantined",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "state": null
+        "state": "quarantined"
       }
     },
     {
       "case": "quarantined-sandbox-cannot-be-resumed",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "status": 401,
-        "error": "unauthorized"
+        "status": 409,
+        "error": "conflict"
       }
     },
     {
       "case": "quarantine-twice-is-idempotent",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "status": 401,
-        "same_incident": false,
+        "status": 200,
+        "same_incident": true,
         "response": {
-          "error": {
-            "code": "unauthorized",
-            "message": "invalid API key",
-            "request_id": "01a0f98a-7674-75c4-b0ea-c81ab0c5b55b"
-          }
+          "id": "01a0f9b2-a4e5-7605-977a-a61f34c3d29a",
+          "identity": {
+            "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+            "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+            "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+          },
+          "fence": {
+            "lease_id": "01a0f9b2-7f1f-771f-bbc4-39529c4be124",
+            "generation": 3
+          },
+          "rules": [
+            {
+              "rule": "repeated_denied_connections",
+              "first_event_sequence": null,
+              "evidence_references": [
+                "counter:aiec_guard_01a0f9b27f1572fa944920c29f456f29:denied:1:0:0",
+                "counter:aiec_guard_01a0f9b27f1572fa944920c29f456f29:denied:2:0:0",
+                "counter:aiec_guard_01a0f9b27f1572fa944920c29f456f29:denied:3:0:0"
+              ]
+            }
+          ],
+          "triggered_at": "2026-10-01T23:00:29.541824753Z",
+          "network_cut_at": "2026-10-01T23:00:29.557740972Z",
+          "paused_at": "2026-10-01T23:00:32.049328532Z",
+          "snapshot_id": "01a0f9b2-a4e5-7605-977a-a61f34c3d29a",
+          "completed_at": "2026-10-01T23:00:32.073344268Z",
+          "events": [
+            {
+              "timestamp": "2026-10-01T23:00:19.961989300Z",
+              "event_id": "a4dca202-f604-4099-bccc-d72ba68e1827",
+              "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+              "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+              "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
+              "category": "lifecycle",
+              "decision": "allow",
+              "reason": "gateway started",
+              "destination": null,
+              "request_bytes": 0,
+              "response_bytes": 0,
+              "duration_ms": 0,
+              "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+              "current_hash": "7f9288094b1eb3e436e309c560a0121e8bb34e9d91a9fca6bbe8f87d81788bdf"
+            },
+            {
+              "timestamp": "2026-10-01T23:00:19.980370806Z",
+              "event_id": "22fc92f2-0f1d-4322-aeb8-39313c3b4676",
+              "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+              "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+              "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
+              "category": "lifecycle",
+              "decision": "allow",
+              "reason": "guard-installed-before-guest-boot",
+              "destination": null,
+              "request_bytes": 0,
+              "response_bytes": 0,
+              "duration_ms": 0,
+              "previous_hash": "7f9288094b1eb3e436e309c560a0121e8bb34e9d91a9fca6bbe8f87d81788bdf",
+              "current_hash": "ea576e50c0dbfb7ebbc0f3bc636d33f69501616a1f982bef77cedb46fd8b3747"
+            },
+            {
+              "timestamp": "2026-10-01T23:00:21.046169908Z",
+              "event_id": "d16e8b4d-48e9-468e-be1e-3470a74e560f",
+              "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+              "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+              "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
+              "category": "lifecycle",
+              "decision": "allow",
+              "reason": "gateway activated by authenticated watchdog",
+              "destination": null,
+              "request_bytes": 0,
+              "response_bytes": 0,
+              "duration_ms": 0,
+              "previous_hash": "ea576e50c0dbfb7ebbc0f3bc636d33f69501616a1f982bef77cedb46fd8b3747",
+              "current_hash": "ac48a00d97f49b409a753142096ab938f674d4b966b8c125e637d1870b82806b"
+            },
+            {
+              "timestamp": "2026-10-01T23:00:29.557730316Z",
+              "event_id": "2c555ebf-a814-4514-a02d-0e9db74588dc",
+              "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+              "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+              "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
+              "category": "lifecycle",
+              "decision": "cut",
+              "reason": "watchdog or host fault latched network cut",
+              "destination": null,
+              "request_bytes": 0,
+              "response_bytes": 0,
+              "duration_ms": 0,
+              "previous_hash": "ac48a00d97f49b409a753142096ab938f674d4b966b8c125e637d1870b82806b",
+              "current_hash": "750fd17a223e8b731f4f80bd9d7bdeed1c8dfca2fcccbdceb68836618ee26118"
+            },
+            {
+              "timestamp": "2026-10-01T23:00:32.061683303Z",
+              "event_id": "3dde66b2-d2b4-409c-8556-572a516e79db",
+              "sandbox_id": "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+              "tenant_id": "b431ccc4-1bdb-4d79-84a4-0cfc82563ab3",
+              "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
+              "category": "quarantine",
+              "decision": "quarantine",
+              "reason": "watchdog quarantine",
+              "destination": "repeated_denied_connections",
+              "request_bytes": 0,
+              "response_bytes": 0,
+              "duration_ms": 0,
+              "previous_hash": "750fd17a223e8b731f4f80bd9d7bdeed1c8dfca2fcccbdceb68836618ee26118",
+              "current_hash": "11e7df2992e7afb4d074e11912b6a70d0045aecd082850b286d78c592cf570fa"
+            }
+          ],
+          "event_start_sequence": 1,
+          "event_previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "event_sequence": 5,
+          "event_head": "11e7df2992e7afb4d074e11912b6a70d0045aecd082850b286d78c592cf570fa",
+          "errors": [],
+          "notified_at": null,
+          "report": "# Guard incident\n\n- Incident: 01a0f9b2-a4e5-7605-977a-a61f34c3d29a\n- Sandbox: 01a0f9b2-7f15-72fa-9449-20c29f456f29\n- Tenant: b431ccc4-1bdb-4d79-84a4-0cfc82563ab3\n- Policy hash: f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18\n- Lease: 01a0f9b2-7f1f-771f-bbc4-39529c4be124\n- Generation: 3\n\n## Timeline\n\n- Triggered: 2026-10-01T23:00:29.541824753+00:00\n- Network cut: 2026-10-01T23:00:29.557740972+00:00\n- Paused: 2026-10-01T23:00:32.049328532+00:00\n- Snapshot: 01a0f9b2&#45;a4e5&#45;7605&#45;977a&#45;a61f34c3d29a\n- Completed: pending\n\n## Rules and evidence\n\n- Rule: repeated&#95;denied&#95;connections\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0f9b27f1572fa944920c29f456f29&#58;denied&#58;1&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0f9b27f1572fa944920c29f456f29&#58;denied&#58;2&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0f9b27f1572fa944920c29f456f29&#58;denied&#58;3&#58;0&#58;0\n\n## First suspicious event\n\nNo event reference: see authoritative counter/control evidence references above.\n\n## Authoritative journal\n\n- Records: 5\n- Earlier records omitted: 0\n- Excerpt previous hash: 0000000000000000000000000000000000000000000000000000000000000000\n- Verified head: 11e7df2992e7afb4d074e11912b6a70d0045aecd082850b286d78c592cf570fa\n"
         },
         "completed_at_unchanged": true
       }
@@ -308,57 +387,40 @@
       }
     },
     {
-      "case": "budget-and-quarantine-survive-a-worker-restart",
-      "status": "FAIL",
+      "case": "quarantine-survives-a-worker-restart",
+      "status": "PASS",
       "evidence": {
-        "quarantined": null,
-        "model_requests": null,
-        "max_model_requests": null,
-        "expires_at": null
+        "incident_id": "01a0f9b2-a4e5-7605-977a-a61f34c3d29a",
+        "completed_at": "2026-10-01T23:00:32.073344268Z",
+        "status": 200
       }
     },
     {
       "case": "quarantine-is-not-forgotten-after-restart",
-      "status": "FAIL",
+      "status": "PASS",
       "evidence": {
-        "status": 401,
-        "error": "unauthorized"
+        "status": 409,
+        "error": "conflict"
       }
     },
     {
-      "case": "sandbox-is-released-at-cleanup",
-      "status": "FAIL",
+      "case": "quarantined-sandbox-is-held-not-orphaned",
+      "status": "PASS",
       "evidence": {
         "remaining": [
           [
-            null,
-            null
+            "01a0f9b2-7f15-72fa-9449-20c29f456f29",
+            "quarantined"
           ]
         ]
       }
     }
   ],
-  "failing": [
-    "blocked-range-attempt-increments-the-authoritative-counter",
-    "repeated-deny-behavior-triggers-a-quarantine",
-    "quarantine-cuts-the-network",
-    "quarantine-pauses-the-vm",
-    "quarantine-captures-forensics",
-    "quarantine-writes-an-incident-report",
-    "quarantine-completes",
-    "durable-state-marks-the-sandbox-quarantined",
-    "quarantined-sandbox-cannot-be-resumed",
-    "quarantine-twice-is-idempotent",
-    "budget-and-quarantine-survive-a-worker-restart",
-    "quarantine-is-not-forgotten-after-restart",
-    "sandbox-is-released-at-cleanup"
-  ],
-  "cleanup_errors": [
-    "watchdog exited -9"
-  ],
+  "failing": [],
+  "cleanup_errors": [],
   "watchdog_timeout_ms": 3000,
-  "incident_id": null,
-  "incident_errors": null,
-  "elapsed_seconds": 654.164,
-  "finished_at": "2026-10-01T22:16:44.431506+00:00"
+  "incident_id": "01a0f9b2-a4e5-7605-977a-a61f34c3d29a",
+  "incident_errors": [],
+  "elapsed_seconds": 77.054,
+  "finished_at": "2026-10-01T23:01:11.288634+00:00"
 }

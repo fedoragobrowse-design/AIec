@@ -71,6 +71,24 @@ const LIMIT_MAX_REQUEST_BYTES: u64 = 64 << 20;
 const LIMIT_MAX_RESPONSE_BYTES: u64 = 512 << 20;
 const LIMIT_MAX_CONCURRENT_REQUESTS: u32 = 1_024;
 
+/// Parses an operator boundary document.
+pub fn parse_boundary(text: &str) -> Result<crate::compiler::OperatorBoundary> {
+    serde_yaml_ng::from_str(text)
+        .map_err(|error| policy_error(format!("operator boundary: {error}")))
+}
+
+/// Serializes a policy as YAML.
+pub fn to_yaml(policy: &GuardPolicy) -> Result<String> {
+    serde_yaml_ng::to_string(policy)
+        .map_err(|error| policy_error(format!("policy serialization: {error}")))
+}
+
+/// Serializes a layer 7 policy as YAML.
+pub fn l7_to_yaml(policy: &L7Policy) -> Result<String> {
+    serde_yaml_ng::to_string(policy)
+        .map_err(|error| policy_error(format!("layer 7 policy serialization: {error}")))
+}
+
 fn policy_error(message: impl Into<String>) -> GuardError {
     GuardError::Policy(message.into())
 }
@@ -343,7 +361,165 @@ fn validate_list(field: &str, items: &[String], max: usize) -> Result<()> {
     Ok(())
 }
 
-/// Where the agent loop runs, which selects the policy default.
+/// How much of a request Guard can see.
+///
+/// `Sni` is the default and the only mode that needs no operator trust in a
+/// certificate authority: Guard matches the name the client asked for and
+/// forwards the tunnel. `Intercept` terminates TLS inside Guard, which is what
+/// makes method and path policy possible - and which means Guard holds a key
+/// that can read every byte of the traffic it governs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L7Mode {
+    #[default]
+    Sni,
+    Intercept,
+}
+
+/// One visible HTTP rule: this host, these verbs, these paths.
+///
+/// An empty `paths` list means every path on that host, which is a decision an
+/// operator makes explicitly rather than one a parser infers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRule {
+    pub host: String,
+    #[serde(default)]
+    pub methods: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// Method and tool rules for visible MCP JSON-RPC traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRules {
+    #[serde(default)]
+    pub allowed_methods: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+}
+
+impl Default for McpRules {
+    fn default() -> Self {
+        Self {
+            allowed_methods: vec![
+                "initialize".into(),
+                "tools/list".into(),
+                "tools/call".into(),
+            ],
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+        }
+    }
+}
+
+/// Bounded GraphQL rules: operation kind, operation name, root fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphqlRules {
+    #[serde(default)]
+    pub allow_mutations: bool,
+    #[serde(default)]
+    pub operations: Vec<String>,
+    #[serde(default)]
+    pub root_fields: Vec<String>,
+}
+
+/// Layer 7 governance, applied only to traffic Guard can actually see.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L7Policy {
+    #[serde(default)]
+    pub mode: L7Mode,
+    #[serde(default)]
+    pub http: Vec<HttpRule>,
+    #[serde(default)]
+    pub mcp: McpRules,
+    #[serde(default)]
+    pub graphql: GraphqlRules,
+    /// Explicit operator acknowledgement that Guard terminates TLS here.
+    #[serde(default)]
+    pub intercept_ack: bool,
+}
+
+/// What the watcher does when it cannot answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherFailureMode {
+    #[default]
+    ContinueWithRules,
+    PauseIfUnavailable,
+}
+
+/// The optional second reviewer. Disabled by default; the product is complete
+/// without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatcherConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub failure_mode: WatcherFailureMode,
+    /// One window in `sample_rate` is reviewed.
+    #[serde(default = "default_watcher_sample_rate")]
+    pub sample_rate: u32,
+    #[serde(default = "default_watcher_batch")]
+    pub batch_size: u32,
+    #[serde(default = "default_watcher_token_budget")]
+    pub token_budget: u64,
+    #[serde(default)]
+    pub cost_budget_micros: u64,
+}
+
+fn default_watcher_sample_rate() -> u32 {
+    10
+}
+fn default_watcher_batch() -> u32 {
+    20
+}
+fn default_watcher_token_budget() -> u64 {
+    200_000
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_mode: WatcherFailureMode::default(),
+            sample_rate: default_watcher_sample_rate(),
+            batch_size: default_watcher_batch(),
+            token_budget: default_watcher_token_budget(),
+            cost_budget_micros: 0,
+        }
+    }
+}
+
+/// A synthetic secret the guest must never touch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanarySpec {
+    /// Path inside the guest, absolute.
+    pub path: String,
+    /// The synthetic value a read would expose.
+    pub value: String,
+}
+
+/// Optional in-guest tripwires. Every value is synthetic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryConfig {
+    #[serde(default)]
+    pub files: Vec<CanarySpec>,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+    /// Placeholder credential names the guest must never present to the gateway.
+    #[serde(default)]
+    pub credentials: Vec<String>,
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -1207,6 +1383,19 @@ pub struct GuardConfig {
     /// Immutable durable model-admission ceiling for this sandbox.
     #[serde(default = "default_max_model_requests")]
     pub max_model_requests: u64,
+    /// Layer 7 governance. Without an explicit L7 policy a policy is hashed
+    /// exactly as it was before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l7: Option<L7Policy>,
+    /// The optional watcher. Disabled unless an operator turns it on.
+    #[serde(default)]
+    pub watcher: WatcherConfig,
+    /// Optional synthetic canaries.
+    #[serde(default)]
+    pub canaries: CanaryConfig,
+    /// Refuse to boot an image whose manifest or digests are not trusted.
+    #[serde(default)]
+    pub require_signed_image: bool,
 }
 
 fn default_watchdog_timeout_ms() -> u64 {
@@ -1227,6 +1416,10 @@ impl Default for GuardConfig {
             allowlist: Vec::new(),
             watchdog_timeout_ms: default_watchdog_timeout_ms(),
             max_model_requests: default_max_model_requests(),
+            l7: None,
+            watcher: WatcherConfig::default(),
+            canaries: CanaryConfig::default(),
+            require_signed_image: false,
         }
     }
 }

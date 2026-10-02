@@ -13,6 +13,8 @@ mod composition;
 pub mod eval_matrix;
 pub mod evaluations;
 pub mod guard;
+mod guard_proposals;
+mod guard_release;
 pub mod omp;
 pub mod ratelimit;
 pub(crate) mod repo_cache;
@@ -868,6 +870,11 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/runs/{id}/artifacts/{*name}", get(download_run_artifact))
         .route("/runs/{id}/cancel", post(cancel_run))
         .merge(guard::routes())
+        .merge(guard_proposals::routes())
+        .route(
+            "/sandboxes/{id}/guard/release",
+            axum::routing::post(guard_release::release_sandbox),
+        )
 }
 pub fn app(state: AppState) -> Router {
     router(state)

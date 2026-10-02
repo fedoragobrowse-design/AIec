@@ -253,6 +253,70 @@ yet using per-VM mutual TLS identity.
 - **Usage.** Usage events are append-only and idempotent, so retries and recovery
   do not double-count.
 
+## Guard (out-of-band governance for agent sandboxes)
+
+Guard enforces a sandbox's network and credential boundary from outside the
+guest, so that a compromised guest or a manipulated model cannot widen its own
+authority. It is optional per sandbox and requires the Firecracker runtime; a
+weaker runtime is refused rather than silently downgraded.
+
+### What Guard enforces, and what proves it
+
+- **Default-deny egress.** A guarded guest's only permitted destination is the
+  Guard gateway. Direct IPv4, direct IPv6, external DNS, DNS-over-TLS,
+  metadata addresses, RFC1918 ranges, the control plane, the worker and other
+  sandboxes are denied by nftables rules the worker installs before the guest
+  boots. Measured on real microVMs with real nftables; see
+  `benchmarks/guard-core-acceptance.json`.
+- **The real model credential never enters the guest.** The guest receives a
+  placeholder; the broker substitutes the credential host-side for the bound
+  destination only. A full memory, state and disk snapshot scan - 13.4 GB in the
+  recorded run - finds no copy of the real value.
+- **Guard owns DNS.** Names resolve only through Guard, only for the zones and
+  record types the policy allows, so DNS cannot be used as a side channel.
+- **Model traffic is bounded.** Requests and responses are limited by policy
+  ceilings, and every model request and byte is additionally reserved against
+  durable control-plane state before it is forwarded.
+- **Loss of the watcher is fail-closed.** A guarded attachment carries no egress
+  until an outside-guest watchdog reports an observation it has verified. If
+  reporting stops, the gateway and the kernel rules cut the attachment and the
+  cut latches. The guest is not destroyed, so an operator may still take a
+  forensic capture.
+- **Lifetime and model budgets are durable.** Ceilings and expiry live in the
+  control plane, and a worker restart cannot reset them.
+- **Quarantine is one authoritative path.** Repeated authoritative denials
+  request a quarantine; the control plane cuts the network, pauses the machine,
+  captures forensics without resuming it, latches durable quarantine state,
+  appends an authoritative event, writes an incident report and notifies. A
+  repeat call returns the same incident rather than acting twice. Observed end
+  to end on a real microVM in `benchmarks/guard-phase2-acceptance.json`.
+
+### What Guard does not enforce
+
+- **Host compromise.** Guard runs on the host; a root attacker rewrites the
+  rules, reads the credential file and forges the journal.
+- **The model endpoint as a data channel.** Guard bounds and binds it. Bytes the
+  provider receives, it has received.
+- **Gateway compromise.** The gateway holds the credential and reads the traffic
+  it proxies.
+- **Layer 7 semantics in the default mode.** Guard sees the requested hostname
+  and forwards the tunnel. Method and path policy exists only where an operator
+  has explicitly enabled TLS interception, which means Guard holds a key that
+  can read the traffic it governs.
+- **The guest's own data**, and anything the guest sends to a destination the
+  policy permits.
+- **A watcher's judgement.** The optional watcher is a second reviewer that can
+  only be more restrictive. It can be wrong, and it can be manipulated by
+  untrusted evidence.
+- **Hardware attestation.** Guard verifies hashes and signed manifests; there is
+  no TPM-backed attestation and none is claimed.
+- **Multi-host security.** Guard's assumptions are about one worker host and its
+  guest.
+
+Claims in this section are written to match the artifacts that back them. Where
+a property is implemented and tested but has not been observed end to end in a
+live run, the documentation says so: see `docs/GUARD_THREAT_MODEL.md`.
+
 ## Known limitations (public alpha)
 
 These are real and are not hidden:
@@ -262,11 +326,13 @@ These are real and are not hidden:
 - Recovery and fencing are proven with two workers on one host. Genuinely
   distributed operation across separate machines is not yet demonstrated.
 - The API surface is not yet stable; endpoints may change.
-- Guest control channel uses a shared build-time secret rather than mutual TLS.
 - Per-tenant **snapshot and persistent-storage byte quotas** are not yet
   enforced; per-request size ceilings are.
-- **Sandbox lifetime** is enforced by the runtime, and a worker restart resets
-  the in-process timer; there is not yet a control-plane lifetime reaper.
+- **Sandbox lifetime** is enforced both by the runtime's in-process timer and,
+  for guarded sandboxes, by durable control-plane state that a worker restart
+  cannot reset. The control-plane reaper that acts on an expired guarded budget
+  is implemented and covered by database tests; it has not yet been observed
+  firing in a live run.
 - Portable workspace snapshots are the supported recovery unit. **Running VM
   memory does not survive** a worker failure and is not claimed to.
 - The audit log is not yet exposed through a dashboard view.

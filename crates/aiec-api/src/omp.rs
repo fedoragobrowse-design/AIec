@@ -213,6 +213,7 @@ fn evaluation_guard(allowlist: Vec<String>) -> aiec_guard::policy::GuardConfig {
         // defaults rather than an opening an operator chose.
         watchdog_timeout_ms: 10_000,
         max_model_requests: 10_000,
+        ..Default::default()
     }
 }
 

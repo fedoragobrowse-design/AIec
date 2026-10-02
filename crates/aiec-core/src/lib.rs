@@ -10,6 +10,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod host_pressure;
+pub mod image_trust;
 pub mod images;
 pub mod network;
 pub mod platform;
@@ -640,6 +641,13 @@ pub enum Scope {
     GuardRead,
     GuardHeartbeat,
     GuardQuarantine,
+    /// Submit a policy proposal. Never sufficient to approve one.
+    GuardPropose,
+    /// Review and approve or deny a policy proposal.
+    GuardApprove,
+    /// Release a quarantined sandbox. Deliberately not the quarantine scope:
+    /// the key that can cause a quarantine must not be the key that undoes it.
+    GuardRelease,
     Admin,
 }
 impl Scope {
@@ -652,6 +660,9 @@ impl Scope {
             "guard:read" => Ok(Self::GuardRead),
             "guard:heartbeat" => Ok(Self::GuardHeartbeat),
             "guard:quarantine" => Ok(Self::GuardQuarantine),
+            "guard:propose" => Ok(Self::GuardPropose),
+            "guard:approve" => Ok(Self::GuardApprove),
+            "guard:release" => Ok(Self::GuardRelease),
             "admin" => Ok(Self::Admin),
             _ => Err(CoreError::InvalidRequest("unknown scope".into())),
         }
@@ -683,6 +694,42 @@ impl Principal {
             Ok(())
         } else {
             Err(CoreError::Forbidden("missing scope".into()))
+        }
+    }
+}
+
+/// A durable policy proposal: what an agent asked for, what it was written
+/// against, and what a human decided.
+///
+/// The identity, ownership and request are fixed once written. Only the state
+/// advances, and only forward: a decision cannot be un-made by a later write.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardProposal {
+    pub id: Uuid,
+    pub sandbox_id: Uuid,
+    pub tenant_id: Uuid,
+    pub agent_id: String,
+    pub request: aiec_guard::proposals::ProposalRequest,
+    pub base_policy_hash: String,
+    pub state: aiec_guard::proposals::ProposalState,
+    #[serde(default)]
+    pub decided_by: Option<String>,
+    #[serde(default)]
+    pub decided_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl GuardProposal {
+    /// The proposal as the Guard crate models it, for handing to the owner.
+    pub fn as_guard(&self) -> aiec_guard::proposals::Proposal {
+        aiec_guard::proposals::Proposal {
+            id: self.id,
+            sandbox_id: self.sandbox_id,
+            tenant_id: self.tenant_id,
+            agent_id: self.agent_id.clone(),
+            request: self.request.clone(),
+            base_policy_hash: self.base_policy_hash.clone(),
+            state: self.state.clone(),
         }
     }
 }

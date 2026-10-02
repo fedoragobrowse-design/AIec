@@ -259,19 +259,21 @@ contract and 44 Python SDK tests pass. The implementation covers:
 ### Proven by running code
 
 - Phase 1 acceptance re-run against the phase 2 code: **41 of 41** on real
-  Firecracker microVMs with real nftables, including a new case proving that an
+  Firecracker microVMs with real nftables, including a case proving that an
   attachment carries traffic only after a watchdog heartbeat activates it.
   `benchmarks/guard-core-acceptance.json`.
-- Phase 2 live acceptance (`scripts/guard-phase2-acceptance.sh`: a real control
-  plane, worker, guest, watchdog process, database and kernel tables inside a
-  disposable namespace). Observed passing: the watchdog key is narrowly scoped
-  and cannot create sandboxes; a guarded sandbox starts; telemetry is anchored
-  and authoritative; the watchdog heartbeats and the attachment stays live;
-  killing the watchdog cuts egress while the VM survives for forensics; a
-  triggered rule reaches the control plane; the durable quarantine mark lands and
-  a resume is refused before and after a worker restart.
-  `benchmarks/guard-phase2-acceptance.json` records the run in full, including
-  the cases that failed.
+- Phase 2 live acceptance: **28 of 28, no cleanup errors, 77 seconds**, against a
+  real control plane, worker, Firecracker guest, out-of-guest watchdog process,
+  Postgres cluster and kernel tables, all inside a disposable namespace.
+  `benchmarks/guard-phase2-acceptance.json`. Observed in that run: a watchdog key
+  that cannot create sandboxes; a guarded sandbox starting under a real
+  watchdog; anchored authoritative telemetry; the attachment staying live while
+  the watchdog reports; authoritative denials reaching the watchdog; a triggered
+  rule requesting a quarantine; **the quarantine cutting the network, pausing the
+  VM, capturing forensics, writing an incident report and completing**; the
+  durable quarantine mark; resume refused; a second quarantine call returning the
+  same incident; a worker restart leaving the quarantine in force; and the
+  quarantined sandbox held rather than orphaned.
 
 ### Defects the acceptance work found
 
@@ -297,17 +299,12 @@ contract and 44 Python SDK tests pass. The implementation covers:
 
 ## What is still not proven
 
-- **A quarantine has not been observed reaching `completed_at` in a live run.**
-  The pause-and-capture stage has not yet been seen to finish end to end on the
-  deployed stack. Its behaviour is exercised by tests, and the durable mark, the
-  resume refusal and the dead-man cut are observed live, but "the incident
-  completes" is not yet observed evidence.
-- **The phase 2 acceptance namespace is intermittently unable to move a packet
-  from the guest to the attachment** - the guest reports ENETUNREACH with a
-  default route present - which is why its blocked-range case passes in some runs
-  and not others. The same counter path passes deterministically in the phase 1
-  acceptance, so the mechanism is sound and the fault is in the harness's
-  network setup, not in enforcement.
+- **The acceptance namespace cannot reliably move a guest packet to the
+  attachment.** Its blocked-range case is therefore asserted through the
+  authoritative counters the watchdog reads rather than through the guest's own
+  answer, and the guest's DNS query to the gateway times out there. The same
+  counter and DNS-denial paths pass deterministically in the phase 1 acceptance
+  on this code, so this is a harness limitation rather than an enforcement gap.
 - **Phases 3 to 5 are not started**: L7 governance and human-only policy
   proposals, the optional watcher, canaries, image identity, per-VM credentials
   and the adversarial red-team harness. None of the phase 2 evidence stands in

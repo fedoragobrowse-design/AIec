@@ -23,6 +23,7 @@ reqwest.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 tokio.workspace = true
 rustls.workspace = true
 uuid.workspace = true

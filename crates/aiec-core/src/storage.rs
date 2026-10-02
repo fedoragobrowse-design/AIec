@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+use crate::GuardProposal;
 pub use crate::{LeaseId, RequestId, SandboxId, SnapshotId, TenantId, WorkerId};
 pub use aiec_guard::control::{
     BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
@@ -517,6 +518,19 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Vec<GuardBudgetState>, CoreError> {
         Err(CoreError::Unsupported("list_expired_guard_budgets".into()))
     }
+    /// Clears a durable quarantine after an authorized release.
+    ///
+    /// The caller has already reopened the network; this makes the stored state
+    /// agree with it. The record of the incident and who released it is kept:
+    /// a released machine is still an audited one.
+    async fn release_guard_quarantine(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+        _released_by: &str,
+    ) -> Result<Sandbox, CoreError> {
+        Err(CoreError::Unsupported("release_guard_quarantine".into()))
+    }
     /// Atomically latches sandbox and budget quarantine; ordinary transitions cannot release it.
     async fn mark_guard_quarantined(
         &self,
@@ -525,6 +539,49 @@ pub trait MetadataStore: Send + Sync {
         _fence: GuardFence,
     ) -> Result<Sandbox, CoreError> {
         Err(CoreError::Unsupported("mark_guard_quarantined".into()))
+    }
+    /// Records the policy hash a sandbox now runs under.
+    ///
+    /// An approved proposal changes the enforcement identity without changing
+    /// the sandbox's lifecycle, so this writes the hash alone rather than
+    /// pretending the machine was started again.
+    async fn update_guard_policy_hash(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+        _policy_hash: &str,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("update_guard_policy_hash".into()))
+    }
+    /// Records a policy proposal and its state.
+    ///
+    /// A proposal is a record of what an agent asked for and what a human
+    /// decided. It has to outlive the process that received it: a pending
+    /// proposal that vanished on restart would silently drop a decision an
+    /// operator still has to make.
+    async fn put_guard_proposal(
+        &self,
+        proposal: GuardProposal,
+    ) -> Result<GuardProposal, CoreError> {
+        let _ = proposal;
+        Err(CoreError::Unsupported("put_guard_proposal".into()))
+    }
+    /// Lists a sandbox's proposals, newest first.
+    async fn list_guard_proposals(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+    ) -> Result<Vec<GuardProposal>, CoreError> {
+        Err(CoreError::Unsupported("list_guard_proposals".into()))
+    }
+    /// One proposal.
+    async fn get_guard_proposal(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+        _id: Uuid,
+    ) -> Result<GuardProposal, CoreError> {
+        Err(CoreError::Unsupported("get_guard_proposal".into()))
     }
     /// Creates a sandbox.
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError>;

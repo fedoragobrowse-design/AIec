@@ -9,8 +9,8 @@ mod run_queue;
 mod snapshots;
 
 use aiec_core::{
-    ApiKeyRecord, CoreError, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
-    UsageSummary,
+    ApiKeyRecord, CoreError, GuardProposal, ImageRecord, Node, Sandbox, SandboxState, Snapshot,
+    UsageEvent, UsageSummary,
     storage::{
         AuditEvent, BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
         MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
@@ -127,6 +127,7 @@ struct MemoryData {
     artifact_scan: Option<String>,
     guard_budgets: HashMap<Uuid, GuardBudgetState>,
     guard_incidents: HashMap<Uuid, GuardIncident>,
+    guard_proposals: HashMap<Uuid, GuardProposal>,
     leases: HashMap<Uuid, WorkerLease>,
 }
 
@@ -475,6 +476,58 @@ impl MetadataStore for MemoryRepository {
             .await
             .map_err(core_error)
     }
+    async fn update_guard_policy_hash(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        policy_hash: &str,
+    ) -> Result<(), CoreError> {
+        Self::update_guard_policy_hash(self, tenant, sandbox, policy_hash)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn release_guard_quarantine(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        released_by: &str,
+    ) -> Result<Sandbox, CoreError> {
+        Self::release_guard_quarantine(self, tenant, sandbox, released_by)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn put_guard_proposal(
+        &self,
+        proposal: GuardProposal,
+    ) -> Result<GuardProposal, CoreError> {
+        Self::put_guard_proposal(self, proposal)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn list_guard_proposals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardProposal>, CoreError> {
+        Self::list_guard_proposals(self, tenant, sandbox)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn get_guard_proposal(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        id: Uuid,
+    ) -> Result<GuardProposal, CoreError> {
+        Self::get_guard_proposal(self, tenant, sandbox, id)
+            .await
+            .map_err(core_error)
+    }
+
     async fn get_guard_budget(
         &self,
         tenant: Uuid,

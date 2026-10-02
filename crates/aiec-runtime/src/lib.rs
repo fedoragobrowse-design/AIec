@@ -51,6 +51,7 @@ pub enum RuntimeError {
 }
 
 pub use aiec_core::runtime::SandboxRuntime;
+pub mod control_identity;
 mod docker;
 pub mod e2b;
 pub mod guest_artifact;
@@ -914,6 +915,16 @@ pub struct FirecrackerConfig {
     pub jailer: Option<PathBuf>,
     pub tap: Option<String>,
     pub state_dir: PathBuf,
+    /// The build-time secret baked into the base guest image.
+    ///
+    /// Retained because the image build writes it and the guest image's own
+    /// tooling reads it, but it is **no longer the control-channel credential**.
+    /// Every sandbox gets its own identity from
+    /// [`control_identity`], written into its own disk at create; a secret that
+    /// every sandbox an image has ever started shares cannot authenticate any of
+    /// them individually. What this value still buys is a placeholder that a
+    /// sandbox's own create overwrites, so a disk that escaped the create path
+    /// authenticates nothing.
     pub guest_secret: Vec<u8>,
     pub guest_cid: u32,
     pub readiness_timeout: Duration,
@@ -921,6 +932,14 @@ pub struct FirecrackerConfig {
     pub guest_artifact_dir: Option<PathBuf>,
     /// Metadata of the configured guest image, when it was built from repository tooling.
     pub guest_artifact: Option<guest_artifact::GuestArtifact>,
+    /// Whether this deployment refuses to boot a guest image that is unsigned or
+    /// signed by a key the operator has removed.
+    ///
+    /// `None` means the deployment has not configured image trust, and the
+    /// existing digest verification is the whole of what is checked. `Some` is
+    /// the requirement a guarded workload sets, and it is enforced by
+    /// [`FirecrackerConfig::check_guest_artifact`] before any boot.
+    pub image_trust: Option<aiec_core::image_trust::ImageTrustGate>,
     /// Whether the deployment refuses to start without a verified coding guest image.
     pub require_coding_guest: bool,
     /// Host memory and disk held back before a create is admitted.
@@ -955,6 +974,64 @@ fn load_guest_artifact_metadata(
         "loaded firecracker guest artifact metadata"
     );
     Ok(Some(artifact))
+}
+
+/// Reads the operator's image trust configuration from the environment, or
+/// `None` when the deployment has not opted in.
+///
+/// Two variables, and both are needed before the gate can do anything:
+/// `AIEC_REQUIRE_SIGNED_IMAGE` states the requirement, and
+/// `AIEC_IMAGE_SIGNING_KEYS` points at a file of `key_id=hex` lines. A
+/// requirement with no key file is a gate that admits nothing, so every boot of
+/// a guarded workload is refused with "signed by unknown key" - which is the
+/// correct answer, and much easier to diagnose than a gate that quietly behaves
+/// as though signing were optional.
+fn load_image_trust_from_env()
+-> Result<Option<aiec_core::image_trust::ImageTrustGate>, RuntimeError> {
+    let raw = match std::env::var("AIEC_REQUIRE_SIGNED_IMAGE") {
+        Ok(raw) => raw,
+        Err(_) => return Ok(None),
+    };
+    let requirement = aiec_core::image_trust::ImageTrustRequirement::parse(&raw)
+        .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+    let mut gate = aiec_core::image_trust::ImageTrustGate::new(requirement);
+    if let Some(path) = std::env::var_os("AIEC_IMAGE_SIGNING_KEYS") {
+        let path = PathBuf::from(path);
+        let document = std::fs::read_to_string(&path).map_err(|error| {
+            RuntimeError::Unavailable(format!(
+                "image signing keys {} are unreadable: {error}",
+                path.display()
+            ))
+        })?;
+        for (number, line) in document.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key_id, secret)) = line.split_once('=') else {
+                return Err(RuntimeError::Unavailable(format!(
+                    "image signing keys {} line {} is not key_id=hex",
+                    path.display(),
+                    number + 1
+                )));
+            };
+            let secret = hex::decode(secret.trim()).map_err(|_| {
+                RuntimeError::Unavailable(format!(
+                    "image signing keys {} line {} is not hexadecimal",
+                    path.display(),
+                    number + 1
+                ))
+            })?;
+            gate.insert_key(key_id.trim(), &secret)
+                .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+        }
+    }
+    tracing::info!(
+        requirement = ?gate.requirement(),
+        key_ids = gate.key_ids().len(),
+        "loaded image trust configuration"
+    );
+    Ok(Some(gate))
 }
 
 impl FirecrackerConfig {
@@ -994,6 +1071,7 @@ impl FirecrackerConfig {
             reserve_mib("AIEC_WORKER_MEMORY_RESERVE_MIB", 512),
             reserve_mib("AIEC_WORKER_DISK_RESERVE_MIB", 2 * 1024),
         );
+        let image_trust = load_image_trust_from_env()?;
         Ok(Self {
             binary: PathBuf::from(required("AIEC_FIRECRACKER_BIN")?),
             kernel: PathBuf::from(required("AIEC_KERNEL")?),
@@ -1008,6 +1086,7 @@ impl FirecrackerConfig {
             readiness_timeout: Duration::from_secs(30),
             guest_artifact_dir,
             guest_artifact,
+            image_trust,
             require_coding_guest: std::env::var("AIEC_REQUIRE_CODING_GUEST")
                 .is_ok_and(|value| value == "1"),
             host_reserves,
@@ -1126,7 +1205,68 @@ impl FirecrackerConfig {
                 },
             )?;
         }
-        self.check_guest_capabilities()
+        self.check_guest_capabilities()?;
+        self.check_image_trust()
+    }
+
+    /// Refuses to boot a guest image whose signed manifest this deployment does
+    /// not admit.
+    ///
+    /// The digests checked here are of the bytes on disk, streamed, and they are
+    /// compared against what the manifest records. That is the whole point: a
+    /// manifest that agrees with itself but not with the image is the case
+    /// signing exists to catch, and a check that compared the manifest against
+    /// itself would wave it through.
+    ///
+    /// A deployment with no `image_trust` configured keeps the digest
+    /// verification it always had and claims nothing beyond it. There is no TPM,
+    /// no measured boot and no attestation here, and none is claimed: what this
+    /// establishes is that the kernel and rootfs about to be booted are the ones
+    /// an operator signed, not that a running guest is unmodified.
+    pub fn check_image_trust(&self) -> Result<(), RuntimeError> {
+        let Some(gate) = &self.image_trust else {
+            return Ok(());
+        };
+        if !gate.is_required() {
+            return Ok(());
+        }
+        let dir = self
+            .guest_artifact_dir
+            .clone()
+            .or_else(|| self.rootfs.parent().map(Path::to_path_buf));
+        let manifest = match dir.as_deref() {
+            // No directory means no manifest, and a required gate refuses that.
+            None => None,
+            Some(dir) => {
+                let path = dir.join(aiec_core::image_trust::TRUSTED_IMAGE_FILE);
+                if path.is_file() {
+                    Some(
+                        aiec_core::image_trust::TrustedImageManifest::load(&path)
+                            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?,
+                    )
+                } else {
+                    None
+                }
+            }
+        };
+        let kernel_sha256 = control_identity::file_digest(&self.kernel)?;
+        let rootfs_sha256 = control_identity::file_digest(&self.rootfs)?;
+        let image = gate
+            .admit(
+                manifest.as_ref(),
+                &kernel_sha256,
+                &rootfs_sha256,
+                chrono::Utc::now(),
+            )
+            .map_err(|error| RuntimeError::Unavailable(error.to_string()))?;
+        tracing::info!(
+            reference = %image.reference(),
+            key_id = %image.key_id(),
+            kernel_sha256 = %image.kernel_sha256(),
+            rootfs_sha256 = %image.rootfs_sha256(),
+            "admitted a signed guest image"
+        );
+        Ok(())
     }
 
     /// Checks the guest capability requirements without hashing the image.
@@ -1260,6 +1400,13 @@ pub struct FirecrackerRuntime {
     lifecycle: Arc<SandboxLifecycle>,
     /// The host a create re-measures before it materializes anything.
     pressure: Arc<dyn HostPressureProbe>,
+    /// Per-sandbox control identities for the host/guest vsock channel.
+    ///
+    /// This is what replaced the shared build-time guest secret. The store is
+    /// per-worker state under [`control_identity::CONTROL_IDENTITY_DIR`], which
+    /// is a sibling of `vms/` and `snapshots/` and inside neither, so an
+    /// identity is not carried by a snapshot of either.
+    identities: Arc<control_identity::LazyControlIdentityStore>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -1666,6 +1813,11 @@ impl FirecrackerRuntime {
         config: FirecrackerConfig,
         network: Arc<dyn NetworkBackend>,
     ) -> Self {
+        let identities = control_identity::LazyControlIdentityStore::new(
+            config
+                .state_dir
+                .join(control_identity::CONTROL_IDENTITY_DIR),
+        );
         Self {
             config,
             vms: Arc::new(Mutex::new(HashMap::new())),
@@ -1673,7 +1825,32 @@ impl FirecrackerRuntime {
             network,
             lifecycle: Arc::new(SandboxLifecycle::new()),
             pressure: Arc::new(MeasuredHostPressure),
+            identities: Arc::new(identities),
         }
+    }
+
+    /// The per-sandbox control identity store backing the guest control channel.
+    ///
+    /// Public so a worker can issue, rotate and revoke an identity without
+    /// reaching into the runtime's private state, and so an operator tool can
+    /// report whether a sandbox currently has a live identity at all.
+    pub fn control_identities(
+        &self,
+    ) -> Result<&control_identity::ControlIdentityStore, RuntimeError> {
+        self.identities.get()
+    }
+
+    /// Replaces the store identities are issued from.
+    ///
+    /// For a deployment that keeps its control identities somewhere other than
+    /// the default state directory, and for tests that need a store whose
+    /// lifetime they control.
+    pub fn with_control_identity_store(
+        mut self,
+        store: Arc<control_identity::LazyControlIdentityStore>,
+    ) -> Self {
+        self.identities = store;
+        self
     }
 
     /// Replaces the host a create re-measures its headroom against.
@@ -1900,6 +2077,19 @@ impl FirecrackerRuntime {
         timeout.max(self.config.readiness_timeout)
     }
 
+    /// The control-channel key for one sandbox.
+    ///
+    /// Resolved per call rather than cached, because the answer changes: an
+    /// identity that has been rotated, has expired, or has been revoked stops
+    /// being usable at the moment it stops being current, not at the next
+    /// restart.
+    fn guest_frame_key(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<control_identity::SecretBytes, RuntimeError> {
+        self.identities.get()?.frame_key(sandbox_id)
+    }
+
     fn fresh_request(operation: Operation, payload: RequestPayload) -> Request {
         Request {
             version: protocol::PROTOCOL_VERSION,
@@ -1914,9 +2104,14 @@ impl FirecrackerRuntime {
         id: Uuid,
         request: Request,
     ) -> Result<ResponsePayload, RuntimeError> {
+        // The per-sandbox identity, not the shared build-time secret. A sandbox
+        // with no live identity - never issued, expired, or revoked - has no key
+        // here, and the call is refused before a byte is written rather than
+        // falling back to a credential every sandbox shares.
+        let key = self.guest_frame_key(id)?;
         let mut stream = self.connect_guest(id).await?;
         let body = serde_json::to_vec(&request)?;
-        let frame = frame_bytes(&self.config.guest_secret, &body);
+        let frame = frame_bytes(key.expose(), &body);
         let remaining = self.guest_call_timeout(&request);
         match tokio::time::timeout(remaining, stream.write_all(&frame)).await {
             Ok(Ok(())) => {}
@@ -1935,7 +2130,7 @@ impl FirecrackerRuntime {
         };
         let response = match tokio::time::timeout(
             remaining,
-            read_frame_async_bounded(&mut stream, &self.config.guest_secret, response_limit),
+            read_frame_async_bounded(&mut stream, key.expose(), response_limit),
         )
         .await
         {
@@ -2376,8 +2571,46 @@ impl FirecrackerRuntime {
             rootfs::discard(&destination);
             return Err(error);
         }
+        // The per-sandbox control identity is planted in this sandbox's own disk
+        // before it can be booted. It has to be here and not in the base image:
+        // a secret baked into an image is the same secret for every sandbox that
+        // image has ever started, which is exactly the credential this replaces.
+        //
+        // A failure here discards the image rather than leaving a disk that
+        // boots a guest no worker can authenticate. A sandbox nobody can control
+        // is not a sandbox worth keeping, and the alternative - booting it with
+        // the shared secret - is the failure this whole path exists to prevent.
+        let identity = match self.install_sandbox_identity(sandbox.id, &destination) {
+            Ok(identity) => identity,
+            Err(error) => {
+                rootfs::discard(&destination);
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            sandbox_id = %sandbox.id,
+            identity_generation = identity.generation(),
+            expires_at = %identity.expires_at(),
+            stage = "control_identity_issued",
+            "issued a per-sandbox control identity"
+        );
         tracing::info!(sandbox_id = %sandbox.id, elapsed_ms = started.elapsed().as_millis() as u64, stage = "create_done", "firecracker create completed");
         Ok(())
+    }
+
+    /// Issues a control identity for `sandbox_id` and writes it into its disk.
+    ///
+    /// Issued on every create, so a restarted sandbox gets a fresh secret and
+    /// the previous one stops verifying. That is rotation for the ordinary case
+    /// and needs no operator action.
+    fn install_sandbox_identity(
+        &self,
+        sandbox_id: Uuid,
+        image: &Path,
+    ) -> Result<control_identity::ControlIdentity, RuntimeError> {
+        let identity = self.identities.get()?.issue(sandbox_id)?;
+        control_identity::install_guest_secret(image, identity.secret())?;
+        Ok(identity)
     }
 
     /// Resizes a freshly materialized disk to what the sandbox asked for.
@@ -3205,6 +3438,27 @@ impl FirecrackerRuntime {
         // behind. Neither failure is visible in the response the caller got.
         let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
         self.stop_vm(sandbox).await?;
+        // The secret stops being usable before the disk it was planted in is
+        // removed. Reversing that order would leave a window where the identity
+        // is dead on this host but a copy of the image - a snapshot, a backup -
+        // still carries a secret that nothing here would have refused.
+        //
+        // A store that cannot be opened is not a reason to skip the revocation:
+        // the guest is already stopped and the directories still go, so the
+        // sandbox is unreachable either way. Failing the whole destroy over it
+        // would report a machine that no longer exists as still existing.
+        if let Err(error) = self
+            .identities
+            .get()
+            .and_then(|store| store.revoke(sandbox.id))
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox.id,
+                error = %error,
+                stage = "control_identity_revoke_failed",
+                "could not revoke the control identity of a destroyed sandbox"
+            );
+        }
         let state = self.config.vm_dir(sandbox.id);
         let socket = self.config.socket_dir(sandbox.id);
         match tokio::fs::remove_dir_all(&state).await {
@@ -3509,6 +3763,7 @@ mod tests {
             readiness_timeout: Duration::from_secs(1),
             guest_artifact_dir: None,
             guest_artifact: None,
+            image_trust: None,
             require_coding_guest: false,
             host_reserves: HostReserves::default(),
         }

@@ -128,6 +128,19 @@ pub struct GuardRuntimeObservation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GuardControlCommand {
+    /// Applies a policy a human approved, on the worker that owns the policy.
+    ///
+    /// The control plane records and checks the human approval; the worker owns
+    /// the live policy cell and the kernel rules, so it re-checks that the
+    /// proposal was written against the policy still in force, verifies the
+    /// candidate against the operator boundary, installs the rules, swaps the
+    /// policy and appends the audit record. A refusal at any step leaves the
+    /// previous policy and its hash in force.
+    ApplyProposal {
+        /// The durable proposal the control plane reviewed and approved.
+        proposal: crate::proposals::Proposal,
+        approved_by: String,
+    },
     /// Binds an attachment to the ownership worker dispatch just proved, before
     /// a guarded machine is created or started. The fence moves forward within
     /// one lease and never backward, and a different lease cannot take an
@@ -152,6 +165,14 @@ pub enum GuardControlCommand {
     CapturePaused {
         snapshot_id: String,
     },
+    /// Reopens an attachment a human has released.
+    ///
+    /// The worker clears the latch and reinstalls the rules; the control plane
+    /// only marks the sandbox released afterwards, so a released sandbox is one
+    /// whose network actually carries traffic again.
+    Release {
+        policy_hash: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,5 +184,13 @@ pub enum GuardControlResponse {
     Forensics {
         snapshot_id: String,
         size_bytes: u64,
+    },
+    Released {
+        policy_hash: String,
+    },
+    PolicyApplied {
+        proposal_id: Uuid,
+        previous_policy_hash: String,
+        policy_hash: String,
     },
 }

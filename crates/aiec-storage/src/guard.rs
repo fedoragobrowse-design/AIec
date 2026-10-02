@@ -1,10 +1,12 @@
 use crate::{MemoryData, MemoryRepository, StoreError, owned};
 use aiec_core::{
-    Sandbox, SandboxState,
+    GuardProposal, Sandbox, SandboxState,
     storage::{
         BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident, WorkerLease,
     },
 };
+use aiec_guard::proposals::ProposalState;
+
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -376,5 +378,124 @@ impl MemoryRepository {
             data.sandboxes.insert(id, sandbox.clone());
         }
         Ok(sandbox)
+    }
+}
+
+impl MemoryRepository {
+    pub(crate) async fn update_guard_policy_hash(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        policy_hash: &str,
+    ) -> Result<(), StoreError> {
+        let mut data = self.data.write().await;
+        let row = data
+            .sandboxes
+            .get_mut(&sandbox)
+            .filter(|row| row.tenant_id == tenant)
+            .ok_or(StoreError::NotFound)?;
+        row.environment.guard_policy_hash = Some(policy_hash.to_owned());
+        row.updated_at = Utc::now();
+        Ok(())
+    }
+
+    pub(crate) async fn release_guard_quarantine(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        released_by: &str,
+    ) -> Result<Sandbox, StoreError> {
+        let mut data = self.data.write().await;
+        {
+            let row = data
+                .sandboxes
+                .get(&sandbox)
+                .filter(|row| row.tenant_id == tenant)
+                .ok_or(StoreError::NotFound)?;
+            if row.state != SandboxState::Quarantined {
+                return Err(StoreError::Conflict("sandbox is not quarantined".into()));
+            }
+        }
+        let row = data.sandboxes.get_mut(&sandbox).expect("checked above");
+        row.state = SandboxState::Paused;
+        row.updated_at = Utc::now();
+        let released = row.clone();
+        if let Some(budget) = data.guard_budgets.get_mut(&sandbox) {
+            budget.quarantined = false;
+        }
+        // The incident is deliberately left alone: it is the immutable record
+        // of what happened, and a release is recorded as an audit event beside
+        // it rather than by rewriting the history.
+        let _ = released_by;
+        Ok(released)
+    }
+
+    /// Records a proposal, and advances its state only forward.
+    pub(crate) async fn put_guard_proposal(
+        &self,
+        proposal: GuardProposal,
+    ) -> Result<GuardProposal, StoreError> {
+        let mut data = self.data.write().await;
+        owned(&data, proposal.tenant_id, proposal.sandbox_id)?;
+        let stored = data
+            .guard_proposals
+            .entry(proposal.id)
+            .or_insert(proposal.clone());
+        if stored.sandbox_id != proposal.sandbox_id
+            || stored.tenant_id != proposal.tenant_id
+            || stored.agent_id != proposal.agent_id
+            || stored.base_policy_hash != proposal.base_policy_hash
+            || stored.request != proposal.request
+            || stored.created_at != proposal.created_at
+        {
+            return Err(StoreError::Conflict(
+                "a policy proposal cannot change what it asked for".into(),
+            ));
+        }
+        // A decision is a decision. Terminal states never move again, so a
+        // replayed request cannot reopen an approved or refused proposal.
+        if !matches!(stored.state, ProposalState::Pending) {
+            return Ok(stored.clone());
+        }
+        if !matches!(proposal.state, ProposalState::Pending)
+            && (proposal.decided_by.is_none() || proposal.decided_at.is_none())
+        {
+            return Err(StoreError::Conflict(
+                "a decided policy proposal requires an operator and a time".into(),
+            ));
+        }
+        *stored = proposal.clone();
+        Ok(stored.clone())
+    }
+
+    pub(crate) async fn list_guard_proposals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardProposal>, StoreError> {
+        let data = self.data.read().await;
+        owned(&data, tenant, sandbox)?;
+        let mut rows: Vec<GuardProposal> = data
+            .guard_proposals
+            .values()
+            .filter(|row| row.tenant_id == tenant && row.sandbox_id == sandbox)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(rows)
+    }
+
+    pub(crate) async fn get_guard_proposal(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        id: Uuid,
+    ) -> Result<GuardProposal, StoreError> {
+        let data = self.data.read().await;
+        owned(&data, tenant, sandbox)?;
+        data.guard_proposals
+            .get(&id)
+            .cloned()
+            .ok_or(StoreError::NotFound)
     }
 }
