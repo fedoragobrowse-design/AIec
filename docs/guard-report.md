@@ -89,11 +89,74 @@ states what this does and does not defend.
 
 ## Evidence
 
-**Phase 1 — `benchmarks/guard-core-acceptance.json`: PASS, 41 cases.**
+**Phase 1 — `benchmarks/guard-core-acceptance.json`: PASS, 47 cases, 111.5
+seconds, no cleanup errors.**
 Real Firecracker microVMs, real nftables, local mocks only. Includes the
 secret-scan (13.4 GB of memory, state and disk with no copy of the real model
 credential) and a case proving an attachment carries traffic only after a
 watchdog heartbeat.
+
+**What Guard costs a DNS lookup.** Ten identical A queries, medians of the
+batch, measured in the same run on the same host:
+
+| | median |
+|---|---:|
+| guarded — the guest's system resolver, in the guest, through the gateway | 4.022 ms |
+| unguarded — the same A query to a policy-free resolver in the same namespace | 0.034 ms |
+| **difference** | **3.987 ms** |
+
+**This is an upper bound, not a policy-engine measurement.** The guarded side
+includes the vsock hop and the guest's own resolver stack on top of the policy
+check, and the two sides are not the same code path: the unguarded query is a
+raw UDP packet from the host, while the guarded one is a real guest resolver
+lookup. It bounds Guard's total contribution and does not isolate it, so the
+figure should not be quoted as "the cost of enforcement". Two samples in the
+guarded batch (26.9 ms and 23.8 ms) are cold first-lookups; the steady state is
+the 3.5-4.5 ms cluster the median sits in.
+
+The direct host-to-gateway comparison that would have isolated the gateway's
+own cost is not possible: the gateway deliberately answers DNS only for its own
+guest, and bypassing that to time it from the host would have meant measuring a
+configuration Guard does not offer.
+
+**The incident reproduction.** The sentinel cases above show destinations being
+blocked, which on its own cannot separate enforcement from a route that never
+existed, a dead mock, or a mistyped address. So the bypass class is reproduced
+twice with the same resolver, name and destination:
+
+- **Control leg** — a deliberately unguarded sandbox, general outbound access,
+  no Guard config. The guest points itself at a resolver it chose, resolves
+  `chatbot.example.test`, and connects. Expected to succeed. The proof is the
+  mock chatbot's own hit counter, not the guest's report that it connected: a
+  guest reporting success without the destination having seen a connection is
+  exactly the failure mode this leg exists to exclude.
+- **Guarded legs** — the same attempt under a model-only policy, twice. Once
+  against the guest-chosen resolver, which the gateway-DNS permit does not
+  cover, so the packet is dropped and an nft counter moves. Once against the
+  gateway itself, which the gateway answers and then refuses the unapproved
+  name with a recorded `DNS name denied` — the leg that ties the reproduction to
+  a policy decision rather than to a default-deny that would have fired anyway.
+
+Both legs assert on host-owned evidence only: nft counters and the hash-chained
+event journal, neither writable by the guest. The chatbot is not reached during
+the guarded legs, asserted by the same counter the control leg incremented.
+
+The control leg needs one unguarded sandbox, which is the one thing the main
+acceptance must never contain, so it is opt-in: `AIEC_REPRO_LEGACY_CONTROL=1`
+makes the launcher set `AIEC_ALLOW_LEGACY_NETWORK=1`. The launcher unsets both
+by default, so an operator who exported the variable beforehand still cannot
+get an unguarded guest into an ordinary run. Without the flag the guarded legs
+still run and their results are still real, but they cannot be attributed to
+Guard rather than to a route that never existed — and the artifact records the
+control leg as absent rather than implying it was covered.
+
+Observed, with the control leg enabled: the unguarded guest resolved
+`chatbot.example.test` through the resolver it chose and the mock chatbot
+answered `HTTP/1.1 200 OK`, its hit counter at 1. Under Guard the same guest got
+`resolved: false` at the `resolve` stage with `deny_delta: 1` from the nft
+counter, and the chatbot counter did not move. Asked through the gateway instead
+of through its own resolver, it got `rcode: 5` (`REFUSED`) with zero answers, and
+the gateway wrote a chain-linked denial naming `chatbot.example.test`.
 
 **Phase 2 — `benchmarks/guard-phase2-acceptance.json`: PASS, 28 cases, no
 cleanup errors, 77 seconds.** Real control plane, worker, guest, watchdog

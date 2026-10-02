@@ -63,7 +63,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 export AIEC_GUARD_ACCEPTANCE_STATE="$state"
-unset AIEC_TAP AIEC_JAILER AIEC_GUARD_CREDENTIALS_FILE AIEC_GUARD_BOUNDARY_FILE AIEC_ALLOW_LEGACY_NETWORK
+unset AIEC_TAP AIEC_JAILER AIEC_GUARD_CREDENTIALS_FILE AIEC_GUARD_BOUNDARY_FILE
+# The incident reproduction needs one deliberately unguarded sandbox as its
+# control leg, which is exactly what the main run must never contain. It is
+# opt-in and unset by default, so the ordinary acceptance still cannot create
+# an unguarded guest even if the operator exported the variable beforehand.
+if [[ ${AIEC_REPRO_LEGACY_CONTROL:-0} == 1 ]]; then
+  export AIEC_ALLOW_LEGACY_NETWORK=1
+else
+  unset AIEC_ALLOW_LEGACY_NETWORK AIEC_REPRO_LEGACY_CONTROL
+fi
 setsid "$1" &
 child=$!
 set +e

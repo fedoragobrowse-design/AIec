@@ -207,6 +207,52 @@ def main(c):
                     'sha256': digest.hexdigest(), 'done': b'data: [DONE]\n\n' in tail}
         finally:
             connection.close()
+    if kind == 'dns_bypass':
+        # The bypass class itself: the guest picks the resolver, asks it for a
+        # name the policy never approved, and connects to whatever address it
+        # is handed. Nothing here consults the system resolver, which is the
+        # whole point - a name allowlist that trusts the guest's resolver is
+        # not an allowlist.
+        answer = None
+        query = dns_packet(c['name'], 1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as resolver:
+            resolver.settimeout(2)
+            try:
+                resolver.sendto(query, (c['resolver'], int(c.get('resolver_port', 53))))
+                reply, _ = resolver.recvfrom(4096)
+            except OSError as error:
+                return {'resolved': False, 'stage': 'resolve', 'errno': error.errno}
+        if len(reply) < 16:
+            return {'resolved': False, 'stage': 'answer', 'malformed': True}
+        # Fields are sliced at their own offsets rather than unpacked from one
+        # window: ancount lives at bytes 6..8, and an offset that reads one
+        # field early silently reports zero answers, which looks exactly like a
+        # resolution failure rather than the policy block being reproduced.
+        flags = struct.unpack('!H', reply[2:4])[0]
+        answers = struct.unpack('!H', reply[6:8])[0]
+        rcode = flags & 15
+        if rcode != 0 or answers < 1:
+            return {'resolved': False, 'stage': 'answer', 'rcode': rcode, 'answers': answers}
+        # The answer name is a pointer to the question's name at offset 12, then
+        # type, class, TTL and RDLENGTH - ten bytes - before the four address
+        # bytes. Walked rather than searched for, so a label that happens to
+        # contain 0xc0 cannot be mistaken for the pointer.
+        pointer = reply.find(b'\xc0\x0c', 12)
+        rdata = pointer + 12
+        if pointer < 0 or rdata + 4 > len(reply):
+            return {'resolved': False, 'stage': 'answer', 'malformed': True}
+        answer = '.'.join(str(b) for b in reply[rdata:rdata + 4])
+        # Connect to the resolved address, not to the name: whatever the policy
+        # matched on is not what is dialled here.
+        try:
+            with socket.create_connection((answer, c['port']), timeout=2) as sock:
+                sock.sendall(b'GET / HTTP/1.1\r\nHost: ' + c['name'].encode() + b'\r\n\r\n')
+                data = sock.recv(256)
+            return {'resolved': True, 'address': answer, 'reachable': True,
+                    'response_bytes': len(data), 'http_status': data.split(b'\r\n')[0].decode('ascii', 'replace')}
+        except OSError as error:
+            return {'resolved': True, 'address': answer, 'reachable': False,
+                    'errno': error.errno, 'timeout': isinstance(error, TimeoutError)}
     raise RuntimeError('unknown guest probe kind')
 
 

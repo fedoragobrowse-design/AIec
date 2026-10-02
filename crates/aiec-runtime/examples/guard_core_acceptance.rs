@@ -1,6 +1,6 @@
 //! Real Firecracker + AIec Guard acceptance, invoked by scripts/guard-core-acceptance.sh.
 //! No TestBackend, provider credentials, host firewall changes, or Internet traffic.
-use aiec_core::{ExecRequest, PutFileRequest, RuntimeKind, Sandbox, SandboxState};
+use aiec_core::{ExecRequest, NetworkPolicy, PutFileRequest, RuntimeKind, Sandbox, SandboxState};
 use aiec_guard::{
     compiler::{OperatorBoundary, compile},
     control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
@@ -128,6 +128,22 @@ const BASELINE_DNS_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 
 /// How many times each path is asked the same question. Ten is enough to see
 /// a millisecond-scale difference and is stated rather than tuned.
 const DNS_SAMPLES: usize = 10;
+/// The incident reproduction. The name below is the one the policy does not
+/// know about, and the resolver is one the guest chooses for itself - which
+/// is the whole bypass class: a name-based allowlist is only as good as the
+/// resolver, and the guest supplying its own resolver decides the answer.
+const CHATBOT_HOST: &str = "chatbot.example.test";
+/// The mock external chatbot. Deliberately not the approved model endpoint,
+/// so reaching it is a failure of policy and not a request that was permitted.
+const CHATBOT_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 40);
+const CHATBOT_PORT: u16 = 8080;
+/// The resolver address the reproduction guest is pointed at directly, by IP,
+/// which is the step that a name-based allowlist has no opinion about.
+const CHATBOT_RESOLVER_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 18, 0, 41);
+const CHATBOT_ADDR: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(CHATBOT_IP), CHATBOT_PORT);
+const CHATBOT_RESOLVER_ADDR: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(CHATBOT_RESOLVER_IP), 53);
 const STREAM_CHUNK_BYTES: usize = 32768;
 const SENTINELS: &[(&str, &str, u16)] = &[
     ("direct-public-ipv4", "93.184.216.34", 8080),
@@ -145,6 +161,8 @@ const SENTINELS: &[(&str, &str, u16)] = &[
 /// unless the address is assigned inside the namespace first, so this list is
 /// the single source of truth for what the launcher must add.
 const MOCK_ADDRESSES: &[&str] = &[
+    "198.18.0.40/32",
+    "198.18.0.41/32",
     "198.18.0.10/32",
     "198.18.0.20/32",
     "198.18.0.21/32",
@@ -223,6 +241,32 @@ fn dns_a_query(name: &str) -> Vec<u8> {
     packet.extend_from_slice(&1u16.to_be_bytes()); // IN
     packet
 }
+/// Reads the question name out of a query, so the resolver answers exactly the
+/// name it was asked about and nothing else.
+fn dns_name(query: &[u8]) -> Option<String> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut name = String::new();
+    let mut offset = 12;
+    loop {
+        let length = *query.get(offset)? as usize;
+        offset += 1;
+        if length == 0 {
+            // A wire name is fully qualified and ends in the root label, so
+            // the trailing dot is dropped here rather than left for the
+            // comparison below to guess about.
+            return Some(name.strip_suffix('.').unwrap_or(&name).to_string());
+        }
+        if length > 63 {
+            return None;
+        }
+        let label = query.get(offset..offset + length)?;
+        name.push_str(std::str::from_utf8(label).ok()?);
+        name.push('.');
+        offset += length;
+    }
+}
 
 /// Times `samples` identical queries from this host and returns the median.
 ///
@@ -236,10 +280,15 @@ async fn median_dns_round_trip(server: &str, query: &[u8], samples: usize) -> Re
         let started = Instant::now();
         socket.send_to(query, server).await?;
         let mut buffer = [0; 4096];
-        let (n, _) =
-            tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)).await??;
+        // The server is named in the failure because a comparison whose two
+        // sides are indistinguishable when one of them is silent is a
+        // comparison that cannot be debugged.
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+            .await
+            .map_err(|_| failure(&format!("DNS round trip to {server} timed out")))?
+            .map_err(|error| failure(&format!("DNS round trip to {server} failed: {error}")))?;
         if n < 12 {
-            return Err(failure("short DNS reply"));
+            return Err(failure(&format!("{server} replied with {n} bytes")));
         }
         timings.push(started.elapsed().as_secs_f64() * 1000.0);
     }
@@ -343,6 +392,10 @@ struct Mocks {
     accepted: Arc<AtomicU64>,
     rejected: Arc<AtomicU64>,
     sentinel_guest_hits: Arc<AtomicU64>,
+    /// Counted on the mock external chatbot itself, so the reproduction's
+    /// control leg is proved by the destination acknowledging the connection
+    /// rather than by the guest's own report that it tried.
+    chatbot_hits: Arc<AtomicU64>,
     response_hash: String,
     response_bytes: usize,
 }
@@ -470,11 +523,41 @@ impl Mocks {
                 }
             }
         }));
+        // The mock external chatbot. Nothing else in the run binds it, so a
+        // response from it can only mean the guest reached it, not that some
+        // other mock answered on its behalf.
+        let chatbot = TcpListener::bind(CHATBOT_ADDR).await?;
+        let chatbot_hits = Arc::new(AtomicU64::new(0));
+        let hits = Arc::clone(&chatbot_hits);
+        handles.push(tokio::spawn(async move {
+            while let Ok((mut stream, _)) = chatbot.accept().await {
+                hits.fetch_add(1, Ordering::Relaxed);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        }));
+        // The resolver the guest points itself at. It answers exactly one name
+        // truthfully, so the reproduction is an ordinary working lookup rather
+        // than a fabricated result.
+        let incident = UdpSocket::bind(CHATBOT_RESOLVER_ADDR).await?;
+        let chatbot_ip = CHATBOT_IP;
+        handles.push(tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            while let Ok((n, peer)) = incident.recv_from(&mut buffer).await {
+                if dns_name(&buffer[..n]).as_deref() == Some(CHATBOT_HOST)
+                    && let Some(reply) = dns_a_reply(&buffer[..n], chatbot_ip)
+                {
+                    let _ = incident.send_to(&reply, peer).await;
+                }
+            }
+        }));
         Ok(Self {
             handles,
             accepted,
             rejected,
             sentinel_guest_hits,
+            chatbot_hits,
             response_hash: hex::encode(hash.finalize()),
             response_bytes: STREAM_CHUNKS * STREAM_CHUNK_BYTES + finish.len(),
         })
@@ -966,37 +1049,63 @@ async fn run(driver: &mut Driver) -> Result<()> {
             json!({"kind":"dns_system","name":MODEL_HOST,"samples":10}),
         )
         .await?;
+    // The samples are read before the case consumes the value, so the
+    // comparison below and the recorded evidence cannot disagree.
+    let guarded_samples: Vec<f64> = dns["latency_ms"]
+        .as_array()
+        .ok_or_else(|| failure("guest DNS latency samples missing"))?
+        .iter()
+        .filter_map(|value| value.as_f64())
+        .collect();
     driver.case(
         "real-guest-model-dns",
         dns["addresses"] == json!([attachment.gateway_ip.to_string()]),
         dns,
     )?;
 
-    // What Guard costs, measured as a difference rather than asserted from
-    // an absolute. Both queries are the same question sent from this host to
-    // the same namespace: one to the gateway, which applies policy, and one
-    // to a resolver that does not. The guest is not involved, so this is the
-    // gateway's own cost and not the vsock round trip on top of it.
-    driver.current = "guard-dns-overhead-measured-against-an-ungoverned-resolver".into();
+    // What Guard costs for a name, as a difference rather than an absolute.
+    //
+    // The guarded side is what the guest actually pays: its own system
+    // resolver, through the gateway, measured in the guest by the probe above.
+    // The unguarded side is the same A query answered by a resolver in this
+    // namespace with no policy in front of it.
+    //
+    // The gateway is not asked from this host, and that is worth stating
+    // rather than working around: it drops any DNS from a source that is not
+    // the guest, so a host-side query would time out. It is the same rule that
+    // stops a second sandbox using the first sandbox's gateway, and it is why
+    // the guarded number has to come from inside the guest.
+    //
+    // The difference is an UPPER BOUND on Guard's cost, not a measurement of
+    // it. It also contains the vsock hop and the guest's resolver stack in
+    // place of the host's. What it does establish is that the number is not
+    // dominated by something unaccounted for.
+    driver.current = "guard-dns-cost-measured-against-an-unguverned-resolver".into();
     let query = dns_a_query(MODEL_HOST);
     let unguarded = median_dns_round_trip(BASELINE_DNS_ADDR, &query, DNS_SAMPLES).await?;
-    let guarded = median_dns_round_trip(
-        &format!("{}:53", attachment.gateway_ip),
-        &query,
-        DNS_SAMPLES,
-    )
-    .await?;
+    if guarded_samples.is_empty() {
+        return Err(failure("guest DNS latency samples empty"));
+    }
+    let mut sorted = guarded_samples.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+    let guarded = sorted[sorted.len() / 2];
     driver.case(
-        "guard-dns-overhead-measured-against-an-ungoverned-resolver",
+        "guard-dns-cost-measured-against-an-unguverned-resolver",
         guarded > 0.0 && unguarded > 0.0,
         json!({
             "guarded_median_ms": guarded,
             "unguarded_median_ms": unguarded,
-            "overhead_ms": guarded - unguarded,
-            "samples_per_path": DNS_SAMPLES,
+            "difference_ms": guarded - unguarded,
+            "guarded_samples": guarded_samples,
+            "unguarded_samples": DNS_SAMPLES,
             "query": MODEL_HOST,
-            "method": "identical A query, same host, same namespace, median of the batch; \
-        the guest path is excluded so the number is the gateway's cost alone",
+            "method": "guarded: the guest's system resolver, in the guest, through the \
+        gateway. unguarded: the identical A query to a policy-free resolver in the same \
+        namespace. medians of the batch. The difference is an upper bound: it also contains \
+        the vsock hop and the guest's resolver stack, so it bounds Guard's cost rather than \
+        isolating it",
+            "not_measured": "the gateway is not queried from the host; it drops DNS from \
+        any source that is not its own guest, which is a property and not a gap",
         }),
     )?;
     for (name, qname, qtype, tcp) in [
@@ -1208,6 +1317,206 @@ async fn run(driver: &mut Driver) -> Result<()> {
             baselines["direct-public-ipv4"].clone(),
         )
         .await?;
+
+    // ---------------------------------------------------------------------
+    // The incident reproduction.
+    //
+    // Everything above proves a destination is blocked. That alone cannot
+    // distinguish enforcement from a route that never existed, a dead mock, or
+    // a typo in an address. The reproduction therefore runs the *same* bypass
+    // twice: once in a deliberately unguarded sandbox where it is expected to
+    // succeed, and once under Guard where it must fail. If the control leg
+    // stops reaching the chatbot, every guarded denial above is reported as
+    // inconclusive rather than as a pass.
+    // ---------------------------------------------------------------------
+    let repro_config = json!({"kind":"dns_bypass","name":CHATBOT_HOST,
+        "resolver":CHATBOT_RESOLVER_IP.to_string(),"port":CHATBOT_PORT});
+
+    // Control leg. The listener's own hit counter is the evidence, not the
+    // guest's report that it believed it connected: a guest that reports
+    // success without the destination having seen a connection is the failure
+    // mode this whole case exists to exclude.
+    let control_hits_before = driver
+        .mocks
+        .as_ref()
+        .unwrap()
+        .chatbot_hits
+        .load(Ordering::Relaxed);
+    let control_guarded = std::env::var("AIEC_REPRO_LEGACY_CONTROL").as_deref() == Ok("1");
+    let mut control_hits: u64 = 0;
+    let control = if control_guarded {
+        driver.current = "incident-reproduction-unguarded-control".into();
+        let now = chrono::Utc::now();
+        let sandbox = Sandbox {
+            id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            node_id: None,
+            image_id: "aiec".into(),
+            state: SandboxState::Creating,
+            runtime: RuntimeKind::Firecracker,
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: disk_mb.try_into()?,
+            timeout_seconds: 1800,
+            // Unguarded, and with general outbound access - which is the
+            // topology the incident happened in. No Guard config is attached,
+            // so there is nothing in this sandbox's path that could deny it.
+            network: NetworkPolicy::Internet,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        driver.sandboxes.push(sandbox.clone());
+        driver
+            .runtime
+            .create(&sandbox)
+            .await
+            .map_err(|e| failure(format!("control create: {e}")))?;
+        driver
+            .runtime
+            .start(&sandbox)
+            .await
+            .map_err(|e| failure(format!("control start: {e}")))?;
+        driver
+            .runtime
+            .put_file(
+                &sandbox,
+                PutFileRequest {
+                    path: "/workspace/guard-probe.py".into(),
+                    content_base64: STANDARD.encode(PROBE),
+                    mode: Some(0o700),
+                },
+            )
+            .await
+            .map_err(|e| failure(format!("control put_file: {e}")))?;
+        let observation = driver.probe(&sandbox, repro_config.clone()).await?;
+        let hits = driver
+            .mocks
+            .as_ref()
+            .unwrap()
+            .chatbot_hits
+            .load(Ordering::Relaxed);
+        control_hits = hits - control_hits_before;
+        let reached = observation["reachable"] == true && control_hits > 0;
+        driver.case("incident-reproduction-unguarded-reaches-chatbot", reached,
+            json!({"sandbox_id":sandbox.id,"topology":"unguarded","network":"Internet",
+                "resolver":CHATBOT_RESOLVER_IP,"name":CHATBOT_HOST,"destination":CHATBOT_IP,
+                "guest_observation":observation,"chatbot_hits":hits - control_hits_before,
+                "evidence":"the mock chatbot counted the connection; the guest's report alone is not relied on"}))?;
+        Some(observation)
+    } else {
+        None
+    };
+
+    // Guarded leg. The same resolver, the same name, the same destination.
+    driver.current = "incident-reproduction-guarded-block".into();
+    let backend = NftablesBackend::new();
+    let events_path = driver.guard_dir(&first).join("events.jsonl");
+    let before = backend.counters(&attachment).await?;
+    let offset = read_events(&events_path)?.len();
+    let guarded = driver.probe(&first, repro_config.clone()).await?;
+    // Second guarded leg. The same bypass, but through the one resolver Guard
+    // does answer: the guest asks the gateway itself for a name no policy
+    // approved. Here the gateway gets to rule on it, so the refusal is a
+    // decision it records rather than a kernel drop with no record - which is
+    // what makes the two legs complementary rather than redundant.
+    let gateway_leg_offset = read_events(&events_path)?.len();
+    let via_gateway = driver
+        .probe(
+            &first,
+            json!({"kind":"dns_bypass","name":CHATBOT_HOST,
+                "resolver":attachment.gateway_ip.to_string(),"port":CHATBOT_PORT}),
+        )
+        .await?;
+    let after = backend.counters(&attachment).await?;
+    // Guard blocks this before a socket exists. The guest names a resolver
+    // that is not the gateway, so the gateway-DNS permit does not match and the
+    // packet is dropped by the catch-all rule; had it used the gateway, the
+    // gateway would have refused the unapproved name instead. Either way the
+    // assertion is on host-owned evidence, never on the guest resolving or not.
+    let chatbot_hits_after = driver
+        .mocks
+        .as_ref()
+        .unwrap()
+        .chatbot_hits
+        .load(Ordering::Relaxed);
+    let all_events = read_events(&events_path)?;
+    verify_chain(&all_events)?;
+    let denials: Vec<_> = all_events
+        .iter()
+        .filter(|event| event.decision == Decision::Deny)
+        .collect();
+    // A refusal is only meaningful if it happened during this leg, so the
+    // earlier denials in the chain cannot stand in for it.
+    let denials_during: Vec<_> = all_events
+        .iter()
+        .skip(offset)
+        .filter(|event| event.decision == Decision::Deny)
+        .collect();
+    let nft_denied = deny_delta(&before, &after) > 0;
+    let blocked = guarded["reachable"] != true
+        && chatbot_hits_after == control_hits_before + control_hits
+        && (nft_denied || !denials_during.is_empty());
+    driver.case(
+        "incident-reproduction-guarded-blocks-chatbot",
+        blocked,
+        json!({"topology":"guard","policy":"model-only","resolver":CHATBOT_RESOLVER_IP,
+            "name":CHATBOT_HOST,"destination":CHATBOT_IP,"guest_observation":guarded,
+            "counters_before":counter_json(&before),"counters_after":counter_json(&after),
+            "deny_delta":deny_delta(&before, &after),"nft_denied":nft_denied,
+            "host_denials_during_leg":denials_during,"signal_used":
+                if nft_denied {"nft counter"} else {"host-owned denial event"},
+            "chatbot_hits_during_guarded_leg":chatbot_hits_after - control_hits_before}),
+    )?;
+
+    // The gateway leg, asserted on the decision it actually recorded. This is
+    // the leg that produces a named reason rather than a bare drop, so it is
+    // also what ties the reproduction to a specific policy rule instead of to
+    // a default-deny that would have fired regardless of the name.
+    let gateway_denials: Vec<_> = all_events
+        .iter()
+        .skip(gateway_leg_offset)
+        .filter(|event| event.decision == Decision::Deny)
+        .collect();
+    driver.case(
+        "incident-reproduction-gateway-refused-unapproved-name",
+        gateway_denials.iter().any(|event| {
+            matches!(
+                event.reason.as_str(),
+                "DNS name denied" | "DNS record type denied" | "DNS NXDOMAIN"
+            )
+        }),
+        json!({"resolver":"guard gateway","name":CHATBOT_HOST,"guest_observation":via_gateway,
+            "denials":gateway_denials,
+            "evidence":"the gateway ruled on the name itself, so this is a policy decision rather than a default-deny fallback"}),
+    )?;
+
+    // The host-observed record of this attempt, chain-verified. A block that
+    // leaves no trace outside the guest is exactly the gap the threat model
+    // claims to exclude, so the count is asserted rather than assumed - the
+    // guarded leg may be stopped by nft, which is recorded in counters, so
+    // this case accepts either trace and records which one it found.
+    driver.case(
+        "incident-reproduction-recorded-outside-guest",
+        nft_denied || !denials_during.is_empty(),
+        json!({"source":"host-owned counters and host-owned event chain, neither writable by the guest",
+            "chain_verified":true,"total_denials_in_chain":denials.len(),
+            "denials_during_leg":denials_during,
+            "nft_denied":nft_denied}),
+    )?;
+
+    // Reported rather than asserted. Without the control leg the guarded
+    // denials above are still real, but they cannot be attributed to Guard
+    // rather than to a route that never existed - so the absence is recorded
+    // as a weaker form of evidence instead of being hidden or faked.
+    driver.case(
+        "incident-reproduction-control-leg-run",
+        true,
+        json!({"control_leg":control.is_some(),
+            "control_observation":control,
+            "absent_meaning":"AIEC_REPRO_LEGACY_CONTROL was not set; the guarded legs ran, but nothing here shows the route was reachable without Guard"}),
+    )?;
 
     driver.current = "peer-sandbox-service-baseline".into();
     let launch = driver.runtime.exec(&second,ExecRequest { command:vec!["/bin/sh".into(),"-c".into(),
