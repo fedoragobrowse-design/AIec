@@ -391,24 +391,44 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 /// The control secret this guest authenticates with.
 ///
 /// A per-sandbox identity is planted at `/etc/aiec-guest-secret` before the
-/// machine boots, and that is what is used when it is there: the host
+/// machine boots, and that is what is used when the file is there: the host
 /// authenticates with the same per-sandbox value, so the shared
 /// `AIEC_GUEST_SECRET` only covers images built before per-sandbox identities
 /// existed.
+///
+/// A planted file that is present but unreadable is a refusal, not a fallback.
+/// Falling back there would turn one damaged file into a credential every
+/// sandbox shares - and the host would refuse it anyway, because the host holds
+/// the per-sandbox key. A fallback buys nothing and hides the damage.
 fn control_secret() -> Vec<u8> {
     const PLANTED: &str = "/etc/aiec-guest-secret";
-    if let Ok(text) = std::fs::read_to_string(PLANTED) {
-        let trimmed = text.trim();
-        if !trimmed.is_empty()
-            && let Some(bytes) = hex_decode(trimmed)
-        {
-            return bytes;
+    match std::fs::read_to_string(PLANTED) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            match hex_decode(trimmed) {
+                Some(bytes) if !bytes.is_empty() => bytes,
+                _ => {
+                    eprintln!(
+                        "planted control identity at {PLANTED} is unreadable; refusing to start \
+                         rather than falling back to a shared secret"
+                    );
+                    std::process::exit(2);
+                }
+            }
         }
-    }
-    match std::env::var("AIEC_GUEST_SECRET") {
-        Ok(value) => value.into_bytes(),
-        Err(_) => {
-            eprintln!("refusing to start without a control identity");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::env::var("AIEC_GUEST_SECRET") {
+                Ok(value) if !value.is_empty() => value.into_bytes(),
+                _ => {
+                    eprintln!(
+                        "no control identity: {PLANTED} is absent and AIEC_GUEST_SECRET is unset"
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("planted control identity at {PLANTED} could not be read: {error}");
             std::process::exit(2);
         }
     }
@@ -468,6 +488,24 @@ mod tests {
         assert_eq!(hex_decode(""), Some(Vec::new()));
         assert_eq!(hex_decode("abc"), None, "an odd length is not a value");
         assert_eq!(hex_decode("zz"), None, "a non-hex byte is not a value");
+    }
+
+    #[test]
+    fn a_present_but_unusable_identity_is_a_refusal_not_a_fallback() {
+        // The decision the code makes: absent falls back (a pre-feature image),
+        // present-but-damaged does not. Only the hex path yields bytes.
+        for damaged in ["", "   ", "zz", "abc"] {
+            assert!(
+                hex_decode(damaged.trim())
+                    .filter(|bytes| !bytes.is_empty())
+                    .is_none(),
+                "{damaged:?} must not yield a credential"
+            );
+        }
+        assert!(
+            hex_decode("00").is_some(),
+            "a well-formed value still works"
+        );
     }
 
     #[test]
