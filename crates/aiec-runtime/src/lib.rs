@@ -2881,10 +2881,24 @@ impl FirecrackerRuntime {
             // curl reads the lower-case names, git and most of the ecosystem
             // read the upper-case ones.
             //
-            // `NO_PROXY` is deliberately empty. Anything listed there would be
-            // reached by a direct socket, which the kernel drops; a guest that
-            // reads an empty value and bypasses the proxy gets a refused
-            // connection rather than an ungoverned one.
+            // `NO_PROXY` carries the gateway, and only the gateway.
+            //
+            // Every other destination has to go through the proxy, which
+            // decides whether it is permitted, so nothing else may be named
+            // here: an address listed in `NO_PROXY` is reached by a direct
+            // socket, and the kernel drops those that are not the gateway,
+            // which is a refused connection rather than an ungoverned one.
+            //
+            // The gateway is the exception, and omitting it is not a
+            // hardening choice. The model endpoint above is addressed to the
+            // gateway itself, and a client that honours `HTTP_PROXY` sends
+            // that request to the proxy path as an absolute-form URI - where
+            // presenting a credential is forbidden by design, because the
+            // proxy has no credential to substitute. Every agent following the
+            // documented `AIEC_AGENT_BASE_URL` therefore failed with
+            // `403 credentials forbidden on proxy` before it made a single
+            // model request. Reaching the enforcement point directly is not
+            // bypassing it: the gateway is where enforcement happens.
             let proxy = format!("http://{gateway}:8443");
             for key in [
                 "HTTP_PROXY",
@@ -2897,7 +2911,7 @@ impl FirecrackerRuntime {
                 request.environment.insert(key.into(), proxy.clone());
             }
             for key in ["NO_PROXY", "no_proxy"] {
-                request.environment.insert(key.into(), String::new());
+                request.environment.insert(key.into(), gateway.clone());
             }
         }
         validate_exec(&request)?;
@@ -2947,39 +2961,133 @@ impl FirecrackerRuntime {
         if content.len() > MAX_FILE {
             return Err(CoreError::LimitExceeded("file".into()).into());
         }
-        self.guest_call(
-            sandbox.id,
-            Operation::WriteFile,
-            RequestPayload::WriteFile {
-                path: request.path,
-                content,
-                mode: request.mode,
-            },
-        )
-        .await?;
+        // A control-channel frame is much smaller than `MAX_FILE`, so a file
+        // that passes the size check above can still be too large to send in
+        // one piece. Sending it anyway does not produce a clean error: the
+        // guest rejects the frame on its declared length and closes the
+        // connection, and this side sees a broken pipe halfway through a write
+        // it believed was going to succeed. Split anything that does not fit.
+        if aiec_core::runtime::write_fits_one_frame(&request.path, &content) {
+            self.guest_call(
+                sandbox.id,
+                Operation::WriteFile,
+                RequestPayload::WriteFile {
+                    path: request.path,
+                    content,
+                    mode: request.mode,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        let size_bytes = content.len() as u64;
+        let mut written = 0usize;
+        for chunk in content.chunks(aiec_core::runtime::FILE_CHUNK_BYTES) {
+            let chunk_request = aiec_core::runtime::FileWriteChunkRequest {
+                path: request.path.clone(),
+                offset: written as u64,
+                size_bytes,
+                // The mode belongs to the last piece, which is the one that
+                // completes the file; sending it with every chunk would make
+                // the file briefly executable while it was still short.
+                mode: request
+                    .mode
+                    .filter(|_| written + chunk.len() == content.len()),
+            };
+            match self
+                .guest_call(
+                    sandbox.id,
+                    Operation::WriteFileChunk,
+                    RequestPayload::WriteFileChunk {
+                        request: chunk_request,
+                        content: chunk.to_vec(),
+                    },
+                )
+                .await?
+            {
+                ResponsePayload::WriteFileChunk {
+                    written: n,
+                    size_bytes: reported,
+                } => {
+                    if n != chunk.len() || reported != size_bytes {
+                        return Err(RuntimeError::Protocol(
+                            aiec_core::protocol::ProtocolError::Malformed(
+                                "invalid file chunk write response".into(),
+                            ),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(RuntimeError::Unavailable(
+                        "guest returned wrong file chunk write response".into(),
+                    ));
+                }
+            }
+            written += chunk.len();
+        }
         Ok(())
     }
 
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, RuntimeError> {
-        match self
-            .guest_call(
-                sandbox.id,
-                Operation::ReadFile,
-                RequestPayload::Path { path: path.into() },
-            )
-            .await?
-        {
-            ResponsePayload::ReadFile { content } => {
-                use base64::Engine;
-                Ok(FileContent {
-                    path: path.into(),
-                    content_base64: base64::engine::general_purpose::STANDARD.encode(content),
-                })
+        use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunkRequest};
+        // Always the chunked read, which is one round trip for a file that fits
+        // a frame and several for one that does not. The single-shot `ReadFile`
+        // cannot be used here at all: a response has to fit one frame too, so a
+        // file large enough to overflow it does not come back as an error - the
+        // guest writes a length it then refuses to send, and this side sees the
+        // connection end mid-frame. A file the API accepts on the way in has to
+        // be readable on the way out.
+        let mut content = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let request = FileChunkRequest {
+                path: path.to_owned(),
+                offset,
+                length: FILE_CHUNK_BYTES,
+                expected_version: None,
+            };
+            let eof = match self
+                .guest_call(
+                    sandbox.id,
+                    Operation::ReadFileChunk,
+                    RequestPayload::ReadFileChunk {
+                        request: request.clone(),
+                    },
+                )
+                .await?
+            {
+                ResponsePayload::ReadFileChunk {
+                    content: chunk,
+                    size_bytes,
+                    version,
+                    eof,
+                } => {
+                    let chunk = aiec_core::runtime::FileChunk {
+                        bytes: bytes::Bytes::from(chunk),
+                        size_bytes,
+                        version,
+                        eof,
+                    };
+                    request.validate_chunk(&chunk)?;
+                    content.extend_from_slice(&chunk.bytes);
+                    eof
+                }
+                _ => {
+                    return Err(RuntimeError::Unavailable(
+                        "guest returned wrong file response".into(),
+                    ));
+                }
+            };
+            if eof {
+                break;
             }
-            _ => Err(RuntimeError::Unavailable(
-                "guest returned wrong file response".into(),
-            )),
+            offset += FILE_CHUNK_BYTES as u64;
         }
+        use base64::Engine;
+        Ok(FileContent {
+            path: path.into(),
+            content_base64: base64::engine::general_purpose::STANDARD.encode(content),
+        })
     }
 
     async fn list_files(

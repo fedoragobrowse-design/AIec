@@ -41,6 +41,7 @@ pub enum Operation {
     ReadFile,
     ReadFileChunk,
     WriteFile,
+    WriteFileChunk,
     ListDirectory,
     CreateDirectory,
     RemoveFile,
@@ -78,6 +79,11 @@ pub enum RequestPayload {
     },
     ReadFileChunk {
         request: crate::runtime::FileChunkRequest,
+    },
+    WriteFileChunk {
+        request: crate::runtime::FileWriteChunkRequest,
+        #[serde(with = "base64_bytes")]
+        content: Vec<u8>,
     },
     WriteFile {
         path: String,
@@ -127,6 +133,10 @@ pub enum ResponsePayload {
         size_bytes: u64,
         version: String,
         eof: bool,
+    },
+    WriteFileChunk {
+        written: usize,
+        size_bytes: u64,
     },
     WriteFile,
     ListDirectory {

@@ -302,6 +302,16 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
                 }
                 _ => Err("write payload required".into()),
             },
+            Operation::WriteFileChunk => match request.payload {
+                RequestPayload::WriteFileChunk { request, content } => request
+                    .write_workspace(Path::new("/workspace"), &content)
+                    .map(|chunk| ResponsePayload::WriteFileChunk {
+                        written: chunk.written,
+                        size_bytes: chunk.size_bytes,
+                    })
+                    .map_err(|error| error.to_string()),
+                _ => Err("write chunk payload required".into()),
+            },
             Operation::ListDirectory => match request.payload {
                 RequestPayload::Path { path } => {
                     let path = safe_path(&path)?;

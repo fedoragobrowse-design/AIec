@@ -50,6 +50,46 @@ pub struct FileChunk {
     pub eof: bool,
 }
 
+/// One piece of a file being written into a sandbox.
+///
+/// The mirror of [`FileChunkRequest`], and it exists for the same reason. A
+/// single `WriteFile` has to fit its whole payload into one authenticated frame
+/// on the control channel, which is far smaller than `MAX_FILE`, so a file that
+/// the API advertises as acceptable could not actually be sent. The total size
+/// is declared up front rather than discovered at the end, so an upload that
+/// would exceed `MAX_FILE` is refused before any of it is written and a caller
+/// that stops early leaves a short file rather than a plausible-looking one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileWriteChunkRequest {
+    pub path: String,
+    pub offset: u64,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub mode: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileWriteChunk {
+    pub written: usize,
+    pub size_bytes: u64,
+}
+
+/// Whether this whole write fits in one control-channel frame.
+///
+/// Small files still travel as a single `WriteFile`, which keeps them to one
+/// round trip and keeps guests that predate chunked writes working. The
+/// payload is a JSON array of numbers, which costs at most four wire bytes per
+/// payload byte, so sizing against that is the conservative estimate; the
+/// fixed term covers the path and the request envelope.
+pub fn write_fits_one_frame(path: &str, content: &[u8]) -> bool {
+    content
+        .len()
+        .saturating_mul(4)
+        .saturating_add(path.len())
+        .saturating_add(256)
+        < crate::protocol::MAX_FRAME
+}
+
 /// A JSON range reply must not allocate an oversized byte vector before validation.
 pub fn deserialize_file_chunk_bytes<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -190,6 +230,121 @@ impl FileChunkRequest {
             bytes: bytes.into(),
             size_bytes: before.len(),
             version: stamp,
+        };
+        self.validate_chunk(&chunk)?;
+        Ok(chunk)
+    }
+}
+
+impl FileWriteChunkRequest {
+    pub fn validate(&self) -> Result<(), crate::CoreError> {
+        crate::safe_path(&self.path)?;
+        if self.size_bytes > crate::MAX_FILE as u64 {
+            return Err(crate::CoreError::LimitExceeded("file".into()));
+        }
+        Ok(())
+    }
+
+    /// Checks one piece of the upload against the declared total.
+    ///
+    /// The rule that matters is the last one: a chunk that is shorter than the
+    /// transfer unit has to be the final one. Without it a caller could declare
+    /// ten megabytes, send three bytes and stop, and the guest would report a
+    /// file that looks complete and is not.
+    pub fn validate_content(&self, content: &[u8]) -> Result<(), crate::CoreError> {
+        self.validate()?;
+        let end = self.offset.saturating_add(content.len() as u64);
+        if content.is_empty() || content.len() > FILE_CHUNK_BYTES || end > self.size_bytes {
+            return Err(crate::CoreError::InvalidRequest(
+                "invalid file chunk write".into(),
+            ));
+        }
+        if end < self.size_bytes && content.len() != FILE_CHUNK_BYTES {
+            return Err(crate::CoreError::InvalidRequest(
+                "only the final chunk of a file may be short".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_chunk(&self, chunk: &FileWriteChunk) -> Result<(), crate::CoreError> {
+        self.validate()?;
+        if chunk.written == 0
+            || chunk.written > FILE_CHUNK_BYTES
+            || chunk.size_bytes != self.size_bytes
+        {
+            return Err(crate::CoreError::Conflict(
+                "invalid file chunk write response".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Writes one piece relative to an opened workspace, never following a
+    /// symlink. Descriptor-relative traversal prevents rename/symlink races in
+    /// the same way the read path does.
+    #[cfg(unix)]
+    pub fn write_workspace(
+        &self,
+        root: &std::path::Path,
+        content: &[u8],
+    ) -> Result<FileWriteChunk, crate::CoreError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        self.validate_content(content)?;
+        let path = crate::safe_path(&self.path)?;
+        let relative = path
+            .strip_prefix("/workspace")
+            .map_err(|_| crate::CoreError::Forbidden("outside workspace".into()))?;
+        // Intermediate directories are created under `root`, not under the
+        // logical `/workspace` path. `safe_path` has already proved the parent
+        // stays inside the workspace, and the guest's root is where that tree
+        // actually lives - creating the logical path instead would escape to
+        // the real filesystem root of whatever process is running this.
+        if let Some(parent) = std::path::Path::new(relative).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(root.join(parent))?;
+        }
+        let mut file = std::fs::OpenOptions::new().read(true).open(root)?;
+        let mut parts = relative.components().peekable();
+        while let Some(part) = parts.next() {
+            let name = std::ffi::CString::new(part.as_os_str().as_bytes())
+                .map_err(|_| crate::CoreError::InvalidRequest("invalid path".into()))?;
+            let final_component = parts.peek().is_none();
+            let mut flags = libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            if final_component {
+                flags |= libc::O_WRONLY | libc::O_CREAT;
+            } else {
+                flags |= libc::O_RDONLY | libc::O_DIRECTORY;
+            }
+            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            file = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(content, self.offset)?;
+        }
+        let end = self.offset + content.len() as u64;
+        if end == self.size_bytes {
+            // A file that already existed longer than the declared total would
+            // otherwise keep its tail, so the upload would appear to succeed and
+            // leave a file with bytes nobody sent.
+            if file.metadata()?.len() > self.size_bytes {
+                file.set_len(self.size_bytes)?;
+            }
+            if let Some(mode) = self.mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+        }
+        file.sync_all()?;
+        let chunk = FileWriteChunk {
+            written: content.len(),
+            size_bytes: self.size_bytes,
         };
         self.validate_chunk(&chunk)?;
         Ok(chunk)
@@ -1215,5 +1370,176 @@ mod file_chunk_tests {
         );
         assert!(serde_json::from_str::<Wire>(r#"{"content":[256]}"#).is_err());
         assert!(serde_json::from_str::<Wire>(r#"{"content":"AA=="}"#).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod file_write_chunk_tests {
+    use super::*;
+
+    struct Root(std::path::PathBuf);
+    impl Root {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("aiec-write-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn request(path: &str, offset: u64, size_bytes: u64) -> FileWriteChunkRequest {
+        FileWriteChunkRequest {
+            path: path.into(),
+            offset,
+            size_bytes,
+            mode: Some(0o700),
+        }
+    }
+
+    /// Writes a whole file the way the runtime does, one bounded chunk at a
+    /// time, and returns what ended up on disk.
+    fn upload(root: &Root, path: &str, content: &[u8]) -> std::io::Result<Vec<u8>> {
+        let size_bytes = content.len() as u64;
+        let mut offset = 0usize;
+        while offset < content.len() {
+            let end = (offset + FILE_CHUNK_BYTES).min(content.len());
+            let chunk = &content[offset..end];
+            let mut piece = request(path, offset as u64, size_bytes);
+            if end != content.len() {
+                piece.mode = None;
+            }
+            piece
+                .write_workspace(root.path(), chunk)
+                .expect("chunk write");
+            offset = end;
+        }
+        std::fs::read(root.path().join(path.trim_start_matches("/workspace/")))
+    }
+
+    /// The reason this path exists. A static binary is larger than one control
+    /// channel frame, and before chunked writes it could not be uploaded at
+    /// all: the guest rejected the frame on its declared length and the sender
+    /// saw a broken pipe instead of an error. Everything above this line is a
+    /// larger-than-one-frame file arriving intact.
+    #[test]
+    fn a_file_larger_than_one_control_frame_arrives_byte_for_byte() {
+        let root = Root::new();
+        let content: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        assert!(!write_fits_one_frame("/workspace/big", &content));
+        assert_eq!(upload(&root, "/workspace/big", &content).unwrap(), content);
+        let on_disk = std::fs::metadata(root.path().join("big")).unwrap().len();
+        assert_eq!(on_disk, content.len() as u64);
+    }
+
+    /// A caller that declares ten megabytes, sends two and stops must not
+    /// produce a file that looks complete. The short-chunk rule is what stops
+    /// it: only the final piece of a file may be smaller than the transfer
+    /// unit, so a truncated stream is refused at the piece that truncated it.
+    #[test]
+    fn a_truncated_upload_is_refused_rather_than_completed() {
+        let root = Root::new();
+        let mut piece = request("/workspace/short", 0, 3 * FILE_CHUNK_BYTES as u64);
+        piece.mode = None;
+        let error = piece
+            .write_workspace(root.path(), &[7u8; 16])
+            .expect_err("a short first chunk must be refused");
+        assert!(
+            error.to_string().contains("final chunk"),
+            "unexpected error: {error}"
+        );
+        assert!(!root.path().join("short").exists());
+    }
+
+    /// Uploading over a longer file must leave the declared size, not the
+    /// longer size. Otherwise a write reports success and the file keeps bytes
+    /// from a previous upload that nobody sent this time.
+    #[test]
+    fn a_shorter_upload_over_a_longer_file_truncates_the_tail() {
+        let root = Root::new();
+        upload(
+            &root,
+            "/workspace/reused",
+            &vec![b'a'; 5 * FILE_CHUNK_BYTES],
+        )
+        .unwrap();
+        let shorter: Vec<u8> = vec![b'b'; 100];
+        assert_eq!(
+            upload(&root, "/workspace/reused", &shorter).unwrap(),
+            shorter
+        );
+        let size = std::fs::metadata(root.path().join("reused")).unwrap().len();
+        assert_eq!(size, 100);
+    }
+
+    #[test]
+    fn a_chunk_write_cannot_escape_the_workspace() {
+        let root = Root::new();
+        for path in ["/etc/passwd", "/workspace/../etc/passwd", "relative"] {
+            assert!(
+                request(path, 0, 4)
+                    .write_workspace(root.path(), b"xxxx")
+                    .is_err(),
+                "{path} should be refused"
+            );
+        }
+    }
+
+    /// The mode belongs to the piece that finishes the file. Applying it
+    /// earlier would make a still-short file executable while it is being
+    /// written, which is exactly the window an attacker with a guest foothold
+    /// would run something in.
+    #[test]
+    fn the_mode_is_applied_once_the_file_is_complete() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new();
+        let first = request("/workspace/script", 0, 2 * FILE_CHUNK_BYTES as u64);
+        first
+            .write_workspace(root.path(), &vec![1u8; FILE_CHUNK_BYTES])
+            .unwrap();
+        let during = std::fs::metadata(root.path().join("script"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            during.mode() & 0o777,
+            0o600,
+            "not executable while incomplete"
+        );
+        let mut last = request(
+            "/workspace/script",
+            FILE_CHUNK_BYTES as u64,
+            2 * FILE_CHUNK_BYTES as u64,
+        );
+        last.mode = Some(0o755);
+        last.write_workspace(root.path(), &vec![1u8; FILE_CHUNK_BYTES])
+            .unwrap();
+        let after = std::fs::metadata(root.path().join("script"))
+            .unwrap()
+            .permissions();
+        assert_eq!(after.mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn the_single_frame_decision_matches_the_frame_limit() {
+        assert!(write_fits_one_frame("/workspace/a", &vec![0u8; 64 * 1024]));
+        assert!(!write_fits_one_frame(
+            "/workspace/a",
+            &vec![0u8; 1024 * 1024]
+        ));
+        // A long path alone cannot tip a small file over.
+        let long_path = format!("/workspace/{}", "d".repeat(300));
+        assert!(write_fits_one_frame(&long_path, &[0u8; 16]));
+        let too_big = request("/workspace/big", 0, crate::MAX_FILE as u64 + 1);
+        assert!(
+            too_big
+                .write_workspace(std::path::Path::new("/"), b"x")
+                .is_err()
+        );
     }
 }
