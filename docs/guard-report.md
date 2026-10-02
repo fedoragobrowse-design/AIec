@@ -164,8 +164,8 @@ phase 2 run above, where a triggered rule is taken all the way to
 `completed_at`; the reproduction's job is to establish that the request is
 blocked at all, which is the precondition the threshold logic sits behind.
 
-**Phase 2 — `benchmarks/guard-phase2-acceptance.json`: PASS, 28 cases, no
-cleanup errors, 77 seconds.** Real control plane, worker, guest, watchdog
+**Phase 2 — `benchmarks/guard-phase2-acceptance.json`: PASS, 29 cases, 78.1
+seconds, no cleanup errors.** Real control plane, worker, guest, watchdog
 process, database and kernel tables. Observed: guarded start; a narrowly-scoped
 watchdog key that cannot create sandboxes; anchored telemetry; a real watchdog
 holding the attachment live; authoritative denials reaching the watchdog; a
@@ -191,6 +191,47 @@ across a multi-minute capture; refusals surfacing as TCP resets; an operator cut
 indistinguishable from a dead-man latch; a gateway shutdown that could not
 complete; a canary cut undone by the next heartbeat; a hostname matcher
 inverted so that subdomains did not match and unrelated domains did.
+
+Two more came out of running the suites rather than out of the product: the
+phase 2 launcher's second `trap ... EXIT` silently replaced the first, so every
+run leaked its lock and the next one refused while nothing was running; and the
+same launcher stopped postgres but never reaped the control plane and worker it
+had launched, so every interrupted run left servers bound to that run's ports.
+
+## What Guard costs
+
+All figures are from the two live runs in this report, on the same host, stated
+with the method that produced them rather than as bare numbers.
+
+**Host.** Intel Core i7-10710U @ 1.10 GHz, 12 threads, Linux 7.2.7-200.fc44,
+x86_64. Every guest is a real Firecracker microVM.
+
+| measurement | guarded | direct | added | samples |
+|---|---:|---:|---:|---:|
+| DNS A lookup, median | 4.022 ms | 0.034 ms | 3.987 ms | 10 per side |
+| model stream, first byte | 16.66 ms | 6.79 ms | 9.87 ms | 3 |
+| model stream, total duration | 804.75 ms | 787.10 ms | 17.68 ms | 3 |
+| alert → network cut | 23.66 ms | — | — | 1 run, real watchdog |
+
+**Stream throughput.** A 4 MiB response arrived as 515 chunks in 804.8 ms
+(~5.2 MiB/s end to end, including the guest's own read loop) against 4 MiB in
+132 chunks in 783.1 ms direct to the model. Guard's chunking turns 132 writes
+into 515; the cost of that is 2.7% of wall time. The per-chunk amplification is
+the price of not handing the guest an unbounded buffer, and it is deliberate.
+
+**What the DNS figure does not say.** It is an upper bound, not the cost of the
+policy engine. The guarded side is a real guest resolver lookup and the
+unguarded side a raw packet from the host, so the difference carries the vsock
+hop and the guest resolver stack as well as the policy check.
+
+**Quarantine latency.** 23.66 ms is the interval in which the rule had fired
+and egress was still up — the exposure window, from the two timestamps the
+incident record already carries. One sample, this hardware, real watchdog
+holding the attachment live. It is not a distribution and no percentile is
+claimed from it.
+
+**Not measured.** CPU and memory cost of the gateway against a host-served
+path, and any aarch64 figure of any kind. Both are absent rather than estimated.
 
 ## Known limitations
 

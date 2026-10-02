@@ -42,7 +42,6 @@ if [[ ${1:-} != --inside ]]; then
     printf '%s\n' 'another phase 2 acceptance run holds the lock; wait for it' >&2
     exit 2
   fi
-  trap 'rmdir "$root/.lock" 2>/dev/null || true' EXIT
   mkdir -p "$pg" "$sock"
   chmod 700 "$root"
   pg_bin=${P2_PG_BIN:-$HOME/.paperclip/cli/installs/npm/2026.916.1/node_modules/@embedded-postgres/linux-x64/native/bin}
@@ -67,9 +66,15 @@ if [[ ${1:-} != --inside ]]; then
   # and make the next run fail on a stale fixture rather than on a real fault.
   # Matching is on this run's own root, which is unique per run, so nothing
   # belonging to another run can be caught by it.
+  # The lock is released here rather than by an earlier trap of its own: a
+  # second `trap ... EXIT` replaces the first, so releasing the lock separately
+  # meant every run that got as far as starting the database leaked its lock
+  # and the next run refused with "another run holds the lock" while nothing
+  # was running. One trap releases both, in that order.
   stop_db() {
     pkill -9 -f -- "$root" >/dev/null 2>&1 || true
     "$pg_bin/pg_ctl" -D "$pg" -m immediate stop >/dev/null 2>&1 || true
+    rmdir "$root/.lock" 2>/dev/null || true
   }
   trap stop_db EXIT
   unshare --user --map-root-user --net --fork --kill-child=KILL bash "$self" --inside

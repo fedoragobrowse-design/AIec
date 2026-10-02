@@ -1,8 +1,8 @@
 {
   "schema": "aiec.guard.phase2-acceptance.v1",
   "status": "PASS",
-  "passed": 28,
-  "cases": 28,
+  "passed": 29,
+  "cases": 29,
   "cases_detail": [
     {
       "case": "worker-registers-and-stays-healthy",
@@ -10,7 +10,7 @@
       "evidence": {
         "registered": true,
         "health": {
-          "node_id": "01a0f90a-e918-7637-9082-a9533163002a",
+          "node_id": "01a0faf5-060a-77cf-a6c6-c67347d151e1",
           "healthy": true,
           "runtime": "firecracker",
           "capabilities": {
@@ -99,7 +99,7 @@
       "case": "watchdog-process-starts-outside-the-guest",
       "status": "PASS",
       "evidence": {
-        "pid": 2331269,
+        "pid": 2350863,
         "exit": null,
         "reason": null
       }
@@ -110,8 +110,8 @@
       "evidence": {
         "status": 200,
         "body": null,
-        "event_head": "6a74383e9b7f11de6e8ce0f81bfd91f86e3ca0a36f47ce951ba0e1b44fdd662b",
-        "table": "aiec_guard_01a0fa889eda7524bb2fc5dc1e748ddd",
+        "event_head": "195ece5eb6491e4400b0258b23e4d3d7ba73bad7facbc24589a72d22fe305f9e",
+        "table": "aiec_guard_01a0faf56bd1737383481befa0408e43",
         "budget_max_model_requests": 10000
       }
     },
@@ -152,9 +152,9 @@
       "status": "PASS",
       "evidence": {
         "status": 200,
-        "gateway": "172.30.15.117",
-        "tap": "ag72e4508de69dd",
-        "kernel_view": "{\"default\": [[\"eth0\", \"00000000\", \"750F1EAC\", \"0003\", \"0\", \"0\", \"0\", \"00000000\", \"0\", \"0\", \"0\"]], \"links\": {\"lo\": \"unknown\", \"eth0\": \"up\"}}\n",
+        "gateway": "172.30.17.13",
+        "tap": "ag226c377667dd3",
+        "kernel_view": "{\"default\": [[\"eth0\", \"00000000\", \"0D111EAC\", \"0003\", \"0\", \"0\", \"0\", \"00000000\", \"0\", \"0\", \"0\"]], \"links\": {\"lo\": \"unknown\", \"eth0\": \"up\"}}\n",
         "response": null
       }
     },
@@ -163,7 +163,7 @@
       "status": "PASS",
       "evidence": {
         "counters": {
-          "table": "aiec_guard_01a0fa889eda7524bb2fc5dc1e748ddd",
+          "table": "aiec_guard_01a0faf56bd1737383481befa0408e43",
           "blocked_range": 3,
           "other_denied": 0,
           "ipv6": 0,
@@ -179,9 +179,9 @@
           }
         ],
         "host_view": {
-          "link": "2: ag72e4508de69dd: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\\    link/ether 7a:f3:7e:32:c5:4b brd ff:ff:ff:ff:ff:ff",
-          "address": "2: ag72e4508de69dd    inet 172.30.15.117/30 scope global ag72e4508de69dd\\       valid_lft forever preferred_lft forever\n2: ag72e4508de69dd    inet6 fe80::78f3:7eff:fe32:c54b/64 scope link proto kernel_ll \\       valid_lft forever preferred_lft forever",
-          "neighbour": "172.30.15.118 lladdr 06:00:ac:10:00:02 STALE"
+          "link": "2: ag226c377667dd3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\\    link/ether 16:dc:03:56:9d:68 brd ff:ff:ff:ff:ff:ff",
+          "address": "2: ag226c377667dd3    inet 172.30.17.13/30 scope global ag226c377667dd3\\       valid_lft forever preferred_lft forever\n2: ag226c377667dd3    inet6 fe80::14dc:3ff:fe56:9d68/64 scope link proto kernel_ll \\       valid_lft forever preferred_lft forever",
+          "neighbour": "172.30.17.14 lladdr 06:00:ac:10:00:02 STALE"
         }
       }
     },
@@ -212,35 +212,45 @@
       "case": "quarantine-cuts-the-network",
       "status": "PASS",
       "evidence": {
-        "network_cut_at": "2026-10-02T02:54:22.403729127Z"
+        "network_cut_at": "2026-10-02T04:53:12.756956066Z"
+      }
+    },
+    {
+      "case": "alert-to-network-cut-latency-is-bounded",
+      "status": "PASS",
+      "evidence": {
+        "triggered_at": "2026-10-02T04:53:12.733300406Z",
+        "network_cut_at": "2026-10-02T04:53:12.756956066Z",
+        "alert_to_cut_ms": 23.656,
+        "meaning": "the interval in which the alert existed and egress was not yet gone"
       }
     },
     {
       "case": "quarantine-pauses-the-vm",
       "status": "PASS",
       "evidence": {
-        "paused_at": "2026-10-02T02:54:24.927246317Z"
+        "paused_at": "2026-10-02T04:53:15.347524371Z"
       }
     },
     {
       "case": "quarantine-captures-forensics",
       "status": "PASS",
       "evidence": {
-        "snapshot_id": "01a0fa88-c4b2-7645-9a82-768b5a374be2"
+        "snapshot_id": "01a0faf5-919d-7784-921a-b609db3dded6"
       }
     },
     {
       "case": "quarantine-writes-an-incident-report",
       "status": "PASS",
       "evidence": {
-        "report_head": "# Guard incident\n\n- Incident: 01a0fa88-c4b2-7645-9a82-768b5a374be2\n- Sandbox: 01a0fa88-9eda-7524-bb2f-c5dc1e748ddd\n- Ten"
+        "report_head": "# Guard incident\n\n- Incident: 01a0faf5-919d-7784-921a-b609db3dded6\n- Sandbox: 01a0faf5-6bd1-7373-8348-1befa0408e43\n- Ten"
       }
     },
     {
       "case": "quarantine-completes",
       "status": "PASS",
       "evidence": {
-        "completed_at": "2026-10-02T02:54:24.975154226Z"
+        "completed_at": "2026-10-02T04:53:15.451166606Z"
       }
     },
     {
@@ -265,14 +275,14 @@
         "status": 200,
         "same_incident": true,
         "response": {
-          "id": "01a0fa88-c4b2-7645-9a82-768b5a374be2",
+          "id": "01a0faf5-919d-7784-921a-b609db3dded6",
           "identity": {
-            "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-            "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+            "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+            "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
             "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
           },
           "fence": {
-            "lease_id": "01a0fa88-9ee3-7037-a7a5-8729e51e4f64",
+            "lease_id": "01a0faf5-6bd8-7590-b31b-0a2eb7a5a182",
             "generation": 3
           },
           "rules": [
@@ -280,23 +290,23 @@
               "rule": "repeated_denied_connections",
               "first_event_sequence": null,
               "evidence_references": [
-                "counter:aiec_guard_01a0fa889eda7524bb2fc5dc1e748ddd:denied:1:0:0",
-                "counter:aiec_guard_01a0fa889eda7524bb2fc5dc1e748ddd:denied:2:0:0",
-                "counter:aiec_guard_01a0fa889eda7524bb2fc5dc1e748ddd:denied:3:0:0"
+                "counter:aiec_guard_01a0faf56bd1737383481befa0408e43:denied:1:0:0",
+                "counter:aiec_guard_01a0faf56bd1737383481befa0408e43:denied:2:0:0",
+                "counter:aiec_guard_01a0faf56bd1737383481befa0408e43:denied:3:0:0"
               ]
             }
           ],
-          "triggered_at": "2026-10-02T02:54:22.386546317Z",
-          "network_cut_at": "2026-10-02T02:54:22.403729127Z",
-          "paused_at": "2026-10-02T02:54:24.927246317Z",
-          "snapshot_id": "01a0fa88-c4b2-7645-9a82-768b5a374be2",
-          "completed_at": "2026-10-02T02:54:24.975154226Z",
+          "triggered_at": "2026-10-02T04:53:12.733300406Z",
+          "network_cut_at": "2026-10-02T04:53:12.756956066Z",
+          "paused_at": "2026-10-02T04:53:15.347524371Z",
+          "snapshot_id": "01a0faf5-919d-7784-921a-b609db3dded6",
+          "completed_at": "2026-10-02T04:53:15.451166606Z",
           "events": [
             {
-              "timestamp": "2026-10-02T02:54:12.824694874Z",
-              "event_id": "a75869c0-661a-4c8d-9173-e824527a4afa",
-              "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-              "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+              "timestamp": "2026-10-02T04:53:03.183374849Z",
+              "event_id": "b278d02c-2db3-4e21-b557-7c9276af179b",
+              "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+              "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
               "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
               "category": "lifecycle",
               "decision": "allow",
@@ -306,13 +316,13 @@
               "response_bytes": 0,
               "duration_ms": 0,
               "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-              "current_hash": "3926f1025f3718c6e096b368cded247cb2ddcf1e72f0e36b70ba54f6e45bb933"
+              "current_hash": "74f92ff808986e8b9b7a7f0c569bfbce6910ce7f06c7cf92bfe9e32adcac29a1"
             },
             {
-              "timestamp": "2026-10-02T02:54:12.844128589Z",
-              "event_id": "9aeaaaf1-cae9-40b3-b944-259052feacad",
-              "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-              "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+              "timestamp": "2026-10-02T04:53:03.201947965Z",
+              "event_id": "bc5b5640-0e5b-4e44-8d31-a2ba7bb259ad",
+              "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+              "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
               "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
               "category": "lifecycle",
               "decision": "allow",
@@ -321,14 +331,14 @@
               "request_bytes": 0,
               "response_bytes": 0,
               "duration_ms": 0,
-              "previous_hash": "3926f1025f3718c6e096b368cded247cb2ddcf1e72f0e36b70ba54f6e45bb933",
-              "current_hash": "fe7f15bf602cba566e927516e8469dad1ddc0c18201ceb66880dd1b79ab7c96d"
+              "previous_hash": "74f92ff808986e8b9b7a7f0c569bfbce6910ce7f06c7cf92bfe9e32adcac29a1",
+              "current_hash": "4d335b4fee17917d8b5893218ea1a589ceebe8e91238896e1b1c34b62eb95b37"
             },
             {
-              "timestamp": "2026-10-02T02:54:13.890172994Z",
-              "event_id": "3014a1ab-d144-4de3-a5e7-d685c882d0fa",
-              "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-              "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+              "timestamp": "2026-10-02T04:53:04.266035281Z",
+              "event_id": "ab8e26db-16d9-4b47-819c-c03b8020c5a0",
+              "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+              "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
               "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
               "category": "lifecycle",
               "decision": "allow",
@@ -337,14 +347,14 @@
               "request_bytes": 0,
               "response_bytes": 0,
               "duration_ms": 0,
-              "previous_hash": "fe7f15bf602cba566e927516e8469dad1ddc0c18201ceb66880dd1b79ab7c96d",
-              "current_hash": "6a74383e9b7f11de6e8ce0f81bfd91f86e3ca0a36f47ce951ba0e1b44fdd662b"
+              "previous_hash": "4d335b4fee17917d8b5893218ea1a589ceebe8e91238896e1b1c34b62eb95b37",
+              "current_hash": "195ece5eb6491e4400b0258b23e4d3d7ba73bad7facbc24589a72d22fe305f9e"
             },
             {
-              "timestamp": "2026-10-02T02:54:22.403679845Z",
-              "event_id": "9b28af63-aa7d-4c7a-bbe0-9421a5f1ae92",
-              "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-              "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+              "timestamp": "2026-10-02T04:53:12.756890817Z",
+              "event_id": "5c9989af-6b6e-444d-8190-45a7749785cf",
+              "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+              "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
               "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
               "category": "lifecycle",
               "decision": "cut",
@@ -353,14 +363,14 @@
               "request_bytes": 0,
               "response_bytes": 0,
               "duration_ms": 0,
-              "previous_hash": "6a74383e9b7f11de6e8ce0f81bfd91f86e3ca0a36f47ce951ba0e1b44fdd662b",
-              "current_hash": "43399074ffe0427187ec109bd25bc861433240f103991f8c93efb679243addb2"
+              "previous_hash": "195ece5eb6491e4400b0258b23e4d3d7ba73bad7facbc24589a72d22fe305f9e",
+              "current_hash": "bb0c45d28ac180154c6c15f41a11f5d6e9deec892b94eab5c3b856342caf04ae"
             },
             {
-              "timestamp": "2026-10-02T02:54:24.964411393Z",
-              "event_id": "5dc46fb4-5fa2-4239-9ce2-a8b75469aec3",
-              "sandbox_id": "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
-              "tenant_id": "8d314e77-eb11-46c4-9c74-86de18807a66",
+              "timestamp": "2026-10-02T04:53:15.384908375Z",
+              "event_id": "9e18dc3c-c698-4127-992b-a6415b95d961",
+              "sandbox_id": "01a0faf5-6bd1-7373-8348-1befa0408e43",
+              "tenant_id": "cacc8968-6b90-4935-ba0f-0ce3d1c210ef",
               "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18",
               "category": "quarantine",
               "decision": "quarantine",
@@ -369,17 +379,17 @@
               "request_bytes": 0,
               "response_bytes": 0,
               "duration_ms": 0,
-              "previous_hash": "43399074ffe0427187ec109bd25bc861433240f103991f8c93efb679243addb2",
-              "current_hash": "84afb12a8a1adcc547b3d146712a6c1ca44e2e22e12a4ed5d6d891e2df90105c"
+              "previous_hash": "bb0c45d28ac180154c6c15f41a11f5d6e9deec892b94eab5c3b856342caf04ae",
+              "current_hash": "2376c219675c356ef76cf1454d9362fec97b41de1851746d77204cdbf0955753"
             }
           ],
           "event_start_sequence": 1,
           "event_previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
           "event_sequence": 5,
-          "event_head": "84afb12a8a1adcc547b3d146712a6c1ca44e2e22e12a4ed5d6d891e2df90105c",
+          "event_head": "2376c219675c356ef76cf1454d9362fec97b41de1851746d77204cdbf0955753",
           "errors": [],
           "notified_at": null,
-          "report": "# Guard incident\n\n- Incident: 01a0fa88-c4b2-7645-9a82-768b5a374be2\n- Sandbox: 01a0fa88-9eda-7524-bb2f-c5dc1e748ddd\n- Tenant: 8d314e77-eb11-46c4-9c74-86de18807a66\n- Policy hash: f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18\n- Lease: 01a0fa88-9ee3-7037-a7a5-8729e51e4f64\n- Generation: 3\n\n## Timeline\n\n- Triggered: 2026-10-02T02:54:22.386546317+00:00\n- Network cut: 2026-10-02T02:54:22.403729127+00:00\n- Paused: 2026-10-02T02:54:24.927246317+00:00\n- Snapshot: 01a0fa88&#45;c4b2&#45;7645&#45;9a82&#45;768b5a374be2\n- Completed: pending\n\n## Rules and evidence\n\n- Rule: repeated&#95;denied&#95;connections\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0fa889eda7524bb2fc5dc1e748ddd&#58;denied&#58;1&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0fa889eda7524bb2fc5dc1e748ddd&#58;denied&#58;2&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0fa889eda7524bb2fc5dc1e748ddd&#58;denied&#58;3&#58;0&#58;0\n\n## First suspicious event\n\nNo event reference: see authoritative counter/control evidence references above.\n\n## Authoritative journal\n\n- Records: 5\n- Earlier records omitted: 0\n- Excerpt previous hash: 0000000000000000000000000000000000000000000000000000000000000000\n- Verified head: 84afb12a8a1adcc547b3d146712a6c1ca44e2e22e12a4ed5d6d891e2df90105c\n"
+          "report": "# Guard incident\n\n- Incident: 01a0faf5-919d-7784-921a-b609db3dded6\n- Sandbox: 01a0faf5-6bd1-7373-8348-1befa0408e43\n- Tenant: cacc8968-6b90-4935-ba0f-0ce3d1c210ef\n- Policy hash: f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18\n- Lease: 01a0faf5-6bd8-7590-b31b-0a2eb7a5a182\n- Generation: 3\n\n## Timeline\n\n- Triggered: 2026-10-02T04:53:12.733300406+00:00\n- Network cut: 2026-10-02T04:53:12.756956066+00:00\n- Paused: 2026-10-02T04:53:15.347524371+00:00\n- Snapshot: 01a0faf5&#45;919d&#45;7784&#45;921a&#45;b609db3dded6\n- Completed: pending\n\n## Rules and evidence\n\n- Rule: repeated&#95;denied&#95;connections\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0faf56bd1737383481befa0408e43&#58;denied&#58;1&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0faf56bd1737383481befa0408e43&#58;denied&#58;2&#58;0&#58;0\n  - Evidence: counter&#58;aiec&#95;guard&#95;01a0faf56bd1737383481befa0408e43&#58;denied&#58;3&#58;0&#58;0\n\n## First suspicious event\n\nNo event reference: see authoritative counter/control evidence references above.\n\n## Authoritative journal\n\n- Records: 5\n- Earlier records omitted: 0\n- Excerpt previous hash: 0000000000000000000000000000000000000000000000000000000000000000\n- Verified head: 2376c219675c356ef76cf1454d9362fec97b41de1851746d77204cdbf0955753\n"
         },
         "completed_at_unchanged": true
       }
@@ -395,8 +405,8 @@
       "case": "quarantine-survives-a-worker-restart",
       "status": "PASS",
       "evidence": {
-        "incident_id": "01a0fa88-c4b2-7645-9a82-768b5a374be2",
-        "completed_at": "2026-10-02T02:54:24.975154226Z",
+        "incident_id": "01a0faf5-919d-7784-921a-b609db3dded6",
+        "completed_at": "2026-10-02T04:53:15.451166606Z",
         "status": 200
       }
     },
@@ -414,7 +424,7 @@
       "evidence": {
         "remaining": [
           [
-            "01a0fa88-9eda-7524-bb2f-c5dc1e748ddd",
+            "01a0faf5-6bd1-7373-8348-1befa0408e43",
             "quarantined"
           ]
         ]
@@ -424,8 +434,8 @@
   "failing": [],
   "cleanup_errors": [],
   "watchdog_timeout_ms": 3000,
-  "incident_id": "01a0fa88-c4b2-7645-9a82-768b5a374be2",
+  "incident_id": "01a0faf5-919d-7784-921a-b609db3dded6",
   "incident_errors": [],
-  "elapsed_seconds": 78.052,
-  "finished_at": "2026-10-02T02:55:04.115513+00:00"
+  "elapsed_seconds": 78.124,
+  "finished_at": "2026-10-02T04:53:54.537020+00:00"
 }
