@@ -19,8 +19,12 @@
 # `aiec` is the deployment's.
 acceptance_database_is_isolated() {
   local url=$1 name
-  name=${url##*/}
-  name=${name%%\?*}
+  # Query first, then path: a socket directory is a query parameter that
+  # contains slashes (`?host=/run/postgresql`), so stripping the path first
+  # reads the last component of the socket path as the database name and
+  # refuses a URL that names a database of its own.
+  name=${url%%\?*}
+  name=${name##*/}
   [[ $name == aiec_guard_* ]]
 }
 
