@@ -118,9 +118,35 @@ impl PostgresRepository {
     /// returned; with `DO NOTHING` the caller would get no row and would have
     /// to go looking for one it had just written.
     ///
-    /// The trigger still forbids rewriting what was asked, so the conflict
-    /// branch cannot quietly restate the request: the update is a no-op
-    /// against a row whose immutable fields are already equal.
+    /// The trigger still forbids rewriting what was asked: identity, tool,
+    /// digest, requester, label, detail and `created_at` are immutable on every
+    /// update, and the update below touches none of them.
+    ///
+    /// `expires_at` is the one field the trigger now permits to move, and only
+    /// for a pending row whose window has already closed — see migration
+    /// `0022_guard_tool_approval_expired_reopen.sql`.
+    ///
+    /// The reopen is a conditional `CASE` rather than a `DO UPDATE ... WHERE`.
+    /// A conditional `WHERE` returns *no row* when the condition is false, so a
+    /// retry of a still-open request would come back with nothing and the
+    /// caller would fail on the fetch instead of being handed the request it
+    /// asked about. With `CASE` every conflict returns the row, and the
+    /// condition decides only what is written to it.
+    ///
+    /// Reopening is load-bearing rather than defensive. The partial index
+    /// counts a row by `state`, so an expired `pending` row still holds the
+    /// live slot; since `decide` requires an unexpired request, such a row can
+    /// never be decided and no grant can ever be spent against it. Returning
+    /// it unchanged would make the ask permanently unaskable.
+    ///
+    /// The comparison is against the database clock, not the caller's
+    /// `created_at`. A client replaying a recorded request would otherwise
+    /// carry its original timestamps and the row would never reopen, which is
+    /// the failure this exists to prevent.
+    ///
+    /// An unexpired row is left alone and returned as-is, so a genuine retry
+    /// joins the request an operator may already be looking at, and its
+    /// deadline is not quietly pushed back by whoever happens to retry.
     pub(crate) async fn get_or_put_guard_tool_approval(
         &self,
         approval: GuardToolApproval,
@@ -133,7 +159,10 @@ impl PostgresRepository {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',NULL,NULL,NULL,$9,NULL,$10) \
              ON CONFLICT (tenant_id, sandbox_id, requested_by_key_id, tool, request_digest) \
              WHERE state = 'pending' \
-             DO UPDATE SET request_digest = EXCLUDED.request_digest \
+             DO UPDATE SET \
+                 expires_at = CASE WHEN guard_tool_approvals.expires_at <= now() \
+                                   THEN EXCLUDED.expires_at \
+                                   ELSE guard_tool_approvals.expires_at END \
              RETURNING {COLUMNS}"
         ))
         .bind(approval.id)
@@ -415,6 +444,157 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 1, "exactly one live request may exist for an ask");
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A pending row whose window has closed must not hold the live slot for
+    /// ever.
+    ///
+    /// The partial unique index counts a row by `state`, not by whether anyone
+    /// can still act on it, so an expired `pending` row still occupies it. That
+    /// row can never be decided — `decide` requires an unexpired request — and
+    /// `get_or_put` returns it unchanged, so every later retry of the same ask
+    /// is handed back a request that no operator is able to grant and no
+    /// consumer is able to spend. The ask is stuck permanently, with no way to
+    /// ask again.
+    #[tokio::test]
+    async fn a_retry_after_the_open_request_expired_gets_a_usable_one() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        // Genuinely past due, judged by the database clock rather than by a
+        // timestamp this test invents: the reopen condition reads `now()`.
+        let created = Utc::now() - chrono::Duration::minutes(10);
+        let mut first = pending(sandbox_id, requester, DIGEST, created);
+        first.tenant_id = tenant;
+        first.expires_at = created + chrono::Duration::seconds(30);
+        let stored = repository
+            .get_or_put_guard_tool_approval(first)
+            .await
+            .unwrap();
+        let now = Utc::now();
+        assert!(
+            stored.expires_at < now,
+            "the test needs an already-expired request to retry after"
+        );
+
+        // The retry arrives after the open request's window has closed.
+        let mut retry = pending(sandbox_id, requester, DIGEST, now);
+        retry.tenant_id = tenant;
+        retry.expires_at = now + chrono::Duration::minutes(5);
+        let reopened = repository
+            .get_or_put_guard_tool_approval(retry)
+            .await
+            .unwrap();
+
+        // The same row is reused with a fresh window rather than a second row
+        // minted: the ask is the same question, and a retry should not grow the
+        // operator queue. What matters is that the request handed back is one
+        // somebody can actually act on.
+        assert_eq!(
+            reopened.id, stored.id,
+            "reopening must reuse the expired row rather than duplicate the ask"
+        );
+        assert!(
+            reopened.expires_at > now,
+            "the live request must carry a usable window, or the retry is stuck"
+        );
+        assert!(
+            reopened.state == ApprovalState::Pending,
+            "the reopened request must be pending, not decided"
+        );
+
+        // And it is actually decidable, not merely newer.
+        let decider = new_id();
+        let decided = repository
+            .decide_guard_tool_approval(ApprovalDecisionRequest {
+                tenant,
+                sandbox: sandbox_id,
+                request_id: reopened.id,
+                decision: ApprovalState::Granted,
+                decided_by_key_id: decider,
+                decided_by_label: "key:operator",
+                at: now + chrono::Duration::seconds(1),
+            })
+            .await
+            .unwrap();
+        assert!(
+            decided.is_some(),
+            "a retry after expiry must produce a request an operator can act on"
+        );
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// The security-relevant half of the reopen: a retry must not extend a
+    /// request that is still open.
+    ///
+    /// Migration `0022` permits `expires_at` to move, so the guarantee that a
+    /// deadline cannot be pushed back is now carried by the *condition* on
+    /// that permission rather than by refusing every update. If that condition
+    /// were dropped, the asker could keep a request alive indefinitely by
+    /// retrying it — handing back the same row with a fresh window every time —
+    /// so an approval never actually goes stale while the asker waits for a
+    /// human. The reopened window must apply only to a row that has already
+    /// closed.
+    #[tokio::test]
+    async fn a_retry_cannot_push_back_the_deadline_of_a_request_still_open() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+        let now = Utc::now();
+        let mut first = pending(sandbox_id, requester, DIGEST, now);
+        first.tenant_id = tenant;
+        first.expires_at = now + chrono::Duration::seconds(30);
+        let stored = repository
+            .get_or_put_guard_tool_approval(first)
+            .await
+            .unwrap();
+
+        // The same ask again, asking for a much longer window.
+        let mut retry = pending(sandbox_id, requester, DIGEST, now);
+        retry.tenant_id = tenant;
+        retry.expires_at = now + chrono::Duration::hours(24);
+        let again = repository
+            .get_or_put_guard_tool_approval(retry)
+            .await
+            .unwrap();
+
+        assert_eq!(again.id, stored.id);
+        assert_eq!(
+            again.expires_at, stored.expires_at,
+            "an operator is judging this request; a retry must not move its deadline"
+        );
+        assert_eq!(
+            again.created_at, stored.created_at,
+            "when the ask was made is what was asked"
+        );
+
+        // And the deadline the operator sees is the one that actually binds:
+        // the short window, not the day-long one the retry asked for.
+        let decider = new_id();
+        let too_late = stored.expires_at + chrono::Duration::seconds(1);
+        let decided = repository
+            .decide_guard_tool_approval(ApprovalDecisionRequest {
+                tenant,
+                sandbox: sandbox_id,
+                request_id: again.id,
+                decision: ApprovalState::Granted,
+                decided_by_key_id: decider,
+                decided_by_label: "key:operator",
+                at: too_late,
+            })
+            .await
+            .unwrap();
+        assert!(
+            decided.is_none(),
+            "the retry's longer window must not have become the binding deadline"
+        );
         drop_test_schema(&repository, admin, schema).await;
     }
 

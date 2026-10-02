@@ -515,6 +515,20 @@ impl MemoryRepository {
             })
             .cloned()
         {
+            // A row whose window has closed still holds the live slot, and
+            // `decide` refuses an expired request, so returning it unchanged
+            // would make the ask permanently unaskable. Reopen it, matching
+            // the conditional `CASE` in the Postgres upsert. An unexpired row
+            // is returned as-is, so a retry joins the request an operator may
+            // already be looking at without extending its deadline.
+            if existing.expires_at <= approval.created_at {
+                let reopened = data
+                    .guard_tool_approvals
+                    .get_mut(&existing.id)
+                    .expect("row was just read from the same map");
+                reopened.expires_at = approval.expires_at;
+                return Ok(reopened.clone());
+            }
             return Ok(existing);
         }
         data.guard_tool_approvals

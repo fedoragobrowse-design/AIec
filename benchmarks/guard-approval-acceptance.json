@@ -1,7 +1,7 @@
 {
   "suite": "guard-approval-acceptance",
   "section": "44",
-  "generated_at": "2026-10-02T09:12:19.055601+00:00",
+  "generated_at": "2026-10-02T09:39:18.448193+00:00",
   "endpoint": "https://127.0.0.1:18544",
   "cases": [
     {
@@ -32,8 +32,8 @@
       "name": "the-requester-is-the-authenticated-key-not-the-body",
       "ok": true,
       "evidence": {
-        "requested_by_label": "key:01a0fbe2-c434-74ab-9c3e-2db291206358",
-        "requested_by_key_id": "01a0fbe2-c434-74ab-9c3e-2db291206358",
+        "requested_by_label": "key:01a0fbfb-7a0c-7642-bafb-9140cb03a25c",
+        "requested_by_key_id": "01a0fbfb-7a0c-7642-bafb-9140cb03a25c",
         "request_digest_matches": true
       }
     },
@@ -55,8 +55,8 @@
       "evidence": {
         "status": 200,
         "state": "granted",
-        "requested_by_key_id": "01a0fbe2-c434-74ab-9c3e-2db291206358",
-        "decided_by_key_id": "01a0fbe2-c43a-75ca-b0c7-1b219b25ab29"
+        "requested_by_key_id": "01a0fbfb-7a0c-7642-bafb-9140cb03a25c",
+        "decided_by_key_id": "01a0fbfb-7a1c-76cf-ae8f-1ac1be40f63c"
       }
     },
     {
