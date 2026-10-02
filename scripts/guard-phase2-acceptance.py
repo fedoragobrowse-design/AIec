@@ -344,6 +344,20 @@ def main() -> int:
     # Blocked-range attempts: the guest tries addresses the operator boundary
     # blocks. These are the attempts the watchdog's first rule watches for.
     status, pre = telemetry(0)
+    # The host side of this attachment, captured while the counters are read:
+    # whether the TAP exists, is up, carries the gateway address and has a
+    # neighbour for the guest is what distinguishes "the guest had no link"
+    # from "Guard dropped the packet".
+    host_view = {}
+    if attachment.get("interface"):
+        interface = attachment["interface"]
+        for name, args in (
+            ("link", ["ip", "-o", "link", "show", interface]),
+            ("address", ["ip", "-o", "addr", "show", "dev", interface]),
+            ("neighbour", ["ip", "neigh", "show", "dev", interface]),
+        ):
+            listed = subprocess.run(args, capture_output=True, text=True, timeout=20)
+            host_view[name] = (listed.stdout or listed.stderr).strip()[:400]
     before = ((first or {}).get("counters") or {}).get("blocked_range", 0)
     cut_before = bool((pre or {}).get("network_cut"))
     case("attachment-is-not-cut-while-a-watchdog-reports", not cut_before,
