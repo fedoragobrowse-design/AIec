@@ -620,6 +620,43 @@ impl GuardNetworkManager {
         gateway_result
     }
 
+    /// Contains a guarded sandbox whose own lifetime has run out.
+    ///
+    /// The runtime's local lifetime timer used to stop the VM outright when a
+    /// guarded sandbox reached its TTL. That is the wrong terminal action: the
+    /// durable budget's `expires_at` is that same deadline, and destroying the
+    /// machine released the Guard attachment at the instant the control plane's
+    /// reaper was trying to cut, pause and capture it - so the reaper could
+    /// only ever lose, and an expired guarded sandbox was torn down without the
+    /// quarantine or the forensics the incident exists to preserve.
+    ///
+    /// Containment is also the fail-closed answer. If the control plane is gone
+    /// when the TTL runs out, cutting here still denies the guest its egress,
+    /// where skipping the local timer entirely would leave it running with
+    /// network access it is no longer entitled to. The reaper remains the owner
+    /// of the durable record: this cut is idempotent with the one it performs.
+    pub async fn guard_hold_expired(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        let guard = self
+            .running
+            .lock()
+            .await
+            .get(&sandbox.id)
+            .cloned()
+            .ok_or_else(|| CoreError::Unavailable("Guard attachment is not running".into()))?;
+        let fence = {
+            let contexts = self
+                .fences
+                .read()
+                .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?;
+            contexts
+                .get(&sandbox.id)
+                .map(|context| context.fence)
+                .ok_or_else(|| CoreError::Unavailable("Guard lease context missing".into()))?
+        };
+        let policy_hash = guard.control.policy_hash();
+        self.guard_cut(sandbox, &policy_hash, fence).await
+    }
+
     /// Caller must authenticate and fence an explicit operator release.
     pub async fn guard_restore(
         &self,
@@ -1018,6 +1055,9 @@ impl NetworkBackend for GuardNetworkManager {
 
     async fn guard_set_fence(&self, sandbox: &Sandbox, fence: GuardFence) -> Result<(), CoreError> {
         GuardNetworkManager::guard_set_fence(self, sandbox, fence).await
+    }
+    async fn guard_hold_expired(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+        GuardNetworkManager::guard_hold_expired(self, sandbox).await
     }
     async fn guard_observe_file_read(
         &self,

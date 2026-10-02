@@ -139,36 +139,55 @@ def base_env(prefix: str) -> dict:
     }
 
 
-def wait_for_health(process: subprocess.Popen, seconds: float = 60.0) -> bool:
+def wait_for_health(process: subprocess.Popen, seconds: float = 60.0) -> tuple[bool, str]:
+    # The reason is returned rather than discarded: a probe that waits a full
+    # minute and then reports only "not ready" throws away the sole evidence of
+    # what was actually wrong, and every consumer here is a failure report.
     deadline = time.time() + seconds
+    reason = "no attempt completed before the deadline"
     while time.time() < deadline:
         if process.poll() is not None:
-            return False
+            return False, f"the process exited {process.returncode}"
         try:
             status, _ = http("GET", "/health", token="", timeout=3.0)
             if status == 200:
-                return True
-        except Exception:
-            pass
+                return True, ""
+            reason = f"the health endpoint answered {status}"
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
         time.sleep(0.5)
-    return False
+    return False, reason
 
 
 def create_sandbox(label: str, timeout_seconds: int, max_model_requests: int, extra_guard=None):
-    guard = {"topology": "inside", "policy_template": "no_network",
+    # Templates are kebab-case in the wire grammar. `no_network` is not a
+    # spelling the policy accepts, and the rejection arrives as a 422 from the
+    # body deserializer rather than as anything naming the field.
+    guard = {"topology": "inside", "policy_template": "no-network",
              "max_model_requests": max_model_requests}
     guard.update(extra_guard or {})
+    # Guard governance lives on `environment`, not `resources`. `resources` is a
+    # Run-side type that the sandbox create body does not carry, so posting it
+    # here is silently dropped - the sandbox comes back with the default
+    # 10 000-request ceiling and a budget nobody asked for.
     return http("POST", "/v1/sandboxes", {
         "image": os.environ.get("RP_IMAGE", "python:3.13"),
         "runtime": "firecracker",
         "cpu": 1, "memory_mb": 1024, "disk_mb": 2048,
         "timeout_seconds": timeout_seconds,
-        "resources": {"guard": guard},
+        "environment": {"guard": guard},
     })
 
 
 def watch_reaper(sandbox_id: str, budget_exhausted_at: float, seconds: float) -> dict:
-    """Polls until the sandbox is durably quarantined, recording the whole wait."""
+    """Polls until the quarantine is durably complete, recording the whole wait.
+
+    Completion is the incident's own five fields, not the first sign of a cut.
+    The network cut is stage one of a quarantine that then pauses, captures and
+    writes the durable mark, so a suite that stops watching at the cut observes
+    a machine that is cut but not yet held - which reads as an incomplete
+    quarantine rather than as a watch that ended early.
+    """
     incident = None
     telemetry = None
     state = None
@@ -176,12 +195,12 @@ def watch_reaper(sandbox_id: str, budget_exhausted_at: float, seconds: float) ->
     deadline = time.time() + seconds
     while time.time() < deadline:
         status, incident = http("GET", f"/v1/sandboxes/{sandbox_id}/guard/incident", timeout=60.0)
-        if status == 200 and incident and incident.get("network_cut_at"):
-            break
-        status, telemetry = http("GET", f"/v1/sandboxes/{sandbox_id}/guard/telemetry", timeout=60.0)
         status, current = http("GET", f"/v1/sandboxes/{sandbox_id}", timeout=30.0)
         state = (current or {}).get("state")
         states.append(state)
+        if status == 200 and complete_incident(incident):
+            break
+        status, telemetry = http("GET", f"/v1/sandboxes/{sandbox_id}/guard/telemetry", timeout=60.0)
         time.sleep(1.0)
     return {
         "observed_after_seconds": round(time.time() - budget_exhausted_at, 3),
@@ -190,6 +209,14 @@ def watch_reaper(sandbox_id: str, budget_exhausted_at: float, seconds: float) ->
         "incident": incident,
         "budget": (telemetry or {}).get("budget"),
     }
+
+
+def complete_incident(incident) -> bool:
+    """A quarantine is complete only when every stage of it is recorded."""
+    incident = incident or {}
+    return bool(incident.get("completed_at") and incident.get("network_cut_at")
+                and incident.get("paused_at") and incident.get("snapshot_id")
+                and incident.get("report"))
 
 
 def main() -> int:
@@ -201,9 +228,11 @@ def main() -> int:
 
     server = spawn("control-plane", [str(BIN / "aiec-server")],
                    {**env, "AIEC_BIND": os.environ["RP_CP_BIND"]})
-    if not wait_for_health(server):
-        log("control plane did not become healthy")
-        print(json.dumps({"status": "FAIL", "error": "control plane did not start"}))
+    healthy, reason = wait_for_health(server)
+    if not healthy:
+        log(f"control plane did not become healthy: {reason}")
+        print(json.dumps({"status": "FAIL", "error": "control plane did not start",
+                          "detail": reason}))
         stop_all()
         return 1
     worker = spawn("worker", [

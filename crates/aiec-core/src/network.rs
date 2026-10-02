@@ -197,4 +197,14 @@ pub trait NetworkBackend: Send + Sync {
     ) -> Result<aiec_guard::control::GuardControlResponse, crate::CoreError> {
         Err(crate::CoreError::Unsupported("Guard control".into()))
     }
+    /// Contains a guarded sandbox whose own lifetime has run out.
+    ///
+    /// Called by the runtime's local lifetime timer instead of stopping the VM,
+    /// because a guarded machine that reaches its TTL is owed a quarantine and a
+    /// forensic capture, not a teardown. A backend that cannot contain it says
+    /// so, and the caller stops the machine rather than leave a guest running
+    /// past its allowance.
+    async fn guard_hold_expired(&self, _sandbox: &Sandbox) -> Result<(), crate::CoreError> {
+        Err(crate::CoreError::Unsupported("Guard containment".into()))
+    }
 }

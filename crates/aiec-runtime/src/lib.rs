@@ -2447,12 +2447,21 @@ impl FirecrackerRuntime {
         self.schedule_lifetime(sandbox, token).await;
     }
 
-    /// Arms the timeout that stops this sandbox's VM when its TTL runs out.
+    /// Arms the timeout that ends this sandbox's VM when its TTL runs out.
     ///
     /// The timer waits on its own timeout racing its own cancellation, so it
     /// ends when its entry is taken from [`Self::lifetimes`] without anything
     /// having to reach into the task - and ends when the timeout wins, having
-    /// stopped the VM that token started.
+    /// ended the VM that token started.
+    ///
+    /// A guarded sandbox is contained rather than stopped. Its TTL is the same
+    /// deadline as the durable budget's `expires_at`, so stopping it here
+    /// destroyed the machine at the exact moment the control plane's reaper
+    /// was trying to cut, pause and capture it - the reaper could only lose,
+    /// and an expired guarded sandbox was torn down with no quarantine and no
+    /// forensics. Containment is the fail-closed terminal action as well: a
+    /// guest that cannot be contained is stopped, never left running past its
+    /// own allowance.
     async fn schedule_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
         let (cancelled, expiry) = oneshot::channel();
         self.lifetimes.lock().await.insert(token, cancelled);
@@ -2461,7 +2470,7 @@ impl FirecrackerRuntime {
         tokio::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(lifetime.timeout_seconds)) => {
-                    runtime.stop_if_token(&lifetime, token).await;
+                    runtime.expire_lifetime(&lifetime, token).await;
                 }
                 _ = expiry => {}
             }
@@ -2470,6 +2479,32 @@ impl FirecrackerRuntime {
             // token's timer under the same id.
             runtime.lifetimes.lock().await.remove(&token);
         });
+    }
+
+    /// Ends a sandbox whose own lifetime has run out, by the action its
+    /// governance calls for.
+    async fn expire_lifetime(&self, sandbox: &Sandbox, token: Uuid) {
+        // This timer belongs to one VM, and a restart replaces the VM under the
+        // same sandbox id. The identity is checked under the same lock that
+        // registers a VM and is held across the containment, so a timer that
+        // outlived its own machine can neither contain nor stop the
+        // replacement - the invariant the token exists to enforce.
+        let vms = self.vms.lock().await;
+        if vms.get(&sandbox.id).map(|vm| vm.start_token) != Some(token) {
+            return;
+        }
+        if sandbox.environment.guard.is_some() {
+            match self.network.guard_hold_expired(sandbox).await {
+                Ok(()) => return,
+                Err(error) => tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    reason = %error,
+                    "expired guarded sandbox could not be contained; stopping it instead"
+                ),
+            }
+        }
+        drop(vms);
+        self.stop_if_token(sandbox, token).await;
     }
 
     async fn terminate_vm(&self, sandbox: &Sandbox, mut vm: FirecrackerVm) {
@@ -4312,8 +4347,105 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
         assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
         assert!(!process_running(fresh_pid));
+    }
+    /// Counts the containment an expired lifetime asks for.
+    #[derive(Default)]
+    struct ContainingNetwork {
+        contained: std::sync::Mutex<Vec<Uuid>>,
+    }
+    #[async_trait]
+    impl NetworkBackend for ContainingNetwork {
+        fn capabilities(&self) -> aiec_core::network::NetworkCapabilities {
+            aiec_core::network::NetworkCapabilities::default()
+        }
+        async fn prepare(
+            &self,
+            _: &Sandbox,
+            _: &NetworkPolicy,
+        ) -> Result<NetworkAttachment, crate::CoreError> {
+            Ok(NetworkAttachment::new("unused", Vec::new()))
+        }
+        async fn release(
+            &self,
+            _: &Sandbox,
+            _: &NetworkAttachment,
+        ) -> Result<(), crate::CoreError> {
+            Ok(())
+        }
+        async fn guard_hold_expired(&self, sandbox: &Sandbox) -> Result<(), crate::CoreError> {
+            self.contained.lock().unwrap().push(sandbox.id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_guarded_sandbox_is_contained_rather_than_destroyed() {
+        let mut config = config();
+        config.state_dir = std::env::temp_dir().join(format!("af-expire-{}", Uuid::now_v7()));
+        let network = Arc::new(ContainingNetwork::default());
+        let runtime = FirecrackerRuntime::with_network_backend(config, network.clone());
+        let mut guarded = sandbox(Uuid::now_v7(), 0);
+        guarded.environment.guard = Some(aiec_guard::policy::GuardConfig::default());
+        let token = Uuid::now_v7();
+        let vm = running_vm(token);
+        let pid = vm.child.id().unwrap();
+        runtime.vms.lock().await.insert(guarded.id, vm);
+
+        runtime.expire_lifetime(&guarded, token).await;
+
+        assert_eq!(network.contained.lock().unwrap().as_slice(), &[guarded.id]);
+        assert!(
+            runtime.vms.lock().await.contains_key(&guarded.id),
+            "a contained sandbox is held for the reaper's capture, not torn down"
+        );
+        assert!(process_running(pid));
+        let _ = tokio::fs::remove_dir_all(&runtime.config.state_dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_lifetime_never_contains_the_vm_that_replaced_it() {
+        let mut config = config();
+        config.state_dir = std::env::temp_dir().join(format!("af-stale-{}", Uuid::now_v7()));
+        let network = Arc::new(ContainingNetwork::default());
+        let runtime = FirecrackerRuntime::with_network_backend(config, network.clone());
+        let mut guarded = sandbox(Uuid::now_v7(), 0);
+        guarded.environment.guard = Some(aiec_guard::policy::GuardConfig::default());
+        let fresh_token = Uuid::now_v7();
+        let vm = running_vm(fresh_token);
+        let pid = vm.child.id().unwrap();
+        runtime.vms.lock().await.insert(guarded.id, vm);
+
+        runtime.expire_lifetime(&guarded, Uuid::now_v7()).await;
+
+        assert!(
+            network.contained.lock().unwrap().is_empty(),
+            "a timer that outlived its own VM must not cut its replacement"
+        );
+        assert!(process_running(pid));
+        let _ = tokio::fs::remove_dir_all(&runtime.config.state_dir).await;
+    }
+
+    #[tokio::test]
+    async fn an_unguarded_sandbox_is_still_stopped_when_its_lifetime_ends() {
+        let mut config = config();
+        config.state_dir = std::env::temp_dir().join(format!("af-plain-{}", Uuid::now_v7()));
+        let network = Arc::new(ContainingNetwork::default());
+        let runtime = FirecrackerRuntime::with_network_backend(config, network.clone());
+        let plain = sandbox(Uuid::now_v7(), 0);
+        let token = Uuid::now_v7();
+        let vm = running_vm(token);
+        let pid = vm.child.id().unwrap();
+        runtime.vms.lock().await.insert(plain.id, vm);
+
+        runtime.expire_lifetime(&plain, token).await;
+
+        assert!(network.contained.lock().unwrap().is_empty());
+        assert!(!runtime.vms.lock().await.contains_key(&plain.id));
+        assert!(!process_running(pid));
+        let _ = tokio::fs::remove_dir_all(&runtime.config.state_dir).await;
     }
 
     #[tokio::test]

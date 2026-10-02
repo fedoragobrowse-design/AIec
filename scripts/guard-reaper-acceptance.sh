@@ -28,7 +28,11 @@ if [[ ${1:-} != --inside ]]; then
   mkdir -p "$root"
   chmod 700 "$root"
   root=$(realpath -m "$root")
+  # The driver travels with the launcher rather than being staged by hand: a
+  # run that could only work after an operator copied a file into the scratch
+  # directory is a run whose evidence depends on what that operator did.
   export RP_ROOT=$root RP_BIN=$bin
+  export RP_DRIVER=${RP_DRIVER:-$(dirname "$self")/guard-reaper-acceptance.py}
   export AIEC_GUARD_ACCEPTANCE_HOST_NETNS=$host_netns
   pg=$root/pg
   sock=$root/s
@@ -69,21 +73,57 @@ export RP_WORKER_BIND=127.0.0.1:$worker_port
 export RP_TENANT=$(cat /proc/sys/kernel/random/uuid)
 export RP_API_KEY="af_live_$key"
 export RP_WORKER_TOKEN="af_live_$key"
-export RP_CA=$HOME/aiec/tls/ca.crt
-export RP_TLS_CERT=$HOME/aiec/tls/api.crt
-export RP_TLS_KEY=$HOME/aiec/tls/api.key
+# Per-run TLS, independent of any operator or deployment certificate. The
+# servers present an end-entity certificate, so it cannot also be the trust
+# anchor: a self-signed leaf used as its own CA is refused by any client that
+# checks basic constraints, and reads as an untrustworthy server rather than as
+# a misconfigured anchor. `keyUsage=keyCertSign` is not decoration either -
+# OpenSSL 3 refuses a CA certificate without it. The deployment CA under
+# ~/aiec/tls has no key usage extension at all, so pointing at it fails here for
+# a reason that has nothing to do with the reaper.
+tls=$root/tls
+mkdir -p "$tls"
+chmod 700 "$tls"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=aiec-reaper-acceptance-ca' \
+  -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -keyout "$tls/ca.key" -out "$tls/ca.crt" 2>/dev/null
+printf '%s\n' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth,clientAuth' \
+  'subjectAltName=IP:127.0.0.1' >"$tls/leaf.ext"
+openssl req -newkey rsa:2048 -nodes -subj '/CN=127.0.0.1' \
+  -keyout "$tls/leaf.key" -out "$tls/leaf.csr" 2>/dev/null
+openssl x509 -req -in "$tls/leaf.csr" -CA "$tls/ca.crt" -CAkey "$tls/ca.key" \
+  -CAcreateserial -days 1 -extfile "$tls/leaf.ext" -out "$tls/leaf.crt" 2>/dev/null
+chmod 600 "$tls/ca.key" "$tls/leaf.key"
+export RP_CA=$tls/ca.crt
+export RP_TLS_CERT=$tls/leaf.crt
+export RP_TLS_KEY=$tls/leaf.key
 export RP_S3_ENDPOINT=http://127.0.0.1:9000
 export RP_S3_ACCESS_KEY_ID=acceptance
 export RP_S3_SECRET_ACCESS_KEY="acceptance-secret-$key"
 export AIEC_STATE_DIR=$root/state-vms
-export AIEC_IMAGE_MANIFEST=${AIEC_IMAGE_MANIFEST:-${AGENTFORGE_IMAGE_MANIFEST:-$HOME/aiec/imgbuild/.aiec/images/manifest.json}}
-export AIEC_IMAGE_MANIFEST_SECRET=${AIEC_IMAGE_MANIFEST_SECRET:-${AGENTFORGE_IMAGE_MANIFEST_SECRET:-}}
+# The guest capability metadata the runtime verifies a guest against travels
+# with the artifact directory the image was built into, which is not necessarily
+# the directory the rootfs is named in - a symlinked rootfs is not next to it.
+artifact_dir=${AIEC_GUEST_ARTIFACT_DIR:-$(dirname "$(realpath "$AIEC_ROOTFS")")}
+# An operator-supplied manifest is used as given; with none supplied the run
+# mints its own, so this suite never depends on a deployment path it does not
+# own. The previous default pointed into the deployment's image directory and
+# did not exist, which the control plane reports only as an opaque
+# file-not-found at startup.
+acceptance_prepare_image_manifest "$root" aiec/firecracker-acceptance \
+  "$artifact_dir/guest-capabilities.json"
+export AIEC_GUEST_ARTIFACT_DIR=$artifact_dir
 
 ip link set lo up
 sysctl -qw net.ipv4.ip_forward=1
 
 set +e
-python3 "$root/driver.py" 2>&1 | tee "$root/driver.log"
+python3 "$RP_DRIVER" 2>&1 | tee "$root/driver.log"
 status=${PIPESTATUS[0]}
 set -e
 exit "$status"
