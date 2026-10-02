@@ -5,6 +5,7 @@
 //! ask for a disposable machine. It deliberately knows nothing about OMP or any
 //! other particular agent, and AIec itself has no dependency on it.
 
+pub mod approval;
 pub mod auth;
 pub mod config;
 pub mod error;

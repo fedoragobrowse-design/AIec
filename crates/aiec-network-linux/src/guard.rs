@@ -974,23 +974,41 @@ impl NetworkBackend for GuardNetworkManager {
                         "proposal belongs to another sandbox or tenant".into(),
                     ));
                 }
-                let store = self
-                    .proposal_store(sandbox, &proposal.base_policy_hash, fence)
-                    .await?;
-                let outcome = store
-                    .apply_attested(proposal, &approved_by)
-                    .await
-                    .map_err(guard_error)?;
-                Ok(GuardControlResponse::PolicyApplied {
-                    proposal_id: outcome.proposal_id,
-                    previous_policy_hash: outcome.previous_policy_hash,
-                    policy_hash: outcome.policy_hash,
-                })
+                let base = proposal.base_policy_hash.clone();
+                let store = self.proposal_store(sandbox, &base, fence).await?;
+                match store.apply_attested(proposal.clone(), &approved_by).await {
+                    Ok(outcome) => Ok(GuardControlResponse::PolicyApplied {
+                        proposal_id: outcome.proposal_id,
+                        previous_policy_hash: outcome.previous_policy_hash,
+                        policy_hash: outcome.policy_hash,
+                        already_applied: false,
+                    }),
+                    // The apply already happened; the control plane is retrying
+                    // after a lost response and needs the same answer, not a
+                    // second ruleset install and a second audit record.
+                    Err(aiec_guard::GuardError::AlreadyApplied(detail)) => {
+                        let hash = detail
+                            .rsplit_once(':')
+                            .map(|(_, hash)| hash.to_owned())
+                            .ok_or_else(|| {
+                                CoreError::Unavailable(
+                                    "replayed apply carried no policy hash".into(),
+                                )
+                            })?;
+                        Ok(GuardControlResponse::PolicyApplied {
+                            proposal_id: proposal.id,
+                            previous_policy_hash: base,
+                            policy_hash: hash,
+                            already_applied: true,
+                        })
+                    }
+                    Err(error) => Err(guard_error(error)),
+                }
             }
             // A release is the same fenced restore an operator already uses:
             // it clears the latch through the gateway's authorized path and
-            // reinstalls the rules before the control plane calls the sandbox
-            // released.
+            // reinstalls the rules, and only then does the control plane call
+            // the sandbox released.
             GuardControlCommand::Release { policy_hash } => {
                 self.guard_restore(sandbox, &policy_hash, fence).await?;
                 Ok(GuardControlResponse::Released {

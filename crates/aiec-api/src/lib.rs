@@ -1760,7 +1760,25 @@ pub(crate) async fn provision_sandbox(
 }
 
 fn create_response(sandbox: Sandbox, reason: &str) -> Response {
-    ([("x-aiec-selection-reason", reason)], Json(sandbox)).into_response()
+    // A response that does not say it is running on a weaker boundary would let
+    // an operator believe a microVM guarantee they did not get.
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", axum::http::header::CONTENT_TYPE.as_str())
+        .header("x-aiec-selection-reason", reason);
+    if let Some(notice) = isolation_notice::notice(sandbox.runtime) {
+        response = response.header("x-aiec-isolation", notice);
+    }
+    response
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&sandbox).unwrap_or_else(|_| b"{}".to_vec()),
+        ))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Whether the operator has explicitly accepted a weaker isolation boundary.
+fn reduced_isolation_allowed() -> bool {
+    std::env::var("AIEC_ALLOW_REDUCED_ISOLATION").as_deref() == Ok("1")
 }
 async fn create_sandbox(
     State(s): State<AppState>,
@@ -1866,12 +1884,23 @@ async fn create_sandbox(
     if runtime_kind == RuntimeKind::Firecracker && r.environment.guard.is_none() {
         r.environment.guard = Some(Default::default());
     }
-    if r.environment.guard.is_some() && runtime_kind != RuntimeKind::Firecracker {
-        return Err(ApiFailure::new(
-            StatusCode::BAD_REQUEST,
-            "guard_runtime_unavailable",
-            "Guard requires the local Firecracker network enforcement backend; no weaker runtime fallback",
-        ));
+    if r.environment.guard.is_some() {
+        // Guard assumes an attacker-controlled guest behind a boundary the host
+        // owns. Running it on a weaker runtime is possible, but only when an
+        // operator has said so once in configuration, and the answer then says
+        // what was given up.
+        if let Err(reason) = isolation_notice::guarded_allowed(
+            runtime_kind,
+            isolation_notice::ReducedIsolation {
+                allowed: reduced_isolation_allowed(),
+            },
+        ) {
+            return Err(ApiFailure::new(
+                StatusCode::BAD_REQUEST,
+                "guard_runtime_unavailable",
+                reason,
+            ));
+        }
     }
     r.environment.guard_policy_hash = r
         .environment

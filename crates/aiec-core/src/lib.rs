@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub mod host_pressure;
 pub mod image_trust;
 pub mod images;
+pub mod isolation_notice;
 pub mod network;
 pub mod platform;
 pub mod policy;

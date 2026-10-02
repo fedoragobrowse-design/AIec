@@ -6,6 +6,8 @@
 //! a worker must not be handed an approval it cannot verify for itself, so it
 //! re-checks the base policy, the boundary and the ruleset before swapping.
 
+use std::collections::BTreeSet;
+
 use aiec_core::{GuardProposal, Sandbox, Scope};
 use aiec_guard::{
     control::{GuardControlCommand, GuardControlResponse, GuardFence},
@@ -17,7 +19,7 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{ApiFailure, ApiResult, AppState, Principal};
@@ -295,10 +297,115 @@ pub(crate) async fn deny_proposal(
     ))
 }
 
+/// The harness asks whether a high-risk tool may run.
+///
+/// The answer is this control plane's, and it is the same answer for every
+/// caller: the request states a sandbox and a tool, and the policy says which
+/// tools need a human. There is no request body that can carry its own verdict,
+/// and no path by which the harness approves itself.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalBody {
+    pub sandbox_id: Uuid,
+    pub tool: String,
+    /// Optional detail for the operator's decision, never parsed.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// The calls that are safe without asking, because they only read.
+///
+/// This is an allowlist rather than a denylist on purpose. A tool nobody has
+/// classified - one added to the MCP surface tomorrow, or one whose name is
+/// misspelled by the caller - is refused until somebody decides it is safe,
+/// which is the only direction that fails the way the rest of Guard fails.
+fn known_safe_tools() -> BTreeSet<String> {
+    [
+        "sandbox.get",
+        "sandbox.list_owned",
+        "sandbox.read_file",
+        "sandbox.list_files",
+        "secret.list",
+        "snapshot.list",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+async fn approve_tool(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ApprovalBody>,
+) -> ApiResult<ApprovalAnswer> {
+    principal
+        .authorize(Scope::SandboxesWrite)
+        .map_err(ApiFailure::from)?;
+    if body.sandbox_id != id {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "approval names a different sandbox than the request path",
+        ));
+    }
+    if body.tool.is_empty() || body.tool.len() > 64 || !body.tool.is_ascii() {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "tool name is empty, oversized or not a plain name",
+        ));
+    }
+    if let Some(detail) = body.detail.as_deref()
+        && (detail.len() > 256 || detail.chars().any(|c| c.is_control()))
+    {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "detail is longer than 256 bytes or carries control characters",
+        ));
+    }
+    // Ownership first: a caller may not ask about a sandbox it does not hold,
+    // and a held sandbox may not be approved for by a stranger's key.
+    let _ = state
+        .repository()
+        .get_sandbox(principal.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    if known_safe_tools().contains(&body.tool) {
+        return Ok(Json(ApprovalAnswer {
+            approved: true,
+            reason: None,
+            required: false,
+        }));
+    }
+    // Everything else needs a recorded human decision, and this control plane
+    // does not yet issue one. The answer is a refusal that names itself: never a
+    // silent yes, and never an approval the harness supplied.
+    Ok(Json(ApprovalAnswer {
+        approved: false,
+        reason: Some(format!(
+            "{} has no operator approval in this deployment",
+            body.tool
+        )),
+        required: true,
+    }))
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApprovalAnswer {
+    pub approved: bool,
+    pub reason: Option<String>,
+    /// Whether this call needed a decision at all. False means it was allowed
+    /// because it is a known-safe read; true means nothing has decided it.
+    pub required: bool,
+}
+
 /// The routes, merged into the tenant's protected surface.
 pub(crate) fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
     axum::Router::new()
+        .route("/sandboxes/{id}/guard/approval", post(approve_tool))
         .route(
             "/sandboxes/{id}/guard/proposals",
             post(submit_proposal).get(list_proposals),

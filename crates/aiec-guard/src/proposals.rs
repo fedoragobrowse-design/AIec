@@ -634,13 +634,44 @@ impl ProposalStore {
             ));
         }
         let id = proposal.id;
-        let agent =
-            AgentCredential::new(proposal.sandbox_id, proposal.tenant_id, &proposal.agent_id)?;
+        // A lost response is the normal case, not the exotic one. `restore` would
+        // overwrite a decided record with the caller's still-pending copy, so a
+        // proposal that is already in the store is reconciled, never restored.
+        if let Ok(existing) = self.proposal(id) {
+            if !same_request(&existing, &proposal) {
+                return Err(GuardError::Denied(
+                    "a replayed proposal id carries a different request".into(),
+                ));
+            }
+            return match &existing.state {
+                ProposalState::Pending => self.apply_locked(id, approved_by).await,
+                ProposalState::Approved { policy_hash } => self.confirm_replay(id, policy_hash),
+                ProposalState::Denied { .. } | ProposalState::Refused { .. } => Err(
+                    GuardError::Denied("policy proposal is no longer pending".into()),
+                ),
+            };
+        }
         // Re-submitting through the public path would mint a second identity for
         // the same request; the durable record is restored as it stands.
         self.restore([proposal])?;
-        let _ = agent;
         self.apply_locked(id, approved_by).await
+    }
+
+    /// Confirms an apply that already happened, without doing it twice.
+    ///
+    /// The confirmation is only given when the live policy really carries the
+    /// hash the first apply produced: "already applied" is a claim about the
+    /// enforcement in force, and has to be true of it rather than of a record.
+    fn confirm_replay(&self, id: Uuid, applied_hash: &str) -> Result<ApplyOutcome> {
+        if self.config.policy.load().policy_hash() != applied_hash {
+            return Err(GuardError::Denied(
+                "the proposal was applied under a different policy than the one in force".into(),
+            ));
+        }
+        Err(GuardError::AlreadyApplied(format!(
+            "{}:{applied_hash}",
+            id.simple()
+        )))
     }
 
     /// Records a human refusal. Nothing about the policy changes.
@@ -799,6 +830,15 @@ fn printable(value: &str) -> bool {
 
 /// Truncates operator-facing text to what an event record accepts, on a
 /// character boundary.
+/// Whether a replayed proposal is the same request that was decided.
+fn same_request(stored: &Proposal, incoming: &Proposal) -> bool {
+    stored.sandbox_id == incoming.sandbox_id
+        && stored.tenant_id == incoming.tenant_id
+        && stored.agent_id == incoming.agent_id
+        && stored.request == incoming.request
+        && stored.base_policy_hash == incoming.base_policy_hash
+}
+
 fn bound_reason(reason: &str) -> String {
     let cleaned: String = reason
         .chars()

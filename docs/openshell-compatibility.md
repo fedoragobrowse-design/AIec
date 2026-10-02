@@ -67,25 +67,44 @@ names, `A` and `AAAA` only, no recursion into unknown zones, and
 `allowed_record_types` that cannot name `ANY`, `NS`, `TXT` or `NULL`.
 
 **Middleware.** `network_middlewares`, including `on_error: fail_closed`, run
-in-process on inspected traffic. Guard has no in-process middleware chain in
-phase 1, so a middleware stanza is refused.
+in-process on inspected traffic. Guard has no in-process middleware chain, so a
+middleware stanza is refused.
 
 **GraphQL, MCP and JSON-RPC inspection.** OpenShell inspects request bodies
 against per-revision rules: GraphQL operation types and field globs, MCP tool
 names and method availability per protocol revision, JSON-RPC method names.
-Guard phase 1 does not inspect request bodies at all. A policy carrying
-GraphQL, `mcp`, `json-rpc` or `deny_rules` is refused as unsupported, because
-accepting it would mean reporting a restriction Guard does not apply. These are
-the subject of the later governance phase, which will inspect bounded requests
-and report exactly what it can and cannot see.
+Guard now governs the same three shapes for traffic it can see, with its own
+bounds rather than OpenShell's: `l7.graphql` decides query versus mutation,
+operation name and root fields; `l7.mcp` decides JSON-RPC method and tool name
+for `tools/call`; an unlisted method or tool is denied. What Guard does not do
+is what OpenShell's revisioned schemas do: there is no per-revision rule table,
+and a document that names a revision Guard does not model is refused by name
+rather than approximated.
+
+Two limits follow from where enforcement lives, and are stated rather than
+papered over. Guard's layer 7 rules apply only where it can see the request,
+which in the default SNI mode means it cannot: method and path policy needs
+`mode: intercept` and the operator's `intercept_ack`, because interception means
+Guard holds a key that can read the traffic it governs. And a CONNECT tunnel to
+a host the layer 7 policy governs is refused rather than forwarded ungoverned,
+because a gateway that cannot read a tunnel cannot claim to have governed it.
 
 ## Import behaviour
 
-An importer, when written, must produce a report listing every field it
-dropped, mapped or refused, and must refuse the conversion if any unsupported
-field carries a security property that the operator did not explicitly
-acknowledge. A conversion that silently drops a `binaries` clause would hand
-the operator a policy that looks equivalent and is strictly weaker.
+`aiec-guard-import-openshell` converts a document and prints a JSON report
+naming every field it converted, every field it could not, and why. It writes
+no policy file on refusal, and it refuses two shapes outright rather than
+approximating them: an endpoint set whose members need different body rules -
+which Guard's per-attachment layer 7 scope cannot hold - and any construct whose
+security property would be lost in translation.
+
+```bash
+aiec-guard-import-openshell --input policy.yaml --out guard.yaml --l7-out l7.yaml
+```
+
+A conversion that silently dropped a `binaries` clause would hand the operator
+a policy that looks equivalent and is strictly weaker, so it does not exist:
+the field is named in the report instead.
 
 ## The honest summary
 

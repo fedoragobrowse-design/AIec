@@ -11,6 +11,7 @@ name = "aiec-mcp"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 aiec-core = { workspace = true }
 aiec-client = { workspace = true }
 aiec-api = { workspace = true }

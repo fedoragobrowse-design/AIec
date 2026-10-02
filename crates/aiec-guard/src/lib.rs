@@ -31,6 +31,12 @@ pub enum GuardError {
     Unavailable(String),
     #[error("Guard I/O: {0}")]
     Io(#[from] std::io::Error),
+    /// A proposal whose apply already succeeded and whose response was lost.
+    ///
+    /// The control plane retries, the worker recognises the replay by the hash
+    /// the first apply produced, and the human's decision is recorded once.
+    #[error("Guard policy already applied: {0}")]
+    AlreadyApplied(String),
     #[error("Guard JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("Guard YAML: {0}")]

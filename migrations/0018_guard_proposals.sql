@@ -82,7 +82,7 @@ BEGIN
   IF TG_OP = 'UPDATE'
      AND OLD.state IS DISTINCT FROM '"pending"'::jsonb
      AND NEW.state IS DISTINCT FROM OLD.state THEN
-    RAISE EXCEPTION 'a decided policy proposal cannot change state';
+      RAISE EXCEPTION 'a decided policy proposal cannot change state';
   END IF;
   IF NEW.state = '"pending"'::jsonb
      AND (NEW.decided_by IS NOT NULL OR NEW.decided_at IS NOT NULL) THEN

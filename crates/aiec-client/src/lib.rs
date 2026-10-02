@@ -419,6 +419,24 @@ impl AIecClient {
         )
         .await
     }
+    /// Asks the control plane whether a high-risk operation may proceed.
+    ///
+    /// The answer is the control plane's; the caller treats an unreachable
+    /// service as no answer rather than as a yes.
+    pub async fn guard_approval(
+        &self,
+        sandbox_id: Uuid,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ClientError> {
+        self.send(
+            self.request(
+                reqwest::Method::POST,
+                &format!("/v1/sandboxes/{sandbox_id}/guard/approval"),
+            )
+            .json(body),
+        )
+        .await
+    }
     pub async fn put_file(&self, id: Uuid, request: &PutFileRequest) -> Result<(), ClientError> {
         self.send_empty(
             self.request(reqwest::Method::PUT, &format!("/v1/sandboxes/{id}/files"))

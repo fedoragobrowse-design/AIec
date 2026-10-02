@@ -187,6 +187,7 @@ dependencies = [
  "aiec-client",
  "aiec-core",
  "aiec-guard",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",

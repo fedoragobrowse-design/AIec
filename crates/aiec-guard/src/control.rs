@@ -192,5 +192,9 @@ pub enum GuardControlResponse {
         proposal_id: Uuid,
         previous_policy_hash: String,
         policy_hash: String,
+        /// True when the first apply had already succeeded and this call is the
+        /// retry after a lost response.
+        #[serde(default)]
+        already_applied: bool,
     },
 }
