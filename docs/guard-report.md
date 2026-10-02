@@ -300,40 +300,102 @@ observed:
   flag is not exercised where it takes effect, because no reachable path in
   this deployment reaches it.
 
+- **A capture that could not have detected its own failure.** The zero-egress
+  proof is a packet capture of the guest's own TAP, and the read of that pcap
+  ran `tcpdump -r` without `-Z root`. In the user namespace the suite runs in,
+  tcpdump cannot drop to the `tcpdump` account, so the read exited non-zero
+  having printed nothing — and the harness counted zero lines. Every count in
+  that window was therefore a false zero that looked exactly like proof of
+  silence. It was caught because an isolated reproduction showed a 109-byte
+  pcap containing one packet reading back as an empty list.
+
+  The read now passes `-Z root`, treats a non-zero exit as an error rather than
+  an empty result, and records the pcap's size on disk so that "recorded
+  nothing" is distinguishable from "never ran".
+
+- **A positive control that was structurally incapable of passing.** The suite
+  proved its capture instrument by having the host write a frame onto the
+  guest's TAP through `AF_PACKET`. That cannot work: such a frame leaves
+  through the tun file descriptor and never appears in a capture taken on that
+  same TAP. Measured — a 24-byte packet-free pcap, where the identical injection
+  on a dummy device *was* captured. The control could only ever have passed if
+  the capture were broken in some new way.
+
+  It was replaced with a stimulus that genuinely traverses the link. The suite
+  had been asserting, in its own evidence, that guest egress is dropped in an
+  `output` hook; Guard installs no such chain, so those packets cross the TAP
+  and are denied in the host's `input` chain on arrival. The guest's own connect
+  attempts are therefore a valid control for both instruments at once, and the
+  two agree exactly: 6 routable frames captured, `cnt_other_denied` +6.
+
+  The control must specifically record a ROUTABLE frame, not merely any frame.
+  Satisfying it with an ARP or neighbour-discovery frame would leave a broken
+  `ROUTABLE` expression able to ship as a passing artifact that still claimed
+  zero egress.
+
 ## What Guard costs
 
-All figures are from the two live runs in this report, on the same host, stated
-with the method that produced them rather than as bare numbers.
+Every figure below comes from the live runs whose artifacts are in
+`benchmarks/`, on one host, stated with the method that produced them. Nothing
+here is projected from a smaller or different run.
 
-**Host.** Intel Core i7-10710U @ 1.10 GHz, 12 threads, Linux 7.2.7-200.fc44,
-x86_64. Every guest is a real Firecracker microVM.
+**Host.** Intel Core 7 240H, x86_64, Linux 7.0.0-34-generic. Every guest is a
+real Firecracker microVM; the model is a local mock, so no figure here includes
+real internet latency.
 
-| measurement | guarded | direct | added | samples |
+| measurement | guarded | unguarded baseline | added | samples |
 |---|---:|---:|---:|---:|
-| DNS A lookup, median | 4.022 ms | 0.034 ms | 3.987 ms | 10 per side |
-| model stream, first byte | 16.66 ms | 6.79 ms | 9.87 ms | 3 |
-| model stream, total duration | 804.75 ms | 787.10 ms | 17.68 ms | 3 |
-| alert → network cut | 23.66 ms | — | — | 1 run, real watchdog |
+| guest DNS A lookup, median | 2.963 ms | 0.024 ms | 2.939 ms | 10 per side |
+| model stream, first byte | 12.01 ms | 6.63 ms | 6.44 ms | 3 |
+| model stream, total duration | 784.68 ms | 786.25 ms | −2.39 ms | 3 |
 
-**Stream throughput.** A 4 MiB response arrived as 515 chunks in 804.8 ms
-(~5.2 MiB/s end to end, including the guest's own read loop) against 4 MiB in
-132 chunks in 783.1 ms direct to the model. Guard's chunking turns 132 writes
-into 515; the cost of that is 2.7% of wall time. The per-chunk amplification is
-the price of not handing the guest an unbounded buffer, and it is deliberate.
+**Stream throughput.** A 4 194 318-byte response arrived at the guest as 516
+chunks in 784.7 ms, against 132 chunks in 786.2 ms to a host-side client
+bypassing Guard. End to end that is ~5.2 MiB/s including the guest's own read
+loop. Guard roughly quadruples the chunk count and costs 0.3% of wall time.
+The amplification is the price of never handing the guest an unbounded buffer,
+and it is deliberate.
 
 **What the DNS figure does not say.** It is an upper bound, not the cost of the
 policy engine. The guarded side is a real guest resolver lookup and the
-unguarded side a raw packet from the host, so the difference carries the vsock
-hop and the guest resolver stack as well as the policy check.
+unguarded side the identical query to a policy-free resolver in the same
+namespace, so the difference also carries the vsock hop and the guest's
+resolver stack.
 
-**Quarantine latency.** 23.66 ms is the interval in which the rule had fired
+**What the total-duration figure does not say.** −2.39 ms is inside the run-to-
+run spread of three samples and must not be read as Guard making streaming
+faster. Only the first-byte difference (+6.44 ms) is a cost with a plausible
+mechanism behind it.
+
+**Aggregate process cost.** The §49 run reports 59.12 s of CPU and a 30 376 KiB
+peak RSS for the acceptance driver process. This is an aggregate over the
+driver, the gateway and the mocks for a 97.9 s run — it is **not** an isolated
+gateway or guarded-VM cost, and the Firecracker processes are outside it. It
+bounds total orchestration overhead; it does not attribute that overhead to
+any component.
+
+**Model-only leg (§49).** One real four-turn tool loop ran in a real VM
+(`read` → `write` → `bash` → final), observed as 4 authenticated model requests
+by the host-side mock, with 0 connections to any forbidden destination and 0
+policy-table denials on the allowed leg. The 28 admitted packets in
+`broker_permitted` are packet-weighted and are deliberately **not** compared to
+the request count.
+
+**Topology B leg (§50).** 15/15 cases, with the zero-egress result established
+two independent host-side ways that agree: 6 routable frames captured on the
+guest's own TAP in the positive-control window, and `cnt_other_denied` moving by
+exactly 6 packets on the same stimulus, while every counter read 0 across the
+agent loop.
+
+**Quarantine latency.** 23.656 ms is the interval in which the rule had fired
 and egress was still up — the exposure window, from the two timestamps the
 incident record already carries. One sample, this hardware, real watchdog
 holding the attachment live. It is not a distribution and no percentile is
 claimed from it.
 
-**Not measured.** CPU and memory cost of the gateway against a host-served
-path, and any aarch64 figure of any kind. Both are absent rather than estimated.
+**Not measured.** The gateway's CPU and memory cost in isolation against a
+host-served path, and any aarch64 figure of any kind. Both are absent rather
+than estimated; only cross-compilation to aarch64 has been exercised.
 
 ## Known limitations
 

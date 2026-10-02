@@ -1,6 +1,8 @@
 //! Real Firecracker + AIec Guard acceptance, invoked by scripts/guard-core-acceptance.sh.
 //! No TestBackend, provider credentials, host firewall changes, or Internet traffic.
-use aiec_core::{ExecRequest, NetworkPolicy, PutFileRequest, RuntimeKind, Sandbox, SandboxState};
+use aiec_core::{
+    ExecRequest, MAX_FILE, NetworkPolicy, PutFileRequest, RuntimeKind, Sandbox, SandboxState,
+};
 use aiec_guard::{
     compiler::{OperatorBoundary, compile},
     control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
@@ -120,6 +122,26 @@ impl BudgetAuthority for FileBudgetAuthority {
 const PROBE: &str = include_str!("../../../scripts/guard_core_guest_probe.py");
 const MODEL_HOST: &str = "model.guard.test";
 const MODEL_ADDR: &str = "198.18.0.10:18080";
+
+/// The second model endpoint, used only by the agent leg below.
+///
+/// It is a separate host, a separate credential and therefore a separate policy
+/// hash, on purpose. Sharing the placeholder endpoint's counters with a
+/// four-turn tool-using conversation would make every count in this file
+/// ambiguous, and a run that has to be interpreted is a run that will be
+/// interpreted wrongly.
+const AGENT_MODEL_HOST: &str = "agent-model.guard.test";
+const AGENT_MODEL_ADDR: &str = "198.18.0.11:18081";
+const AGENT_MODEL_CREDENTIAL: &str = "agent-model";
+/// The string the agent's first tool observation has to carry back for the
+/// mock provider to be willing to continue.
+///
+/// This is the load-bearing part of the leg. A provider that answers every
+/// turn identically would let a harness that never returned a tool result to
+/// the model look identical to one that did, and "the agent used tools" would
+/// be indistinguishable from "the agent issued tool calls and threw the
+/// results away". Requiring the token makes the round trip part of the script.
+const AGENT_TOKEN: &str = "7f3a1c9e";
 const STREAM_CHUNKS: usize = 128;
 /// A resolver bound directly to the namespace, with no policy in front of it.
 /// The comparison it exists for is Guard's cost, not the cost of a name.
@@ -164,6 +186,7 @@ const MOCK_ADDRESSES: &[&str] = &[
     "198.18.0.40/32",
     "198.18.0.41/32",
     "198.18.0.10/32",
+    "198.18.0.11/32",
     "198.18.0.20/32",
     "198.18.0.21/32",
     "93.184.216.34/32",
@@ -387,6 +410,377 @@ fn guest_address(address: std::net::IpAddr) -> bool {
         std::net::IpAddr::V6(ip) => ip.segments()[0] == 0xfd00 && ip.segments()[1] == 0xbeef,
     }
 }
+/// One model request the local provider served, recorded from its own side.
+///
+/// The turn number is derived from the conversation the harness sent rather
+/// than from a counter this server keeps. That distinction is the whole point:
+/// a server counting its own requests would hand the third step's answer to a
+/// harness that had only asked once.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentTurn {
+    turn: usize,
+    /// The tool names the harness had advertised to the model on this request.
+    /// A model that asks for a tool the client never offered would be caught
+    /// here rather than being shrugged off as a malformed reply.
+    advertised: Vec<String>,
+    /// `(tool, first bytes of the observation)` for each tool result the
+    /// harness sent back. Bounded, because a file could be any size.
+    observations: Vec<(String, String)>,
+    /// What this server answered with: a tool name, or nothing for a final
+    /// answer.
+    emitted: Vec<String>,
+    /// Server-sent-event frames written for this reply, including the finish
+    /// and the terminator.
+    frames: usize,
+}
+
+/// A local model provider that behaves like one.
+///
+/// It reads the request, works out which turn of the conversation it is being
+/// asked for, and answers with the next tool call - or with a final answer,
+/// once the observation the previous tool call should have produced has
+/// actually come back. If the harness drops a tool result the script stops
+/// there and says so in prose, so a broken round trip cannot be papered over
+/// by a provider that keeps answering regardless.
+///
+/// Replies are streamed in fragments and written to the socket in several
+/// chunks, because "the agent could finish the task" is not the property
+/// under test; "the agent could finish the task through a governed, streaming
+/// model path" is.
+struct AgentModel {
+    accepted: Arc<AtomicU64>,
+    rejected: Arc<AtomicU64>,
+    turns: std::sync::Arc<tokio::sync::Mutex<Vec<AgentTurn>>>,
+    handle: JoinHandle<()>,
+}
+
+/// One `data:` frame carrying a single choice delta.
+fn sse_frame(delta: serde_json::Value, finish: Option<&str>) -> String {
+    let mut choice = json!({"index":0,"delta":delta});
+    choice["finish_reason"] = match finish {
+        Some(reason) => json!(reason),
+        None => serde_json::Value::Null,
+    };
+    format!("data: {}\n\n", json!({"choices":[choice]}))
+}
+
+/// A streamed tool call, fragmented the way a provider fragments one.
+fn agent_tool_call(
+    id: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> (String, Vec<String>, usize) {
+    let mut body = sse_frame(
+        json!({"tool_calls":[{"index":0,"id":id,"type":"function",
+            "function":{"name":name,"arguments":""}}]}),
+        None,
+    );
+    let mut frames = 1;
+    // Chunked on characters, not bytes: a slice through the middle of a
+    // multi-byte character would put invalid UTF-8 on the wire, and the
+    // arguments here are small enough that the copy costs nothing.
+    let characters: Vec<char> = arguments.to_string().chars().collect();
+    for piece in characters.chunks(24) {
+        let fragment: String = piece.iter().collect();
+        body.push_str(&sse_frame(
+            json!({"tool_calls":[{"index":0,"function":{"arguments":fragment}}]}),
+            None,
+        ));
+        frames += 1;
+    }
+    body.push_str(&sse_frame(json!({}), Some("tool_calls")));
+    body.push_str("data: [DONE]\n\n");
+    (body, vec![name.to_owned()], frames + 2)
+}
+
+/// A streamed final answer, with no tool call in it.
+fn agent_text(text: &str) -> (String, Vec<String>, usize) {
+    let mut body = String::new();
+    let mut frames = 0;
+    let characters: Vec<char> = text.chars().collect();
+    for piece in characters.chunks(24) {
+        let fragment: String = piece.iter().collect();
+        body.push_str(&sse_frame(json!({"content":fragment}), None));
+        frames += 1;
+    }
+    body.push_str(&sse_frame(json!({}), Some("stop")));
+    body.push_str("data: [DONE]\n\n");
+    (body, Vec::new(), frames + 2)
+}
+
+/// Reads the conversation the harness sent: which turn it is, what it offered,
+/// and what it actually returned.
+fn read_conversation(body: &[u8]) -> (usize, Vec<String>, Vec<(String, String)>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (0, Vec::new(), Vec::new());
+    };
+    let advertised = value["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut turn = 0usize;
+    let mut observations = Vec::new();
+    // `tool_call_id` -> tool name, learned from the assistant messages, because
+    // an OpenAI-shaped tool result carries the identifier and not the name.
+    let mut names: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for message in value["messages"].as_array().into_iter().flatten() {
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("assistant") => {
+                let Some(calls) = message
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|calls| !calls.is_empty())
+                else {
+                    continue;
+                };
+                turn += 1;
+                for call in calls {
+                    let id = call.get("id").and_then(serde_json::Value::as_str);
+                    let name = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(serde_json::Value::as_str);
+                    if let (Some(id), Some(name)) = (id, name) {
+                        names.insert(id.to_owned(), name.to_owned());
+                    }
+                }
+            }
+            Some("tool") => {
+                let id = message
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let name = names.get(id).cloned().unwrap_or_else(|| id.to_owned());
+                let content = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                observations.push((name, content.chars().take(512).collect()));
+            }
+            _ => {}
+        }
+    }
+    (turn, advertised, observations)
+}
+
+/// A chunked request body, or `None` while it is still arriving.
+///
+/// The mock has to understand chunked framing because that is what the gateway
+/// actually sends: it forwards the body as a stream, so the request carries
+/// `Transfer-Encoding: chunked` and no `Content-Length`. A reader that only
+/// understands `Content-Length` sees an empty body from the gateway, and then
+/// every conclusion drawn from that conversation — which tools were offered,
+/// what the agent observed — is an artefact of the reader rather than
+/// something the agent sent.
+fn chunked_body(bytes: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
+    let mut body = Vec::new();
+    let mut at = start;
+    loop {
+        let line_end = bytes
+            .get(at..)?
+            .windows(2)
+            .position(|pair| pair == b"\r\n")?;
+        // A chunk header may carry extensions after a `;`. The size is what
+        // precedes them.
+        let size_text = std::str::from_utf8(&bytes[at..at + line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.trim().split(';').next()?, 16).ok()?;
+        at += line_end + 2;
+        if size == 0 {
+            return Some((body, at));
+        }
+        if bytes.len() < at + size + 2 {
+            return None;
+        }
+        body.extend_from_slice(&bytes[at..at + size]);
+        at += size + 2;
+    }
+}
+
+/// The script. Each step refuses to advance until the observation the previous
+/// step should have produced is in the request, so "the agent continued the
+/// conversation" is enforced here rather than asserted at the far end.
+fn agent_reply(
+    turn: usize,
+    advertised: &[String],
+    observations: &[(String, String)],
+) -> (String, Vec<String>, usize) {
+    let offered = |name: &str| advertised.iter().any(|tool| tool == name);
+    let returned = |name: &str| {
+        observations
+            .iter()
+            .filter(|(tool, _)| tool == name)
+            .map(|(_, body)| body.as_str())
+            .collect::<String>()
+    };
+    match turn {
+        0 if offered("read") => agent_tool_call("call-1", "read", &json!({"path":"notes.txt"})),
+        1 => match returned("read") {
+            // The token is the loop's proof of life. Without it the notes never
+            // arrived and there is nothing honest to continue with.
+            body if body.contains(AGENT_TOKEN) => agent_tool_call(
+                "call-2",
+                "write",
+                &json!({"path":"answer.txt","content":format!("TOKEN={AGENT_TOKEN}\nthe notes were read and carried the token\n")}),
+            ),
+            _ => agent_text("the notes did not arrive, so there is nothing to summarise"),
+        },
+        2 => match returned("write") {
+            body if !body.trim().is_empty() => {
+                agent_tool_call("call-3", "bash", &json!({"command":["cat","answer.txt"]}))
+            }
+            _ => agent_text("the answer file was never written"),
+        },
+        _ => match returned("bash") {
+            body if body.contains(AGENT_TOKEN) => agent_text(&format!(
+                "the token {AGENT_TOKEN} was read from the notes, written to the answer and read back"
+            )),
+            _ => agent_text("the answer was never read back, so the task is not done"),
+        },
+    }
+}
+
+impl AgentModel {
+    async fn start(secret: &str, sentinel_guest_hits: Arc<AtomicU64>) -> Result<Self> {
+        let accepted = Arc::new(AtomicU64::new(0));
+        let rejected = Arc::new(AtomicU64::new(0));
+        let turns = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind(AGENT_MODEL_ADDR).await?;
+        let authorization = format!("Bearer {secret}");
+        let good = accepted.clone();
+        let bad = rejected.clone();
+        let recorded = turns.clone();
+        let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    socket = listener.accept() => {
+                        let Ok((mut socket, peer)) = socket else { break; };
+                        if guest_address(peer.ip()) {
+                            // Counted here, on the endpoint itself, so that
+                            // "the agent's model traffic was the only guest
+                            // traffic" stays a host observation rather than the
+                            // guest's own account of itself.
+                            sentinel_guest_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let expected = authorization.clone();
+                        let good = good.clone();
+                        let bad = bad.clone();
+                        let recorded = recorded.clone();
+                        connections.spawn(async move {
+                            let serve = async {
+                                let mut request = Vec::new();
+                                let mut buffer = [0; 8192];
+                                let headers_end = loop {
+                                    let n = socket.read(&mut buffer).await?;
+                                    if n == 0 || request.len() + n > 262_144 {
+                                        return Err(io::Error::other("bounded agent request"));
+                                    }
+                                    request.extend_from_slice(&buffer[..n]);
+                                    if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                                        break index + 4;
+                                    }
+                                };
+                                let headers = String::from_utf8_lossy(&request[..headers_end]).into_owned();
+                                let allowed = headers.lines().next() == Some("POST /v1/chat/completions HTTP/1.1")
+                                    && headers.lines().any(|line| line.split_once(':').is_some_and(|(name, value)|
+                                        name.eq_ignore_ascii_case("authorization") && value.trim() == expected));
+                                let chunked = headers.lines().any(|line| line.split_once(':').is_some_and(|(name, value)|
+                                    name.eq_ignore_ascii_case("transfer-encoding")
+                                        && value.to_ascii_lowercase().contains("chunked")));
+                                let declared = headers.lines().find_map(|line| line.split_once(':').and_then(|(name, value)|
+                                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()));
+                                // A real agent request carries a system prompt and every
+                                // tool schema. The placeholder mock's 4 KiB bound would
+                                // refuse it, and that refusal would be a bound rather
+                                // than a policy, which is exactly the wrong thing to
+                                // be measuring here.
+                                const MAX_AGENT_BODY: usize = 512 * 1024;
+                                let body = loop {
+                                    if chunked {
+                                        if let Some((body, _)) = chunked_body(&request, headers_end) {
+                                            break body;
+                                        }
+                                    } else if request.len() >= headers_end + declared.unwrap_or(0) {
+                                        break request[headers_end..headers_end + declared.unwrap_or(0)].to_vec();
+                                    }
+                                    if request.len() > MAX_AGENT_BODY {
+                                        return Err(io::Error::other("bounded agent body"));
+                                    }
+                                    let n = socket.read(&mut buffer).await?;
+                                    if n == 0 { return Err(io::Error::other("truncated agent body")); }
+                                    request.extend_from_slice(&buffer[..n]);
+                                };
+                                if body.len() > MAX_AGENT_BODY {
+                                    return Err(io::Error::other("bounded agent body"));
+                                }
+                                if !allowed {
+                                    bad.fetch_add(1, Ordering::Relaxed);
+                                    socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                                    return Ok::<_, io::Error>(());
+                                }
+                                good.fetch_add(1, Ordering::Relaxed);
+                                let (turn, advertised, observations) = read_conversation(&body);
+                                let (payload, emitted, frames) = agent_reply(turn, &advertised, &observations);
+                                recorded.lock().await.push(AgentTurn {
+                                    turn,
+                                    advertised,
+                                    observations,
+                                    emitted,
+                                    frames,
+                                });
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await?;
+                                for piece in payload.as_bytes().chunks(512) {
+                                    // Written in pieces so the client is reading a
+                                    // stream rather than a body that arrived whole.
+                                    tokio::time::sleep(Duration::from_millis(2)).await;
+                                    socket.write_all(format!("{:x}\r\n", piece.len()).as_bytes()).await?;
+                                    socket.write_all(piece).await?;
+                                    socket.write_all(b"\r\n").await?;
+                                }
+                                socket.write_all(b"0\r\n\r\n").await?;
+                                socket.shutdown().await
+                            };
+                            let _ = tokio::time::timeout(Duration::from_secs(120), serve).await;
+                        });
+                    }
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        Ok(Self {
+            accepted,
+            rejected,
+            turns,
+            handle,
+        })
+    }
+
+    /// Everything this provider has seen, from its own side.
+    async fn snapshot(&self) -> serde_json::Value {
+        json!({
+            "address": AGENT_MODEL_ADDR,
+            "host": AGENT_MODEL_HOST,
+            "accepted": self.accepted.load(Ordering::Relaxed),
+            "rejected": self.rejected.load(Ordering::Relaxed),
+            "turns": self.turns.lock().await.clone(),
+        })
+    }
+
+    fn shutdown(&self) {
+        self.handle.abort();
+    }
+}
+
 struct Mocks {
     handles: Vec<JoinHandle<()>>,
     accepted: Arc<AtomicU64>,
@@ -590,6 +984,10 @@ struct Driver {
     policy_hash: String,
     secret: String,
     mocks: Option<Mocks>,
+    /// The conversation-aware provider the agent leg talks to. `Option` because
+    /// it is started with the rest of the mocks but has to stay reachable from
+    /// the leg that reads its own record of what it served.
+    agent_model: Option<AgentModel>,
     cases: Vec<Value>,
     current: String,
     started: Instant,
@@ -843,6 +1241,37 @@ async fn model_baseline(secret: &str, expected_hash: &str, expected_bytes: usize
         json!({"bytes":bytes,"headers_ms":headers_ms,"first_byte_ms":first_ms,"duration_ms":start.elapsed().as_secs_f64()*1000.0,"chunks":chunks}),
     )
 }
+/// Reads a JSON document back out of a running guest.
+///
+/// Going through the guest's own file read rather than parsing the agent's
+/// stdout matters: the document is what the harness chose to record about
+/// itself, and a self-report is only worth something if it is the one the agent
+/// actually wrote.
+async fn guest_json(driver: &Driver, sandbox: &Sandbox, path: &str) -> Result<Value> {
+    let content = driver
+        .runtime
+        .get_file(sandbox, path)
+        .await
+        .map_err(|e| failure(format!("reading {path} back from the guest: {e}")))?;
+    let bytes = STANDARD
+        .decode(content.content_base64.as_bytes())
+        .map_err(|e| failure(format!("{path} did not come back as base64: {e}")))?;
+    serde_json::from_slice(&bytes).map_err(|e| failure(format!("{path} was not JSON: {e}")))
+}
+/// The same read for a file that is not JSON: the artifact the agent was
+/// asked to produce, read back as bytes rather than taken on trust from the
+/// agent's own summary of it.
+async fn guest_text(driver: &Driver, sandbox: &Sandbox, path: &str) -> Result<String> {
+    let content = driver
+        .runtime
+        .get_file(sandbox, path)
+        .await
+        .map_err(|e| failure(format!("reading {path} back from the guest: {e}")))?;
+    let bytes = STANDARD
+        .decode(content.content_base64.as_bytes())
+        .map_err(|e| failure(format!("{path} did not come back as base64: {e}")))?;
+    String::from_utf8(bytes).map_err(|e| failure(format!("{path} is not utf-8: {e}")))
+}
 
 async fn run(driver: &mut Driver) -> Result<()> {
     // The watchdog heartbeat, reported from outside the guest for the length of
@@ -863,6 +1292,21 @@ async fn run(driver: &mut Driver) -> Result<()> {
     assign_mock_addresses().await?;
     driver.current = "local-mock-startup".into();
     driver.mocks = Some(Mocks::start(&driver.secret).await?);
+    // Started here rather than in the leg that uses it so that a provider that
+    // cannot bind fails during startup, where the failure is unambiguous, and
+    // not halfway through a case whose evidence would then be half-recorded.
+    driver.agent_model = Some(
+        AgentModel::start(
+            &driver.secret,
+            driver
+                .mocks
+                .as_ref()
+                .expect("mocks started")
+                .sentinel_guest_hits
+                .clone(),
+        )
+        .await?,
+    );
     let mut baselines = BTreeMap::new();
     for (name, host, port) in SENTINELS {
         driver.current = format!("host-baseline-{name}");
@@ -897,6 +1341,21 @@ async fn run(driver: &mut Driver) -> Result<()> {
         }),
         ..Default::default()
     };
+    // The agent leg's policy differs from the placeholder endpoint's in one
+    // field: which model endpoint it points at. Everything else is the same
+    // governed shape, which is the point - a model-only policy that only works
+    // for a curl-shaped request is not a model-only policy.
+    let agent_config = GuardConfig {
+        model_endpoint: Some(ModelEndpoint {
+            host: AGENT_MODEL_HOST.into(),
+            port: 18081,
+            scheme: "http".into(),
+            allowed_methods: vec!["POST".into()],
+            allowed_paths: vec!["/v1/chat/completions".into()],
+            credential: AGENT_MODEL_CREDENTIAL.into(),
+        }),
+        ..config.clone()
+    };
     let policy = config
         .effective_policy()
         .map_err(|e| failure(format!("effective_policy: {e}")))?;
@@ -907,7 +1366,27 @@ async fn run(driver: &mut Driver) -> Result<()> {
         .map_err(|e| failure(format!("rootfs metadata: {e}")))?
         .len();
     let disk_mb = rootfs_bytes.div_ceil(1024 * 1024).max(512);
-    for _ in 0..2 {
+    // The hash each sandbox was actually built from, so the persistence check
+    // below compares against the policy that sandbox carries rather than
+    // against whatever the driver last computed.
+    let mut expected_hashes: BTreeMap<Uuid, String> = BTreeMap::new();
+    for index in 0..3 {
+        let sandbox_config = if index == 2 {
+            agent_config.clone()
+        } else {
+            config.clone()
+        };
+        let hash = sandbox_config
+            .effective_policy()
+            .map_err(|e| failure(format!("effective_policy: {e}")))?
+            .hash()
+            .map_err(|e| failure(format!("policy hash: {e}")))?;
+        if index != 2 {
+            // The driver's own `policy_hash` describes the primary pair, which
+            // is what the rest of this file's evidence is about. The agent leg
+            // carries its own hash and is asserted through `expected_hashes`.
+            driver.policy_hash = hash.clone();
+        }
         let now = chrono::Utc::now();
         let mut sandbox = Sandbox {
             id: Uuid::now_v7(),
@@ -926,8 +1405,9 @@ async fn run(driver: &mut Driver) -> Result<()> {
             updated_at: now,
             runtime_path: None,
         };
-        sandbox.environment.guard = Some(config.clone());
-        sandbox.environment.guard_policy_hash = Some(driver.policy_hash.clone());
+        sandbox.environment.guard = Some(sandbox_config);
+        sandbox.environment.guard_policy_hash = Some(hash.clone());
+        expected_hashes.insert(sandbox.id, hash);
         driver.sandboxes.push(sandbox.clone());
         // The attachment is bound to the ownership this worker proved before
         // anything is built for it, exactly as WorkerService does for a guarded
@@ -970,17 +1450,31 @@ async fn run(driver: &mut Driver) -> Result<()> {
             .map_err(|e| failure(format!("put_file: {e}")))?;
     }
     let first = driver.sandboxes[0].clone();
+    // The third VM exists only for the agent leg and gets its own policy, so it
+    // is deliberately left out of the pair case above rather than folded into
+    // it with a "same policy" claim that would be false.
+    let agent_sandbox = driver.sandboxes[2].clone();
     let second = driver.sandboxes[1].clone();
     let attachment = driver.attachment(&first)?;
     let peer_attachment = driver.attachment(&second)?;
     driver.case("real-firecracker-two-guarded-sandboxes", true,
         json!({"primary":attachment,"peer":peer_attachment,"vcpu_each":1,"memory_mib_each":512,"disk_mib_each":disk_mb,"policy_hash":driver.policy_hash}))?;
-    for sandbox in [&first, &second] {
+    // Every sandbox's persisted policy is checked against the hash it was
+    // created with, including the agent VM's distinct one: a driver that
+    // silently reused the primary hash would still pass a check written
+    // against `driver.policy_hash`.
+    for sandbox in driver.sandboxes.clone() {
         let persisted: Value = serde_json::from_slice(&std::fs::read(
-            driver.guard_dir(sandbox).join("effective-policy.json"),
+            driver.guard_dir(&sandbox).join("effective-policy.json"),
         )?)?;
-        if persisted["policy_hash"] != driver.policy_hash {
-            return Err(failure("persisted effective policy hash differs"));
+        let expected = expected_hashes
+            .get(&sandbox.id)
+            .ok_or_else(|| failure("a sandbox was created without a recorded policy hash"))?;
+        if persisted["policy_hash"].as_str() != Some(expected.as_str()) {
+            return Err(failure(format!(
+                "persisted effective policy hash differs for {}",
+                sandbox.id
+            )));
         }
     }
     driver.current = "secret-absent-actual-guest-environment".into();
@@ -1616,6 +2110,357 @@ async fn run(driver: &mut Driver) -> Result<()> {
     let rejected = mock.rejected.load(Ordering::Relaxed);
     driver.case("bound-secret-used-only-at-model-mock", rejected == 0 && authenticated == 8,
         json!({"authenticated_requests":authenticated,"expected_authenticated_requests":8,"wrong_credential_requests":rejected,"never_printed_or_passed_to_guest":true}))?;
+    // ---------------------------------------------------------------------
+    // A real tool-using agent, on the model-only policy, inside a real VM.
+    //
+    // Everything above proves the guard permits exactly one destination. This
+    // proves the permitted destination is enough to do the work the product
+    // exists for: an agent that reads a file, writes a file, runs a command
+    // and reports back, with every one of those steps decided by the model
+    // endpoint the policy allows. A sandbox that cannot run a real agent is
+    // not a sandbox, whatever its counters say.
+    // ---------------------------------------------------------------------
+    driver.current = "model-only-agent-runs-a-real-tool-loop".into();
+    let harness_path = std::env::var("AIEC_AGENT_BINARY").map_err(|_| {
+        failure("AIEC_AGENT_BINARY must point at a static harness binary built for this guest")
+    })?;
+    let harness_bytes = std::fs::read(&harness_path)
+        .map_err(|e| failure(format!("in-guest harness binary {harness_path}: {e}")))?;
+    if harness_bytes.len() < 64 * 1024 {
+        return Err(failure(format!(
+            "in-guest harness binary is {} bytes, which is not a program",
+            harness_bytes.len()
+        )));
+    }
+    if harness_bytes.len() > MAX_FILE {
+        return Err(failure(
+            "in-guest harness binary exceeds the runtime file limit",
+        ));
+    }
+    let agent_attachment = driver.attachment(&agent_sandbox)?;
+    let sentinel_before = driver
+        .mocks
+        .as_ref()
+        .ok_or_else(|| failure("model mock missing"))?
+        .sentinel_guest_hits
+        .load(Ordering::Relaxed);
+    let counters_before = backend.counters(&agent_attachment).await?;
+    // The binary is uploaded at run time rather than baked into the guest
+    // image: that image is the one artifact whose bytes are pinned by a
+    // digest, and changing it to suit a test would mean the evidence for this
+    // case and the evidence for every other case stopped describing the same
+    // machine.
+    //
+    // It goes under /workspace because that is the only tree the guest agent
+    // will write to, and it arrives in pieces because a static harness is
+    // larger than one control-channel frame.
+    let cpu_before = self_cost().0;
+    let rss_before = self_cost().1;
+    driver
+        .runtime
+        .put_file(
+            &agent_sandbox,
+            PutFileRequest {
+                path: "/workspace/bin/aiec-agent".into(),
+                content_base64: STANDARD.encode(&harness_bytes),
+                mode: Some(0o700),
+            },
+        )
+        .await
+        .map_err(|e| failure(format!("uploading the in-guest harness: {e}")))?;
+    let cpu_after_upload = self_cost().0;
+    let rss_after_upload = self_cost().1;
+    driver
+        .runtime
+        .put_file(
+            &agent_sandbox,
+            PutFileRequest {
+                path: "/workspace/notes.txt".into(),
+                content_base64: STANDARD.encode(
+                    format!("TOKEN={AGENT_TOKEN}\nthe only content of these notes\n").as_bytes(),
+                ),
+                mode: Some(0o644),
+            },
+        )
+        .await
+        .map_err(|e| failure(format!("uploading the agent input: {e}")))?;
+    let task_document = json!({
+        "task_id":"guard-model-only-agent",
+        "instruction":"Read notes.txt. It carries a token. Write that token alone into answer.txt. Then read answer.txt back and report the token you found.",
+        "workspace":"/workspace",
+        "tools":["read","write","bash"],
+        // A validation entry is a bare argv array, not an object with an
+        // `argv` field: the harness deserializes it transparently into the
+        // command it runs. An object here is refused as "invalid type: map,
+        // expected a sequence", before the agent does anything at all.
+        "validation":[
+            ["/usr/bin/grep","-q",AGENT_TOKEN,"/workspace/answer.txt"]
+        ],
+        "limits":{"wall_seconds":180,"max_model_requests":8,"command_timeout_seconds":30}
+    });
+    driver
+        .runtime
+        .put_file(
+            &agent_sandbox,
+            PutFileRequest {
+                path: "/workspace/task.json".into(),
+                content_base64: STANDARD.encode(serde_json::to_vec(&task_document)?),
+                mode: Some(0o644),
+            },
+        )
+        .await
+        .map_err(|e| failure(format!("uploading the agent task: {e}")))?;
+    let agent_started = Instant::now();
+    let agent_run = tokio::time::timeout(
+        Duration::from_secs(300),
+        driver.runtime.exec(
+            &agent_sandbox,
+            ExecRequest {
+                command: vec![
+                    "/workspace/bin/aiec-agent".into(),
+                    "run".into(),
+                    "--task".into(),
+                    "/workspace/task.json".into(),
+                    "--result".into(),
+                    "/workspace/result.json".into(),
+                    "--events".into(),
+                    "/workspace/events.jsonl".into(),
+                    "--provider".into(),
+                    "openai-compatible".into(),
+                    "--model".into(),
+                    "guard-mock".into(),
+                ],
+                working_directory: Some("/workspace".into()),
+                environment: BTreeMap::new(),
+                timeout_seconds: 240,
+                stdin: None,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| failure("the in-guest agent did not finish inside 300s"))?
+    .map_err(|e| failure(format!("the in-guest agent failed to execute: {e}")))?;
+    let agent_wall_ms = agent_started.elapsed().as_millis() as u64;
+    // An agent that ran and produced nothing is the most likely way this leg
+    // fails, and the exit status and streams are the only things that say why.
+    // Without them a missing result file arrives as an I/O error about a file
+    // that was never written, which points at the file rather than the run.
+    let agent_exec = json!({
+        "exit_code": agent_run.exit_code,
+        "timed_out": agent_run.timed_out,
+        "stdout": agent_run.stdout.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>(),
+        "stderr": agent_run.stderr.chars().rev().take(4000).collect::<String>().chars().rev().collect::<String>(),
+    });
+    let agent_result = match guest_json(driver, &agent_sandbox, "/workspace/result.json").await {
+        Ok(value) => value,
+        Err(e) => {
+            let events = guest_text(driver, &agent_sandbox, "/workspace/events.jsonl")
+                .await
+                .unwrap_or_else(|_| "<unreadable>".into());
+            return Err(failure(format!(
+                "{e}; the agent process reported {}",
+                serde_json::to_string_pretty(&json!({
+                    "execution": agent_exec,
+                    "event_log_tail": events
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }))
+                .unwrap_or_default()
+            )));
+        }
+    };
+    let agent_answer = match guest_text(driver, &agent_sandbox, "/workspace/answer.txt").await {
+        Ok(text) => text,
+        Err(e) => {
+            // The result document carries the harness's own account of why it
+            // stopped - the validation that failed, the model error, the turn
+            // budget it hit. Without it, an artifact that was never produced
+            // is indistinguishable from a transport failure.
+            let events = guest_text(driver, &agent_sandbox, "/workspace/events.jsonl")
+                .await
+                .unwrap_or_else(|_| "<unreadable>".into());
+            return Err(failure(format!(
+                "{e}; the agent reported {}",
+                serde_json::to_string_pretty(&json!({
+                    "execution": agent_exec,
+                    "result": agent_result,
+                    // What the endpoint itself saw. The harness's result says
+                    // the loop ended; this says what the endpoint was asked and
+                    // what it answered, which is the half that cannot be
+                    // reconstructed from the guest.
+                    "endpoint_view": driver
+                        .agent_model
+                        .as_ref()
+                        .ok_or_else(|| failure("agent model mock missing"))?
+                        .snapshot()
+                        .await,
+                    "event_log_tail": events
+                        .lines()
+                        .rev()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }))
+                .unwrap_or_default()
+            )));
+        }
+    };
+    let observed_tools = json!({
+        "read":agent_result["metrics"]["tool_calls"]["read"].as_u64().unwrap_or(0),
+        "write":agent_result["metrics"]["tool_calls"]["write"].as_u64().unwrap_or(0),
+        "bash":agent_result["metrics"]["tool_calls"]["bash"].as_u64().unwrap_or(0),
+    });
+    // The provider is read and then dropped, because recording a case needs
+    // the driver mutably and a borrow held across that would be the driver's
+    // own snapshot keeping the mock alive for no reason.
+    let conversation = driver
+        .agent_model
+        .as_ref()
+        .ok_or_else(|| failure("agent model mock missing"))?
+        .snapshot()
+        .await;
+    let turns = conversation["turns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let observation_for = |turn: &Value, tool: &str| -> String {
+        turn["observations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry[0].as_str() == Some(tool))
+            .filter_map(|entry| entry[1].as_str().map(str::to_string))
+            .collect::<String>()
+    };
+    let admitted = conversation["accepted"].as_u64().unwrap_or(0);
+    // Every turn has to have arrived as a stream rather than as one pre-formed
+    // body. A provider that answered in a single shot would satisfy "four
+    // turns happened" while testing none of the streaming path.
+    let every_turn_streamed = !turns.is_empty()
+        && turns
+            .iter()
+            .all(|turn| turn["frames"].as_u64().unwrap_or(0) >= 3);
+    let every_turn_offered_tools = !turns.is_empty()
+        && turns.iter().all(|turn| {
+            let advertised = turn["advertised"].as_array().cloned().unwrap_or_default();
+            ["read", "write", "bash"]
+                .iter()
+                .all(|name| advertised.iter().any(|entry| entry.as_str() == Some(name)))
+        });
+    let token_came_back_through_read = turns
+        .get(1)
+        .map(|turn| observation_for(turn, "read").contains(AGENT_TOKEN))
+        .unwrap_or(false);
+    let token_came_back_through_bash = turns
+        .get(3)
+        .map(|turn| observation_for(turn, "bash").contains(AGENT_TOKEN))
+        .unwrap_or(false);
+    let tools_correct = observed_tools["read"] == json!(1)
+        && observed_tools["write"] == json!(1)
+        && observed_tools["bash"] == json!(1);
+    driver.case(
+        "model-only-agent-runs-a-real-tool-loop",
+        agent_run.exit_code == 0
+            && agent_result["status"] == json!("success")
+            && agent_result["validation"][0]["ok"] == json!(true)
+            && agent_result["metrics"]["model_requests"] == json!(4)
+            && tools_correct
+            && admitted == 4
+            && conversation["rejected"] == json!(0)
+            && turns.len() == 4
+            && (0..4).all(|i| turns[i]["turn"] == json!(i))
+            && every_turn_streamed
+            && every_turn_offered_tools
+            && token_came_back_through_read
+            && token_came_back_through_bash
+            && agent_answer.contains(AGENT_TOKEN),
+        json!({
+            "sandbox_id":agent_sandbox.id,
+            "exec":{
+                "exit_code":agent_run.exit_code,
+                "wall_ms":agent_wall_ms,
+                "stdout_tail":agent_run.stdout.chars().rev().take(240).collect::<String>().chars().rev().collect::<String>(),
+            },
+            "task":task_document,
+            "task_result":agent_result,
+            "answer_written_by_the_agent":agent_answer,
+            "tool_calls":observed_tools,
+            "model":{
+                "host":AGENT_MODEL_HOST,
+                "provider":"openai-compatible",
+                "credential_label":AGENT_MODEL_CREDENTIAL,
+                "authenticated_requests":admitted,
+                "rejected_requests":conversation["rejected"],
+                "turns":turns,
+                "every_turn_delivered_as_a_stream":every_turn_streamed,
+                "every_turn_was_offered_the_same_three_tools":every_turn_offered_tools,
+                "token_reached_the_agent_through_the_read_tool":token_came_back_through_read,
+                "token_reached_the_agent_through_the_bash_tool":token_came_back_through_bash,
+            },
+            "note":"The model host, the credential label and the policy are the agent sandbox's own, not the pair's. The guest was handed an operator-mode placeholder for this credential and the broker substituted the real one on the way out, which is why the mock can authenticate the request and the guest can still be shown never to have held the secret.",
+        }),
+    )?;
+    let counters_after = backend.counters(&agent_attachment).await?;
+    let (cpu_after_run, rss_after_run) = self_cost();
+    let sentinel_after = driver
+        .mocks
+        .as_ref()
+        .ok_or_else(|| failure("model mock missing"))?
+        .sentinel_guest_hits
+        .load(Ordering::Relaxed);
+    let broker_permitted = counters_after
+        .broker_permitted
+        .saturating_sub(counters_before.broker_permitted);
+    // The sentinel counter counts connections the guest made to the forbidden
+    // destinations, so the claim is that it did not move — not that it equals
+    // the request count. Comparing it to `admitted` would compare a leak
+    // counter with a request count, which fails for a guest that behaved
+    // perfectly and would pass for one that reached the sentinel.
+    let sentinel_hits = sentinel_after - sentinel_before;
+    driver.case(
+        "model-only-agent-egress-is-limited-to-the-model-endpoint",
+        sentinel_hits == 0 && admitted > 0 && deny_delta(&counters_before, &counters_after) == 0,
+        json!({
+            "host_observed_connections_to_forbidden_sentinels_during_the_agent_run":sentinel_hits,
+            "authenticated_model_requests_seen_by_the_mock":admitted,
+            "the_agent_did_reach_the_model_endpoint":admitted > 0,
+            "no_connection_reached_any_forbidden_destination":sentinel_hits == 0,
+            "denied_by_the_per_sandbox_table":deny_delta(&counters_before, &counters_after),
+            "broker_admitted":broker_permitted,
+            "counters_before":counter_json(&counters_before),
+            "counters_after":counter_json(&counters_after),
+            "observation":"The request count comes from the host side of the mock listener, which authenticates the credential before answering, and the sentinel and nftables counters are read from the host. The broker counter is packet-weighted rather than per request, so it is reported as it stands and not compared against the request count. Nothing the agent reports about itself decides whether it went anywhere else.",
+            "host_cost_of_this_leg":{
+                "scope":"this process, which hosts the Guard gateway and both mocks; the Firecracker VM and the guest agent are separate processes and are not counted in any of these numbers",
+                "cpu_seconds_to_upload_the_harness":cpu_after_upload - cpu_before,
+                "cpu_seconds_for_the_tool_loop":cpu_after_run - cpu_after_upload,
+                "cpu_seconds_total":cpu_after_run - cpu_before,
+                "resident_set_kib_before":rss_before,
+                "resident_set_kib_after_upload":rss_after_upload,
+                "resident_set_kib_after_the_tool_loop":rss_after_run,
+                "resident_set_kib_growth_over_the_leg":rss_after_run as i64 - rss_before as i64,
+                "authenticated_model_requests":admitted,
+                "cpu_milliseconds_per_model_request":if admitted == 0 {
+                    Value::Null
+                } else {
+                    json!((cpu_after_run - cpu_before) * 1000.0 / admitted as f64)
+                },
+                "note":"a single sample, on one host, with the gateway and the mocks in the same process as the harness. It bounds the cost of the whole leg rather than isolating the gateway, and no distribution may be inferred from it.",
+            },
+        }),
+    )?;
+    if let Some(provider) = driver.agent_model.as_ref() {
+        provider.shutdown();
+    }
     Ok(())
 }
 
@@ -1709,6 +2554,49 @@ fn hardware() -> Value {
         "metrics_scope":"driver process includes Guard gateway and local mocks; Firecracker processes are separate"})
 }
 
+/// The driver's own CPU seconds and current resident set, for taking a delta
+/// across one step.
+///
+/// `hardware()` above reports a peak, because a peak is the right summary for a
+/// whole run. It is useless for a delta: `VmHWM` never falls, so "peak grew by
+/// zero" is the answer whether or not memory was returned. A step's cost is
+/// the CPU it burned and the resident set it was holding while it did.
+fn self_cost() -> (f64, u64) {
+    let ticks = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .unwrap_or(100.0);
+    let process_stat = std::fs::read_to_string("/proc/self/stat").ok();
+    let cpu_seconds = process_stat
+        .as_deref()
+        .and_then(|stat| stat.rsplit_once(") "))
+        .and_then(|(_, fields)| {
+            let fields: Vec<_> = fields.split_whitespace().collect();
+            Some(
+                (fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?)
+                    / ticks,
+            )
+        })
+        .unwrap_or(0.0);
+    let rss_kib = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmRSS:")
+                    .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            })
+        })
+        .unwrap_or(0);
+    (cpu_seconds, rss_kib)
+}
+
 #[tokio::main]
 async fn main() {
     // Async because configuring the namespace is the driver's job, and
@@ -1764,10 +2652,19 @@ async fn main() {
             .map_err(|e| failure(format!("operator permissions: {e}")))?;
         let secret = format!("guard-synthetic-{}-{}", Uuid::now_v7(), Uuid::now_v7());
         let credentials = operator.join("credentials.json");
-        private_file(&credentials, &json!({"model-main":secret}))
-            .map_err(|e| failure(format!("credential file: {e}")))?;
+        // Two credentials, not one shared secret with two hostnames. The agent
+        // endpoint is a separate policy with its own hash, and sharing the key
+        // would let a guest that reaches one endpoint present the other's
+        // credential - which would make the agent leg's refusals unprovable.
+        private_file(
+            &credentials,
+            &json!({"model-main":secret,"agent-model":secret}),
+        )
+        .map_err(|e| failure(format!("credential file: {e}")))?;
         let boundary: OperatorBoundary = serde_json::from_value(
-            json!({"blocked_cidrs":[],"protected_cidrs":["198.18.0.20/32","198.18.0.21/32"],"blocked_hosts":[],"test_destinations":{format!("{MODEL_HOST}:18080"):["198.18.0.10"]}}),
+            json!({"blocked_cidrs":[],"protected_cidrs":["198.18.0.20/32","198.18.0.21/32"],"blocked_hosts":[],"test_destinations":{
+                format!("{MODEL_HOST}:18080"):["198.18.0.10"],
+                format!("{AGENT_MODEL_HOST}:18081"):["198.18.0.11"]}}),
         )?;
         let boundary_path = operator.join("boundary.json");
         private_file(&boundary_path, &serde_json::to_value(&boundary)?)
@@ -1813,6 +2710,7 @@ async fn main() {
             policy_hash: String::new(),
             secret,
             mocks: None,
+            agent_model: None,
             cases: Vec::new(),
             current: "initialization".into(),
             started: Instant::now(),

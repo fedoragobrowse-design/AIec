@@ -1,0 +1,616 @@
+{
+  "schema": "aiec.guard.topology-b-acceptance.v1",
+  "section": "50",
+  "suite": "guard-topology-b-acceptance",
+  "status": "PASS",
+  "claim_under_test": "topology B: the agent runs outside the sandbox, the trusted harness drives it through AIec's control channel, and the guest has no egress at all",
+  "runtime": "firecracker",
+  "endpoint": "https://127.0.0.1:18644",
+  "generated_at": "2026-10-02T09:11:40.586114+00:00",
+  "cases": [
+    {
+      "case": "deployment-object-store-is-a-real-s3-endpoint",
+      "status": "PASS",
+      "evidence": {
+        "endpoint": "http://127.0.0.1:19844",
+        "put_status": 200,
+        "get_bytes": 5,
+        "round_trip_ok": true
+      }
+    },
+    {
+      "case": "control-plane-and-worker-serve-one-tenant-over-tls",
+      "status": "PASS",
+      "evidence": {
+        "control_plane": {
+          "health": 200,
+          "endpoint": "https://127.0.0.1:18644",
+          "database": "aiec_topob"
+        },
+        "worker": {
+          "endpoint": "https://127.0.0.1:19644",
+          "advertised_health": {
+            "status": 200,
+            "authenticated_health": 200
+          },
+          "runtime": "firecracker"
+        }
+      }
+    },
+    {
+      "case": "agent-key-is-scoped-to-the-control-channel-and-nothing-else",
+      "status": "PASS",
+      "evidence": {
+        "scopes": [
+          "sandboxes:write",
+          "sandboxes:read"
+        ],
+        "issued_through": "POST /v1/keys",
+        "used_for": "every model tool call and every independent read-back",
+        "note": "the key is per-run and is never written to the report"
+      }
+    },
+    {
+      "case": "explicit-guard-request-is-refused-at-placement",
+      "status": "PASS",
+      "gating": false,
+      "evidence": {
+        "http_status": 501,
+        "error_code": "unsupported",
+        "error_message": "runtime Firecracker lacks required capabilities",
+        "demanded_capability": "network_policy",
+        "request": {
+          "runtime": "firecracker",
+          "environment.guard": {
+            "topology": "outside",
+            "policy_template": "no-network"
+          }
+        }
+      }
+    },
+    {
+      "case": "guarded-sandbox-boots-on-a-real-microvm",
+      "status": "PASS",
+      "evidence": {
+        "http_status": 200,
+        "state": "running",
+        "error": null,
+        "response": {
+          "id": "01a0fbe1-fe0f-741b-8e0b-5554b448e00c",
+          "tenant_id": "643aa5ac-7671-4310-88bc-7f5a4fe09b49",
+          "node_id": "01a0fb96-9d4a-7568-ba86-b498fb71b49b",
+          "image_id": "afimg1_57b5b9aef43c7efac07f802ecf6ae320f57fe12e44581f34b234871a82cdbd3c",
+          "state": "running",
+          "runtime": "firecracker",
+          "cpu": 1,
+          "memory_mb": 1024,
+          "disk_mb": 4096,
+          "timeout_seconds": 900,
+          "network": {
+            "enabled": false
+          },
+          "environment": {
+            "workspace": {
+              "type": "empty"
+            },
+            "toolkits": [],
+            "layers": [],
+            "guard": {
+              "topology": "outside",
+              "policy_template": "no-network",
+              "policy": null,
+              "model_endpoint": null,
+              "allowlist": [],
+              "watchdog_timeout_ms": 10000,
+              "max_model_requests": 10000,
+              "watcher": {
+                "enabled": false,
+                "failure_mode": "continue_with_rules",
+                "sample_rate": 10,
+                "batch_size": 20,
+                "token_budget": 200000,
+                "cost_budget_micros": 0
+              },
+              "canaries": {
+                "files": [],
+                "hostnames": [],
+                "credentials": []
+              },
+              "require_signed_image": false
+            },
+            "guard_policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+          },
+          "created_at": "2026-10-02T09:11:26.991232Z",
+          "updated_at": "2026-10-02T09:11:27.005055075Z",
+          "runtime_path": null
+        },
+        "runtime": "firecracker",
+        "image": "python:3.13",
+        "worker": {
+          "status": 200,
+          "authenticated_health": 200
+        }
+      }
+    },
+    {
+      "case": "sandbox-reads-back-as-topology-b-with-no-network",
+      "status": "PASS",
+      "evidence": {
+        "read_from": "GET /v1/sandboxes/<id>",
+        "http_status": 200,
+        "state": "running",
+        "topology": "outside",
+        "policy_template": "no-network",
+        "explicit_policy": null,
+        "guard_policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+      }
+    },
+    {
+      "case": "guard-installed-a-host-side-attachment-for-this-sandbox",
+      "status": "PASS",
+      "evidence": {
+        "read_from": "the attachment Guard itself persisted, not from the guest",
+        "interface": "ag29b947e19746a",
+        "gateway_ip": "172.30.8.49",
+        "guest_ip": "172.30.8.50",
+        "dns_port": 53,
+        "broker_port": 8443
+      }
+    },
+    {
+      "case": "guest-has-a-link-and-a-default-route-it-may-not-use",
+      "status": "PASS",
+      "evidence": {
+        "exec_http_status": 200,
+        "guest_own_view_of_/proc/net/route": {
+          "default_routes": [
+            "00000000"
+          ],
+          "links": {
+            "eth0": "up",
+            "lo": "unknown"
+          }
+        },
+        "host_gateway_for_that_guest": "172.30.8.49",
+        "meaning": "the guest is not isolated by having no route; it is isolated by policy"
+      }
+    },
+    {
+      "case": "external-agent-loop-ran-streamed-multi-turn-tool-calls-over-the-control-channel",
+      "status": "PASS",
+      "evidence": {
+        "model_endpoint": "http://127.0.0.1:18999/v1/chat/completions",
+        "turns": [
+          {
+            "turn": 1,
+            "sse_events": 8,
+            "finish_reason": "tool_calls",
+            "tools": [
+              "write_file"
+            ],
+            "content": ""
+          },
+          {
+            "turn": 2,
+            "sse_events": 6,
+            "finish_reason": "tool_calls",
+            "tools": [
+              "exec"
+            ],
+            "content": ""
+          },
+          {
+            "turn": 3,
+            "sse_events": 5,
+            "finish_reason": "tool_calls",
+            "tools": [
+              "read_file"
+            ],
+            "content": ""
+          },
+          {
+            "turn": 4,
+            "sse_events": 14,
+            "finish_reason": "stop",
+            "tools": [],
+            "content": "verified /workspace/topology-b.txt: the guest hashed it to 6d76a0960f472e0d727badc67fee5c0c108946cf3db8efc9832440c570a94353, and the bytes read back through the control channel hash to the same value"
+          }
+        ],
+        "tool_calls": [
+          {
+            "tool": "write_file",
+            "channel": "PUT /v1/sandboxes/<id>/files",
+            "arguments": {
+              "path": "/workspace/topology-b.txt",
+              "content": "topology-b-acceptance-eb95f3d4cc3ef750\n"
+            },
+            "result": {
+              "ok": true,
+              "path": "/workspace/topology-b.txt",
+              "bytes": 39,
+              "http_status": 200,
+              "response": {
+                "status": "written"
+              }
+            },
+            "latency_ms": 20.2
+          },
+          {
+            "tool": "exec",
+            "channel": "POST /v1/sandboxes/<id>/exec",
+            "arguments": {
+              "command": [
+                "sha256sum",
+                "/workspace/topology-b.txt"
+              ]
+            },
+            "result": {
+              "ok": true,
+              "http_status": 200,
+              "exit_code": 0,
+              "stdout": "6d76a0960f472e0d727badc67fee5c0c108946cf3db8efc9832440c570a94353  /workspace/topology-b.txt\n",
+              "stderr": ""
+            },
+            "latency_ms": 17.4
+          },
+          {
+            "tool": "read_file",
+            "channel": "GET /v1/sandboxes/<id>/files/content",
+            "arguments": {
+              "path": "/workspace/topology-b.txt"
+            },
+            "result": {
+              "ok": true,
+              "http_status": 200,
+              "path": "/workspace/topology-b.txt",
+              "content": "topology-b-acceptance-eb95f3d4cc3ef750\n"
+            },
+            "latency_ms": 17.2
+          }
+        ],
+        "model_requests": 4,
+        "sse_events_delivered": 29,
+        "final_content": "verified /workspace/topology-b.txt: the guest hashed it to 6d76a0960f472e0d727badc67fee5c0c108946cf3db8efc9832440c570a94353, and the bytes read back through the control channel hash to the same value",
+        "loop_runs_on": "the host, outside the sandbox"
+      }
+    },
+    {
+      "case": "task-complete-is-verifiable-by-reading-the-guest-back",
+      "status": "PASS",
+      "evidence": {
+        "read_from": "GET /v1/sandboxes/<id>/files/content",
+        "http_status": 200,
+        "path": "/workspace/topology-b.txt",
+        "expected_bytes": "topology-b-acceptance-eb95f3d4cc3ef750",
+        "observed_bytes": "topology-b-acceptance-eb95f3d4cc3ef750",
+        "match": true,
+        "sha256_of_both": "6d76a0960f472e0d727badc67fee5c0c108946cf3db8efc9832440c570a94353",
+        "agent_reported": "verified /workspace/topology-b.txt: the guest hashed it to 6d76a0960f472e0d727badc67fee5c0c108946cf3db8efc9832440c570a94353, and the bytes read back through the control channel hash to the same value"
+      }
+    },
+    {
+      "case": "host-nftables-counters-for-this-attachment-are-zero-across-the-agent-loop",
+      "status": "PASS",
+      "evidence": {
+        "measurement": "the named nftables counters in this attachment's own table, read out of the host kernel by the harness with nft(8)",
+        "table": "aiec_guard_01a0fbe1fe0f741b8e0b5554b448e00c",
+        "source": "host nft(8), invoked by the harness",
+        "read_before_the_loop": "2026-10-02T09:11:29.509657+00:00",
+        "read_after_the_loop": "2026-10-02T09:11:29.584321+00:00",
+        "counters_before": {
+          "cnt_blocked_range": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_other_denied": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_dns_permitted": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_broker_permitted": {
+            "packets": 0,
+            "bytes": 0
+          }
+        },
+        "counters_after": {
+          "cnt_blocked_range": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_other_denied": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_dns_permitted": {
+            "packets": 0,
+            "bytes": 0
+          },
+          "cnt_broker_permitted": {
+            "packets": 0,
+            "bytes": 0
+          }
+        },
+        "per_counter": {
+          "cnt_blocked_range": {
+            "before": 0,
+            "after": 0
+          },
+          "cnt_other_denied": {
+            "before": 0,
+            "after": 0
+          },
+          "cnt_dns_permitted": {
+            "before": 0,
+            "after": 0
+          },
+          "cnt_broker_permitted": {
+            "before": 0,
+            "after": 0
+          }
+        },
+        "counters_present": [
+          "cnt_blocked_range",
+          "cnt_broker_permitted",
+          "cnt_dns_permitted",
+          "cnt_other_denied"
+        ],
+        "counters_absent": [
+          "cnt_ipv6"
+        ],
+        "read_error": null
+      }
+    },
+    {
+      "case": "guard-telemetry-read-through-the-control-plane-agrees",
+      "status": "PASS",
+      "evidence": {
+        "endpoint": "GET /v1/sandboxes/<id>/guard/telemetry",
+        "http_status": 200,
+        "counters": {
+          "dns_permitted": 0,
+          "broker_permitted": 0,
+          "blocked_range": 0,
+          "other_denied": 0,
+          "ipv6": 0
+        },
+        "table": "aiec_guard_01a0fbe1fe0f741b8e0b5554b448e00c",
+        "network_cut": true,
+        "event_head": "c30b2f52fb4695a67468f6e01ca5871871beccaefcf3f2e799d7100ca85025fc",
+        "note": "the watchdog's own read path, not the host's; it is recorded so the two independent readings of the same table can be compared rather than one standing in for the other"
+      }
+    },
+    {
+      "case": "the-egress-observation-is-positive-control-proven",
+      "status": "PASS",
+      "evidence": {
+        "method": "the identical nftables readings, taken immediately after the guest was made to emit traffic on its only link",
+        "attempted": {
+          "gateway": "172.30.8.49",
+          "off_link_addresses": [
+            "1.1.1.1:53"
+          ]
+        },
+        "host_nft_counter_delta_packets": {
+          "cnt_blocked_range": 0,
+          "cnt_other_denied": 6,
+          "cnt_dns_permitted": 0,
+          "cnt_broker_permitted": 0
+        },
+        "host_nft_counters_moved": true,
+        "host_packet_capture_of_the_guest_link": {
+          "captured": true,
+          "tcpdump_attached": true,
+          "pcap_bytes_on_disk": 1656,
+          "pcap_holds_any_packet": true,
+          "window": "positive-control",
+          "interface": "ag29b947e19746a",
+          "source": "tcpdump on the guest's own TAP device, read by the harness",
+          "frames_seen_by_the_host": 18,
+          "packets_that_could_have_been_egress": 6,
+          "packets_listed": [
+            "02:11:29.762022 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:30.788300 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:32.804459 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:34.766818 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+            "02:11:35.780511 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+            "02:11:37.796582 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0"
+          ],
+          "filter": "(ip and not (dst net 224.0.0.0/4)) or (ip6 and not (dst net ff02::/16))",
+          "filter_meaning": "IP packets, excluding link-local multicast (neighbour discovery and the like), which is not egress"
+        },
+        "host_capture_saw_frames": true,
+        "host_capture_saw_the_same_packets_the_counters_did": true,
+        "the_capture_and_the_counters_are_independent_instruments": true,
+        "why_two_instruments_on_one_stimulus": "the same guest-originated frames cross the TAP and are then denied in the host's input chain, so the packet capture and the nftables counters observe the same traffic by different means. Agreement between them is what makes either zero credible.",
+        "guest_own_report_of_its_attempts": {
+          "exec_http_status": 200,
+          "exec_exit_code": 0,
+          "probe": {
+            "links": {
+              "eth0": {
+                "operstate": "up",
+                "flags": "0x1003",
+                "address": "06:00:ac:10:00:02",
+                "mtu": "1500"
+              },
+              "lo": {
+                "operstate": "unknown",
+                "flags": "0x9",
+                "address": "00:00:00:00:00:00",
+                "mtu": "65536"
+              }
+            },
+            "connects": [
+              {
+                "host": "172.30.8.49",
+                "port": 8443,
+                "connected": false,
+                "errno": null,
+                "strerror": "timed out"
+              },
+              {
+                "host": "172.30.8.49",
+                "port": 9,
+                "connected": false,
+                "errno": null,
+                "strerror": "timed out"
+              },
+              {
+                "host": "1.1.1.1",
+                "port": 53,
+                "connected": false,
+                "errno": 101,
+                "strerror": "[Errno 101] Network is unreachable"
+              },
+              {
+                "host": "198.18.0.10",
+                "port": 80,
+                "connected": false,
+                "errno": 101,
+                "strerror": "[Errno 101] Network is unreachable"
+              }
+            ],
+            "/proc/net/route": [
+              "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT                                                       ",
+              "eth0\t00000000\t31081EAC\t0003\t0\t0\t0\t00000000\t0\t0\t0                                                                               ",
+              "eth0\t30081EAC\t00000000\t0001\t0\t0\t0\tFCFFFFFF\t0\t0\t0"
+            ],
+            "/proc/net/ip_route": "unreadable: [Errno 2] No such file or directory: '/proc/net/ip_route'"
+          }
+        },
+        "guest_report_is_corroboration_only": true,
+        "meaning": "the same counters that read zero across the agent loop read non-zero here, so the zero above is a measurement and not a constant"
+      }
+    },
+    {
+      "case": "the-packet-capture-instrument-is-positive-control-proven",
+      "status": "PASS",
+      "evidence": {
+        "method": "the guest is made to emit real traffic on its only link from inside the VM, and the capture on that same TAP is read back",
+        "stimulus": {
+          "source": "GUEST_PROBE executed inside the guest over the control channel",
+          "guest_reported_attempts": [
+            {
+              "host": "172.30.8.49",
+              "port": 8443,
+              "connected": false,
+              "errno": null,
+              "strerror": "timed out"
+            },
+            {
+              "host": "172.30.8.49",
+              "port": 9,
+              "connected": false,
+              "errno": null,
+              "strerror": "timed out"
+            },
+            {
+              "host": "1.1.1.1",
+              "port": 53,
+              "connected": false,
+              "errno": 101,
+              "strerror": "[Errno 101] Network is unreachable"
+            },
+            {
+              "host": "198.18.0.10",
+              "port": 80,
+              "connected": false,
+              "errno": 101,
+              "strerror": "[Errno 101] Network is unreachable"
+            }
+          ],
+          "why_these_traverse_the_link": "Guard installs input, forward and forward_to_guest chains and no output chain, so a guest packet crosses the TAP and is denied in the host's input chain on arrival - which is what moves the host nft counters",
+          "why_no_host_injection": "a frame written onto a TAP through AF_PACKET leaves through the tun file descriptor and is not visible to a capture on that TAP, so it could not have served as a control"
+        },
+        "capture": {
+          "captured": true,
+          "tcpdump_attached": true,
+          "pcap_bytes_on_disk": 1656,
+          "pcap_holds_any_packet": true,
+          "window": "positive-control",
+          "interface": "ag29b947e19746a",
+          "source": "tcpdump on the guest's own TAP device, read by the harness",
+          "frames_seen_by_the_host": 18,
+          "packets_that_could_have_been_egress": 6,
+          "packets_listed": [
+            "02:11:29.762022 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:30.788300 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:32.804459 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+            "02:11:34.766818 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+            "02:11:35.780511 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+            "02:11:37.796582 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0"
+          ],
+          "filter": "(ip and not (dst net 224.0.0.0/4)) or (ip6 and not (dst net ff02::/16))",
+          "filter_meaning": "IP packets, excluding link-local multicast (neighbour discovery and the like), which is not egress"
+        },
+        "capture_attached": true,
+        "frames_seen_by_the_host": 18,
+        "pcap_bytes_on_disk": 1656,
+        "packets_carrying_an_ip_header_recorded": 6,
+        "packets_listed": [
+          "02:11:29.762022 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+          "02:11:30.788300 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+          "02:11:32.804459 IP 172.30.8.50.35182 > 172.30.8.49.8443: tcp 0",
+          "02:11:34.766818 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+          "02:11:35.780511 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0",
+          "02:11:37.796582 IP 172.30.8.50.38048 > 172.30.8.49.9: tcp 0"
+        ],
+        "meaning": "this capture, on this device, in this window, records frames - which is the only thing that makes its zero during the agent loop evidence"
+      }
+    },
+    {
+      "case": "host-packet-capture-of-the-guest-link-saw-no-guest-originated-egress",
+      "status": "PASS",
+      "evidence": {
+        "measurement": "tcpdump on the guest's own TAP device for the whole agent loop",
+        "captured": true,
+        "tcpdump_attached": true,
+        "pcap_bytes_on_disk": 24,
+        "pcap_holds_any_packet": false,
+        "window": "agent-loop",
+        "interface": "ag29b947e19746a",
+        "source": "tcpdump on the guest's own TAP device, read by the harness",
+        "frames_seen_by_the_host": 0,
+        "packets_that_could_have_been_egress": 0,
+        "packets_listed": [],
+        "filter": "(ip and not (dst net 224.0.0.0/4)) or (ip6 and not (dst net ff02::/16))",
+        "filter_meaning": "IP packets, excluding link-local multicast (neighbour discovery and the like), which is not egress",
+        "instrument_was_proven_in_this_same_run": true,
+        "interpretation": "no packet carrying an IP header left the guest for any destination, during a loop in which three control-channel tool calls ran to completion. The zero is read as evidence only because the same capture, on the same device, was shown to be recording in the positive control above; without that it would be indistinguishable from a capture that never started."
+      }
+    }
+  ],
+  "passed": 15,
+  "total": 15,
+  "failing_cases": [],
+  "cleanup_errors": [],
+  "observation_split": {
+    "host_observed": [
+      "the attachment's named nftables counters, read out of the host kernel by the harness with nft(8) rather than through the product",
+      "a tcpdump capture on the guest's own TAP device, over two named windows",
+      "every control-channel HTTP status, response body and latency",
+      "the worker and control plane process state and their HTTP health answers"
+    ],
+    "guest_reported": [
+      "the errno and connected flags of the positive control's connect attempts",
+      "the guest's own view of /proc/net/route"
+    ],
+    "note": "Guest-reported values corroborate host-observed ones. No case rests on a guest-reported value alone."
+  },
+  "limitations": [
+    "Proves the guest emitted no routable IP packet on its only link, over a private user+network namespace, on the Firecracker runtime. It proves nothing about the Docker or hosted runtimes, which implement no Guard attachment at all and so cannot carry a Guard policy in the first place. The routable frames this capture does record, in the positive-control window, were addressed to the permitted gateway; the denial of forbidden off-link destinations is established by the nftables counters moving on those attempts, not by observing them on the wire.",
+    "A counter that reads zero also reads zero when nothing tries to egress, and a packet the guest never emits is invisible to every method here. That is why the positive-control case exists: it takes the identical host-side reading after a deliberate outbound attempt and records the difference. Without it, the zero would be an assumption about the guest rather than a measurement of it.",
+    "Both host-side instruments are proven by the SAME stimulus: the guest's own connect attempts. Guard installs input, forward and forward_to_guest chains and no output chain, so those packets cross the TAP and are denied in the host's input chain on arrival - which is why the nftables counters move and the capture sees frames in the same window. The capture's proof is specifically a ROUTABLE frame, because the agent-loop case asserts against the ROUTABLE-filtered count: an ARP or neighbour-discovery frame would not have exercised the filter that the zero rests on. An earlier draft of this suite instead had the host write a frame onto the TAP through AF_PACKET; that cannot work, because such a frame leaves through the tun file descriptor and never appears in a capture taken on that same TAP (measured: a 24-byte packet-free pcap, where the identical injection on a dummy device was captured). It would have been a permanent false zero that could only have passed if the capture were broken in some new way.",
+    "The guest's own report - the errno from its connect attempts, its view of /proc/net/route - is labelled guest-reported everywhere it appears. It corroborates what the host already counted and is never the primary evidence for any case.",
+    "No attestation is performed. The host establishes which kernel and rootfs were booted (a manifest the suite signs with a per-run key, over the digest of the bytes on disk, which the worker verifies) and that the attachment's counters stayed at zero. It does not measure a running kernel, and a guest compromised after boot keeps whatever privileges it has inside the guest.",
+    "The object store is a real, running S3-compatible endpoint that answered a put and a get, and the control plane booted against it. No case stores or retrieves an artifact: object storage is exercised for reachability only.",
+    "The model provider is a scripted local endpoint, not a language model. What is under test is the loop - streaming decode, tool dispatch, tool-result feedback and termination - not model quality or tool-use correctness in the general case.",
+    "Counters are cumulative for the life of the attachment. The zero-egress case is scoped to the window between the two reads named in its evidence; a packet sent before the attachment was enforced, or after the sandbox was destroyed, is outside what this run could see.",
+    "Topology B is the configuration with no watchdog attached, and an attachment with no live watchdog is in its deny-all initial state. For a no-network policy that is a stricter state than the policy asks for, and the counters do not distinguish the two. This suite therefore proves 'no egress happened', not 'the no-network rule set is what stopped it'; the policy selection itself is proven by the read-back in the sandbox-reads-back case."
+  ],
+  "elapsed_seconds": 21.259,
+  "finished_at": "2026-10-02T09:11:40.586243+00:00"
+}

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Builds nothing. Every address/listener/firewall change is in a disposable netns.
+# Builds the in-guest agent harness (a static musl container build) and changes
+# nothing else on the host. Every address/listener/firewall change is in a
+# disposable netns.
 #
 # The launcher creates the namespace and nothing else. Loopback, the local
 # sentinel addresses and the namespace-scoped forward setting belong to the
@@ -17,6 +19,18 @@ if [[ ${1:-} != --inside ]]; then
   # Absolute, because the re-exec happens inside a namespace where a relative
   # $0 no longer resolves to anything.
   self=$(realpath "$0")
+  # The in-guest agent harness is static musl, which is a container build, and
+  # a container is a host-side tool - so it is built here, before the namespace
+  # exists, and the path is handed to the driver. Building it inside the
+  # namespace instead would mean the one artifact the agent leg depends on is
+  # produced by a step the acceptance is supposed to be verifying. The script
+  # prints progress on stderr and the absolute path on its last stdout line.
+  AIEC_AGENT_BINARY=$(bash "$(dirname "$self")/build-harness-static.sh" | tail -n1)
+  [[ -x $AIEC_AGENT_BINARY ]] || {
+    printf 'the in-guest harness build produced no executable: %s\n' "$AIEC_AGENT_BINARY" >&2
+    exit 2
+  }
+  export AIEC_AGENT_BINARY
   # The host's network namespace inode, recorded BEFORE unshare. Inside the new
   # namespace PID 1 belongs to the host namespace but reading another process's
   # namespace link is denied, so `/proc/1/ns/net` comes back empty rather than
@@ -73,10 +87,37 @@ if [[ ${AIEC_REPRO_LEGACY_CONTROL:-0} == 1 ]]; then
 else
   unset AIEC_ALLOW_LEGACY_NETWORK AIEC_REPRO_LEGACY_CONTROL
 fi
-setsid "$1" &
+# The driver writes its report to stdout. It is captured to a file rather than
+# piped, because the run also has to be waited on as a process and a pipe
+# would make the status that matters be the reader's rather than the driver's.
+report=$(mktemp "${TMPDIR:-/tmp}/guard-core-report.XXXXXX")
+setsid "$1" >"$report" 2>&1 &
 child=$!
 set +e
 wait "$child"
 status=$?
 set -e
+cat "$report"
+# The driver prints a build line before its report, so the report is the JSON
+# object in the stream rather than the stream itself.
+json=$(python3 -c 'import json, sys
+text = sys.stdin.read()
+start = text.find("{")
+if start < 0:
+    sys.exit(1)
+try:
+    report = json.loads(text[start:])
+except ValueError:
+    sys.exit(1)
+print(json.dumps(report))
+sys.exit(0 if report.get("status") == "PASS" else 1)' <"$report") || json=
+if [[ $status == 0 && -n $json ]]; then
+  artifact=${AIEC_AGENT_REPORT:-benchmarks/guard-core-acceptance.json}
+  mkdir -p "$(dirname "$artifact")"
+  printf '%s\n' "$json" >"$artifact"
+  printf 'published %s\n' "$artifact" >&2
+else
+  printf 'run did not pass; leaving the committed artifact untouched\n' >&2
+fi
+rm -f "$report"
 exit "$status"
