@@ -436,3 +436,81 @@ async fn postgres_guard_release_clears_both_latches_and_leaves_them_armed() {
     );
     drop_test_schema(&repository, admin, schema).await;
 }
+
+/// The memory repository has no trigger, so the narrowing 0023 exists to make -
+/// that an approved policy may rebind a budget to the hash the sandbox now
+/// carries - is a property only the database can refuse. 0024 replaced the
+/// whole function to add the release path and re-froze the entire identity
+/// object, which put the rebind back exactly where 0023 found it, and the
+/// memory test stayed green throughout. The catalog is the place that can see
+/// it, so the catalog is where it is asserted.
+#[tokio::test]
+async fn postgres_guard_budget_rebinds_its_policy_hash_without_moving_ownership() {
+    let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let worker = register_test_worker(&repository, tenant).await;
+    let (state, fence) = place(&repository, tenant, worker).await;
+    repository.put_guard_budget(state.clone()).await.unwrap();
+    repository
+        .reserve_guard_budget(
+            state.identity.clone(),
+            fence,
+            BudgetDebit {
+                model_requests: 5,
+                bytes_in: 11,
+                bytes_out: 13,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut approved = state.clone();
+    approved.identity.policy_hash = "c".repeat(64);
+    let rebound = repository
+        .put_guard_budget(approved.clone())
+        .await
+        .expect("an approved policy rebinds the budget it was opened against");
+    assert_eq!(rebound.identity, approved.identity);
+    assert_eq!(
+        (rebound.model_requests, rebound.bytes_in, rebound.bytes_out),
+        (5, 11, 13),
+        "usage spent under the previous policy is still spent"
+    );
+
+    // The narrowing is to the two ownership fields, not to the identity as a
+    // whole and not to policy_hash: everything else about the identity is
+    // still frozen.
+    for (_, column, value) in [
+        (
+            "identity.sandbox_id",
+            "{identity,sandbox_id}",
+            new_id().to_string(),
+        ),
+        (
+            "identity.tenant_id",
+            "{identity,tenant_id}",
+            new_id().to_string(),
+        ),
+    ] {
+        assert!(
+            sqlx::query(&format!(
+                "UPDATE guard_budgets SET payload=jsonb_set(payload, '{column}', to_jsonb($2::text)) WHERE sandbox_id=$1"
+            ))
+            .bind(approved.identity.sandbox_id)
+            .bind(value)
+            .execute(&repository.pool)
+            .await
+            .is_err(),
+            "{column} is ownership and may not move"
+        );
+    }
+    // And an approval still cannot buy a second allowance.
+    let mut raised = approved.clone();
+    raised.max_model_requests = approved.max_model_requests + 1;
+    assert!(matches!(
+        repository.put_guard_budget(raised).await,
+        Err(StoreError::Conflict(_))
+    ));
+    drop_test_schema(&repository, admin, schema).await;
+}

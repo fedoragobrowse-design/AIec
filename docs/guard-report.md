@@ -692,9 +692,68 @@ P3_PG_ADMIN_URL=postgresql://user:password@127.0.0.1:5432/aiec \
   python3 scripts/guard-phase3-acceptance.py
 ```
 
+`P3_ROOT` selects where the scratch tree and any failure evidence live; it
+defaults to `$HOME/aiec/phase3`.
+
 The report is written to `benchmarks/guard-phase3-acceptance.json`, with
 per-case detail, the provider request count, and the observation provenance
 that distinguishes host-observed evidence from a guest's own claim.
+
+### What the second Phase 3 run found
+
+Rerunning Phase 3 against the current tree failed at case 35 of 47 with
+`live-run-completes: RuntimeError`, and the control plane had logged the cause
+one line earlier: `guard budget could not follow the approved policy ...
+conflict: record violates a storage invariant`. It failed at the telemetry
+read immediately after an approved proposal was applied, which is exactly the
+point at which the sandbox's policy identity has moved.
+
+The budget's policy identity is meant to move. `0023` narrowed the trigger's
+ownership check from the whole `identity` object to the two fields that are
+ownership — `sandbox_id` and `tenant_id` — so that an approved proposal can
+rebind the row to the hash the sandbox now carries, and the in-memory
+repository has always done exactly that.
+
+`0024` added the quarantine release path, and it added that path by replacing
+the entire trigger body. The replacement carried the release rules and,
+unwittingly, carried back `NEW.payload->'identity' IS DISTINCT FROM
+OLD.payload->'identity'`. The rebind was frozen again, silently, in a migration
+whose subject was the release latch. Nothing in Rust saw it: the in-memory
+repository has no trigger to freeze, so the one test that covers the rebind —
+`an_approved_policy_change_rebinds_the_budget_without_refilling_it` — passes
+against the defective schema. Only a run against a real PostgreSQL refused,
+which is exactly what a trigger is for.
+
+`0025` restores the narrowing and carries `0024`'s release rules over
+unchanged. Published migrations are append-only, so the correction is a new
+statement about the same function rather than an edit to a file that has
+already run in production.
+
+The regression is now held by a test that cannot pass vacuously:
+`postgres_guard_budget_rebinds_its_policy_hash_without_moving_ownership`
+rebinds through the real repository and then asserts in the catalog that
+`identity.sandbox_id` and `identity.tenant_id` are still refused, so the
+narrowing cannot quietly widen again. With `0025` removed it fails on the
+rebind itself with the same `record violates a storage invariant` the live run
+produced; with it in place it passes, alongside the release test that holds
+`0024`'s half.
+
+### Where the Phase 3 harness keeps its state
+
+The driver used `tempfile.mkdtemp` with no parent, so an entire run — a
+PostgreSQL data directory, two rootfs copies and the manifests bound to them —
+was allocated on the default temporary directory, which on this host is
+RAM-backed. The tree was also only removed on success, so every failed run left
+its whole scratch tree behind.
+
+The scratch parent is now `P3_ROOT` (`$HOME/aiec/phase3` by default, matching
+`P4_ROOT`/`P5_ROOT`/`RP_ROOT`), and the tree is torn down on every run. A
+failed run copies `failure.json` and the service logs out to
+`$P3_ROOT/failed/<timestamp>-<id>/` before the tree goes, so the diagnostic
+outlives the scratch without the database, socket or rootfs copies outliving it
+too. A teardown that fails is a `cleanup_errors` entry and flips a passing run
+to failing, and the tree that would not go is named in the run's JSON as
+`residue` rather than left to be found later.
 
 
 ## What Phase 4 changed in the product
@@ -820,12 +879,19 @@ failed with exactly two disks, and both belonged to the two machines the
 canaries had quarantined.
 
 **A quarantined sandbox's writable disk outlived the worker, along with its
-guest.** Nothing in the worker reclaims machines on exit. The listener was
+guest.** What the suite measured was the disk: two writable rootfs files were
+still in the state tree after the worker exited. That the Firecracker child
+was still running with them follows from the mechanism rather than from a
+reading. Nothing in the worker reclaims machines on exit. The listener was
 awaited alone, so the process ended on `SIGTERM` with no teardown at all — and
 the default disposition of that signal runs no destructor either, so the
-`kill_on_drop(true)` on each Firecracker child never fired. The guest process
-survived its controller, and with it a 4 GiB writable disk under
-`state-vms/vms/<id>/`, per sandbox, for as long as the filesystem did.
+`kill_on_drop(true)` on each Firecracker child had no way to fire: it is an
+`impl Drop` on a `Child` in a process that is already terminating. A child that
+outlives its parent that way is left running, and with it a 4 GiB writable
+disk under `state-vms/vms/<id>/`, per sandbox, for as long as the filesystem
+did. The suite does not enumerate processes, so this is the reasoning that
+accounts for the disks it did find, and the disk census is what the fix is
+held to.
 
 The quarantine is what made this look like intended behaviour rather than a
 leak, and it is worth stating plainly why the machine cannot be resumed after
@@ -862,6 +928,16 @@ The census is unchanged in strength: `live_rootfs_copies: 0`, with the two
 quarantined forensic captures retained. The worker log for that run records
 `reclaimed=2`, so the two disks are gone because the worker took them with it,
 not because the assertion was relaxed.
+
+The same boundary applies to the process side of that finding, and it is worth
+being explicit about which half was observed. The Phase 5 suite censuses
+writable rootfs files and forensic captures; it does not take a process
+census, so "the guest survived its controller" is an account of the mechanism
+— a `SIGTERM` default disposition that runs no destructor, and therefore a
+`kill_on_drop` that cannot fire — rather than a reading the suite made. The
+disk was observed; the process is why the disk was there. Adding a process
+census to the suite would close that gap; nothing else in the finding depends
+on it, because the fix is judged on the files.
 
 ### Reading the logs when a request seems to vanish
 

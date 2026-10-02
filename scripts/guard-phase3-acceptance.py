@@ -696,9 +696,15 @@ def outer():
     import psycopg
     from psycopg import sql
     from urllib.parse import urlsplit, quote
-    # New DB, scratch tree and namespace each run: no destructive cleanup of
-    # another suite's state, and no fixed shared acceptance credentials.
-    scratch = Path(tempfile.mkdtemp(prefix="aiec-p3-"))
+    # Disk-backed, operator-visible and bounded. The default temporary
+    # directory is RAM-backed and far too small for a PostgreSQL data
+    # directory plus the rootfs copies this run makes, and a failed run's
+    # evidence has to outlive the tree that produced it, so both the scratch
+    # parent and the failure evidence are pinned under P3_ROOT.
+    parent = Path(os.environ.get("P3_ROOT") or Path.home() / "aiec" / "phase3")
+    parent.mkdir(parents=True, exist_ok=True)
+    parent.chmod(0o700)
+    scratch = Path(tempfile.mkdtemp(prefix="aiec-p3-", dir=parent))
     scratch.chmod(0o700)
     database = "aiec_p3_" + uuid.uuid4().hex
     admin = os.environ.get("P3_PG_ADMIN_URL", "postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec")
@@ -750,16 +756,39 @@ def outer():
         if cleanup:
             result["status"] = "FAIL"
     report = Path(os.environ.get("P3_REPORT", str(REPO / "benchmarks/guard-phase3-acceptance.json")))
-    destination = report if result["status"] == "PASS" else scratch / "failure.json"
+    evidence = None
+    if result["status"] != "PASS":
+        # The scratch tree is torn down either way, so the diagnostic has to be
+        # copied out of it first. What survives a failed run is the report and
+        # the service logs — small, and kept together under one name — and not
+        # the database, socket, manifests or rootfs copies that make the tree
+        # large enough to have been a problem in the first place.
+        evidence = parent / "failed" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8])
+        evidence.mkdir(parents=True, exist_ok=True)
+        evidence.chmod(0o700)
+        for log in sorted(scratch.glob("*.log")):
+            shutil.copy2(log, evidence / log.name)
+    try:
+        shutil.rmtree(scratch)
+    except OSError as error:
+        # Residue that outlives the run is a cleanup failure rather than a
+        # silent leftover, and a run that passed while leaving a tree behind
+        # has not cleaned up.
+        result.setdefault("cleanup_errors", []).append("scratch teardown: " + type(error).__name__)
+        result["status"] = "FAIL"
+        if evidence is None:
+            evidence = scratch
+    destination = report if result["status"] == "PASS" else evidence / "failure.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
     private(temporary, json.dumps(result, indent=2))
     os.replace(temporary, destination)
     print(json.dumps({"status": result["status"], "passed": result.get("passed", 0),
                       "cases": result.get("cases", 0), "cleanup_errors": result["cleanup_errors"],
-                      "report": str(destination), "scratch": str(scratch)}))
-    if result["status"] == "PASS":
-        shutil.rmtree(scratch)
+                      "report": str(destination), "evidence": str(evidence) if evidence else None,
+                      # A tree that would not go is named, so the operator is
+                      # told where it is rather than left to find it.
+                      "residue": str(scratch) if evidence is scratch else None}))
     return 0 if result["status"] == "PASS" else 1
 
 
