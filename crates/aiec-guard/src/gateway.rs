@@ -260,7 +260,7 @@ pub(crate) struct Runtime {
     /// ever seeing a policy that is half of two.
     policy: Arc<AtomicPolicy>,
     pub(crate) broker: SocketAddr,
-    identity: GuardIdentity,
+    identity: std::sync::RwLock<GuardIdentity>,
     fence: std::sync::RwLock<GuardFence>,
     cut: AtomicBool,
     terminal_failure: AtomicBool,
@@ -281,6 +281,43 @@ impl Runtime {
     /// The policy in force right now.
     pub(crate) fn compiled(&self) -> Arc<CompiledPolicy> {
         self.policy.compiled()
+    }
+
+    /// The enforcement identity in force right now.
+    ///
+    /// A poisoned lock yields an identity nothing can match, so a reader that
+    /// cannot learn who it is talking to fails closed instead of guessing.
+    pub(crate) fn identity(&self) -> GuardIdentity {
+        self.identity
+            .read()
+            .map(|identity| identity.clone())
+            .unwrap_or(GuardIdentity {
+                sandbox_id: Uuid::nil(),
+                tenant_id: Uuid::nil(),
+                policy_hash: String::new(),
+            })
+    }
+    /// Names the enforcement generation installed by an approved proposal.
+    ///
+    /// Ownership is fixed for the life of the attachment: only the policy hash
+    /// moves, only to a hash the live policy cell already reports, and only
+    /// from the code path that installs policies. A caller that cannot install
+    /// a policy cannot rebind this identity, so the watchdog binding stays as
+    /// tight as it was before the first approval.
+    pub(crate) fn adopt_policy(&self, policy_hash: &str) -> Result<()> {
+        if self.policy.policy_hash() != policy_hash {
+            return Err(GuardError::Unavailable(
+                "refusing to name a policy that is not in force".into(),
+            ));
+        }
+        let mut identity = self
+            .identity
+            .write()
+            .map_err(|_| GuardError::Unavailable("gateway identity is poisoned".into()))?;
+        if identity.policy_hash != policy_hash {
+            identity.policy_hash = policy_hash.to_owned();
+        }
+        Ok(())
     }
 
     /// The layer 7 rules in force, if the attachment has any.
@@ -482,10 +519,11 @@ impl Runtime {
             return Err(GuardError::Denied("gateway cut".into()));
         }
         let mut cancel = self.stop.subscribe();
+        let identity = self.identity();
         tokio::select! {
             biased;
             _ = cancel.changed() => Err(GuardError::Denied("gateway cut".into())),
-            result = self.config.budget_authority.reserve(&self.identity, *self.fence.read().map_err(|_| GuardError::Unavailable("gateway ownership fence is poisoned".into()))?, debit) => {
+            result = self.config.budget_authority.reserve(&identity, *self.fence.read().map_err(|_| GuardError::Unavailable("gateway ownership fence is poisoned".into()))?, debit) => {
                 result?;
                 if !self.active() {
                     return Err(GuardError::Denied("gateway cut".into()));
@@ -602,9 +640,10 @@ impl GatewayControl {
     pub fn cut(&self) -> Result<()> {
         self.state.latch_cut(false).map(|_| ())
     }
-    pub fn identity(&self) -> &GuardIdentity {
-        &self.state.identity
+    pub fn identity(&self) -> GuardIdentity {
+        self.state.identity()
     }
+
     /// The hash of the policy in force, which changes when an approved
     /// proposal is applied and not before.
     pub fn policy_hash(&self) -> String {
@@ -664,6 +703,24 @@ impl GuardGateway {
     pub async fn start(config: GatewayConfig) -> Result<Self> {
         Self::start_with_l7(config, None).await
     }
+
+    /// The canary monitor for this attachment, if one is configured.
+    ///
+    /// Trusted host code observes file reads through this rather than asking
+    /// the guest what it read: the guest's answer is exactly the thing under
+    /// suspicion.
+    pub fn canaries(&self) -> Option<std::sync::Arc<crate::canaries::CanaryMonitor>> {
+        self.state.canary.lock().clone()
+    }
+
+    /// Names the enforcement generation an approved proposal installed.
+    ///
+    /// This is the one place a live gateway's identity moves, and it moves
+    /// only to a hash the live policy cell is already enforcing.
+    pub fn adopt_policy(&self, policy_hash: &str) -> Result<()> {
+        self.state.adopt_policy(policy_hash)
+    }
+
     /// Starts a gateway that also governs the traffic it can see.
     ///
     /// The layer 7 policy is an argument rather than a configuration field so
@@ -717,11 +774,11 @@ impl GuardGateway {
         let request_limit = config.compiled.policy().limits.max_concurrent_requests as usize;
         let state = Arc::new(Runtime {
             policy,
-            identity: GuardIdentity {
+            identity: std::sync::RwLock::new(GuardIdentity {
                 sandbox_id: config.sandbox_id,
                 tenant_id: config.tenant_id,
                 policy_hash: config.compiled.policy_hash().to_owned(),
-            },
+            }),
             fence: std::sync::RwLock::new(config.fence),
             watchdog: AuditMutex::new(WatchdogState {
                 deadline: tokio::time::Instant::now() + config.watchdog_timeout,
@@ -813,8 +870,8 @@ impl GuardGateway {
     pub fn dns_addr(&self) -> SocketAddr {
         self.dns
     }
-    pub fn identity(&self) -> &GuardIdentity {
-        &self.state.identity
+    pub fn identity(&self) -> GuardIdentity {
+        self.state.identity()
     }
 
     pub fn control(&self) -> GatewayControl {
@@ -836,7 +893,17 @@ impl GuardGateway {
     /// Host-authenticated first activation is not a release of a latched cut.
     /// Returns true only for the first activation, when the manager must install filters.
     pub fn heartbeat(&self, identity: &GuardIdentity) -> Result<bool> {
-        if identity != &self.state.identity {
+        // An approved proposal installs a new generation before the gateway is
+        // told about it. A watchdog still reporting under the superseded one
+        // is reporting on rules that are no longer in force, so the check is
+        // against the policy actually being enforced, not only the last one
+        // named.
+        if identity.policy_hash != self.state.policy.policy_hash() {
+            return Err(GuardError::Denied(
+                "watchdog generation is not in force".into(),
+            ));
+        }
+        if identity != &self.state.identity() {
             return Err(GuardError::Denied("watchdog identity mismatch".into()));
         }
         self.health()?;
@@ -1365,6 +1432,30 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
     if forbidden_headers(request.headers()) {
         return deny(&state, "invalid request headers", StatusCode::BAD_REQUEST).await;
     }
+    // Observe the credential the client actually presents, even when its route
+    // or binding is otherwise invalid. A configured model name is not evidence
+    // that the guest exercised a tripwire.
+    if let Some(canary) = state.canaries() {
+        for value in request.headers().values() {
+            let Some(value) = value.to_str().ok() else {
+                continue;
+            };
+            let value = value.strip_prefix("Bearer ").unwrap_or(value);
+            if let Some(presented) = value.strip_prefix("placeholder://") {
+                match canary.observe_credential(presented).await {
+                    Ok(outcome) if outcome.trip.is_none() => {}
+                    Ok(_) | Err(_) => {
+                        return deny(
+                            &state,
+                            "presentation of a canary credential refused",
+                            StatusCode::FORBIDDEN,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
     if request.method() == Method::CONNECT {
         return connect(request, state, permit).await;
     }
@@ -1400,21 +1491,6 @@ async fn handle(mut request: Request<Body>, state: Arc<Runtime>) -> Response<Bod
                 || !path_allowed(path, &model.allowed_paths)
             {
                 return deny(&state, "model method or path denied", StatusCode::FORBIDDEN).await;
-            }
-            // A canary credential is presented by name, so the host sees the
-            // presentation even though it never sees the secret.
-            if let Some(canary) = state.canaries()
-                && let Ok(outcome) = canary.observe_credential(&model.credential).await
-                && outcome.trip.is_some()
-            {
-                // Firing has already cut or quarantined; the request does not
-                // proceed either way.
-                return deny(
-                    &state,
-                    "presentation of a canary credential refused",
-                    StatusCode::FORBIDDEN,
-                )
-                .await;
             }
             let Some(binding) = broker.policy().credentials.iter().find(|b| {
                 b.name == model.credential && b.host == model.host && b.port == model.port

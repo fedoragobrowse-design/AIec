@@ -650,13 +650,14 @@ impl MetadataStore for MemoryRepository {
             .await
             .map_err(core_error)
     }
-    async fn update_guard_policy_hash(
+    async fn update_guard_policy(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
+        guard: &aiec_guard::policy::GuardConfig,
         policy_hash: &str,
     ) -> Result<(), CoreError> {
-        Self::update_guard_policy_hash(self, tenant, sandbox, policy_hash)
+        Self::update_guard_policy(self, tenant, sandbox, guard, policy_hash)
             .await
             .map_err(core_error)
     }

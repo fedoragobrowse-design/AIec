@@ -1,0 +1,1067 @@
+{
+  "schema": "aiec.guard.phase3-acceptance.v1",
+  "status": "PASS",
+  "passed": 47,
+  "cases": 47,
+  "cases_detail": [
+    {
+      "case": "production-guest-gateway-and-nftables-attached",
+      "status": "PASS",
+      "evidence": {
+        "sandbox_id": "01a0fde4-8dbd-732d-af97-6c7a3d6ba9d5",
+        "effective_policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919",
+        "kernel_table": "aiec_guard_01a0fde48dbd732daf976c7a3d6ba9d5"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "mcp-tools-list-allowed",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
+        "provider_receipts": [
+          {
+            "nonce": "ba166059650d4c02bc464a1620376f5a",
+            "method": "POST",
+            "path": "/v1/mcp",
+            "host": "mcp.guard.test:18880",
+            "body_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
+            "bytes": 51
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.218
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "mcp-read-only-tool-allowed",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "313def3abe10fea59275691330c984b077830db25a86d9a7f795f224652807e5",
+        "provider_receipts": [
+          {
+            "nonce": "7ee0f029c4ef431c93cbf7e0792cb16f",
+            "method": "POST",
+            "path": "/v1/mcp",
+            "host": "mcp.guard.test:18880",
+            "body_sha256": "313def3abe10fea59275691330c984b077830db25a86d9a7f795f224652807e5",
+            "bytes": 127
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.115
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "mcp-write-tool-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "b982874b05d66f703c2c1f4640fe79743d3075d269e2b047a295ddaba207ffb4",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 mcp: tool name is explicitly denied",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.08
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "mcp-unknown-tool-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "f0cc5e4b0f2402e4475d6d411787b04d102a29eb9f0d86d912ebee5f6e0dd579",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 mcp: tool name is not in the allowed set",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.087
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "mcp-unknown-method-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "6f63ae05981af1396fa241c78d22c598233f5ebd885d95a09b21db02f0991a20",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 mcp: method is not in the allowed set",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.055
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "mcp-positive-control-after-denials",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "6b8097b12ce9d3d9271d02e25e117ca5f89ebae03a09a164ed59e607c9abdc11",
+        "provider_receipts": [
+          {
+            "nonce": "502ff33d1e3746d692d614aa7cac1132",
+            "method": "POST",
+            "path": "/v1/mcp",
+            "host": "mcp.guard.test:18880",
+            "body_sha256": "6b8097b12ce9d3d9271d02e25e117ca5f89ebae03a09a164ed59e607c9abdc11",
+            "bytes": 124
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.068
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-query-allowed",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
+        "provider_receipts": [
+          {
+            "nonce": "9995eabbc567468392d4f6019181b4ac",
+            "method": "POST",
+            "path": "/v1/graphql",
+            "host": "graphql.guard.test:18880",
+            "body_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
+            "bytes": 72
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.092
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-allowed-root-alias-allowed",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "6dc5f20274429c4618a075cf3cdc33d6709911340048a7e075c73521c18526be",
+        "provider_receipts": [
+          {
+            "nonce": "5a2f364094024c4a8f326db358af8c12",
+            "method": "POST",
+            "path": "/v1/graphql",
+            "host": "graphql.guard.test:18880",
+            "body_sha256": "6dc5f20274429c4618a075cf3cdc33d6709911340048a7e075c73521c18526be",
+            "bytes": 52
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.119
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-mutation-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "8cdde2978befe123c6c94b93c45854f7db8d2c98b00e2212e6912058f9922044",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: mutation is not allowed",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.095
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-unknown-operation-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "cde48cbe164f0c37f722465a021e6b953b7d751ee787b4066a6acf421e243507",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: operation name is not allowed",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.084
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-unknown-root-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "3697c5bb22f3270f88fac99b9006e76ee95829444fe2443b391927da430cfc67",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: root field is not allowed",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.081
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-alias-cannot-hide-root-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "33cca86e88458595190f2b1faaab4a3ecbad244441777630a1784b89656dc305",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: root field is not allowed",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.063
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-selected-query-cannot-hide-mutation-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "96ec6f01e14e3a96735a9ddfebb98d46d60ee0c7731e87fff9a044f30598c6c8",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: mutation is not allowed",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.076
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-depth-bound-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "255ac044bf45f17136b735fb672582b36ec382a94b9d5a85ebe8c59f318b324b",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: selection set nests too deeply",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.077
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-field-bound-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "9713e3f1eee0bdcdaf17053692ac302f96379cde65f33c4a8a565339522afc3b",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: document selects too many fields",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.071
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-operation-bound-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "559846a5060c93043a53f6191da029803923ed56b38e1bd59de7dbda614331e8",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: document declares too many operations",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.09
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-fragment-unsupported-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e5ee61cd13d263a4c876eb104555c3620686b0856bd37d27750b281163b3cdc5",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: fragment spreads are not inspected",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.1
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-malformed-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 400,
+        "expected_status": 400,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "beb6fc0d78e7678a015bc0b1a560394aa6079dbb6ad1d8e6247a7d1e587439f0",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 graphql: document is not parsable",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.052
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-body-bound-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 413,
+        "expected_status": 413,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e345357063879feb37929b160f8ca081bcffec22b34c7042eda5ccb1ed489152",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7: request body exceeds the inspection bound",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.067
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "graphql-positive-control-after-bounds",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
+        "provider_receipts": [
+          {
+            "nonce": "cabfc347bfca42e5b1b8d13ae4018a95",
+            "method": "POST",
+            "path": "/v1/graphql",
+            "host": "graphql.guard.test:18880",
+            "body_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
+            "bytes": 72
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.078
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "visible-http-method-path-allowed",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [
+          {
+            "nonce": "7167c726f4a147eeba1f39838b2989d2",
+            "method": "GET",
+            "path": "/v1/item",
+            "host": "api.guard.test:18880",
+            "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.092
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "visible-http-write-method-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 http: method is not allowed for this host",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.078
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "visible-http-unlisted-path-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 http: path is not allowed for this host",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.07
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "visible-http-prefix-boundary-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "l7 http: path is not allowed for this host",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.063
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "opaque-tunnel-cannot-bypass-visible-rules",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "mode": "sni",
+        "interception_requested": false
+      },
+      "observation_provenance": "runtime host journal + advisory guest CONNECT response",
+      "samples": 1
+    },
+    {
+      "case": "pending-proposal-destination-still-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "proxy destination denied",
+            "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+          }
+        ],
+        "elapsed_seconds": 0.123
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "pending-proposal-preserves-effective-policy",
+      "status": "PASS",
+      "evidence": {
+        "proposal_id": "01a0fde4-9f25-72dc-bdb8-eb844d8f1107",
+        "state": "pending",
+        "effective_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "proposal-agent-cannot-approve",
+      "status": "PASS",
+      "evidence": {
+        "status": 403
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "proposal-self-principal-cannot-approve",
+      "status": "PASS",
+      "evidence": {
+        "status": 403,
+        "pending_state_preserved": true,
+        "effective_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "proposal-self-principal-cannot-deny",
+      "status": "PASS",
+      "evidence": {
+        "status": 403,
+        "pending_state_preserved": true,
+        "effective_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "proposal-independent-human-can-deny",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "state": {
+          "denied": {
+            "note": "separate human denies duplicate ask"
+          }
+        },
+        "effective_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "separate-human-safe-proposal-applies-new-hash-and-audit",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "previous_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919",
+        "effective_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
+        "decided_by": "key:01a0fde4-9f0a-7290-b6a3-d1a6ab7047fc",
+        "events": [
+          {
+            "timestamp": "2026-10-02T18:33:34.042700031Z",
+            "event_id": "0f3c062e-f091-4398-b722-28194d35cedb",
+            "sandbox_id": "01a0fde4-8dbd-732d-af97-6c7a3d6ba9d5",
+            "tenant_id": "7a188e9c-bf76-45a2-8df3-7dd5ed96a9ed",
+            "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
+            "category": "policy",
+            "decision": "allow",
+            "reason": "policy proposal 01a0fde49f2572dcbdb8eb844d8f1107 applied by operator review",
+            "destination": "safe.guard.test:18880",
+            "request_bytes": 0,
+            "response_bytes": 0,
+            "duration_ms": 0,
+            "previous_hash": "a2eb84c89de92ad74e3aac165fa1ebbb486368bb2d83fa26f4f4996ff39999fb",
+            "current_hash": "b1bbfa38287d11b7f1fd24098a7f54c7f7d8727f62e708608458ea65f7c7e901"
+          }
+        ]
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "approved-destination-live-through-gateway",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [
+          {
+            "nonce": "f7275fc3643942868e9ba12a11d872c3",
+            "method": "GET",
+            "path": "/v1/item",
+            "host": "safe.guard.test:18880",
+            "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.124
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "approved-grant-remains-read-only",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "proxy method or path denied",
+            "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c"
+          }
+        ],
+        "elapsed_seconds": 0.085
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "atomic-apply-keeps-existing-mcp-authority",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
+        "provider_receipts": [
+          {
+            "nonce": "309179e0771f4ddcb39a6713636287e4",
+            "method": "POST",
+            "path": "/v1/mcp",
+            "host": "mcp.guard.test:18880",
+            "body_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
+            "bytes": 51
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.104
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "human-approval-runs-verifier-and-unsafe-change-is-rejected",
+      "status": "PASS",
+      "evidence": {
+        "status": 503,
+        "effective_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
+        "verifier_events": [
+          {
+            "timestamp": "2026-10-02T18:33:34.450764844Z",
+            "event_id": "de184279-047c-4e13-b1b1-84abe93f5034",
+            "sandbox_id": "01a0fde4-8dbd-732d-af97-6c7a3d6ba9d5",
+            "tenant_id": "7a188e9c-bf76-45a2-8df3-7dd5ed96a9ed",
+            "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
+            "category": "policy",
+            "decision": "deny",
+            "reason": "verifier refused the proposal: invalid Guard policy: DENIED BOUNDARY VIOLATION: host=unsafe.guard.test port=18880 protocol=tcp matched rule=network.egress[5] unsafe.guard.test: host name is listed in the operator boundary blocked_hosts",
+            "destination": null,
+            "request_bytes": 0,
+            "response_bytes": 0,
+            "duration_ms": 0,
+            "previous_hash": "4078a732b8eff86fdaf870038c802280553d6a87cf8dcda69ba7c25767bf0d7e",
+            "current_hash": "f328516500436b747a3df7e95b20d84c88a0b7bdb09138099103da5360c2a0fd"
+          }
+        ],
+        "error_code": "backend_unavailable"
+      },
+      "observation_provenance": "host/control-plane",
+      "samples": 1
+    },
+    {
+      "case": "unsafe-destination-no-provider-hit",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "proxy destination denied",
+            "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c"
+          }
+        ],
+        "elapsed_seconds": 0.118
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "safe-destination-survives-unsafe-refusal",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [
+          {
+            "nonce": "588c8c9d32c74d2c91f59ff1b0a0d752",
+            "method": "GET",
+            "path": "/v1/item",
+            "host": "safe.guard.test:18880",
+            "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.085
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "openshell-supported-fields-and-semantic-report",
+      "status": "PASS",
+      "evidence": {
+        "exit": 0,
+        "report": {
+          "schema_reference": "https://github.com/NVIDIA/OpenShell/blob/71440b28f48d5fefc569d779f70d6e63893aa80a/docs/how-it-works/policies/schema.mdx",
+          "converted": [
+            {
+              "field": "network_policies.api.binaries",
+              "mapped_to": "absent: treated as unrestricted, which is Guard's per-sandbox scope"
+            },
+            {
+              "field": "network_policies.api.endpoints[0].enforcement",
+              "mapped_to": "always enforced: a Guard rule either permits or refuses"
+            },
+            {
+              "field": "network_policies.api.endpoints[0].access",
+              "mapped_to": "network.egress allowed_methods and allowed_paths"
+            }
+          ],
+          "unsupported": [
+            {
+              "field": "network_policies.*.dns",
+              "reason": "OpenShell DNS controls are binary-scoped; Guard resolves only the hosts its egress rules name, through its own default-deny resolver",
+              "fatal": false
+            }
+          ]
+        }
+      },
+      "observation_provenance": "production CLI",
+      "samples": 1
+    },
+    {
+      "case": "openshell-unknown-semantics-refused",
+      "status": "PASS",
+      "evidence": {
+        "exit": 2,
+        "previous_output_preserved": true,
+        "input_bytes": 202
+      },
+      "observation_provenance": "production CLI + host output bytes",
+      "samples": 1
+    },
+    {
+      "case": "openshell-binary-scoped-authority-refused",
+      "status": "PASS",
+      "evidence": {
+        "exit": 2,
+        "previous_output_preserved": true,
+        "input_bytes": 220
+      },
+      "observation_provenance": "production CLI + host output bytes",
+      "samples": 1
+    },
+    {
+      "case": "openshell-oversized-document-refused",
+      "status": "PASS",
+      "evidence": {
+        "exit": 2,
+        "previous_output_preserved": true,
+        "input_bytes": 4194305
+      },
+      "observation_provenance": "production CLI + host output bytes",
+      "samples": 1
+    },
+    {
+      "case": "openshell-imported-read-authority-live",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 200,
+        "expected_status": 200,
+        "provider_hits": 1,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [
+          {
+            "nonce": "e445613b057f41e089d55818a6db8524",
+            "method": "GET",
+            "path": "/anything",
+            "host": "api.guard.test:18880",
+            "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "bytes": 0
+          }
+        ],
+        "deny_events": [],
+        "elapsed_seconds": 0.108
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "openshell-imported-write-authority-denied",
+      "status": "PASS",
+      "evidence": {
+        "guest_response_status": 403,
+        "expected_status": 403,
+        "provider_hits": 0,
+        "provider_direct_control_status": 200,
+        "provider_direct_control_hits": 1,
+        "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "provider_receipts": [],
+        "deny_events": [
+          {
+            "sequence": null,
+            "category": "network",
+            "decision": "deny",
+            "reason": "proxy method or path denied",
+            "policy_hash": "683a8c34af8f38b55d21aced9f494f5c1fb6ea53fa7fa2cc59c2d8b2fd6cc1ba"
+          }
+        ],
+        "elapsed_seconds": 0.101
+      },
+      "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
+      "samples": 1
+    },
+    {
+      "case": "live-teardown-removes-guard-tables-and-taps",
+      "status": "PASS",
+      "evidence": {
+        "remaining_tables": "",
+        "remaining_interfaces": [
+          "lo"
+        ]
+      },
+      "observation_provenance": "namespace host kernel",
+      "samples": 1
+    },
+    {
+      "case": "no-credentials-in-service-logs",
+      "status": "PASS",
+      "evidence": {
+        "files_scanned": 2,
+        "leaking_files": []
+      },
+      "observation_provenance": "host private logs",
+      "samples": 2
+    }
+  ],
+  "cleanup_errors": [],
+  "provider_requests": 43,
+  "elapsed_seconds": 13.847,
+  "finished_at": "2026-10-02T18:33:38.452581+00:00",
+  "environment": {
+    "runtime": "firecracker",
+    "isolated_network_namespace": true,
+    "rootfs_sha256": "6a53d8fd6b6a8324c7a3e78c61a3c99c4cd1be11188232ea7cc87fb5361e1b60",
+    "provider": "permissive local socket server",
+    "tls_interception": false
+  },
+  "observation_provenance": {
+    "authoritative": [
+      "provider socket receipts",
+      "runtime host event journal",
+      "control-plane API",
+      "namespace nftables"
+    ],
+    "advisory": [
+      "guest HTTP responses"
+    ]
+  }
+}

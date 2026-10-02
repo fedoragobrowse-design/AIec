@@ -834,13 +834,13 @@ impl<'a> Parser<'a> {
                 }
                 _ => {}
             }
-            let field = self.name()?;
+            let mut field = self.name()?;
             self.selected += 1;
             if self.selected > MAX_GRAPHQL_FIELDS {
                 return Err(unsupported("l7 graphql: document selects too many fields"));
             }
             if self.eat(b':') {
-                self.name()?;
+                field = self.name()?;
             }
             if depth == 1 && !roots.contains(&field) {
                 roots.push(field);
@@ -1267,6 +1267,19 @@ mod tests {
                 "query Read { ...Frag } fragment Frag on Repo { id }"
             )
             .refusal(),
+            Some(Refusal::Forbidden)
+        );
+    }
+
+    #[test]
+    fn graphql_root_authority_uses_the_field_not_its_response_alias() {
+        let rules = GraphqlRules {
+            root_fields: vec!["user".into()],
+            ..GraphqlRules::default()
+        };
+        assert!(graphql_verdict(&rules, "{ account: user { id } }").allowed());
+        assert_eq!(
+            graphql_verdict(&rules, "{ user: admin { id } }").refusal(),
             Some(Refusal::Forbidden)
         );
     }

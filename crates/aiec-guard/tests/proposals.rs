@@ -10,7 +10,7 @@ use aiec_guard::{
     policy::{EgressRule, GuardPolicy, ModelEndpoint, PolicyTemplate},
     proposals::{
         AgentCredential, AtomicPolicy, EgressGrant, HumanApproval, ProposalRequest, ProposalState,
-        ProposalStore, ProposalStoreConfig,
+        ProposalStore, ProposalStoreConfig, applied_policy,
     },
 };
 use parking_lot::Mutex;
@@ -526,5 +526,37 @@ async fn a_human_denial_is_recorded_and_leaves_the_policy_alone() {
         h.events()
             .iter()
             .any(|event| event.reason.contains("denied by ops-oncall"))
+    );
+}
+
+#[tokio::test]
+async fn the_policy_the_control_plane_names_is_the_one_the_store_installs() {
+    // The control plane re-derives the applied policy so it can record it on
+    // the sandbox, and may only do so while its derivation is the store's: a
+    // divergence would leave the record naming a policy the guest is not
+    // enforced by, and every later observation would refuse.
+    let h = Harness::new(None, None).await;
+    let submitted = request(GRANTED_HOST, 443);
+    let base = h.policy.compiled().policy().clone();
+    let proposal = h
+        .store
+        .submit(&h.agent, submitted.clone())
+        .await
+        .expect("submission");
+    let outcome = h
+        .store
+        .approve(&h.operator(), proposal.id)
+        .await
+        .expect("a safe proposal applies");
+    let derived = applied_policy(&base, &submitted).expect("the derived policy");
+    assert_eq!(
+        derived.hash().expect("canonical hash"),
+        outcome.policy_hash,
+        "the derived policy is the one in force"
+    );
+    assert_eq!(
+        derived.normalized(),
+        h.policy.compiled().policy().clone().normalized(),
+        "the control plane can name the installed ruleset"
     );
 }

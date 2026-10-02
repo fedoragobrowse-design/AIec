@@ -1,4 +1,6 @@
 {
+  "schema": "aiec.guard.approval-acceptance.v1",
+  "status": "PASS",
   "suite": "guard-approval-acceptance",
   "section": "44",
   "generated_at": "2026-10-02T09:54:13.830304+00:00",

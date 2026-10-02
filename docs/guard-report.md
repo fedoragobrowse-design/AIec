@@ -61,6 +61,12 @@ states what this does and does not defend.
 - **Quarantine.** One path: cut, fence, pause, forensic capture without
   resuming, durable latch, authoritative event, incident report, notification.
   A repeat call finishes pending stages or returns the existing incident.
+- **Retry, then terminal.** An unfinished quarantine is resumed by posting
+  again, on a growing delay, and every attempt carries a closed data-free
+  failure label. When neither the incident nor the control plane answers within
+  the retry window the watchdog exits instead of continuing to look like a
+  working observer. That direction is fail-closed: the exit withholds the
+  heartbeat, which is exactly what the gateway's deadman needs in order to cut.
 - **Budgets and lifetime.** Durable ceilings; a worker restart cannot reset
   them.
 - **Layer 7.** Method, path, MCP method/tool and GraphQL operation/root-field
@@ -389,17 +395,27 @@ leave its ledger unchanged.
 
 | conventional median, n=7 per side | direct provider path | guarded path |
 |---|---:|---:|
-| gateway CPU per 64-request window | 0.00 s (idle gateway) | **0.48 s** |
-| sampled peak gateway RSS | 8 008 KiB | **8 884 KiB** |
-| client wall time per 64 requests | 0.210 s | 1.722 s |
+| gateway CPU per 64-request window | 0.00 s (idle gateway) | **0.46 s** |
+| sampled peak gateway RSS | 7 936 KiB | **8 896 KiB** |
+| client wall time per 64 requests | 0.176 s | 1.614 s |
 
-The separate warmed-idle RSS baseline has median **7 996 KiB**. The median
-**paired** guarded peak minus that pair's idle RSS is **916 KiB** (range
-816–1 128 KiB); it is not the subtraction of the two independently aggregated
-RSS medians. Gateway CPU minus the pair's one-second idle CPU rate, normalized
-to the guarded accounting window, also has median **0.48 s**. Gross gateway CPU
-ranges 0.38–0.55 s: the median corresponds to **7.5 ms CPU per request for this
+Three RSS baselines are recorded separately because they answer different
+questions. The **pre-request startup** RSS, read after the gateway is serving
+and before any traffic, has median 7 056 KiB. The **warmed-idle** RSS, read
+after both sides' warmups have run, has median 7 860 KiB and is steady-state
+rather than cold: buffer and allocator growth from warmup traffic sits inside
+it. The paired guarded peak minus warmed idle is **988 KiB** (range
+620–1 144 KiB) and so understates memory attributable to serving requests,
+since warmup already paid part of it. The paired guarded peak minus
+**startup** is **1 804 KiB** (range 1 356–1 876 KiB); that is the larger and
+more honest figure for memory this workload added, and neither is the
+subtraction of two independently aggregated medians.
+
+Gateway CPU minus the pair's one-second idle CPU rate, normalized to the
+guarded accounting window, has median **0.46 s**. Gross gateway CPU ranges
+0.33–0.54 s: the median corresponds to **7.2 ms CPU per request for this
 workload**, not a general request cost or an end-to-end CPU delta.
+
 
 CPU comes from `/proc/PID/stat` across gateway threads at 100 ticks/s, with
 before/after snapshots enclosing each client invocation. RSS comes from
@@ -574,15 +590,30 @@ python3 scripts/guard-resource-benchmark.py \
 bash scripts/build-firecracker-guest.sh
 ```
 
+```bash
+# Phase 5 acceptance, on a freshly rebuilt scratch image. The launcher mints
+# this run's per-run image manifest, TLS material, guard credentials and trust
+# keys, and refuses to start against a named-but-absent manifest. P5_PHASES is
+# an operator diagnostic: a subset run reports acceptance_scope
+# "diagnostic_subset" and cannot stand as acceptance for the suite.
+AIEC_FIRECRACKER_BIN=$PWD/.agentforge/bin/firecracker-v1.17.0-x86_64 \
+AIEC_KERNEL=/path/to/vmlinux \
+AIEC_ROOTFS=/path/to/freshly/built/aiec-rootfs.ext4 \
+AIEC_GUEST_SECRET=/path/to/guest-secret \
+P5_PG_BIN=/path/to/postgres/bin \
+P5_DRIVER=scripts/guard-phase5-acceptance.py \
+  bash scripts/guard-phase5-acceptance.sh
+```
+
 ## §60 definition-of-done audit
 
 | required area | evidence and disposition |
 |---|---|
 | Phase 1 enforcement, DNS, model credentials, telemetry | Live core suite: 48/48. Includes §49's model-only in-guest tool loop. Local mock providers only. |
 | Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29; alert→network-cut latency 23.656 ms (n=1), from the incident timestamps. The durable lifetime reaper itself has not been observed firing. |
-| Phase 3 MCP/GraphQL policy, proposals, human approval | Implemented and test-covered; §44 additionally proves the live approval API lifecycle. This is not a complete live MCP/GraphQL policy acceptance. |
+| Phase 3 MCP/GraphQL policy, proposals, human approval | Live Phase 3 suite: 47/47, no cleanup errors (`benchmarks/guard-phase3-acceptance.json`), on real Firecracker guests inside a network namespace with an isolated PostgreSQL. Covers agent submission of a proposal, operator approval, the approved policy applying to a running attachment, the enforcement generation moving with it so heartbeats and budget reservations survive the change, allowlisted read authority reaching its destination live, DNS answers rewritten to the gateway, TLS with SNI matching, interception refused without credentials, blocked and private destinations denied, and an OpenShell import producing an enforced policy. |
 | Optional Phase 4 watcher | Implemented and test-covered; no complete live optional-watcher acceptance is claimed. |
-| Phase 5 canaries, image trust, identity, red-team CI | Implemented and test-covered; image verification and per-VM identity participate in the live VM suites. Full Phase 5 live acceptance remains absent. |
+| Phase 5 canaries, image trust, identity, red-team CI | Live Phase 5 suite: 36/36 full-suite, no cleanup errors (`benchmarks/guard-phase5-acceptance.json`). Real Firecracker guests on a freshly rebuilt scratch image, an isolated PostgreSQL, a real worker and watchdog, all inside a network namespace. Covers unsigned/untrusted/tampered/expired image refusal, kernel and rootfs digest enforcement, distinct per-VM identities, cross-sandbox frame refusal, revocation and rotation, host-observed DNS, credential and file canaries with a durable cut and a preserved machine, and a completed incident with cut, pause, snapshot and report timestamps. |
 | Topologies A and B | §49 completes a real in-guest tool loop; §50 completes an external loop with positive-control-validated host capture and counters (15/15). |
 | Existing lifecycle, snapshots, fencing, MCP, eval | Workspace regressions passed in the serial gate; compatibility suite passes 8/8 within its documented coverage. Untested legacy branches and strict response deserializers remain excluded. |
 | §51 performance | DNS upper-middle order statistics (n=10 per side), conventional streaming medians (n=3 per side), quarantine alert→network-cut latency (n=1), and isolated gateway CPU/RSS (n=7 matched pairs) have published artifacts, hardware/kernel/architecture, explicit baselines, and scope. No aarch64 runtime/performance or deployment-wide resource claim. |
@@ -593,24 +624,74 @@ The full non-deferred definition of done is not satisfied.
 
 ## Verdict
 
-**AIEC GUARD: PHASES 1-2 PROVEN LIVE; PHASES 3-5 IMPLEMENTED, NOT YET PROVEN LIVE**
+**AIEC GUARD: PHASES 1-3 AND 5 PROVEN LIVE; PHASE 4 AND THE REAPER NOT YET**
 
-Phases 1 and 2 run on real Firecracker machines against the image produced by
-the build: 48/48 and 29/29, no cleanup errors. §49 proves the in-guest model-only
-tool loop; §50 independently proves the external loop and its bounded
-zero-egress window (15/15). The guest identity and host attachment paths are
-included in the live evidence.
+Phases 1, 2, 3 and 5 run on real Firecracker machines against the image produced
+by the build: 48/48, 29/29, 47/47 and 36/36 full-suite, none with cleanup
+errors. §49 proves the in-guest model-only tool loop; §50 independently proves
+the external loop and its bounded zero-egress window (15/15). The guest
+identity, host attachment, approved-policy and OpenShell-import paths are all
+inside the live Phase 3 evidence.
 
-Phases 3 to 5 are implemented and covered by unit and integration tests, with
-their acceptance exercised against local mocks rather than real machines. Two
-green artifacts do not make that whole surface proven, and the two are kept
-apart on purpose.
+Phase 4 is implemented and unit-covered but has no live run, and the lifetime
+reaper has never been observed firing. Also outstanding: `CAP_NET_ADMIN` is
+absent from the production worker on this host; Layer 7 needs interception to
+govern a tunnelled request; multi-host deployment modes are unvalidated; and
+aarch64 is compiled but never run. Parallel test reliability is unresolved.
+Operator actions remain deploying the rebuilt image and granting the worker
+`CAP_NET_ADMIN`.
 
-Still outstanding: the lifetime reaper has never fired in a live run;
-`CAP_NET_ADMIN` is absent from the production worker on this host; Layer 7
-needs interception to govern a tunnelled request; multi-host deployment modes
-are unvalidated; and aarch64 is compiled but never run. §51 lacks controlled
-gateway resource overhead. Parallel test reliability is unresolved.
-Operator actions include deploying the rebuilt
-image and granting the worker `CAP_NET_ADMIN`. The live approval lifecycle is
-no longer a blocker.
+## What Phase 3 changed in the product
+
+Three defects were found by running it, none of which unit coverage could see.
+
+**An approved policy could not reach the guest it was approved for.** The
+attachment's gateway named the generation it booted with, and approval installs
+a new policy without restarting it, so every heartbeat and every budget
+reservation after an approval was refused against a generation that no longer
+existed. The gateway now names the installed generation at the point the policy
+is applied, and refuses to name anything the live policy cell is not already
+enforcing (`Gateway::adopt_policy`, `Runtime::adopt_policy`). Ownership, node,
+lease fence and release state are unchanged by it: only the hash moves, and only
+where the policy is installed. Heartbeats are additionally checked against the
+policy actually in force, so a watchdog still reporting under a superseded
+generation is refused rather than trusted until someone remembers to tell the
+gateway.
+
+**An approval moved the record but not every other consumer of it.** The
+sandbox record, journal expectations and durable budget each derived the
+installed policy separately. The control plane now derives the policy the
+worker actually installed, verifies its hash against what the worker reports,
+and persists that; the durable budget is re-initialised across the change,
+preserving usage and caps and moving only the policy hash. Published migrations
+are immutable, so this is migration `0023_guard_budget_policy_rebind.sql`.
+Journal pages are checked for chain order, completeness and ownership; a page
+written under an earlier generation is history, not a page from another
+tenant's sandbox, so its recorded hash is not re-judged as if it were current.
+
+**An allowlist without a model endpoint was unenforceable.** The kernel permit
+for the gateway's broker listener was derived from the presence of a model
+endpoint alone. A `read_only_api` policy, which is what an OpenShell import
+produces, names destinations but no model, so its guest was sealed and its
+allowlist could never apply. The permit now follows whether the policy gives
+the guest any destination to reach at all; the gateway is Guard's enforcement
+point, not a privilege, and what the guest can then reach is still decided rule
+by rule inside the gateway. `no-network` has neither and keeps neither listener.
+
+## Running Phase 3
+
+The harness creates its own database, credentials, TLS material, ports and
+scratch paths, and performs its own trusted namespace initialization. It needs
+only an image directory and an administrative PostgreSQL URL; a supplied image
+directory is used exactly as given, and a missing one is an error rather than a
+search.
+
+```text
+P3_IMAGES=/path/to/a/directory/holding/vmlinux-and-aiec-rootfs.ext4 \
+P3_PG_ADMIN_URL=postgresql://user:password@127.0.0.1:5432/aiec \
+  python3 scripts/guard-phase3-acceptance.py
+```
+
+The report is written to `benchmarks/guard-phase3-acceptance.json`, with
+per-case detail, the provider request count, and the observation provenance
+that distinguishes host-observed evidence from a guest's own claim.

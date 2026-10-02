@@ -18,17 +18,24 @@ pub(crate) fn initialize(
     state: GuardBudgetState,
 ) -> Result<GuardBudgetState, StoreError> {
     if let Some(existing) = existing {
-        if existing.identity != state.identity
+        if existing.identity.sandbox_id != state.identity.sandbox_id
+            || existing.identity.tenant_id != state.identity.tenant_id
             || existing.expires_at != state.expires_at
             || existing.max_model_requests != state.max_model_requests
             || existing.max_bytes_in != state.max_bytes_in
             || existing.max_bytes_out != state.max_bytes_out
         {
             return Err(StoreError::Conflict(
-                "Guard budget identity, caps and expiration are immutable".into(),
+                "Guard budget ownership, caps and expiration are immutable".into(),
             ));
         }
-        return Ok(existing.clone());
+        let mut carried = existing.clone();
+        // Usage already spent under the previous policy is still spent. A
+        // human approval may change what the sandbox may reach; it may not buy
+        // the sandbox a second allowance, so the counters move with the
+        // policy identity and never reset to zero.
+        carried.identity.policy_hash = state.identity.policy_hash;
+        return Ok(carried);
     }
     if state.model_requests != 0 || state.bytes_in != 0 || state.bytes_out != 0 || state.quarantined
     {
@@ -382,10 +389,11 @@ impl MemoryRepository {
 }
 
 impl MemoryRepository {
-    pub(crate) async fn update_guard_policy_hash(
+    pub(crate) async fn update_guard_policy(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
+        guard: &aiec_guard::policy::GuardConfig,
         policy_hash: &str,
     ) -> Result<(), StoreError> {
         let mut data = self.data.write().await;
@@ -394,6 +402,7 @@ impl MemoryRepository {
             .get_mut(&sandbox)
             .filter(|row| row.tenant_id == tenant)
             .ok_or(StoreError::NotFound)?;
+        row.environment.guard = Some(guard.clone());
         row.environment.guard_policy_hash = Some(policy_hash.to_owned());
         row.updated_at = Utc::now();
         Ok(())

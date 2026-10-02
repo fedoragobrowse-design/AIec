@@ -40,9 +40,9 @@
 //!
 //! Reading a canary file or resolving a canary hostname is high severity: the
 //! event is recorded at [`Decision::Cut`] and the attachment's network is cut.
-//! Presenting a canary credential is immediate quarantine, and the quarantine
-//! happens *before* the event is appended, so a failing journal cannot leave a
-//! sandbox that exercised a credential running with its egress.
+//! Presenting a canary credential cuts the network, appends the critical event,
+//! and requests durable quarantine. A failed callback is not completion; the
+//! already-cut attachment remains contained and the event remains journaled.
 //!
 //! The monitor never restores, never releases a quarantine and never widens a
 //! policy. It cuts and it quarantines, which are the two directions the
@@ -658,42 +658,91 @@ impl CanaryMonitor {
 
     /// The one place a firing is turned into telemetry and an action.
     ///
-    /// The action comes first. A credential canary quarantines before its record
-    /// is appended, because a journal that cannot be written is a problem to
-    /// report about a sandbox that is already contained, and never a reason to
-    /// leave a sandbox that exercised a credential running with its egress. The
-    /// same order applies to a cut: the network goes first and the evidence
-    /// follows, so a slow or failing sink cannot buy a window of egress.
+    /// Cuts and journals before the durable quarantine callback. A slow sink
+    /// cannot buy an egress window, and the callback can collect its evidence.
     async fn observe(&self, trip: Option<CanaryTrip>) -> Result<CanaryOutcome> {
         let Some(trip) = trip else {
             return Ok(CanaryOutcome::clear());
         };
+        // Contain and journal before calling back into the control plane. The
+        // callback may collect this very journal and pause the guest; holding
+        // attachment locks or appending afterward would lose its evidence.
+        tracing::warn!(
+            sandbox_id = %self.identity.sandbox_id,
+            canary = %trip.reference,
+            rule = trip.rule,
+            "guard canary tripped"
+        );
+        let input = self.event_input(&trip);
+        let reference = trip.reference.clone();
+        let sandbox_id = self.identity.sandbox_id;
+        let enforcer = Arc::clone(&self.enforcer);
+        let events = Arc::clone(&self.events);
         let request = QuarantineRequest {
             fence: self.fence,
             policy_hash: self.identity.policy_hash.clone(),
             rules: vec![RuleTrigger {
                 rule: trip.rule.to_owned(),
                 first_event_sequence: None,
-                evidence_references: vec![trip.reference.clone()],
+                evidence_references: vec![reference.clone()],
             }],
         };
-        let (cut, quarantined) = match trip.response {
-            CanaryResponse::Cut => {
-                self.enforcer.cut().await?;
-                (true, false)
-            }
-            CanaryResponse::Quarantine => {
-                self.enforcer.quarantine(request).await?;
-                (true, true)
-            }
+        // The whole containment sequence runs in a task of its own, and the
+        // caller waits for it when it can. Two callers can otherwise cancel the
+        // evidence mid-flight: a DNS server whose latched cut it selects on, or
+        // a request handler whose client disconnected. Both drop this future,
+        // which would leave a cut with no journal record and no durable
+        // quarantine - a tripwire that fires and is then denied its own
+        // evidence. A spawned task survives its parent being dropped.
+        let contain = async move {
+            enforcer.cut().await.map_err(|error| {
+                tracing::error!(
+                    %sandbox_id,
+                    canary = %reference,
+                    %error,
+                    "guard canary cut failed before the journal record"
+                );
+                error
+            })?;
+            let event = events.append(input).await.map_err(|error| {
+                tracing::error!(
+                    %sandbox_id,
+                    canary = %reference,
+                    %error,
+                    "guard canary journal append failed after the cut"
+                );
+                error
+            })?;
+            let mut request = request;
+            let quarantined = match trip.response {
+                CanaryResponse::Cut => false,
+                CanaryResponse::Quarantine => {
+                    request.rules[0]
+                        .evidence_references
+                        .push(event.current_hash.clone());
+                    enforcer.quarantine(request).await?;
+                    true
+                }
+            };
+            Ok::<CanaryOutcome, crate::GuardError>(CanaryOutcome {
+                trip: Some(trip),
+                event: Some(event),
+                cut: true,
+                quarantined,
+            })
         };
-        let input = self.event_input(&trip);
-        let event = self.events.append(input).await?;
-        Ok(CanaryOutcome {
-            trip: Some(trip),
-            event: Some(event),
-            cut,
-            quarantined,
+        Ok(match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let joined = tokio::spawn(contain).await.map_err(|error| {
+                    crate::GuardError::Unavailable(format!(
+                        "canary containment did not complete: {error}"
+                    ))
+                })?;
+                joined?
+            }
+            // No runtime to spawn into, which is a synchronous caller such as a
+            // test: containment still runs, it just cannot outlive this future.
+            Err(_) => contain.await?,
         })
     }
 
@@ -739,12 +788,25 @@ mod tests {
     struct Recorder {
         cuts: std::sync::Mutex<u32>,
         quarantines: std::sync::Mutex<Vec<QuarantineRequest>>,
+        /// How long a cut takes, so a test can cancel a caller mid-containment.
+        cut_delay_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl Recorder {
+        fn slow_cut(&self, millis: u64) {
+            self.cut_delay_ms
+                .store(millis, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
     impl CanaryEnforcer for Recorder {
         async fn cut(&self) -> Result<()> {
             *self.cuts.lock().expect("recorder") += 1;
+            let delay = self.cut_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             Ok(())
         }
 
@@ -901,6 +963,44 @@ mod tests {
         verify_chain(&events).expect("chain");
     }
 
+    /// A caller that abandons its observation takes nothing with it.
+    ///
+    /// The cut is what latches, and latching is what the DNS servers and the
+    /// runtime's file-read handlers watch: a containment that ran inline could
+    /// be cancelled by the very latch it installed, leaving the guest cut with
+    /// no canary record and no durable quarantine behind it.
+    #[tokio::test]
+    async fn containment_completes_after_its_caller_is_cancelled() {
+        let (monitor, recorder, fixture) = monitor(default_config()).await;
+        recorder.slow_cut(250);
+        let caller = tokio::spawn(async move { monitor.observe_dns_query(HOST).await });
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        caller.abort();
+        let _ = caller.await;
+
+        let mut recorded = false;
+        for _ in 0..200 {
+            let events = read_events(&fixture.journal).expect("journal");
+            recorded = events
+                .iter()
+                .any(|event| event.category == Category::Dns && event.decision == Decision::Cut);
+            if recorded {
+                verify_chain(&events).expect("chain");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            recorded,
+            "a cancelled caller still leaves the canary record in the journal"
+        );
+        assert_eq!(
+            *recorder.cuts.lock().expect("cuts"),
+            1,
+            "the network is cut exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn presenting_a_canary_credential_quarantines_immediately() {
         let (monitor, recorder, fixture) = monitor(default_config()).await;
@@ -918,17 +1018,18 @@ mod tests {
         );
         assert!(outcome.cut, "quarantining also takes the network");
 
+        let events = read_events(&fixture.journal).expect("journal");
         let quarantines = recorder.quarantines.lock().expect("quarantines");
         assert_eq!(quarantines.len(), 1);
         assert_eq!(quarantines[0].fence.generation, 7);
         assert_eq!(quarantines[0].rules[0].rule, RULE_CANARY_CREDENTIAL);
+        // The reference binds the callback to the exact host event it cut for:
+        // the opaque canary reference, then that event's own hash.
         assert_eq!(
             quarantines[0].rules[0].evidence_references,
-            vec![trip.reference.clone()]
+            vec![trip.reference.clone(), events[0].current_hash.clone()]
         );
         drop(quarantines);
-
-        let events = read_events(&fixture.journal).expect("journal");
         assert_eq!(events[0].decision, Decision::Quarantine);
         verify_chain(&events).expect("chain");
     }

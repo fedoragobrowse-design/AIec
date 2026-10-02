@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     // Owner-side activation, not a guest-supplied heartbeat or relaxed policy.
-    gateway.heartbeat(gateway.control().identity())?;
+    gateway.heartbeat(&gateway.control().identity())?;
     println!(
         "{}",
         serde_json::json!({"gateway":"ready", "policy_hash":gateway.control().policy_hash(),
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                gateway.heartbeat(gateway.control().identity())?;
+                gateway.heartbeat(&gateway.control().identity())?;
             }
         }
     }

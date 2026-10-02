@@ -936,6 +936,18 @@ async fn acquire_sandbox(
     if run.resources.guard.is_some() {
         required.network_policy = true;
     }
+    // The registry profile is the control plane's own runtime, so it cannot
+    // answer for the workers. Placement filters nodes by the full requirement;
+    // the kind selection only gets to veto when nothing in the deployment can
+    // enforce egress at all, which keeps the refusal fail-closed.
+    let mut kind_requirement = required.clone();
+    if run.resources.guard.is_some()
+        && crate::worker_enforces_egress(state)
+            .await
+            .map_err(|error| (error, reasons.clone()))?
+    {
+        kind_requirement.network_policy = false;
+    }
     // A Guard selection is enforced by the runtime that owns the guest's
     // network attachment, and there is no weaker fallback: asking for Guard and
     // landing on a runtime that cannot install the rules would be a sandbox
@@ -955,7 +967,7 @@ async fn acquire_sandbox(
     let (runtime_kind, reason) = match state.runtime_registry() {
         Some(registry) => {
             let selection = registry
-                .select(requested, &required, minimum)
+                .select(requested, &kind_requirement, minimum)
                 .await
                 .map_err(|error| (error, reasons.clone()))?;
             (selection.runtime, selection.reason)

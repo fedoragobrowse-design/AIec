@@ -72,6 +72,7 @@ struct RunningGuard {
 struct AttachmentCanaryEnforcer {
     guard: Weak<RunningGuard>,
     cut: std::sync::Arc<dyn aiec_guard::enforcement::EnforcementBackend>,
+    authority: Arc<dyn BudgetAuthority>,
 }
 
 #[async_trait]
@@ -86,7 +87,7 @@ impl CanaryEnforcer for AttachmentCanaryEnforcer {
             // touched a tripwire.
             gateway.hold_cut("canary fired")?;
         }
-        let _ = self.cut.cut_network(&guard.attachment).await;
+        self.cut.cut_network(&guard.attachment).await?;
         guard
             .kernel_cut
             .store(true, std::sync::atomic::Ordering::Release);
@@ -94,14 +95,15 @@ impl CanaryEnforcer for AttachmentCanaryEnforcer {
     }
 
     async fn quarantine(&self, request: QuarantineRequest) -> Result<(), aiec_guard::GuardError> {
-        // The quarantine itself is a control-plane decision - it marks durable
-        // state and dispatches a pause and a capture - so a worker-side canary
-        // cuts and reports, and the control plane's reaper path decides the
-        // rest. Reporting an unapplied quarantine as done would be a lie.
-        let _ = request;
-        Err(aiec_guard::GuardError::Unavailable(
-            "canary quarantine is applied by the control plane".into(),
-        ))
+        let guard = self.guard.upgrade().ok_or_else(|| {
+            aiec_guard::GuardError::Unavailable("canary attachment disappeared".into())
+        })?;
+        let identity = GuardIdentity {
+            sandbox_id: guard.attachment.sandbox_id,
+            tenant_id: guard.attachment.tenant_id,
+            policy_hash: request.policy_hash.clone(),
+        };
+        self.authority.quarantine(&identity, request).await
     }
 }
 
@@ -187,12 +189,25 @@ fn probe_enforcement() -> bool {
 
 impl GuardNetworkManager {
     pub fn new(state_dir: PathBuf) -> Self {
+        let local_test_mode = std::env::var("AIEC_GUARD_TEST_MODE").as_deref() == Ok("1");
+        // Local mock destinations need the host's namespace inode to compare
+        // against, and a process inside a fresh user+network namespace cannot
+        // read it for itself: PID 1 belongs to a namespace it cannot see. The
+        // launcher read it before unsharing, so it passes it in.
+        //
+        // Read only in local test mode. That mode is already an explicit
+        // operator opt-in, and outside it the recording is never taken, so a
+        // production worker has no way to satisfy the isolation condition and
+        // mock destinations stay unreachable from a shipped binary.
+        if local_test_mode && let Ok(host) = std::env::var("AIEC_GUARD_ACCEPTANCE_HOST_NETNS") {
+            aiec_guard::deployment::set_host_network_namespace(host);
+        }
         Self {
             state_dir,
             credential_file: std::env::var_os("AIEC_GUARD_CREDENTIALS_FILE").map(PathBuf::from),
             boundary_file: std::env::var_os("AIEC_GUARD_BOUNDARY_FILE").map(PathBuf::from),
             allow_legacy: std::env::var("AIEC_ALLOW_LEGACY_NETWORK").as_deref() == Ok("1"),
-            local_test_mode: std::env::var("AIEC_GUARD_TEST_MODE").as_deref() == Ok("1"),
+            local_test_mode,
             can_enforce: probe_enforcement(),
             enforcement: Arc::new(NftablesBackend::new()),
             running: Arc::new(Mutex::new(BTreeMap::new())),
@@ -495,6 +510,39 @@ impl GuardNetworkManager {
         *guard.proposals.lock().await = Some(store.clone());
         Ok(store)
     }
+    /// Names the enforcement generation an approved proposal just installed.
+    ///
+    /// The attachment's gateway still names the policy it booted with, and an
+    /// approved change does not restart it. Every watchdog heartbeat and every
+    /// budget reservation would then be refused against a generation that no
+    /// longer exists, which is the same sandbox failing closed on a correct
+    /// decision.
+    ///
+    /// The attachment is bound under the new hash, which is what the live
+    /// policy cell reports by the time this runs: ownership, node, fence and
+    /// release are all still checked, and the generation is precisely the one
+    /// value the apply is entitled to move. The gateway refuses the rebind
+    /// unless that same hash is what it is actually enforcing.
+    async fn guard_adopt_policy(
+        &self,
+        sandbox: &Sandbox,
+        policy_hash: &str,
+    ) -> Result<(), CoreError> {
+        let fence = self
+            .fences
+            .read()
+            .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?
+            .get(&sandbox.id)
+            .map(|context| context.fence)
+            .ok_or_else(|| CoreError::Unavailable("Guard lease context missing".into()))?;
+        let guard = self.bound_guard(sandbox, policy_hash, fence).await?;
+        let gateway = guard.gateway.lock().await;
+        gateway
+            .as_ref()
+            .ok_or_else(|| CoreError::Unavailable("Guard gateway missing".into()))?
+            .adopt_policy(policy_hash)
+            .map_err(guard_error)
+    }
 
     pub async fn guard_heartbeat(
         &self,
@@ -623,11 +671,18 @@ impl GuardNetworkManager {
             .await
             .map_err(|_| CoreError::Unavailable("Guard journal verification task failed".into()))?
             .map_err(guard_error)?;
-        if page.events.iter().any(|event| {
-            event.sandbox_id != sandbox.id
-                || event.tenant_id != sandbox.tenant_id
-                || event.policy_hash != policy_hash
-        }) {
+        // Ownership is what a page has to prove. The policy a row carries is
+        // the policy that was in force when the row was written, and the
+        // journal is append-only across approvals: requiring every row to
+        // carry the current hash would make a sandbox unreadable the moment a
+        // human approved a change, which is exactly when its audit trail
+        // matters most. Ordering and completeness are what `verified_snapshot`
+        // already proved over the hash chain.
+        if page
+            .events
+            .iter()
+            .any(|event| event.sandbox_id != sandbox.id || event.tenant_id != sandbox.tenant_id)
+        {
             return Err(CoreError::Unavailable(
                 "Guard journal identity mismatch".into(),
             ));
@@ -834,7 +889,7 @@ impl GuardNetworkManager {
                 dns_port: DNS_PORT,
                 credentials: Arc::new(credentials),
                 events: events.clone(),
-                budget_authority: authority,
+                budget_authority: authority.clone(),
                 watchdog_timeout: Duration::from_millis(config.watchdog_timeout_ms),
             }, l7)
             .await
@@ -886,11 +941,9 @@ impl GuardNetworkManager {
                     guard: Arc::downgrade(&guard),
                     enforcement: self.enforcement.clone(),
                 }));
-                // Canaries are optional and are only constructed when the
-                // sandbox configures one. Only the two observations the host
-                // actually sees are wired: a resolved name and a presented
-                // credential. A file the guest reads is not visible outside the
-                // guest, so it is not wired to an authoritative action here.
+                // DNS and credential presentation are host-observed. File
+                // canaries cover trusted control-channel reads only, never
+                // arbitrary in-guest execution or advisory guest logs.
                 if let Some(guard_config) = &sandbox.environment.guard {
                     let monitor = CanaryMonitor::new(
                         &guard_config.canaries,
@@ -904,6 +957,7 @@ impl GuardNetworkManager {
                         Arc::new(AttachmentCanaryEnforcer {
                             guard: Arc::downgrade(&guard),
                             cut: self.enforcement.clone(),
+                            authority: authority.clone(),
                         }),
                     )
                     .map_err(guard_error)?;
@@ -953,6 +1007,43 @@ impl NetworkBackend for GuardNetworkManager {
     async fn guard_set_fence(&self, sandbox: &Sandbox, fence: GuardFence) -> Result<(), CoreError> {
         GuardNetworkManager::guard_set_fence(self, sandbox, fence).await
     }
+    async fn guard_observe_file_read(
+        &self,
+        sandbox: &Sandbox,
+        path: &str,
+    ) -> Result<(), CoreError> {
+        let Some(config) = sandbox.environment.guard.as_ref() else {
+            return Ok(());
+        };
+        if config.canaries.files.is_empty() {
+            return Ok(());
+        }
+        let fence = self
+            .fences
+            .read()
+            .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?
+            .get(&sandbox.id)
+            .map(|context| context.fence)
+            .ok_or_else(|| CoreError::Unavailable("Guard lease context missing".into()))?;
+        let hash = sandbox
+            .environment
+            .guard_policy_hash
+            .as_deref()
+            .ok_or_else(|| CoreError::Unavailable("Guard policy hash missing".into()))?;
+        let guard = self.bound_guard(sandbox, hash, fence).await?;
+        // Clone the monitor handle out of the gateway and drop the lock: the
+        // observation can journal events and cut the attachment, and must not
+        // be holding the gateway's own lock while it does.
+        let monitor = guard
+            .gateway
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|gateway| gateway.canaries())
+            .ok_or_else(|| CoreError::Unavailable("Guard file canary monitor missing".into()))?;
+        monitor.observe_file_read(path).await.map_err(guard_error)?;
+        Ok(())
+    }
 
     async fn guard_control(
         &self,
@@ -977,12 +1068,16 @@ impl NetworkBackend for GuardNetworkManager {
                 let base = proposal.base_policy_hash.clone();
                 let store = self.proposal_store(sandbox, &base, fence).await?;
                 match store.apply_attested(proposal.clone(), &approved_by).await {
-                    Ok(outcome) => Ok(GuardControlResponse::PolicyApplied {
-                        proposal_id: outcome.proposal_id,
-                        previous_policy_hash: outcome.previous_policy_hash,
-                        policy_hash: outcome.policy_hash,
-                        already_applied: false,
-                    }),
+                    Ok(outcome) => {
+                        self.guard_adopt_policy(sandbox, &outcome.policy_hash)
+                            .await?;
+                        Ok(GuardControlResponse::PolicyApplied {
+                            proposal_id: outcome.proposal_id,
+                            previous_policy_hash: outcome.previous_policy_hash,
+                            policy_hash: outcome.policy_hash,
+                            already_applied: false,
+                        })
+                    }
                     // The apply already happened; the control plane is retrying
                     // after a lost response and needs the same answer, not a
                     // second ruleset install and a second audit record.
@@ -995,6 +1090,7 @@ impl NetworkBackend for GuardNetworkManager {
                                     "replayed apply carried no policy hash".into(),
                                 )
                             })?;
+                        self.guard_adopt_policy(sandbox, &hash).await?;
                         Ok(GuardControlResponse::PolicyApplied {
                             proposal_id: proposal.id,
                             previous_policy_hash: base,

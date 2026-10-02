@@ -1,5 +1,7 @@
 mod guard;
+mod image;
 use guard::{GuardCommand, guard_command};
+use image::{ImageCommand, image_command};
 
 use aiec_api::{
     HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
@@ -92,6 +94,11 @@ enum Command {
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
+    },
+    /// The signed manifest a deployment's image trust gate checks.
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
     },
     Benchmark(BenchmarkArgs),
 }
@@ -444,6 +451,7 @@ async fn main() -> Result<()> {
         Command::File { command } => file_command(&url, api_key.clone(), command).await,
         Command::Snapshot { command } => snapshot_command(&url, api_key.clone(), command).await,
         Command::Guard { command } => guard_command(&url, api_key.clone(), command).await,
+        Command::Image { command } => image_command(command).await,
         Command::Run { command } => run_command(&url, api_key.clone(), command).await,
         Command::Eval { command } => eval_command(&url, api_key.clone(), command).await,
         Command::Benchmark(args) => benchmark(&url, api_key, args).await,

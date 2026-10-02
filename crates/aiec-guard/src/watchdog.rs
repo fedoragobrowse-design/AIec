@@ -538,12 +538,12 @@ fn high_entropy(label: &str, config: &WatchdogConfig) -> bool {
 fn validate_rules(rules: &[RuleTrigger]) -> Result<()> {
     if rules.len() > MAX_RULES
         || rules.iter().any(|rule| {
-            rule.rule.is_empty()
+            // The same grammar the policy compiler enforces, not a second and
+            // stricter one: a watchdog that rejects `canary.credential-
+            // presented` cannot read its own canary's incident, which is the
+            // opposite of what independent evidence checking is for.
+            !crate::policy::is_rule_name(&rule.rule)
                 || rule.rule.len() > 64
-                || !rule
-                    .rule
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 || rule.evidence_references.len() > MAX_REFERENCES
                 || rule.evidence_references.iter().any(|r| {
                     r.len() > 256 || !r.is_ascii() || r.bytes().any(|b| b.is_ascii_control())
@@ -1027,6 +1027,45 @@ impl ControlPlaneTransport {
         }
         Ok(())
     }
+    /// Restriction-only watcher dispatch. The target is host-owned, never taken
+    /// from reviewer text. The existing pause API retains its authorization,
+    /// placement and worker fencing checks.
+    pub async fn pause(&self, fence: GuardFence) -> Result<()> {
+        let observation = self.observe(0).await?;
+        if observation.identity != self.identity
+            || observation.fence.lease_id != fence.lease_id
+            || observation.fence.generation < fence.generation
+        {
+            return Err(integrity("pause observation identity or lease mismatch"));
+        }
+        if observation.paused || observation.budget.quarantined {
+            return Ok(());
+        }
+        let endpoint = self
+            .base
+            .join(&format!("/v1/sandboxes/{}/pause", self.identity.sandbox_id))
+            .map_err(|_| GuardError::Policy("invalid pause endpoint".into()))?;
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(self.token.as_str())
+            .send()
+            .await
+            .map_err(|_| GuardError::Unavailable("pause dispatch lost".into()))?;
+        let sandbox: serde_json::Value = bounded_json(response).await?;
+        let expected = (
+            self.identity.sandbox_id.to_string(),
+            self.identity.tenant_id.to_string(),
+        );
+        if sandbox.get("id").and_then(serde_json::Value::as_str) != Some(expected.0.as_str())
+            || sandbox.get("tenant_id").and_then(serde_json::Value::as_str)
+                != Some(expected.1.as_str())
+            || sandbox.get("state").and_then(serde_json::Value::as_str) != Some("paused")
+        {
+            return Err(integrity("pause response identity or state mismatch"));
+        }
+        Ok(())
+    }
     pub async fn quarantine(
         &self,
         fence: GuardFence,
@@ -1234,6 +1273,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+    /// A canary incident carries a dotted, hyphenated rule name, and the
+    /// watchdog has to be able to read it: a stricter private copy of the
+    /// rule-name grammar rejected `canary.credential-presented` here, which
+    /// stopped the control plane's report stage and left the incident
+    /// permanently incomplete.
+    #[test]
+    fn an_incident_named_by_a_canary_rule_is_itself_valid_evidence() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let e = event(
+            "credential refused",
+            Category::Credential,
+            GENESIS_HASH,
+            now,
+        );
+        let incident = GuardIncident {
+            id: Uuid::from_u128(4),
+            identity: identity(),
+            fence: GuardFence {
+                lease_id: Uuid::from_u128(3),
+                generation: 1,
+            },
+            rules: vec![RuleTrigger {
+                rule: crate::canaries::RULE_CANARY_CREDENTIAL.into(),
+                first_event_sequence: Some(1),
+                evidence_references: vec![format!("event:1:{}", e.current_hash)],
+            }],
+            triggered_at: now,
+            network_cut_at: Some(now),
+            paused_at: Some(now),
+            snapshot_id: Some("incident-id".into()),
+            completed_at: Some(now),
+            event_start_sequence: 1,
+            event_previous_hash: GENESIS_HASH.into(),
+            event_sequence: 1,
+            event_head: e.current_hash.clone(),
+            events: vec![e],
+            errors: Vec::new(),
+            notified_at: None,
+            report: String::new(),
+        };
+        validate_incident(&incident).unwrap();
+        generate_incident_report(&incident).unwrap();
+        // The same grammar still refuses a name that could carry a value.
+        let mut tampered = incident;
+        tampered.rules[0].rule = "canary credential\n".into();
+        assert!(validate_incident(&tampered).is_err());
     }
     #[tokio::test]
     async fn report_escapes_evidence_and_refuses_false_completion_or_tail() {

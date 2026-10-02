@@ -172,6 +172,22 @@ pub trait NetworkBackend: Send + Sync {
     ) -> Result<(), crate::CoreError> {
         Err(crate::CoreError::Unsupported("Guard ownership".into()))
     }
+    /// Observes a trusted control-channel file read, not arbitrary guest syscalls.
+    async fn guard_observe_file_read(
+        &self,
+        sandbox: &Sandbox,
+        _path: &str,
+    ) -> Result<(), crate::CoreError> {
+        if sandbox
+            .environment
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !guard.canaries.files.is_empty())
+        {
+            return Err(crate::CoreError::Unsupported("Guard file canaries".into()));
+        }
+        Ok(())
+    }
     /// Controls only an existing identity-bound attachment.
     async fn guard_control(
         &self,

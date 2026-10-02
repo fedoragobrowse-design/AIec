@@ -780,6 +780,16 @@ fn candidate_policy(base: &GuardPolicy, request: &ProposalRequest) -> Result<Gua
     Ok(candidate)
 }
 
+/// The policy a granted request installs, derived exactly as the store
+/// derives it.
+///
+/// The control plane needs the resulting policy, not only its hash: the
+/// sandbox record is what authorizes later observations, and a record that
+/// still carries the base policy can no longer name the ruleset in force.
+pub fn applied_policy(base: &GuardPolicy, request: &ProposalRequest) -> Result<GuardPolicy> {
+    candidate_policy(base, request)
+}
+
 fn is_extension_of(base: &GuardPolicy, candidate: &GuardPolicy) -> bool {
     if base.version != candidate.version
         || base.limits != candidate.limits

@@ -53,6 +53,16 @@ pub trait BudgetAuthority: Send + Sync {
         fence: GuardFence,
         debit: BudgetDebit,
     ) -> Result<()>;
+    /// Requests durable containment from the authenticated control plane.
+    async fn quarantine(
+        &self,
+        _identity: &GuardIdentity,
+        _request: QuarantineRequest,
+    ) -> Result<()> {
+        Err(crate::GuardError::Unavailable(
+            "Guard quarantine authority is not configured".into(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

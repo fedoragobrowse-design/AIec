@@ -562,18 +562,23 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Sandbox, CoreError> {
         Err(CoreError::Unsupported("mark_guard_quarantined".into()))
     }
-    /// Records the policy hash a sandbox now runs under.
+    /// Records the Guard configuration a sandbox now runs under.
     ///
     /// An approved proposal changes the enforcement identity without changing
-    /// the sandbox's lifecycle, so this writes the hash alone rather than
-    /// pretending the machine was started again.
-    async fn update_guard_policy_hash(
+    /// the sandbox's lifecycle, so this writes the configuration and its hash
+    /// alone rather than pretending the machine was started again. The policy
+    /// itself has to be written with the hash: every later observation is
+    /// authorized against the policy the record carries, and a record holding
+    /// the superseded policy would refuse every read of a correctly enforced
+    /// sandbox.
+    async fn update_guard_policy(
         &self,
         _tenant: TenantId,
         _sandbox: SandboxId,
+        _guard: &aiec_guard::policy::GuardConfig,
         _policy_hash: &str,
     ) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported("update_guard_policy_hash".into()))
+        Err(CoreError::Unsupported("update_guard_policy".into()))
     }
     /// Records a policy proposal and its state.
     ///

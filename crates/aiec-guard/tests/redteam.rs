@@ -293,7 +293,7 @@ impl Harness {
         // would pass for entirely the wrong reason.
         assert!(
             gateway
-                .heartbeat(gateway.identity())
+                .heartbeat(&gateway.identity())
                 .expect("first heartbeat activates the attachment"),
             "the first heartbeat must activate the attachment"
         );

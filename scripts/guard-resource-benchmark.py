@@ -44,6 +44,7 @@ def meter_control():
     print("ready", flush=True)
     sys.stdin.readline()
     memory = bytearray(32 * 1024 * 1024)
+    memory[::4096] = b"x" * (len(memory) // 4096)
     until = time.monotonic() + 0.3
     while time.monotonic() < until:
         sum(range(10000))
@@ -326,6 +327,7 @@ def benchmark(args):
                                 raise RuntimeError(f"gateway failed before readiness: {diagnostic}")
                             ready = json.loads(line)
                         fixture.identity = {"sandbox_id": sandbox, "tenant_id": tenant, "policy_hash": ready["policy_hash"]}
+                        startup = snapshot(gateway.pid)
                         direct = {"address": "198.18.0.10", "port": port, "path": "/v1/chat/completions", "authorization": "Bearer " + fixture.secret,
                                   "chunks": args.chunks, "requests": args.requests}
                         guarded = {**direct, "address": "127.0.0.1", "port": int(ready["broker"].rsplit(":", 1)[1]),
@@ -346,7 +348,8 @@ def benchmark(args):
                         time.sleep(1)
                         idle_after = snapshot(gateway.pid)
                         idle_wall = time.monotonic() - idle_start
-                        pair = {"index": index, "idle": {"before": idle_before, "after": idle_after, "wall_seconds": idle_wall},
+                        pair = {"index": index, "startup_before_any_request": startup,
+                                "idle": {"before": idle_before, "after": idle_after, "wall_seconds": idle_wall},
                                 "order": ["direct", "guarded"] if index % 2 == 0 else ["guarded", "direct"]}
                         for side in pair["order"]:
                             before = snapshot(gateway.pid)
@@ -369,14 +372,17 @@ def benchmark(args):
                             pair[side] = value
                         pair["guarded_cpu_minus_normalized_idle_seconds"] = pair["guarded"]["gateway_cpu_seconds"] - (idle_after["cpu_ticks"] - idle_before["cpu_ticks"]) / HZ / idle_wall * pair["guarded"]["gateway_window_seconds"]
                         pair["sampled_peak_rss_minus_idle_kib"] = pair["guarded"]["gateway_sampled_peak_rss_kib"] - idle_after["rss_kib"]
+                        pair["sampled_peak_rss_minus_startup_kib"] = pair["guarded"]["gateway_sampled_peak_rss_kib"] - startup["rss_kib"]
                         result["samples"].append(pair)
                         print(f"pair {index + 1}/{args.samples}: verified {args.requests} requests per side", file=sys.stderr)
                     finally:
-                        gateway.send_signal(signal.SIGINT)
+                        if gateway.poll() is None:
+                            gateway.send_signal(signal.SIGINT)
                         try:
                             gateway.wait(timeout=20)
                         except subprocess.TimeoutExpired:
-                            gateway.kill()
+                            if gateway.poll() is None:
+                                gateway.kill()
                             gateway.wait(timeout=5)
                             raise RuntimeError("gateway required forced cleanup")
                         gateway.stdout.close()
@@ -390,8 +396,10 @@ def benchmark(args):
                                 ("gateway_cpu_seconds", "gateway_sampled_peak_rss_kib", "cpu_seconds", "wall_seconds", "peak_rss_kib")}
                          for side in ("direct", "guarded")}
     result["summary"].update({key: statistics.median(p[key] for p in pairs) for key in
-                              ("guarded_cpu_minus_normalized_idle_seconds", "sampled_peak_rss_minus_idle_kib")})
+                              ("guarded_cpu_minus_normalized_idle_seconds", "sampled_peak_rss_minus_idle_kib",
+                               "sampled_peak_rss_minus_startup_kib")})
     result["summary"]["idle_gateway_rss_kib"] = statistics.median(p["idle"]["after"]["rss_kib"] for p in pairs)
+    result["summary"]["startup_gateway_rss_kib"] = statistics.median(p["startup_before_any_request"]["rss_kib"] for p in pairs)
     assert all(p["guarded"]["gateway_cpu_seconds"] >= 5 / HZ for p in pairs), "workload CPU below five meter ticks; increase requests"
     encoded = json.dumps(result, indent=2) + "\n"
     assert fixture.secret not in encoded and fixture.worker not in encoded, "credential leaked in artifact"

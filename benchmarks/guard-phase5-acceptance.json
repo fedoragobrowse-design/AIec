@@ -1,0 +1,608 @@
+{
+ "artifact": "guard-phase5-acceptance",
+ "status": "PASS",
+ "acceptance_scope": "full_suite",
+ "started_at": 1790958352.4017098,
+ "elapsed_seconds": 170.2,
+ "passed": 36,
+ "cases_total": 36,
+ "failing": [],
+ "cleanup_errors": [],
+ "phases_run": [
+  "identity",
+  "file",
+  "hostname",
+  "credential"
+ ],
+ "observation_provenance": {
+  "canaries": "host-observed by the shipped Guard monitor: guest dns queries over the attachment resolver, credential presentation on the worker gateway, and control-channel file reads on the worker",
+  "durable_quarantine": "control-plane state latched by the worker-authenticated quarantine endpoint, not a worker-local claim",
+  "image_and_identity": "real local Firecracker guests, host filesystem digests and authenticated vsock control channel, driven by guard_phase5_acceptance",
+  "out_of_scope": "arbitrary in-guest process file reads are not observable from outside the guest without trusted in-guest instrumentation and are not claimed here"
+ },
+ "guest_image": "freshly rebuilt scratch rootfs for this run; the deployment's kernel and rootfs were verified unchanged after every refusal",
+ "environment": {
+  "runtime": "local Firecracker microVM, one worker process, real guest agent",
+  "control_plane": "aiec-server on an isolated PostgreSQL",
+  "isolation": "network namespace, per-run database, credentials, TLS material, ports and scratch paths"
+ },
+ "cases": [
+  {
+   "case": "unsigned image refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "image with no trusted signer refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "image signed by an untrusted key refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "tampered signed manifest refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "expired signed manifest refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "tampered kernel digest refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "tampered rootfs digest refused before boot",
+   "status": "PASS",
+   "evidence": {
+    "create_refused": true,
+    "mutated_files": "copies inside this run's scratch directory",
+    "socket_directory_absent": true,
+    "start_refused": true,
+    "vm_directory_absent": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "the signed manifest admits the kernel and rootfs actually on disk",
+   "status": "PASS",
+   "evidence": {
+    "digests": "streamed from the files the runtime would boot",
+    "kernel_sha256": "586a02db8ea1fd331d45efa6ebf502fff21ceddfedf010ef70ba389b8e095523",
+    "requirement": "required",
+    "rootfs_sha256": "6a53d8fd6b6a8324c7a3e78c61a3c99c4cd1be11188232ea7cc87fb5361e1b60",
+    "scope": "gate admission only; guarded boot enforcement is covered by the phase 2 suite",
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "two real guests boot from the signed image and take distinct identities",
+   "status": "PASS",
+   "evidence": {
+    "booted_guests": 2,
+    "kernel_sha256": "586a02db8ea1fd331d45efa6ebf502fff21ceddfedf010ef70ba389b8e095523",
+    "rootfs_sha256": "6a53d8fd6b6a8324c7a3e78c61a3c99c4cd1be11188232ea7cc87fb5361e1b60",
+    "scope": "unguarded boots; Guard enforcement of a guarded boot is the phase 2 suite's claim, not this one's",
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "per-VM identity uniqueness with working positive controls",
+   "status": "PASS",
+   "evidence": {
+    "distinct_keys": true,
+    "guest_key_placement_checks": 2,
+    "own_key_health_responses": 2,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "cross-sandbox control frames refused in both directions",
+   "status": "PASS",
+   "evidence": {
+    "post_refusal_positive_controls": 2,
+    "refusals": 2,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "portable workspace snapshot excludes per-VM identities",
+   "status": "PASS",
+   "evidence": {
+    "entries": 1,
+    "keys_scanned": 2,
+    "marker_content_intact": true,
+    "scope": "the portable workspace archive; a memory snapshot is a different artifact",
+    "spellings_scanned": [
+     "hex",
+     "base64"
+    ],
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "revocation refuses real host control dispatch for that sandbox only",
+   "status": "PASS",
+   "evidence": {
+    "host_dispatch_refused": true,
+    "other_vm_positive_control": true,
+    "scope": "host authority revocation; the guest root's already installed key is outside host control",
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "rotation invalidates the old guest's frames and keeps portable work",
+   "status": "PASS",
+   "evidence": {
+    "generation_advanced": true,
+    "key_changed": true,
+    "new_frame_health": true,
+    "old_frame_refused": true,
+    "restored_marker": true,
+    "rotation_boundary": "stop, recreate, import the portable workspace",
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "the deployment's kernel and rootfs are unchanged after every refusal",
+   "status": "PASS",
+   "evidence": {
+    "both_digests_identical": true,
+    "samples": 1,
+    "provenance": "real local Firecracker guest, authenticated vsock control channel, host filesystem"
+   }
+  },
+  {
+   "case": "identity scratch directory removed",
+   "status": "PASS",
+   "evidence": {
+    "absent": true
+   }
+  },
+  {
+   "case": "control plane and worker are serving",
+   "status": "PASS",
+   "evidence": {
+    "cp": "127.0.0.1:18445",
+    "worker": "127.0.0.1:19445"
+   }
+  },
+  {
+   "case": "watchdog key is narrowly scoped",
+   "status": "PASS",
+   "evidence": {
+    "status": 200,
+    "scopes": [
+     "guard:read",
+     "guard:heartbeat",
+     "guard:quarantine"
+    ]
+   }
+  },
+  {
+   "case": "the watchdog key cannot read the tenant's sandboxes",
+   "status": "PASS",
+   "evidence": {
+    "status": 403
+   }
+  },
+  {
+   "case": "attachment is live under a real watchdog process",
+   "status": "PASS",
+   "evidence": {
+    "sandbox": "01a0fd70-e250-77af-8df6-c3b3b7fdeecd",
+    "pid": 3590682,
+    "network_cut": false,
+    "lifecycle_events": [
+     "gateway started",
+     "guard-installed-before-guest-boot",
+     "gateway activated by authenticated watchdog"
+    ]
+   }
+  },
+  {
+   "case": "guarded sandbox with signed admission boots and runs",
+   "status": "PASS",
+   "evidence": {
+    "status": 200,
+    "manifest": "manifest.json"
+   }
+  },
+  {
+   "case": "attachment is live under a real watchdog process",
+   "status": "PASS",
+   "evidence": {
+    "sandbox": "01a0fd71-036d-765d-91c2-8f6c43694616",
+    "pid": 3590737,
+    "network_cut": false,
+    "lifecycle_events": [
+     "gateway started",
+     "guard-installed-before-guest-boot",
+     "gateway activated by authenticated watchdog"
+    ]
+   }
+  },
+  {
+   "case": "ordinary workspace read is served and trips nothing",
+   "status": "PASS",
+   "evidence": {
+    "write_status": 200,
+    "read_status": 200,
+    "content_matches": true,
+    "file_canary_events": 0
+   }
+  },
+  {
+   "case": "ordinary guest resolution works and trips no hostname canary",
+   "status": "PASS",
+   "evidence": {
+    "resolved_count": 1,
+    "resolved": [
+     "172.30.16.89"
+    ],
+    "guest_resolvers": [
+     "172.30.16.89"
+    ],
+    "guest_error": null,
+    "attachment_resolver": null,
+    "queried": "model.phase5.invalid",
+    "dns_canary_events": 0
+   }
+  },
+  {
+   "case": "ordinary placeholder presentation reaches the broker and trips no credential canary",
+   "status": "PASS",
+   "evidence": {
+    "presented": "placeholder://model-main",
+    "presented_status": 403,
+    "guest_error": null,
+    "credential_canary_events": 0
+   }
+  },
+  {
+   "case": "configured file canary read is observed by the host and journals a high-severity cut",
+   "status": "PASS",
+   "evidence": {
+    "read_status": 200,
+    "read_body_code": null,
+    "events": [
+     {
+      "category": "credential",
+      "decision": "cut",
+      "reason": "canary file read, severity high, network cut",
+      "destination": "file#0",
+      "current_hash": "eecb4b835ea13793c44613d9a44ad7a0202ce4521327821c16b7edba3bc2dbf5"
+     }
+    ],
+    "planted_in": "sandbox workspace at boot; the base image is never written"
+   }
+  },
+  {
+   "case": "file canary read cuts the attachment in host observation",
+   "status": "PASS",
+   "evidence": {
+    "network_cut": true,
+    "counters": {
+     "table": "aiec_guard_01a0fd71036d765d91c28f6c43694616",
+     "blocked_range": 0,
+     "other_denied": 0,
+     "ipv6": 0,
+     "dns_permitted": 1,
+     "broker_permitted": 5
+    }
+   }
+  },
+  {
+   "case": "the cut preserves the machine rather than destroying it",
+   "status": "PASS",
+   "evidence": {
+    "exec_status": 200,
+    "exec_code": null,
+    "sandbox_state": "running",
+    "incident_network_cut_at": null,
+    "incident_paused_at": null,
+    "incident_snapshot_id": null,
+    "rootfs_present": true,
+    "rootfs": "/home/gobrowse/aiec/phase5/state-vms/vms/01a0fd71-036d-765d-91c2-8f6c43694616/rootfs.ext4"
+   }
+  },
+  {
+   "case": "attachment is live under a real watchdog process",
+   "status": "PASS",
+   "evidence": {
+    "sandbox": "01a0fd71-0f56-7793-9d36-335abcfa2d48",
+    "pid": 3590819,
+    "network_cut": false,
+    "lifecycle_events": [
+     "gateway started",
+     "guard-installed-before-guest-boot",
+     "gateway activated by authenticated watchdog"
+    ]
+   }
+  },
+  {
+   "case": "guest resolution of a canary hostname raises a host-observed cut",
+   "status": "PASS",
+   "evidence": {
+    "probe": {
+     "queried": "phase5-canary.invalid",
+     "resolvers": [
+      "172.30.13.33"
+     ],
+     "direct": {
+      "error": "TimeoutError"
+     },
+     "resolved": [],
+     "error": "resolution failed"
+    },
+    "model_probe": {
+     "queried": "api.example-model.com",
+     "resolvers": [
+      "172.30.13.33"
+     ],
+     "direct": {
+      "error": "TimeoutError"
+     },
+     "resolved": [],
+     "error": "resolution failed"
+    },
+    "attachment": {
+     "attachment": {
+      "broker_port": 8443,
+      "dns_port": 53,
+      "gateway_ip": "172.30.13.33",
+      "guest_ip": "172.30.13.34",
+      "interface": "ag9bb8569a81f8d",
+      "sandbox_id": "01a0fd71-0f56-7793-9d36-335abcfa2d48",
+      "tenant_id": "e3306c00-2edd-44f2-8229-0609d9344be8"
+     },
+     "node_id": "01a0fd70-bbc6-758b-a625-21d82052a1e0"
+    },
+    "guest_net": "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000\n    inet 172.30.13.34/30 brd 172.30.13.35 scope global eth0\n       valid_lft forever preferred_lft forever\n---\ndefault via 172.30.13.33 dev eth0 \n172.30.13.32/30 dev eth0 proto kernel scope link src 172.30.13.34 \n---\nnameserver 172.30.13.33\noptions timeout:1 attempts:1\n",
+    "host_view": "4: ag9bb8569a81f8d: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    inet 172.30.13.33/30 scope global ag9bb8569a81f8d\n       valid_lft forever preferred_lft forever\nError: No such file or directory\nlist table inet aiec_guard_01a0fd710f5677939d36335abcfa2d48\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "live_journal": [
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "gateway started",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "guard-installed-before-guest-boot",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "gateway activated by authenticated watchdog",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "cut",
+      "reason": "guard attachment held cut",
+      "destination": null
+     },
+     {
+      "category": "dns",
+      "decision": "cut",
+      "reason": "canary hostname resolution, severity high, network cut",
+      "destination": "hostname#0"
+     },
+     {
+      "category": "lifecycle",
+      "decision": "cut",
+      "reason": "watchdog or host fault latched network cut",
+      "destination": null
+     },
+     {
+      "category": "dns",
+      "decision": "deny",
+      "reason": "DNS inbound byte budget exhausted",
+      "destination": null
+     }
+    ],
+    "listeners": "Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                   \nudp   UNCONN 0      0       172.30.13.33:53         0.0.0.0:*    users:((\"aiec\",pid=3590525,fd=20))       \ntcp   LISTEN 0      128     172.30.13.33:8443       0.0.0.0:*    users:((\"aiec\",pid=3590525,fd=17))       \ntcp   LISTEN 0      128        127.0.0.1:19445      0.0.0.0:*    users:((\"aiec\",pid=3590525,fd=10))       \ntcp   LISTEN 0      128        127.0.0.1:18445      0.0.0.0:*    users:((\"aiec-server\",pid=3590500,fd=12))\ntcp   LISTEN 0      128     172.30.13.33:53         0.0.0.0:*    users:((\"aiec\",pid=3590525,fd=19))",
+    "counters": {
+     "table": "aiec_guard_01a0fd710f5677939d36335abcfa2d48",
+     "blocked_range": 0,
+     "other_denied": 3,
+     "ipv6": 0,
+     "dns_permitted": 1,
+     "broker_permitted": 0
+    },
+    "all_events": [
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "gateway started",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "guard-installed-before-guest-boot",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "allow",
+      "reason": "gateway activated by authenticated watchdog",
+      "destination": null
+     },
+     {
+      "category": "lifecycle",
+      "decision": "cut",
+      "reason": "guard attachment held cut",
+      "destination": null
+     },
+     {
+      "category": "dns",
+      "decision": "cut",
+      "reason": "canary hostname resolution, severity high, network cut",
+      "destination": "hostname#0"
+     },
+     {
+      "category": "lifecycle",
+      "decision": "cut",
+      "reason": "watchdog or host fault latched network cut",
+      "destination": null
+     },
+     {
+      "category": "dns",
+      "decision": "deny",
+      "reason": "DNS inbound byte budget exhausted",
+      "destination": null
+     }
+    ],
+    "events": [
+     {
+      "category": "dns",
+      "decision": "cut",
+      "reason": "canary hostname resolution, severity high, network cut",
+      "destination": "hostname#0",
+      "current_hash": "1121c327d84c0d5b9ea21a73ecc49a8045acdc34c87ee594bf568a9634983515"
+     }
+    ]
+   }
+  },
+  {
+   "case": "canary hostname cut removes guest name resolution",
+   "status": "PASS",
+   "evidence": {
+    "network_cut": true,
+    "post_cut_exec_status": 409,
+    "post_cut_resolution": null,
+    "post_cut_sandbox_state": "quarantined"
+   }
+  },
+  {
+   "case": "attachment is live under a real watchdog process",
+   "status": "PASS",
+   "evidence": {
+    "sandbox": "01a0fd71-bec9-75e4-8fa4-d217a6847dfa",
+    "pid": 3591216,
+    "network_cut": false,
+    "lifecycle_events": [
+     "gateway started",
+     "guard-installed-before-guest-boot",
+     "gateway activated by authenticated watchdog"
+    ]
+   }
+  },
+  {
+   "case": "presented canary credential is refused and journals critical quarantine",
+   "status": "PASS",
+   "evidence": {
+    "guest_observed_status": 403,
+    "guest_error": null,
+    "events": [
+     {
+      "category": "credential",
+      "decision": "quarantine",
+      "reason": "canary credential presented, severity critical, immediate quarantine",
+      "destination": "credential#0",
+      "current_hash": "aec19de62f0863df56201dc743409473c17efe5bc921a9c344f57ccea2fc8932"
+     }
+    ]
+   }
+  },
+  {
+   "case": "worker callback latches a complete durable quarantine",
+   "status": "PASS",
+   "evidence": {
+    "sandbox_state": "quarantined",
+    "incident_id_present": true,
+    "network_cut_at": "2026-10-02T16:28:08.377453969Z",
+    "paused_at": "2026-10-02T16:28:12.055760799Z",
+    "snapshot_id": "01a0fd71-cb32-7748-b072-9ae1aa11b676",
+    "completed_at": "2026-10-02T16:28:12.078565845Z",
+    "stage_errors": [],
+    "rules": [
+     "canary.credential-presented"
+    ]
+   }
+  },
+  {
+   "case": "a quarantined sandbox cannot be resumed",
+   "status": "PASS",
+   "evidence": {
+    "status": 409,
+    "code": "conflict"
+   }
+  },
+  {
+   "case": "worker left no VM disk behind",
+   "status": "PASS",
+   "evidence": {
+    "live_rootfs_copies": 0,
+    "quarantined_forensics_retained": 2,
+    "forensics_without_a_quarantine": []
+   }
+  }
+ ]
+}

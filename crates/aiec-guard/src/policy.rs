@@ -21,6 +21,24 @@ use sha2::{Digest, Sha256};
 
 use crate::{GuardError, Result};
 
+/// The one grammar for a Guard rule name.
+///
+/// Rule names travel from the policy compiler, through the hash-chained
+/// journal, into the watchdog's independent evidence checks, so the grammar
+/// belongs to one definition. It was stated twice with two different charsets,
+/// and the stricter of the two rejected `canary.credential-presented` - a rule
+/// name this product emits - which stopped a canary incident from ever being
+/// reported. `[A-Za-z0-9._-]` covers both families: the built-in detector
+/// names (`repeated_denied_connections`) and the canary names
+/// (`canary.credential-presented`). Rule names are identifiers, never data, so
+/// nothing that could carry a value passes.
+pub fn is_rule_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// The only policy version this Guard understands.
 pub const POLICY_VERSION: u32 = 1;
 
@@ -328,10 +346,7 @@ fn validate_binding_name(name: &str, field: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(policy_error(format!("{field} must be 1..=64 bytes")));
     }
-    let valid = name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-    if !valid {
+    if !is_rule_name(name) {
         return Err(policy_error(format!(
             "{field} must match [A-Za-z0-9._-] and must not carry a secret value"
         )));

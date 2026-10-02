@@ -66,6 +66,22 @@ fn reviewer(principal: &Principal, label: Option<&str>) -> Result<String, ApiFai
     Ok(identity)
 }
 
+/// A scope grants review authority, not permission to review one's own ask.
+/// The requester identity is stamped at submission from the authenticated key.
+fn require_independent_reviewer(
+    principal: &Principal,
+    proposal: &GuardProposal,
+) -> Result<(), ApiFailure> {
+    if proposal.agent_id == format!("key:{}", principal.key_id) {
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "a policy proposal requires a different authenticated reviewer",
+        ));
+    }
+    Ok(())
+}
+
 async fn sandbox_of(state: &AppState, principal: &Principal, id: Uuid) -> ApiResult<Sandbox> {
     let sandbox = state
         .repository()
@@ -195,6 +211,7 @@ pub(crate) async fn approve_proposal(
         .get_guard_proposal(principal.tenant_id, id, proposal)
         .await
         .map_err(ApiFailure::from)?;
+    require_independent_reviewer(&principal, &stored)?;
     if !matches!(stored.state, ProposalState::Pending) {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
@@ -246,13 +263,67 @@ pub(crate) async fn approve_proposal(
         .put_guard_proposal(stored)
         .await
         .map_err(ApiFailure::from)?;
-    // The sandbox's recorded identity is the hash it runs under from now on.
+    // The applied ruleset becomes the sandbox's recorded configuration, not
+    // just a hash beside the superseded policy: every later observation,
+    // heartbeat and release is authorized against the policy this record
+    // carries, so a record still holding the base policy would refuse reads of
+    // a correctly enforced sandbox. The policy is derived from the same base
+    // and request the store derived it from, and is accepted only when it
+    // hashes to what the worker actually installed.
+    let mut applied = sandbox.environment.guard.clone().ok_or_else(|| {
+        ApiFailure::new(StatusCode::CONFLICT, "conflict", "sandbox is not guarded")
+    })?;
+    let base = applied.effective_policy().map_err(|error| {
+        ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("recorded guard policy is unusable: {error}"),
+        )
+    })?;
+    let policy = aiec_guard::proposals::applied_policy(&base, &stored.request).map_err(|_| {
+        ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "proposal is not a valid extension of the recorded policy",
+        )
+    })?;
+    let derived = policy.hash().map_err(|error| {
+        ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!("applied policy is unusable: {error}"),
+        )
+    })?;
+    if derived != new_hash {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_GATEWAY,
+            "runtime_unavailable",
+            "worker applied a policy the control plane cannot name",
+        ));
+    }
+    applied.policy = Some(policy);
+    applied.policy_template = aiec_guard::policy::PolicyTemplate::NoNetwork;
+    applied.model_endpoint = None;
+    applied.allowlist.clear();
     if let Err(error) = state
         .repository()
-        .update_guard_policy_hash(principal.tenant_id, id, &new_hash)
+        .update_guard_policy(principal.tenant_id, id, &applied, &new_hash)
         .await
     {
-        tracing::warn!(%id, %error, "guard policy applied but its recorded hash could not be updated");
+        tracing::warn!(%id, %error, "guard policy applied but its recorded configuration could not be updated");
+    } else if let Ok(rebound) = state
+        .repository()
+        .get_sandbox(principal.tenant_id, id)
+        .await
+    {
+        // The durable budget is bound to the policy it was opened under, so
+        // the approved policy has to be named there too: usage already spent
+        // carries over, and the ceilings do not move.
+        if let Err(error) =
+            crate::guard::initialize_guard_budget(state.repository().as_ref(), &rebound).await
+        {
+            tracing::warn!(%id, %error, "guard budget could not follow the approved policy");
+        }
     }
     Ok(Json(stored))
 }
@@ -271,6 +342,7 @@ pub(crate) async fn deny_proposal(
         .get_guard_proposal(principal.tenant_id, id, proposal)
         .await
         .map_err(ApiFailure::from)?;
+    require_independent_reviewer(&principal, &stored)?;
     if !matches!(stored.state, ProposalState::Pending) {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,

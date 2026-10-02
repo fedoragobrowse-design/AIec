@@ -31,11 +31,18 @@ pub fn set_host_network_namespace(inode: String) {
 /// isolated - a local-mock exception must never be granted because the check
 /// could not be performed.
 fn differs_from_host(own: Option<&std::path::Path>, host: Option<&str>) -> bool {
-    let (Some(host), Some(own)) = (host, own) else {
+    // A recorded-but-empty inode is not a recording: `/proc/self/ns/net` never
+    // reads as empty, so comparing against "" would answer "different" for a
+    // process that is in fact on the host's namespace and hand the exception to
+    // exactly the case it exists to refuse. Blank is treated as absent.
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(own) = own else {
         return false;
     };
     std::fs::read_link(own)
-        .map(|value| value.to_string_lossy().trim() != host.trim())
+        .map(|value| value.to_string_lossy().trim() != host)
         .unwrap_or(false)
 }
 
@@ -107,6 +114,22 @@ mod tests {
         assert!(!differs_from_host(
             Some(std::path::Path::new("/proc/self/ns/net")),
             None,
+        ));
+    }
+
+    /// An operator who set the variable and left it empty has recorded
+    /// nothing, and nothing must not be read as "a different namespace" -
+    /// that would grant the exception to a process sitting on the host's
+    /// network, which is the one configuration the exception must never reach.
+    #[test]
+    fn a_blank_recorded_host_namespace_is_treated_as_not_isolated() {
+        assert!(!differs_from_host(
+            Some(std::path::Path::new("/proc/self/ns/net")),
+            Some(""),
+        ));
+        assert!(!differs_from_host(
+            Some(std::path::Path::new("/proc/self/ns/net")),
+            Some("   "),
         ));
     }
 

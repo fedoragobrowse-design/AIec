@@ -221,14 +221,24 @@ impl EnforcementModel {
     /// A permit exists only where the policy itself gives the guest something
     /// to reach. The gateway listeners are the only permitted destination, so
     /// `permits_dns` is true exactly when the policy configures a DNS scope and
-    /// `permits_broker` exactly when it configures a model endpoint. Both are
-    /// read from the compiled policy rather than from a template name, so an
-    /// explicit policy and a template-built one are judged identically. Every
-    /// shipped template except `no-network` populates both fields, so the
-    /// model template keeps a working DNS path, and `no-network` keeps none.
+    /// `permits_broker` exactly when the policy gives the guest at least one
+    /// destination to reach at all: a model endpoint, an allowlisted egress
+    /// rule, or both. Both are read from the compiled policy rather than from a
+    /// template name, so an explicit policy and a template-built one are judged
+    /// identically.
+    ///
+    /// The broker is Guard's enforcement point, not a privilege. A policy that
+    /// names an allowlisted destination without naming a model — the documented
+    /// `read_only_api` shape, and what an OpenShell import produces — is
+    /// governed entirely by rules the broker applies on the way through, so a
+    /// broker permit that depended on a model endpoint would seal a guest whose
+    /// allowlist it could otherwise enforce. What the guest can then reach is
+    /// still only what its own policy permits, one rule at a time, inside the
+    /// gateway. Only `no-network`, which has neither, keeps neither listener.
     pub fn build(policy: &CompiledPolicy, attachment: &GuardAttachment, cut: bool) -> Result<Self> {
         let permits_dns = !policy.dns().allowed_zones.is_empty();
-        let permits_broker = policy.model_endpoint().is_some();
+        let permits_broker =
+            policy.model_endpoint().is_some() || !policy.policy().network.egress.is_empty();
         // Blocked ranges are the boundary's own denied networks: the operator's
         // additions plus the ranges that can never be authorized, which the
         // runtime fills with the gateway, the assigned guest, peer sandboxes
@@ -1194,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_without_a_model_endpoint_leaves_the_broker_denied() {
+    fn an_allowlist_without_a_model_endpoint_still_reaches_the_broker_that_enforces_it() {
         let attached = attachment();
         let model = EnforcementModel::build(&egress_only_policy(), &attached, false)
             .expect("egress-only model");
@@ -1204,7 +1214,18 @@ mod tests {
             Transport::Udp,
             attached.dns_port
         ));
-        assert!(!model.permits(
+        // The allowlist is enforced inside the gateway, so the guest has to be
+        // able to reach it. Whether any particular destination is then permitted
+        // is the gateway's decision, not the kernel's.
+        assert!(model.permits(
+            attached.guest_ip,
+            attached.gateway_ip,
+            Transport::Tcp,
+            attached.broker_port
+        ));
+        // A cut still denies it whatever the policy asked for.
+        let cut = EnforcementModel::build(&egress_only_policy(), &attached, true).expect("cut");
+        assert!(!cut.permits(
             attached.guest_ip,
             attached.gateway_ip,
             Transport::Tcp,

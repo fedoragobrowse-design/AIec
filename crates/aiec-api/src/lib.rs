@@ -894,6 +894,10 @@ fn worker_routes() -> Router<AppState> {
         )
         .route("/{node}/ownership/{sandbox_id}", get(sandbox_ownership))
         .route("/{node}/guard/reserve", post(guard::reserve_guard_budget))
+        .route(
+            "/{node}/guard/quarantine",
+            post(guard::worker_guard_quarantine),
+        )
         .route("/{id}/drain", post(drain_worker))
 }
 #[derive(Deserialize)]
@@ -1776,6 +1780,22 @@ fn create_response(sandbox: Sandbox, reason: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Whether any healthy, live worker in this deployment advertises egress
+/// enforcement.
+///
+/// This is the fact the runtime-kind selection cannot answer for itself, and
+/// the fact placement depends on: a governed machine may only be placed where
+/// the rules can actually be installed, while the control plane's own runtime
+/// profile says nothing about its workers.
+pub(crate) async fn worker_enforces_egress(state: &AppState) -> Result<bool, CoreError> {
+    Ok(state
+        .repository()
+        .list_workers(false)
+        .await?
+        .iter()
+        .any(|worker| worker.registration.capabilities.network_policy))
+}
+
 /// Whether the operator has explicitly accepted a weaker isolation boundary.
 fn reduced_isolation_allowed() -> bool {
     std::env::var("AIEC_ALLOW_REDUCED_ISOLATION").as_deref() == Ok("1")
@@ -1818,17 +1838,29 @@ async fn create_sandbox(
             ));
         }
     };
+    let guarded = body.request.environment.guard.is_some();
     let required = aiec_core::runtime::RuntimeCapabilities {
         exec: true,
         files: true,
         // A guarded sandbox needs a worker that can enforce its egress, so the
         // capability is demanded at placement rather than discovered at boot.
-        network_policy: body.request.environment.guard.is_some(),
+        network_policy: guarded,
         ..Default::default()
     };
+    // The registry profile describes the control plane's own runtime, not the
+    // workers that will actually run the machine. Asking it to vouch for egress
+    // enforcement makes a worker-proxied deployment refuse every guarded
+    // sandbox, because a proxy reports what it can do rather than what its
+    // nodes can do. Placement already filters nodes by the full requirement,
+    // so the kind selection only gets to veto when nothing in the deployment
+    // offers the capability at all - which keeps the refusal fail-closed.
+    let mut kind_requirement = required.clone();
+    if guarded && worker_enforces_egress(&s).await.map_err(ApiFailure::from)? {
+        kind_requirement.network_policy = false;
+    }
     let (runtime_kind, _selection_reason) = if let Some(registry) = s.runtime_registry() {
         let selection = registry
-            .select(requested_runtime, &required, minimum_isolation)
+            .select(requested_runtime, &kind_requirement, minimum_isolation)
             .await
             .map_err(|error| match error {
                 CoreError::Unavailable(message) => {

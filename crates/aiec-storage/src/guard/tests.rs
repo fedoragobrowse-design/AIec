@@ -224,6 +224,64 @@ async fn lifetime_byte_ceiling_and_overflow_refuse_without_partial_debits() {
 }
 
 #[tokio::test]
+async fn an_approved_policy_change_rebinds_the_budget_without_refilling_it() {
+    let (repository, budget, fence) = fixture().await;
+    repository
+        .put_guard_budget(budget.clone())
+        .await
+        .expect("budget initialized");
+    repository
+        .reserve_guard_budget(
+            budget.identity.clone(),
+            fence,
+            BudgetDebit {
+                model_requests: 5,
+                bytes_in: 11,
+                bytes_out: 13,
+            },
+        )
+        .await
+        .expect("the sandbox spends under its own policy");
+
+    // The human approves a change: the policy identity moves, and the budget
+    // follows it rather than being replaced by a fresh allowance.
+    let mut approved = budget.clone();
+    approved.identity.policy_hash = "c".repeat(64);
+    let rebound = repository
+        .put_guard_budget(approved.clone())
+        .await
+        .expect("the budget follows the approved policy");
+    assert_eq!(rebound.identity, approved.identity);
+    assert_eq!(rebound.model_requests, 5);
+    assert_eq!(rebound.bytes_in, 11);
+    assert_eq!(rebound.bytes_out, 13);
+    assert_eq!(rebound.max_model_requests, budget.max_model_requests);
+
+    // The ceilings themselves do not move, in either direction.
+    let mut raised = approved.clone();
+    raised.max_model_requests = budget.max_model_requests + 1;
+    assert!(matches!(
+        repository.put_guard_budget(raised).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // And the sandbox still spends against the ceiling it started with.
+    let spent = repository
+        .reserve_guard_budget(
+            approved.identity.clone(),
+            fence,
+            BudgetDebit {
+                model_requests: 12,
+                bytes_in: 0,
+                bytes_out: 0,
+            },
+        )
+        .await
+        .expect("the remaining allowance survives the approval");
+    assert_eq!(spent.model_requests, 17);
+}
+
+#[tokio::test]
 async fn tenant_policy_and_stale_ownership_cannot_spend_or_quarantine() {
     let (repository, budget, fence) = fixture().await;
     let tenant = budget.identity.tenant_id;

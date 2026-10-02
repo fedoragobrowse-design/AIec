@@ -160,7 +160,7 @@ async fn serve_control(path: &Path, gateway: Arc<GuardGateway>, lease: GuardFenc
                                 if policy_hash != gateway.control().policy_hash() {
                                     return Err(GuardError::Denied("policy hash mismatch".into()));
                                 }
-                                gateway.heartbeat(gateway.control().identity()).map(|_| ())
+                                gateway.heartbeat(&gateway.control().identity()).map(|_| ())
                             }
                             GuardControlCommand::Cut { policy_hash } => {
                                 if policy_hash != gateway.control().policy_hash() {

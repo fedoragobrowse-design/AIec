@@ -16,17 +16,22 @@ fn map(error: StoreError) -> CoreError {
 }
 
 impl PostgresRepository {
-    pub(crate) async fn update_guard_policy_hash(
+    pub(crate) async fn update_guard_policy(
         &self,
         tenant: uuid::Uuid,
         sandbox: uuid::Uuid,
+        guard: &aiec_guard::policy::GuardConfig,
         policy_hash: &str,
     ) -> Result<(), CoreError> {
+        let config = serde_json::to_value(guard).map_err(|error| {
+            CoreError::Backend(format!("guard config did not serialize: {error}"))
+        })?;
         let changed = sqlx::query(
-            "UPDATE sandboxes SET environment = jsonb_set(environment, '{guard_policy_hash}',              to_jsonb($3::text)), updated_at = now() WHERE id = $1 AND tenant_id = $2",
+            "UPDATE sandboxes SET environment =              jsonb_set(jsonb_set(environment, '{guard}', $3::jsonb), '{guard_policy_hash}',              to_jsonb($4::text)), updated_at = now() WHERE id = $1 AND tenant_id = $2",
         )
         .bind(sandbox)
         .bind(tenant)
+        .bind(config)
         .bind(policy_hash)
         .execute(&self.pool)
         .await

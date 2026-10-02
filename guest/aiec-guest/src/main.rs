@@ -1,4 +1,5 @@
 use aiec_core::{MAX_FILE, protocol::*};
+use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -98,6 +99,194 @@ fn safe_path(raw: &str) -> Result<PathBuf, String> {
         return Err("symlink escape rejected".into());
     }
     Ok(existing)
+}
+
+/// Traverses to `raw` inside the workspace, creating the intermediate
+/// directories it is missing, and opens the leaf with `leaf_flags`.
+///
+/// `safe_path` resolves a missing leaf by canonicalising its parent, so a path
+/// whose parent does not exist yet is refused before a caller can create
+/// anything: `WriteFile` and `CreateDirectory` both carried a
+/// `create_dir_all` that sat behind a resolution which had already failed, so
+/// a nested write or a nested `mkdir` into a fresh workspace could not happen
+/// at all.
+///
+/// Traversal is descriptor-relative and every component is opened with
+/// `O_NOFOLLOW`, the same traversal `write_workspace` uses for chunked
+/// uploads. It has to be: checking each component by name and then acting
+/// through the name afterwards is a check followed by a race, and the process
+/// doing the writing is the sandbox's own - it can rename a directory that was
+/// just verified and put a link in its place, and a write that went through the
+/// path would follow it out of the workspace. Nothing here re-reads the
+/// pathname once traversal has started, so there is no window to win. Callers
+/// act only through the returned handle, which is also why a file's mode is
+/// applied with `fchmod` on it rather than by name.
+fn open_in_workspace(
+    root: &Path,
+    raw: &str,
+    leaf_flags: libc::c_int,
+    leaf_is_directory: bool,
+) -> Result<File, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut components = Vec::new();
+    for part in Path::new(raw.trim_start_matches('/')).components() {
+        match part {
+            std::path::Component::Normal(name) => components
+                .push(CString::new(name.as_bytes()).map_err(|_| "invalid path".to_owned())?),
+            std::path::Component::CurDir => {}
+            _ => return Err("path traversal rejected".into()),
+        }
+    }
+    let directory = fs::File::open(root).map_err(|error| error.to_string())?;
+    open_below(&directory, &components, leaf_flags, leaf_is_directory)
+}
+
+/// Continues a traversal from an already-open directory, creating what is
+/// missing and opening the leaf.
+///
+/// Taking the directory as a handle rather than as a path is the whole point:
+/// once a component has been opened, the rest of the traversal cannot be
+/// redirected by renaming it, because the name is never looked up again.
+fn open_below(
+    directory: &File,
+    components: &[CString],
+    leaf_flags: libc::c_int,
+    leaf_is_directory: bool,
+) -> Result<File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn step(dir: &File, name: &CStr, flags: libc::c_int) -> std::io::Result<File> {
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+    /// Creates `name` inside `dir` and re-opens it. A link already at that
+    /// name makes `mkdirat` fail with `EEXIST`, and the re-open then refuses
+    /// it with `O_NOFOLLOW`; a file planted there is refused the same way.
+    fn create(dir: &File, name: &CStr, flags: libc::c_int) -> Result<File, String> {
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.to_string());
+            }
+        }
+        step(dir, name, flags).map_err(|error| error.to_string())
+    }
+    let (leaf, directories) = components
+        .split_last()
+        .ok_or_else(|| "path is the workspace root".to_owned())?;
+    let mut directory = directory.try_clone().map_err(|error| error.to_string())?;
+    for name in directories {
+        match step(&directory, name, DIRECTORY_FLAGS) {
+            Ok(opened) => directory = opened,
+            // Created relative to the directory that was just opened, never
+            // through a path, so the name lands inside the workspace even if a
+            // component above it is replaced while this call runs.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                directory = create(&directory, name, DIRECTORY_FLAGS)?;
+            }
+            // `O_NOFOLLOW` on a link reports `ELOOP`, which is not one of the
+            // kinds that could be a missing directory. It is refused here as
+            // the escape it is rather than reported as absent.
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match step(&directory, leaf, leaf_flags) {
+        Ok(opened) => Ok(opened),
+        Err(error) if leaf_is_directory && error.kind() == std::io::ErrorKind::NotFound => {
+            create(&directory, leaf, leaf_flags)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+const DIRECTORY_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// Flags for opening a write target. `O_NONBLOCK` is there so a FIFO planted
+/// at the target is refused rather than waited on - this is the control
+/// channel's only loop, and a blocking open there stalls every later request.
+/// `O_TRUNC` is deliberately absent: truncation happens after the handle has
+/// been validated, so a refused target is left intact.
+const WRITE_FLAGS: libc::c_int =
+    libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+
+/// The workspace-confined entry point: `raw` is a `/workspace/...` path as the
+/// protocol spells it, and everything below is relative to the resolved
+/// workspace root.
+fn open_in(raw: &str, leaf_flags: libc::c_int, leaf_is_directory: bool) -> Result<File, String> {
+    let root = fs::canonicalize("/workspace")
+        .map_err(|error| format!("workspace unavailable: {error}"))?;
+    open_in_workspace(
+        &root,
+        workspace_relative(raw)?,
+        leaf_flags,
+        leaf_is_directory,
+    )
+}
+
+/// Reduces a `/workspace/...` path to what may be looked up inside the
+/// workspace. Anything that is not under `/workspace` is refused here, before
+/// a name is resolved against the filesystem at all.
+fn workspace_relative(raw: &str) -> Result<&str, String> {
+    let relative = raw
+        .strip_prefix("/workspace")
+        .ok_or_else(|| "outside workspace".to_owned())?;
+    if !relative.is_empty() && !relative.starts_with('/') {
+        return Err("outside workspace".into());
+    }
+    Ok(relative)
+}
+
+/// Opens a write target and prepares it to be replaced.
+///
+/// The open deliberately does not truncate: `O_TRUNC` empties whatever the
+/// name pointed at *before* anything has decided what it points at, so a
+/// refused write - a FIFO, a device, a file that another name also reaches -
+/// would still destroy what was there. The open is `O_NONBLOCK` for the same
+/// reason in the other direction: opening a FIFO for writing blocks until a
+/// reader appears, and this is the control channel's only loop, so a FIFO
+/// planted at the target would stall every later request rather than being
+/// refused. `O_NONBLOCK` makes that open fail immediately instead.
+///
+/// Validation is `fstat` on the handle, not a lookup by name, and truncation
+/// happens after it on that same handle: what is checked is what is written.
+fn open_write_target(raw: &str) -> Result<File, String> {
+    let root = fs::canonicalize("/workspace")
+        .map_err(|error| format!("workspace unavailable: {error}"))?;
+    open_write_target_in(&root, workspace_relative(raw)?)
+}
+
+/// `open_write_target` against an already-resolved workspace root.
+fn open_write_target_in(root: &Path, relative: &str) -> Result<File, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = open_in_workspace(root, relative, WRITE_FLAGS, false)?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("write target is not a regular file".into());
+    }
+    // A file with a second name is a file something else in the sandbox can
+    // still be changing. Refusing is the honest answer to "write this file
+    // atomically": there is no atomic answer for a file another process is
+    // holding open under a different name.
+    if metadata.nlink() != 1 {
+        return Err("write target is reachable under another name".into());
+    }
+    // Only now, with the object known to be an ordinary file, is what was
+    // there discarded. Truncating first would have destroyed it even in the
+    // cases refused above.
+    file.set_len(0).map_err(|error| error.to_string())?;
+    Ok(file)
+}
+
+/// Opens a directory inside the workspace, creating it and anything missing
+/// above it.
+fn open_write_directory(raw: &str) -> Result<File, String> {
+    open_in(raw, DIRECTORY_FLAGS, true)
 }
 
 fn response(id: Uuid, payload: ResponsePayload) -> Response {
@@ -249,141 +438,170 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
             }
             Err(error) => return Err(error.to_string()),
         };
-        let payload = match request.operation {
-            Operation::Health => Ok(ResponsePayload::Health {
-                ready: Path::new("/workspace").is_dir(),
-            }),
-            Operation::Exec => run_command(request.payload),
-            Operation::ReadFile => match request.payload {
-                RequestPayload::Path { path } => {
-                    let path = safe_path(&path)?;
-                    let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
-                    if !metadata.is_file() || metadata.len() > MAX_FILE as u64 {
-                        return Err("file too large or not regular".into());
-                    }
-                    fs::read(path)
-                        .map(|content| ResponsePayload::ReadFile { content })
-                        .map_err(|error| error.to_string())
-                }
-                _ => Err("path payload required".into()),
-            },
-            Operation::ReadFileChunk => match request.payload {
-                RequestPayload::ReadFileChunk { request } => request
-                    .read_workspace(Path::new("/workspace"))
-                    .map(|chunk| ResponsePayload::ReadFileChunk {
-                        content: chunk.bytes.into(),
-                        size_bytes: chunk.size_bytes,
-                        version: chunk.version,
-                        eof: chunk.eof,
-                    })
-                    .map_err(|error| error.to_string()),
-                _ => Err("chunk payload required".into()),
-            },
-            Operation::WriteFile => match request.payload {
-                RequestPayload::WriteFile {
-                    path,
-                    content,
-                    mode,
-                } => {
-                    let path = safe_path(&path)?;
-                    if content.len() > MAX_FILE {
-                        return Err("file too large".into());
-                    }
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                    }
-                    fs::write(&path, content).map_err(|error| error.to_string())?;
-                    if let Some(mode) = mode {
-                        use std::os::unix::fs::PermissionsExt;
-                        fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-                            .map_err(|error| error.to_string())?;
-                    }
-                    Ok(ResponsePayload::WriteFile)
-                }
-                _ => Err("write payload required".into()),
-            },
-            Operation::WriteFileChunk => match request.payload {
-                RequestPayload::WriteFileChunk { request, content } => request
-                    .write_workspace(Path::new("/workspace"), &content)
-                    .map(|chunk| ResponsePayload::WriteFileChunk {
-                        written: chunk.written,
-                        size_bytes: chunk.size_bytes,
-                    })
-                    .map_err(|error| error.to_string()),
-                _ => Err("write chunk payload required".into()),
-            },
-            Operation::ListDirectory => match request.payload {
-                RequestPayload::Path { path } => {
-                    let path = safe_path(&path)?;
-                    let mut entries = Vec::new();
-                    for item in fs::read_dir(path).map_err(|error| error.to_string())? {
-                        let item = item.map_err(|error| error.to_string())?;
-                        // `symlink_metadata` rather than `metadata`: a link is
-                        // described by what it is, not by what it points at, so
-                        // a link out of the tree is not reported as the
-                        // directory it targets and a walker does not descend
-                        // through it.
-                        let metadata =
-                            fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
-                        let kind = if metadata.is_dir() {
-                            FileKind::Directory
-                        } else {
-                            FileKind::File
-                        };
-                        // The path reported is the one the caller asked about
-                        // plus this entry's name, which is inside the workspace
-                        // by construction. Resolving it is left to the
-                        // operation that uses it: a link whose target escapes
-                        // is still listed, so the caller can see that it is
-                        // there, and still cannot read through it, because
-                        // every read resolves the path again and refuses.
-                        // Resolving here instead aborted the whole listing on
-                        // the first escaping link, which is how a repository
-                        // containing one lost its entire file list.
-                        let child = item.path();
-                        entries.push(DirectoryEntry {
-                            name: item.file_name().to_string_lossy().into_owned(),
-                            path: child.to_string_lossy().into_owned(),
-                            kind,
-                            size: metadata.len(),
-                        });
-                    }
-                    Ok(ResponsePayload::ListDirectory { entries })
-                }
-                _ => Err("path payload required".into()),
-            },
-            Operation::CreateDirectory => match request.payload {
-                RequestPayload::Path { path } => {
-                    let path = safe_path(&path)?;
-                    fs::create_dir_all(path).map_err(|error| error.to_string())?;
-                    Ok(ResponsePayload::CreateDirectory)
-                }
-                _ => Err("path payload required".into()),
-            },
-            Operation::RemoveFile => match request.payload {
-                RequestPayload::Path { path } => {
-                    let path = safe_path(&path)?;
-                    match fs::remove_file(&path) {
-                        Ok(()) => Ok(ResponsePayload::RemoveFile),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            Ok(ResponsePayload::RemoveFile)
+        // Every refusal has to come back as an answer. `?` inside a match arm
+        // propagates out of the *function* the arm is written in, not out of
+        // the arm, so with the match inlined in this loop a single refused
+        // path - a parent directory that does not exist, a link out of the
+        // workspace, a file over the limit - closed the control socket with no
+        // response frame at all. The host sees a control channel that went
+        // silent and reports the guest as gone, not as a write that was
+        // denied; the denial never reaches the operation that caused it.
+        // Bounding the match in its own function is what keeps "denied"
+        // distinguishable from "gone".
+        let request_id = request.request_id;
+        let payload = (|| -> Result<ResponsePayload, String> {
+            match request.operation {
+                Operation::Health => Ok(ResponsePayload::Health {
+                    ready: Path::new("/workspace").is_dir(),
+                }),
+                Operation::Exec => run_command(request.payload),
+                Operation::ReadFile => match request.payload {
+                    RequestPayload::Path { path } => {
+                        let path = safe_path(&path)?;
+                        let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+                        if !metadata.is_file() || metadata.len() > MAX_FILE as u64 {
+                            return Err("file too large or not regular".into());
                         }
-                        Err(error) => Err(error.to_string()),
+                        fs::read(path)
+                            .map(|content| ResponsePayload::ReadFile { content })
+                            .map_err(|error| error.to_string())
                     }
+                    _ => Err("path payload required".into()),
+                },
+                Operation::ReadFileChunk => match request.payload {
+                    RequestPayload::ReadFileChunk { request } => request
+                        .read_workspace(Path::new("/workspace"))
+                        .map(|chunk| ResponsePayload::ReadFileChunk {
+                            content: chunk.bytes.into(),
+                            size_bytes: chunk.size_bytes,
+                            version: chunk.version,
+                            eof: chunk.eof,
+                        })
+                        .map_err(|error| error.to_string()),
+                    _ => Err("chunk payload required".into()),
+                },
+                Operation::WriteFile => match request.payload {
+                    RequestPayload::WriteFile {
+                        path,
+                        content,
+                        mode,
+                    } => {
+                        // Checked before anything is created: the limit is a
+                        // property of the request, not of what it managed to
+                        // leave on disk first.
+                        if content.len() > MAX_FILE {
+                            return Err("file too large".into());
+                        }
+                        // Opening the target creates the directories above it,
+                        // and returns the only handle the write goes through.
+                        let mut file = open_write_target(&path)?;
+                        file.write_all(&content)
+                            .map_err(|error| error.to_string())?;
+                        // Applied to the handle, not to the path: a mode set by
+                        // name would be setting it on whatever a rename during
+                        // the write put there. `sync_all` on the same handle is
+                        // what makes a completed write actually durable - the
+                        // previous `fs::write` returned once the bytes were in
+                        // the page cache and before any of them reached the
+                        // disk.
+                        if let Some(mode) = mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            file.set_permissions(fs::Permissions::from_mode(mode))
+                                .map_err(|error| error.to_string())?;
+                        }
+                        file.sync_all().map_err(|error| error.to_string())?;
+                        Ok(ResponsePayload::WriteFile)
+                    }
+                    _ => Err("write payload required".into()),
+                },
+                Operation::WriteFileChunk => match request.payload {
+                    RequestPayload::WriteFileChunk { request, content } => request
+                        .write_workspace(Path::new("/workspace"), &content)
+                        .map(|chunk| ResponsePayload::WriteFileChunk {
+                            written: chunk.written,
+                            size_bytes: chunk.size_bytes,
+                        })
+                        .map_err(|error| error.to_string()),
+                    _ => Err("write chunk payload required".into()),
+                },
+                Operation::ListDirectory => match request.payload {
+                    RequestPayload::Path { path } => {
+                        let path = safe_path(&path)?;
+                        let mut entries = Vec::new();
+                        for item in fs::read_dir(path).map_err(|error| error.to_string())? {
+                            let item = item.map_err(|error| error.to_string())?;
+                            // `symlink_metadata` rather than `metadata`: a link is
+                            // described by what it is, not by what it points at, so
+                            // a link out of the tree is not reported as the
+                            // directory it targets and a walker does not descend
+                            // through it.
+                            let metadata = fs::symlink_metadata(item.path())
+                                .map_err(|error| error.to_string())?;
+                            let kind = if metadata.is_dir() {
+                                FileKind::Directory
+                            } else {
+                                FileKind::File
+                            };
+                            // The path reported is the one the caller asked about
+                            // plus this entry's name, which is inside the workspace
+                            // by construction. Resolving it is left to the
+                            // operation that uses it: a link whose target escapes
+                            // is still listed, so the caller can see that it is
+                            // there, and still cannot read through it, because
+                            // every read resolves the path again and refuses.
+                            // Resolving here instead aborted the whole listing on
+                            // the first escaping link, which is how a repository
+                            // containing one lost its entire file list.
+                            let child = item.path();
+                            entries.push(DirectoryEntry {
+                                name: item.file_name().to_string_lossy().into_owned(),
+                                path: child.to_string_lossy().into_owned(),
+                                kind,
+                                size: metadata.len(),
+                            });
+                        }
+                        Ok(ResponsePayload::ListDirectory { entries })
+                    }
+                    _ => Err("path payload required".into()),
+                },
+                Operation::CreateDirectory => match request.payload {
+                    RequestPayload::Path { path } => {
+                        // The same traversal a write uses, and for the same
+                        // reason: `safe_path` refuses a path whose parent is
+                        // missing, so creating a nested directory - which is
+                        // what this operation exists to do - failed on the
+                        // parent it was meant to create. Opening the leaf as a
+                        // directory proves it is one; the handle is dropped.
+                        drop(open_write_directory(&path)?);
+                        Ok(ResponsePayload::CreateDirectory)
+                    }
+                    _ => Err("path payload required".into()),
+                },
+                Operation::RemoveFile => match request.payload {
+                    RequestPayload::Path { path } => {
+                        let path = safe_path(&path)?;
+                        match fs::remove_file(&path) {
+                            Ok(()) => Ok(ResponsePayload::RemoveFile),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                Ok(ResponsePayload::RemoveFile)
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err("path payload required".into()),
+                },
+                Operation::Shutdown => Ok(ResponsePayload::Shutdown),
+                Operation::PrepareSnapshot => {
+                    let workspace = safe_path("/workspace")?;
+                    sync_directory(&workspace)?;
+                    Ok(ResponsePayload::PrepareSnapshot)
                 }
-                _ => Err("path payload required".into()),
-            },
-            Operation::Shutdown => Ok(ResponsePayload::Shutdown),
-            Operation::PrepareSnapshot => {
-                let workspace = safe_path("/workspace")?;
-                sync_directory(&workspace)?;
-                Ok(ResponsePayload::PrepareSnapshot)
             }
-        };
+        })();
         let shutdown = matches!(payload, Ok(ResponsePayload::Shutdown));
         let response = match payload {
-            Ok(payload) => response(request.request_id, payload),
-            Err(error) => error_response(request.request_id, error),
+            Ok(payload) => response(request_id, payload),
+            Err(error) => error_response(request_id, error),
         };
         write_response(&mut writer, secret, &response).map_err(|error| error.to_string())?;
         if shutdown {
@@ -531,5 +749,280 @@ mod tests {
                 .collect::<String>()
         );
         assert_eq!(hex_decode(encoded.trim()), Some(secret.to_vec()));
+    }
+
+    /// A workspace stand-in for tests, removed when it goes out of scope.
+    struct Workspace(PathBuf);
+
+    impl Workspace {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aiec-guest-{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&path).expect("workspace");
+            Workspace(fs::canonicalize(&path).expect("canonical workspace"))
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(self.0.join(parent)).expect("parent");
+            }
+            fs::write(self.0.join(path), contents).expect("seed");
+        }
+
+        fn read(&self, path: &str) -> String {
+            fs::read_to_string(self.0.join(path)).expect("read")
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.0.join(path).symlink_metadata().is_ok()
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The production write path, rooted at a test workspace.
+    fn write_target(workspace: &Workspace, path: &str) -> Result<File, String> {
+        let root = fs::canonicalize(&workspace.0).map_err(|error| error.to_string())?;
+        open_write_target_in(&root, path)
+    }
+
+    #[test]
+    fn a_nested_write_into_a_fresh_workspace_lands_inside_it() {
+        // The case the control channel used to die on: the canary path's parent
+        // does not exist in a new machine, `safe_path` refused it by
+        // canonicalising a parent that was not there, and the refusal closed
+        // the connection with no response frame - the host saw a write that
+        // became a dead channel rather than a write that was answered.
+        let workspace = Workspace::new("nested");
+        let mut file = write_target(&workspace, "/secrets/canary.txt").expect("nested write");
+        file.write_all(b"canary").expect("write");
+        file.sync_all().expect("sync");
+        assert_eq!(workspace.read("secrets/canary.txt"), "canary");
+    }
+
+    #[test]
+    fn a_write_replaces_the_whole_file_and_never_appends() {
+        let workspace = Workspace::new("truncate");
+        workspace.write("plain/ordinary.txt", "a much longer first version");
+        let mut file = write_target(&workspace, "/plain/ordinary.txt").expect("open");
+        file.write_all(b"short").expect("write");
+        file.sync_all().expect("sync");
+        assert_eq!(
+            workspace.read("plain/ordinary.txt"),
+            "short",
+            "a shorter write must not leave the old tail behind"
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_not_an_ordinary_file_is_refused_and_left_alone() {
+        let workspace = Workspace::new("special");
+
+        // A FIFO at the target. Two things are being checked: that the write is
+        // refused rather than blocking this loop forever waiting for a reader,
+        // and that the refusal did not consume the FIFO. `O_TRUNC` at open
+        // would have made the open itself wait, with nothing to cancel it.
+        let fifo = workspace.0.join("pipe");
+        let fifo_path = CString::new(fifo.to_str().expect("utf-8 path")).expect("path has no nul");
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo"
+        );
+        assert!(
+            write_target(&workspace, "/pipe").is_err(),
+            "a FIFO is not a file to write"
+        );
+
+        // The other reachable case: an ordinary file that also answers to a
+        // second name, so something else in the sandbox can still be changing
+        // it through that name. Refused, with both names intact.
+        workspace.write("plain/data.txt", "original");
+        fs::hard_link(
+            workspace.0.join("plain/data.txt"),
+            workspace.0.join("plain/alias.txt"),
+        )
+        .expect("hard link");
+        assert!(
+            write_target(&workspace, "/plain/data.txt").is_err(),
+            "a file reachable under another name is refused"
+        );
+        assert_eq!(workspace.read("plain/data.txt"), "original");
+        assert_eq!(workspace.read("plain/alias.txt"), "original");
+    }
+
+    #[test]
+    fn a_missing_directory_is_created_but_a_leaf_named_like_a_file_is_not() {
+        let workspace = Workspace::new("mkdir");
+        drop(open_in_workspace(&workspace.0, "/a/b/c", DIRECTORY_FLAGS, true).expect("mkdir"));
+        assert!(workspace.exists("a/b/c"));
+        workspace.write("a/file", "x");
+        assert!(
+            open_in_workspace(&workspace.0, "/a/file/c", DIRECTORY_FLAGS, true).is_err(),
+            "a file in the middle of the path is refused, not created around"
+        );
+    }
+
+    #[test]
+    fn a_link_anywhere_in_the_path_is_refused_rather_than_followed() {
+        let workspace = Workspace::new("escape");
+        let outside = Workspace::new("escape-outside");
+        outside.write("stolen.txt", "original");
+
+        // A link as an intermediate component: the write must not reach
+        // through it, and the target outside the workspace must be untouched.
+        std::os::unix::fs::symlink(&outside.0, workspace.0.join("secrets")).expect("link");
+        assert!(
+            open_in_workspace(&workspace.0, "/secrets/canary.txt", WRITE_FLAGS, false).is_err(),
+            "a link in the path must not be followed"
+        );
+        assert_eq!(outside.read("stolen.txt"), "original");
+        assert!(!outside.exists("canary.txt"), "nothing was written outside");
+
+        // A link as the leaf: same answer, and the file it points at keeps its
+        // contents instead of being overwritten through the link.
+        let other = Workspace::new("escape-leaf");
+        other.write("target.txt", "original");
+        std::os::unix::fs::symlink(other.0.join("target.txt"), workspace.0.join("link.txt"))
+            .expect("link");
+        assert!(
+            open_in_workspace(&workspace.0, "/link.txt", WRITE_FLAGS, false).is_err(),
+            "a leaf that is a link must be refused"
+        );
+        assert_eq!(other.read("target.txt"), "original");
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_link_mid_write_cannot_redirect_the_write() {
+        // The race the descriptor-relative traversal exists for, stated without
+        // a thread: the attacker renames a directory the guest has already
+        // opened and leaves a link to the outside world in its place. A
+        // verify-then-write-by-name implementation writes through the link. An
+        // implementation holding the opened directory cannot, because after
+        // traversal has opened a component the name is never looked up again.
+        let workspace = Workspace::new("swap");
+        let outside = Workspace::new("swap-outside");
+        let held = open_in_workspace(&workspace.0, "/secrets", DIRECTORY_FLAGS, true)
+            .expect("create and open the directory");
+
+        let inside = workspace.0.join("secrets");
+        let parked = workspace.0.join("parked");
+        fs::rename(&inside, &parked).expect("park the real directory");
+        std::os::unix::fs::symlink(&outside.0, &inside).expect("leave a link in its place");
+
+        let leaf = CString::new("canary.txt").expect("leaf");
+        let mut file = open_below(&held, &[leaf], WRITE_FLAGS, false)
+            .expect("the write follows the directory it opened, not the name");
+        file.write_all(b"canary").expect("write");
+        file.sync_all().expect("sync");
+
+        assert_eq!(
+            fs::read_to_string(parked.join("canary.txt")).expect("inside"),
+            "canary"
+        );
+        assert!(
+            !outside.exists("canary.txt"),
+            "the write followed the link out of the workspace"
+        );
+
+        // A fresh traversal refuses the same path, because it has to look the
+        // name up again and the name is now a link.
+        assert!(open_in_workspace(&workspace.0, "/secrets/other.txt", WRITE_FLAGS, false).is_err());
+        assert!(!outside.exists("other.txt"));
+    }
+
+    #[test]
+    fn traversal_out_of_the_workspace_is_refused_before_any_syscall() {
+        let workspace = Workspace::new("traversal");
+        for path in ["/../etc/passwd", "/a/../../etc/passwd", "/a/b/.."] {
+            assert!(
+                open_in_workspace(&workspace.0, path, WRITE_FLAGS, false).is_err(),
+                "{path:?} must be refused"
+            );
+        }
+        // The root itself is not a leaf: an operation that resolved to the
+        // directory rather than to something inside it is not an operation on
+        // a file.
+        assert!(open_in_workspace(&workspace.0, "", WRITE_FLAGS, false).is_err());
+        assert!(open_in_workspace(&workspace.0, "/", WRITE_FLAGS, false).is_err());
+    }
+
+    /// A control channel over a socket pair, answered by `serve_connection`.
+    fn serve_over_pair(secret: Vec<u8>) -> (File, thread::JoinHandle<Result<bool, String>>) {
+        let mut pair = [0 as libc::c_int; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) },
+            0,
+            "socketpair"
+        );
+        let guest = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let host = unsafe { File::from_raw_fd(pair[1]) };
+        let handle = thread::spawn(move || serve_connection(guest, &secret));
+        (host, handle)
+    }
+
+    fn write_file_request(path: &str) -> Request {
+        Request {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: Operation::WriteFile,
+            payload: RequestPayload::WriteFile {
+                path: path.to_owned(),
+                content: b"canary".to_vec(),
+                mode: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_refused_operation_is_answered_and_the_connection_survives_it() {
+        // The defect was never the refusal itself, it was what the refusal did
+        // to the connection: `?` inside a match arm propagated out of the whole
+        // connection loop, so the socket closed with nothing written to it. The
+        // host read that as a dead control channel - "the guest is gone" -
+        // instead of "this write was denied", and the denial never reached the
+        // operation that caused it. This runs the real connection loop.
+        let secret = b"acceptance-secret".to_vec();
+        let (mut host, server) = serve_over_pair(secret.clone());
+
+        // A path that cannot be resolved: the loop must answer rather than
+        // hang up.
+        write_frame(
+            &mut host,
+            &secret,
+            &write_file_request("/workspace/../etc/passwd"),
+        )
+        .expect("write the request");
+        let answered: Response =
+            serde_json::from_slice(&read_frame(&mut host, &secret).expect("a frame, not an eof"))
+                .expect("a response");
+        assert!(
+            matches!(&answered.payload, ResponsePayload::Error { .. }),
+            "a denied write is answered as a denial: {:?}",
+            answered.payload
+        );
+
+        // The channel is still usable: the connection outlived the refusal.
+        let mut health = write_file_request("/workspace/../etc/passwd");
+        health.operation = Operation::Health;
+        health.payload = RequestPayload::None;
+        write_frame(&mut host, &secret, &health).expect("write a second request");
+        let answered: Response =
+            serde_json::from_slice(&read_frame(&mut host, &secret).expect("a second frame"))
+                .expect("a second response");
+        assert!(matches!(&answered.payload, ResponsePayload::Health { .. }));
+
+        drop(host);
+        assert_eq!(
+            server.join().expect("the connection closed cleanly"),
+            Ok(false)
+        );
     }
 }

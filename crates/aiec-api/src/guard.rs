@@ -111,6 +111,102 @@ pub(crate) async fn reserve_guard_budget(
         .map_err(ApiFailure::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerQuarantineBody {
+    identity: GuardIdentity,
+    request: QuarantineRequest,
+}
+
+/// The assigned host worker may restrict its sandbox after a critical canary.
+/// It cannot supply a release, arbitrary rule, or unanchored guest assertion.
+pub(crate) async fn worker_guard_quarantine(
+    State(state): State<AppState>,
+    Path(node): Path<Uuid>,
+    Json(body): Json<WorkerQuarantineBody>,
+) -> Result<StatusCode, ApiFailure> {
+    let sandbox = state
+        .repository()
+        .get_sandbox(body.identity.tenant_id, body.identity.sandbox_id)
+        .await
+        .map_err(ApiFailure::from)?;
+    if sandbox.node_id != Some(node)
+        || body.identity.policy_hash != body.request.policy_hash
+        || guard_policy_hash(&sandbox)? != body.identity.policy_hash
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "canary quarantine is not bound to this worker and policy",
+        ));
+    }
+    let fence = current_fence(&state, sandbox.tenant_id, sandbox.id).await?;
+    // A different lease is a reassignment and is refused. A generation *behind*
+    // the current one on the same lease is a renewal the attachment could not
+    // observe yet: refusing it would leave a critical canary with a cut network
+    // and no durable quarantine, which is the worse outcome. This request can
+    // only restrict, never release, and the durable write below always uses the
+    // fence this read resolved rather than the one the caller supplied.
+    if fence.lease_id != body.request.fence.lease_id
+        || body.request.fence.generation > fence.generation
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "canary quarantine names an unissued or stale lease",
+        ));
+    }
+    let [rule] = body.request.rules.as_slice() else {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "worker quarantine requires one critical credential-canary rule",
+        ));
+    };
+    if rule.rule != aiec_guard::canaries::RULE_CANARY_CREDENTIAL
+        || rule.evidence_references.len() != 2
+    {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "worker quarantine requires an opaque canary reference and journal hash",
+        ));
+    }
+    let observation = observe(state.clone(), sandbox.tenant_id, sandbox.id, 0).await?;
+    if !observation.network_cut
+        || !observation.events.iter().any(|event| {
+            event.category == aiec_guard::events::Category::Credential
+                && event.decision == aiec_guard::events::Decision::Quarantine
+                && event.destination.as_ref() == Some(&rule.evidence_references[0])
+                && event.current_hash == rule.evidence_references[1]
+                && event.policy_hash == body.identity.policy_hash
+        })
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "critical canary lacks a verified cut and matching host journal event",
+        ));
+    }
+    begin_quarantine(state.clone(), sandbox.tenant_id, sandbox.id, body.request).await?;
+    // Acknowledgment means durable restriction, not merely queued work. The
+    // latched budget is also picked up by the existing recovery reaper.
+    state
+        .repository()
+        .mark_guard_quarantined(sandbox.tenant_id, sandbox.id, fence)
+        .await
+        .map_err(ApiFailure::from)?;
+    tokio::spawn(async move {
+        if let Err(error) = advance_quarantine(state, sandbox.tenant_id, sandbox.id).await {
+            tracing::warn!(
+                sandbox_id = %sandbox.id,
+                reason = %error.message,
+                "critical canary forensic stages remain incomplete"
+            );
+        }
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TelemetryQuery {
@@ -515,32 +611,46 @@ async fn advance_quarantine(
     }
     incident = record_stage(&state, incident, Vec::new()).await?;
 
-    // 4. the authoritative event, appended outside the guest.
-    let event = aiec_guard::events::EventInput {
-        sandbox_id: id,
-        tenant_id: tenant,
-        policy_hash: policy_hash.clone(),
-        category: aiec_guard::events::Category::Quarantine,
-        decision: aiec_guard::events::Decision::Quarantine,
-        reason: "watchdog quarantine".into(),
-        destination: request.rules.first().map(|rule| rule.rule.clone()),
-        request_bytes: 0,
-        response_bytes: 0,
-        duration_ms: 0,
-    };
+    // 4. the authoritative event, appended outside the guest. Appended once per
+    //    incident: a stage that is still being retried must not add a second
+    //    "quarantine" to a hash-chained stream, because every reader counts
+    //    those rows and a retry storm would read as repeated decisions. Whether
+    //    one is already there is answered by re-reading the stream, not by what
+    //    this process remembers doing.
+    let already_recorded = observe(state.clone(), tenant, id, 0)
+        .await?
+        .events
+        .iter()
+        .any(|event| event.category == aiec_guard::events::Category::Quarantine);
     let mut failures: Vec<String> = Vec::new();
-    if let Err(error) = runtime
-        .guard_control(
-            &sandbox,
-            fence,
-            GuardControlCommand::AppendEvent {
-                policy_hash: policy_hash.clone(),
-                event,
-            },
-        )
-        .await
-    {
-        failures.push(format!("guard event: {error}"));
+    if already_recorded {
+        tracing::warn!("quarantine event already recorded for {id}; not appending a duplicate");
+    } else {
+        let event = aiec_guard::events::EventInput {
+            sandbox_id: id,
+            tenant_id: tenant,
+            policy_hash: policy_hash.clone(),
+            category: aiec_guard::events::Category::Quarantine,
+            decision: aiec_guard::events::Decision::Quarantine,
+            reason: "watchdog quarantine".into(),
+            destination: request.rules.first().map(|rule| rule.rule.clone()),
+            request_bytes: 0,
+            response_bytes: 0,
+            duration_ms: 0,
+        };
+        if let Err(error) = runtime
+            .guard_control(
+                &sandbox,
+                fence,
+                GuardControlCommand::AppendEvent {
+                    policy_hash: policy_hash.clone(),
+                    event,
+                },
+            )
+            .await
+        {
+            failures.push(format!("guard event: {error}"));
+        }
     }
     // The incident's evidence is re-read from the authoritative stream rather
     // than assembled from what this process happened to be told.

@@ -1317,7 +1317,8 @@ impl FirecrackerConfig {
         let digest = hex::encode(Sha256::digest(self.state_dir.to_string_lossy().as_bytes()));
         std::env::temp_dir().join("aiec-fc").join(&digest[..16])
     }
-    fn socket_dir(&self, id: Uuid) -> PathBuf {
+    /// Host socket directory for the sandbox's real Firecracker control channels.
+    pub fn socket_dir(&self, id: Uuid) -> PathBuf {
         self.socket_root().join(id.to_string())
     }
     fn vm_dir(&self, id: Uuid) -> PathBuf {
@@ -1828,6 +1829,38 @@ impl FirecrackerRuntime {
             identities: Arc::new(identities),
         }
     }
+    /// Admits the signed image a guarded workload demanded, before any machine
+    /// exists for it.
+    ///
+    /// The deployment-wide setting is read once, at worker start, and cannot
+    /// know which sandbox asked. A per-sandbox `require_signed_image` therefore
+    /// re-admits here with a required gate: with no operator keys in it, that
+    /// gate admits nothing, because an unsigned image is not signed.
+    async fn admit_signed_image(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        if !sandbox
+            .environment
+            .guard
+            .as_ref()
+            .is_some_and(|guard| guard.require_signed_image)
+        {
+            return Ok(());
+        }
+        let mut config = self.config.clone();
+        if !config
+            .image_trust
+            .as_ref()
+            .is_some_and(aiec_core::image_trust::ImageTrustGate::is_required)
+        {
+            config.image_trust = Some(aiec_core::image_trust::ImageTrustGate::new(
+                aiec_core::image_trust::ImageTrustRequirement::REQUIRED,
+            ));
+        }
+        tokio::task::spawn_blocking(move || config.check_image_trust())
+            .await
+            .map_err(|error| {
+                RuntimeError::Unavailable(format!("image admission task failed: {error}"))
+            })?
+    }
 
     /// The per-sandbox control identity store backing the guest control channel.
     ///
@@ -1936,18 +1969,26 @@ impl FirecrackerRuntime {
                 }
             }
         };
+        // Every I/O failure on this exchange names the request that produced
+        // it. A bare `io: early eof` - which is what a server that closes
+        // mid-response looks like - says nothing about which of the six
+        // configuration calls it came from, and nothing in the process that
+        // receives it can recover the request afterwards.
+        let fail = |error: std::io::Error| {
+            RuntimeError::FirecrackerApi(format!("{method} {path}: {error}"))
+        };
         let body = body.map(|value| serde_json::to_vec(&value)).transpose()?;
         let body = body.unwrap_or_default();
         let request = format!(
             "{method} http://localhost{path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(&body).await?;
+        stream.write_all(request.as_bytes()).await.map_err(fail)?;
+        stream.write_all(&body).await.map_err(fail)?;
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
         while !header.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).await? == 0 {
+            if stream.read(&mut byte).await.map_err(fail)? == 0 {
                 return Err(RuntimeError::FirecrackerApi(
                     "API closed before response headers".into(),
                 ));
@@ -1976,7 +2017,7 @@ impl FirecrackerRuntime {
             })
             .unwrap_or(0);
         let mut response_body = vec![0; content_length];
-        stream.read_exact(&mut response_body).await?;
+        stream.read_exact(&mut response_body).await.map_err(fail)?;
         if !(200..300).contains(&status) {
             return Err(RuntimeError::FirecrackerApi(format!(
                 "{method} {path} returned {status}: {}",
@@ -2165,7 +2206,7 @@ impl FirecrackerRuntime {
         payload: RequestPayload,
     ) -> Result<ResponsePayload, RuntimeError> {
         let request = Self::fresh_request(operation, payload);
-        match tokio::time::timeout(
+        let result = match tokio::time::timeout(
             self.guest_call_timeout(&request),
             self.guest_call_inner(id, request),
         )
@@ -2175,7 +2216,19 @@ impl FirecrackerRuntime {
             Err(_) => Err(RuntimeError::Unavailable(
                 "guest vsock call timed out".into(),
             )),
-        }
+        };
+        // A call that fails without a reply - the guest closed the channel, or
+        // the framing broke - is otherwise indistinguishable from any other
+        // transport failure, and the operation is the one thing that says which
+        // request was in flight. The guest's own refusals arrive as an error
+        // response and are already specific.
+        result.map_err(|error| match error {
+            RuntimeError::Io(cause) => RuntimeError::Io(std::io::Error::new(
+                cause.kind(),
+                format!("guest {operation:?}: {cause}"),
+            )),
+            other => other,
+        })
     }
 
     async fn spawn(&self, id: Uuid) -> Result<FirecrackerVm, RuntimeError> {
@@ -2298,6 +2351,29 @@ impl FirecrackerRuntime {
                             return Err(RuntimeError::Unavailable(
                                 "Guard guest resolver setup failed".into(),
                             ));
+                        }
+                    }
+                    // Plant the configured file canaries in this sandbox's own
+                    // workspace. Only workspace paths: the guest's write path
+                    // is confined to the workspace, and the host-side read
+                    // observation covers the control channel's file reads, so a
+                    // canary outside the workspace could never be both planted
+                    // and observed. No base image is ever written.
+                    if let Some(guard) = &sandbox.environment.guard {
+                        for canary in &guard.canaries.files {
+                            if !canary.path.starts_with("/workspace/") {
+                                continue;
+                            }
+                            self.guest_call(
+                                sandbox.id,
+                                Operation::WriteFile,
+                                RequestPayload::WriteFile {
+                                    path: canary.path.clone(),
+                                    content: canary.value.as_bytes().to_vec(),
+                                    mode: Some(0o600),
+                                },
+                            )
+                            .await?;
                         }
                     }
                     return Ok(());
@@ -2516,6 +2592,7 @@ impl FirecrackerRuntime {
         // while this create is still copying into the directory it removes, and
         // so the copy that follows is the only one writing there.
         let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        self.admit_signed_image(sandbox).await?;
         // Admission is the first thing this asks, before it validates anything
         // and before it writes anything. A host that cannot physically hold the
         // sandbox is refused whether or not its configuration is also wrong,
@@ -2684,9 +2761,24 @@ impl FirecrackerRuntime {
         // and return success, and the boot would then finish and publish a live
         // process behind it.
         let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
+        self.admit_signed_image(sandbox).await?;
         self.config.check()?;
         let mut vm = self.spawn(sandbox.id).await?;
         if let Err(error) = self.configure_and_start(sandbox, &mut vm).await {
+            // The guest's console goes to the VMM's log, and it is the only
+            // place a boot failure says why: the guest agent logs its own
+            // refusals there, and without the tail a refusal reads as "the
+            // machine did not come up".
+            let boot_log = self.config.vm_dir(sandbox.id).join("firecracker.log");
+            if let Ok(text) = std::fs::read_to_string(&boot_log) {
+                let tail: Vec<&str> = text.lines().rev().take(60).collect();
+                tracing::error!(
+                    sandbox_id = %sandbox.id,
+                    error = %error,
+                    "machine configuration or start failed; last console output follows\n{}",
+                    tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+                );
+            }
             if let Some(network) = &vm.network {
                 let _ = self.network.release(sandbox, network).await;
             }
@@ -3030,6 +3122,9 @@ impl FirecrackerRuntime {
 
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, RuntimeError> {
         use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunkRequest};
+        // Before the read, not after it: a configured canary must be able to
+        // refuse the file without its bytes ever crossing the channel.
+        self.network.guard_observe_file_read(sandbox, path).await?;
         // Always the chunked read, which is one round trip for a file that fits
         // a frame and several for one that does not. The single-shot `ReadFile`
         // cannot be used here at all: a response has to fit one frame too, so a
@@ -3166,6 +3261,12 @@ impl FirecrackerRuntime {
                     });
                     pending.push(child.path);
                 } else {
+                    // A portable snapshot must not become a way around a
+                    // configured file canary: observe each file before its
+                    // bytes are read for the archive.
+                    self.network
+                        .guard_observe_file_read(sandbox, &child.path)
+                        .await?;
                     let response = self
                         .guest_call(
                             sandbox.id,

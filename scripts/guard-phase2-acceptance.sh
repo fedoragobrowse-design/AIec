@@ -12,6 +12,10 @@ self=$(realpath "$0")
 host_netns=$(readlink /proc/self/ns/net)
 [[ $host_netns == net:* ]] || { printf '%s\n' 'cannot read the host network namespace' >&2; exit 2; }
 
+# Shared with the other launchers: an isolated database for this run, either a
+# private cluster or one the caller names and owns alone.
+source "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/acceptance-db.sh"
+
 if [[ ${1:-} != --inside ]]; then
   bin=${P2_BIN:-$HOME/aiec/phase2-bin}
   [[ -x "$bin/aiec-server" && -x "$bin/aiec" && -x "$bin/aiec-guard-watchdog" ]] || {
@@ -42,23 +46,8 @@ if [[ ${1:-} != --inside ]]; then
     printf '%s\n' 'another phase 2 acceptance run holds the lock; wait for it' >&2
     exit 2
   fi
-  mkdir -p "$pg" "$sock"
-  chmod 700 "$root"
   pg_bin=${P2_PG_BIN:-$HOME/.paperclip/cli/installs/npm/2026.916.1/node_modules/@embedded-postgres/linux-x64/native/bin}
-  # A fresh cluster per run: capacity, leases and quarantined sandboxes from an
-  # earlier run would otherwise make this one start against a host that is
-  # already full, which is a stale-fixture failure rather than a product one.
-  # A run that was interrupted leaves its postmaster holding this directory and
-  # its socket lock; a fresh acceptance must not inherit either.
-  "$pg_bin/pg_ctl" -D "$pg" -m immediate stop >/dev/null 2>&1 || true
-  rm -rf -- "$sock"
-  mkdir -p "$sock"
-  rm -rf -- "$pg"
-  "$pg_bin/initdb" -D "$pg" -U aiec -A trust --no-sync >"$root/initdb.log" 2>&1
-  "$pg_bin/pg_ctl" -D "$pg" -o "-k $sock -h ''" -l "$root/postgres.log" -w start >/dev/null
-  # The bundled server has no client binaries, so the acceptance uses the
-  # database `initdb` already created rather than one it cannot ask for.
-  export DATABASE_URL="postgresql://aiec@localhost/postgres?host=$sock"
+  acceptance_prepare_database "$root" "$pg" "$sock" "$pg_bin"
   # Reap anything this run started before stopping the database. The drivers
   # launch a control plane and a worker, and `unshare --kill-child` only kills
   # the direct child, so an interrupted run otherwise leaves servers bound to
@@ -72,9 +61,7 @@ if [[ ${1:-} != --inside ]]; then
   # and the next run refused with "another run holds the lock" while nothing
   # was running. One trap releases both, in that order.
   stop_db() {
-    pkill -9 -f -- "$root" >/dev/null 2>&1 || true
-    "$pg_bin/pg_ctl" -D "$pg" -m immediate stop >/dev/null 2>&1 || true
-    rmdir "$root/.lock" 2>/dev/null || true
+    acceptance_stop_database "$root" "$pg" "$pg_bin"
   }
   trap stop_db EXIT
   unshare --user --map-root-user --net --fork --kill-child=KILL bash "$self" --inside

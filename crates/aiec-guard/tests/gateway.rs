@@ -1,9 +1,14 @@
 use aiec_guard::{
     compiler::{OperatorBoundary, compile},
     control::{BudgetAuthority, BudgetDebit, GuardFence, GuardIdentity},
+    enforcement::{GuardAttachment, TestBackend},
     events::{EventInput, EventSink, FileEventSink, GuardEvent, read_events},
     gateway::{CredentialStore, GatewayConfig, GuardGateway},
     policy::{EgressRule, GuardPolicy, ModelEndpoint, PolicyTemplate},
+    proposals::{
+        AgentCredential, EgressGrant, HumanApproval, ProposalRequest, ProposalStore,
+        ProposalStoreConfig,
+    },
 };
 use axum::{
     Router,
@@ -270,7 +275,7 @@ impl Fixture {
         let control = gateway.control();
         Self {
             gateway: Some(gateway),
-            identity: control.identity().clone(),
+            identity: control.identity(),
             control,
             mock,
             server,
@@ -1105,5 +1110,110 @@ async fn an_in_flight_tunnel_is_cancelled_by_the_watchdog_without_closing_the_ga
     let closed = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte)).await;
     assert!(closed.is_ok(), "an in-flight tunnel is cancelled at cut");
     assert!(f.control.network_cut());
+    let _ = f.finish().await;
+}
+
+#[tokio::test]
+async fn an_approved_proposal_moves_the_enforcement_generation_and_nothing_else() {
+    // An approved proposal installs a new policy into a gateway that keeps
+    // running. Without the rebind, every watchdog heartbeat and every budget
+    // reservation would be refused against a generation that no longer
+    // exists. With it, the generation moves and the ownership it is built on
+    // does not.
+    const OPERATOR_CREDENTIAL: &str = "operator-approval";
+    const OPERATOR_SECRET: &str = "operator-only-synthetic-secret";
+    const GRANTED_HOST: &str = "api.guard.test";
+
+    let f = Fixture::with_sink(|_| {}, |sink| sink).await;
+    let base = f.gateway().identity();
+    let directory = std::env::temp_dir().join(format!("aiec-guard-adopt-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let sink: Arc<dyn EventSink> =
+        Arc::new(FileEventSink::open(directory.join("events.jsonl")).unwrap());
+    let mut credentials = CredentialStore::empty();
+    credentials
+        .insert(OPERATOR_CREDENTIAL.into(), OPERATOR_SECRET.into())
+        .unwrap();
+    let store = ProposalStore::new(ProposalStoreConfig {
+        sandbox_id: base.sandbox_id,
+        tenant_id: base.tenant_id,
+        boundary: {
+            // The proposal is verified against the same boundary the fixture
+            // compiled its own policy under.
+            let mut boundary = OperatorBoundary::default();
+            for host in ["model.guard.test", "web.guard.test"] {
+                boundary.test_destinations.insert(
+                    format!("{host}:{}", f.port),
+                    vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                );
+            }
+            boundary
+        },
+        policy: f.control.policy(),
+        enforcement: Arc::new(TestBackend::default()),
+        attachment: GuardAttachment {
+            sandbox_id: base.sandbox_id,
+            tenant_id: base.tenant_id,
+            interface: "veth-guard".into(),
+            guest_ip: Ipv4Addr::new(10, 0, 2, 2),
+            gateway_ip: Ipv4Addr::new(10, 0, 2, 1),
+            dns_port: 53,
+            broker_port: 8080,
+        },
+        events: sink,
+    })
+    .expect("proposal store");
+    let agent = AgentCredential::new(base.sandbox_id, base.tenant_id, "planner-1").unwrap();
+    let proposal = store
+        .submit(
+            &agent,
+            ProposalRequest {
+                summary: format!("please allow {GRANTED_HOST}:443"),
+                allow: vec![EgressGrant {
+                    host: GRANTED_HOST.to_owned(),
+                    port: 443,
+                    methods: vec!["POST".into()],
+                    paths: vec!["/v2/".into()],
+                }],
+            },
+        )
+        .await
+        .expect("an agent may submit");
+    let outcome = store
+        .approve(
+            &HumanApproval::operator(
+                "ops-oncall",
+                OPERATOR_CREDENTIAL,
+                OPERATOR_SECRET,
+                &credentials,
+            )
+            .unwrap(),
+            proposal.id,
+        )
+        .await
+        .expect("a safe proposal applies");
+
+    // The rebind only ever names a policy that is actually in force.
+    assert!(
+        f.gateway().adopt_policy(&base.policy_hash).is_err(),
+        "a generation that is no longer in force cannot be named"
+    );
+    // Until the new generation is named, the superseded one cannot report.
+    assert!(
+        f.gateway().heartbeat(&base).is_err(),
+        "the superseded generation cannot keep reporting"
+    );
+    f.gateway()
+        .adopt_policy(&outcome.policy_hash)
+        .expect("the installed generation is named");
+    let rebound = f.gateway().identity();
+    assert_ne!(rebound.policy_hash, base.policy_hash);
+    assert_eq!(rebound.policy_hash, outcome.policy_hash);
+    assert_eq!(rebound.sandbox_id, base.sandbox_id);
+    assert_eq!(rebound.tenant_id, base.tenant_id);
+    f.gateway()
+        .heartbeat(&rebound)
+        .expect("the watchdog keeps reporting across an approval");
+    let _ = std::fs::remove_dir_all(&directory);
     let _ = f.finish().await;
 }

@@ -37,11 +37,13 @@ pub(crate) async fn serve_udp(socket: UdpSocket, state: Arc<Runtime>) -> Result<
                     state.record(state.measured_event(Category::Dns, Decision::Deny, "DNS guest source mismatch", None, size as u64, 0, Duration::ZERO)).await?;
                     continue;
                 }
-                let reply = tokio::select! {
-                    biased;
-                    _ = stop.changed() => None,
-                    result = answer(&bytes[..size], &state, false) => result?,
-                };
+                // Not selected against a stop: a canary trips by cutting the
+                // attachment, which is the very latch this loop watches, so
+                // preemption here drops the trip's own containment and journal
+                // append mid-flight and leaves a cut the guest can never
+                // explain. A latched cut makes `answer` refuse with "gateway
+                // cut", so finishing the query is both bounded and truthful.
+                let reply = answer(&bytes[..size], &state, false).await?;
                 if state.active()
                     && let Some(reply) = reply { socket.send_to(&reply, peer).await?; }
             }
@@ -66,7 +68,7 @@ pub(crate) async fn serve_tcp(listener: TcpListener, state: Arc<Runtime>) -> Res
                 let Ok(permit) = state.connections.clone().try_acquire_owned() else { continue; };
                 let state = state.clone();
                 tasks.spawn(async move {
-                    let _permit = permit; let mut stop = state.stop.subscribe();
+                    let _permit = permit;
                     let process = async {
                         // One bounded frame per connection. Clients can reopen for another question.
                         let size = socket.read_u16().await? as usize;
@@ -82,7 +84,10 @@ pub(crate) async fn serve_tcp(listener: TcpListener, state: Arc<Runtime>) -> Res
                         }
                         socket.shutdown().await?; Ok(())
                     };
-                    tokio::select! { _ = stop.changed() => {}, _ = tokio::time::sleep(Duration::from_secs(15)) => {}, _ = process => {} }
+                    // Bounded by the read deadline rather than by the stop
+                    // watch, for the same reason as UDP: a drop here discards a
+                    // trip's containment and journal append along with it.
+                    tokio::select! { _ = tokio::time::sleep(Duration::from_secs(15)) => {}, _ = process => {} }
                 });
             }
         }
@@ -133,13 +138,22 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
     } else if let Ok(query) = Message::from_vec(bytes) {
         // A canary hostname is resolved only by this resolver, so this is the
         // authoritative place to see the attempt.
+        //
+        // The trip is terminal. It is recorded even for a query whose shape is
+        // refused, because an attempt is the thing the canary exists to see;
+        // and it is not allowed to fall through into the resolution branch
+        // below, because a name an operator also listed as reachable would
+        // otherwise be answered NoError and journalled as an allowed lookup
+        // immediately after the attempt tripped.
+        let mut canary_trip = false;
         if let (Some(canary), Some(answer)) = (state.canaries(), query.queries().first())
             && let Ok(outcome) = canary.observe_dns_query(&answer.name().to_utf8()).await
-            && outcome.trip.is_some()
         {
-            reply.set_response_code(ResponseCode::Refused);
-            reason = "canary hostname refused";
-            decision = Decision::Deny;
+            canary_trip = outcome.trip.is_some();
+            if canary_trip {
+                reason = "canary hostname refused";
+                decision = Decision::Deny;
+            }
         }
         // Prevent parser differential attacks: parse/reencode alone is not sufficient; reject
         // question compression (unnecessary for one question), trailing wire data and all additions.
@@ -152,6 +166,9 @@ async fn answer(bytes: &[u8], state: &Runtime, tcp: bool) -> Result<Option<Vec<u
             && raw_question_valid(bytes);
         if !shape_valid {
             reply.set_response_code(ResponseCode::FormErr);
+        } else if canary_trip {
+            reply.add_query(query.queries()[0].clone());
+            reply.set_response_code(ResponseCode::Refused);
         } else {
             let q = &query.queries()[0];
             let name = q
