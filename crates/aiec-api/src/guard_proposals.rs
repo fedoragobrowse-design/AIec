@@ -8,7 +8,9 @@
 
 use std::collections::BTreeSet;
 
-use aiec_core::{GuardProposal, Sandbox, Scope};
+use aiec_core::{
+    ApprovalDecisionRequest, ApprovalState, GuardProposal, GuardToolApproval, Sandbox, Scope,
+};
 use aiec_guard::{
     control::{GuardControlCommand, GuardControlResponse, GuardFence},
     proposals::{ProposalRequest, ProposalState},
@@ -297,17 +299,25 @@ pub(crate) async fn deny_proposal(
     ))
 }
 
-/// The harness asks whether a high-risk tool may run.
+/// The harness asks whether one high-risk tool call may run.
 ///
 /// The answer is this control plane's, and it is the same answer for every
-/// caller: the request states a sandbox and a tool, and the policy says which
-/// tools need a human. There is no request body that can carry its own verdict,
-/// and no path by which the harness approves itself.
+/// caller: the request states a sandbox, a tool and a digest of the call's own
+/// arguments, and the answer comes from a recorded human decision about exactly
+/// that call. No request body can carry its own verdict.
+///
+/// `digest` is what stops an approval from being a capability. An operator who
+/// permitted `write_file("/etc/rc", <these bytes>)` did not permit different
+/// bytes at the same path, and a request that omits the digest cannot spend a
+/// grant because none matches.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalBody {
     pub sandbox_id: Uuid,
     pub tool: String,
+    /// Digest of the tool and its canonical arguments, lowercase hex.
+    #[serde(default)]
+    pub digest: Option<String>,
     /// Optional detail for the operator's decision, never parsed.
     #[serde(default)]
     pub detail: Option<String>,
@@ -333,6 +343,9 @@ fn known_safe_tools() -> BTreeSet<String> {
     .collect()
 }
 
+/// How long an unanswered request stays open before it stops being a request.
+const APPROVAL_TTL_SECONDS: i64 = 300;
+
 async fn approve_tool(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -356,6 +369,24 @@ async fn approve_tool(
             "tool name is empty, oversized or not a plain name",
         ));
     }
+    let Some(digest) = body.digest.as_deref() else {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "digest is required: an approval is for one call, not for a tool",
+        ));
+    };
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "digest must be 64 lowercase hex characters",
+        ));
+    }
     if let Some(detail) = body.detail.as_deref()
         && (detail.len() > 256 || detail.chars().any(|c| c.is_control()))
     {
@@ -365,8 +396,7 @@ async fn approve_tool(
             "detail is longer than 256 bytes or carries control characters",
         ));
     }
-    // Ownership first: a caller may not ask about a sandbox it does not hold,
-    // and a held sandbox may not be approved for by a stranger's key.
+    // Ownership first: a caller may not ask about a sandbox it does not hold.
     let _ = state
         .repository()
         .get_sandbox(principal.tenant_id, id)
@@ -379,17 +409,159 @@ async fn approve_tool(
             required: false,
         }));
     }
-    // Everything else needs a recorded human decision, and this control plane
-    // does not yet issue one. The answer is a refusal that names itself: never a
-    // silent yes, and never an approval the harness supplied.
+
+    // Spend any grant a human already made. The spend is atomic and bound to
+    // this key, so a grant is good for exactly one call by exactly the key that
+    // asked for it.
+    let spent = state
+        .repository()
+        .consume_guard_tool_approval(
+            principal.tenant_id,
+            id,
+            &body.tool,
+            digest,
+            principal.key_id,
+            Utc::now(),
+        )
+        .await
+        .map_err(ApiFailure::from)?;
+    if spent.is_some() {
+        return Ok(Json(ApprovalAnswer {
+            approved: true,
+            reason: None,
+            required: true,
+        }));
+    }
+
+    // Nothing has decided this call. Record the request so an operator can, and
+    // answer with a refusal that names itself - never a silent yes, and never
+    // an approval the harness supplied.
+    state
+        .repository()
+        .put_guard_tool_approval(GuardToolApproval {
+            id: new_id(),
+            sandbox_id: id,
+            tenant_id: principal.tenant_id,
+            tool: body.tool.clone(),
+            request_digest: digest.to_string(),
+            detail: body.detail.clone(),
+            // From the principal, never from the body: a caller must not be
+            // able to nominate somebody to decide on its behalf.
+            requested_by_key_id: principal.key_id,
+            requested_by_label: reviewer(&principal, None)?,
+            state: ApprovalState::Pending,
+            decided_by_key_id: None,
+            decided_by_label: None,
+            decided_at: None,
+            expires_at: Utc::now() + chrono::Duration::seconds(APPROVAL_TTL_SECONDS),
+            consumed_at: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .map_err(ApiFailure::from)?;
     Ok(Json(ApprovalAnswer {
         approved: false,
         reason: Some(format!(
-            "{} has no operator approval in this deployment",
+            "{} has no operator approval for this exact call",
             body.tool
         )),
         required: true,
     }))
+}
+
+/// An operator's decision on one pending request.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionBody {
+    /// The request being decided, as recorded by the asker.
+    pub request_id: Uuid,
+    pub decision: ApprovalState,
+}
+
+/// Records an operator's decision about one specific high-risk call.
+///
+/// This is the positive half of §44, and the reason it needs
+/// `Scope::GuardApprove` while the check above needs only `SandboxesWrite`:
+/// the identity that asks must not be the identity that decides. Scope alone
+/// would not be enough, since one key may hold both scopes, so the decision is
+/// additionally refused when the decider is the requester - by key id, in the
+/// store, and by a trigger beneath it.
+async fn decide_tool_approval(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DecisionBody>,
+) -> ApiResult<GuardToolApproval> {
+    principal
+        .authorize(Scope::GuardApprove)
+        .map_err(ApiFailure::from)?;
+    if body.decision == ApprovalState::Pending {
+        return Err(ApiFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "decision must be granted or denied",
+        ));
+    }
+    let _ = state
+        .repository()
+        .get_sandbox(principal.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let decided = state
+        .repository()
+        .decide_guard_tool_approval(ApprovalDecisionRequest {
+            tenant: principal.tenant_id,
+            sandbox: id,
+            request_id: body.request_id,
+            decision: body.decision,
+            decided_by_key_id: principal.key_id,
+            decided_by_label: &reviewer(&principal, None)?,
+            at: Utc::now(),
+        })
+        .await
+        .map_err(ApiFailure::from)?;
+    // Unknown, already decided and self-approval are one answer on purpose:
+    // telling them apart would tell a caller probing for its own authority
+    // exactly which of them happened.
+    decided
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::CONFLICT,
+                "conflict",
+                "approval request is not pending, or was not this requester's to decide",
+            )
+        })
+        .map(Json)
+}
+
+/// Lists the approval requests for one sandbox, so an operator can find the
+/// `request_id` a decision needs.
+///
+/// Without this the ask/grant flow is unusable through the API: the harness
+/// knows it asked, but nothing in the API's surface carried the request's id
+/// back to the person meant to decide, so the only way to find one was to read
+/// the table directly. It requires `GuardApprove` rather than
+/// `SandboxesWrite` because it is the operator's queue, not the caller's.
+async fn list_tool_approvals(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Vec<GuardToolApproval>> {
+    principal
+        .authorize(Scope::GuardApprove)
+        .map_err(ApiFailure::from)?;
+
+    let _ = state
+        .repository()
+        .get_sandbox(principal.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    let approvals = state
+        .repository()
+        .list_guard_tool_approvals(principal.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?;
+    Ok(Json(approvals))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -406,6 +578,10 @@ pub(crate) fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
     axum::Router::new()
         .route("/sandboxes/{id}/guard/approval", post(approve_tool))
+        .route(
+            "/sandboxes/{id}/guard/tool-approvals",
+            post(decide_tool_approval).get(list_tool_approvals),
+        )
         .route(
             "/sandboxes/{id}/guard/proposals",
             post(submit_proposal).get(list_proposals),

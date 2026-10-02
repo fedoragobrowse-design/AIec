@@ -3,8 +3,9 @@ use crate::{
 };
 mod guard;
 use aiec_core::{
-    ApiKeyRecord, CoreError, GuardProposal, ImageRecord, Node, RuntimeKind, Sandbox, SandboxState,
-    Scope, Snapshot, UsageEvent, UsageSummary, new_id,
+    ApiKeyRecord, ApprovalDecisionRequest, CoreError, GuardProposal, GuardToolApproval,
+    ImageRecord, Node, RuntimeKind, Sandbox, SandboxState, Scope, Snapshot, UsageEvent,
+    UsageSummary, new_id,
     run::{
         Placement, RetentionPolicy, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults,
         RunSandbox, RunState, WorkloadSpec,
@@ -3874,6 +3875,49 @@ impl MetadataStore for PostgresRepository {
         Self::get_guard_proposal(self, tenant, sandbox, id).await
     }
 
+    async fn put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Self::put_guard_tool_approval(self, approval).await
+    }
+
+    async fn decide_guard_tool_approval(
+        &self,
+        request: ApprovalDecisionRequest<'_>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Self::decide_guard_tool_approval(self, request).await
+    }
+
+    async fn consume_guard_tool_approval(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        tool: &str,
+        request_digest: &str,
+        requested_by_key_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Self::consume_guard_tool_approval(
+            self,
+            tenant,
+            sandbox,
+            tool,
+            request_digest,
+            requested_by_key_id,
+            now,
+        )
+        .await
+    }
+
+    async fn list_guard_tool_approvals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardToolApproval>, CoreError> {
+        Self::list_guard_tool_approvals(self, tenant, sandbox).await
+    }
+
     async fn get_guard_budget(
         &self,
         tenant: Uuid,
@@ -4718,7 +4762,7 @@ async fn release_capacity(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     mod guard_durable;
     use sqlx::postgres::PgPoolOptions;
 
@@ -4761,7 +4805,11 @@ mod tests {
             serde_json::from_value(value).unwrap();
         assert_eq!(parsed, capabilities);
     }
-    fn sandbox(tenant: Uuid) -> Sandbox {
+    pub(crate) fn sandbox_record(tenant: Uuid) -> Sandbox {
+        sandbox(tenant)
+    }
+
+    pub(super) fn sandbox(tenant: Uuid) -> Sandbox {
         let now = Utc::now();
         Sandbox {
             id: new_id(),
@@ -5090,7 +5138,7 @@ mod tests {
 
     // Recovery and sweep queries cross tenants, so a fresh tenant alone cannot
     // isolate their inputs from other tests or rows left by previous runs.
-    async fn isolated_repository_and_tenant()
+    pub(crate) async fn isolated_repository_and_tenant()
     -> Option<(Arc<PostgresRepository>, Uuid, sqlx::PgPool, String)> {
         let url = std::env::var("DATABASE_URL")
             .ok()
@@ -5132,7 +5180,7 @@ mod tests {
         Some((repository, tenant, admin, schema))
     }
 
-    async fn drop_test_schema(
+    pub(crate) async fn drop_test_schema(
         repository: &PostgresRepository,
         admin: sqlx::PgPool,
         schema: String,

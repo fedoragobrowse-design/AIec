@@ -183,6 +183,24 @@ and the fact that `AIEC_ALLOW_LEGACY_NETWORK=1` cannot unguard a Firecracker
 sandbox. The launcher is the phase 2 one with different ports, so the two suites
 can run on one host.
 
+**Two-phase human approval —
+`benchmarks/guard-approval-acceptance.json`: PASS, 10 cases, no cleanup
+errors.** The deployed binaries over HTTPS with PostgreSQL as the store, on a
+database of its own. Ten cases covering an undecided call refused immediately,
+the operator queue readable only with `GuardApprove`, the requester recorded
+from the authenticated principal, self-approval refused even for a key holding
+every scope, a grant recorded against a different identity, an approved call
+allowed once, its replay refused, changed content at the same path refused, a
+denial that is neither spendable nor overturnable, and an ask without a digest
+refused. Launched by `scripts/guard-approval-acceptance.sh`, which mints its
+own certificate authority and its own keys per run.
+
+**What this suite does not cover.** It runs on the container runtime with no
+Guard gateway and no microVM, because the approval surface is ownership-scoped
+rather than runtime-scoped: what is under test is who may decide and who may
+spend. It is not evidence about Guard's network enforcement or about placement;
+Phases 1 and 2 are.
+
 Two properties are deliberately *not* claimed by that suite.
 `AIEC_ALLOW_LEGACY_NETWORK` is only asserted to grant nothing on Firecracker,
 where Guard is injected into every request; the branch it actually guards —

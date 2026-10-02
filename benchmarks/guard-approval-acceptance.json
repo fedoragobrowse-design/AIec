@@ -1,0 +1,122 @@
+{
+  "suite": "guard-approval-acceptance",
+  "section": "44",
+  "generated_at": "2026-10-02T06:59:25.709043+00:00",
+  "endpoint": "https://127.0.0.1:18544",
+  "cases": [
+    {
+      "name": "an-undecided-call-is-refused-immediately",
+      "ok": true,
+      "evidence": {
+        "status": 200,
+        "answer": {
+          "approved": false,
+          "reason": "sandbox.write_file has no operator approval for this exact call",
+          "required": true
+        },
+        "note": "refused, not deferred: there is no poll"
+      }
+    },
+    {
+      "name": "the-operator-queue-is-readable-only-with-the-approve-scope",
+      "ok": true,
+      "evidence": {
+        "operator_status": 200,
+        "operator_pending": 1,
+        "harness_status": 403,
+        "harness_error": "forbidden",
+        "note": "without this the request id is only discoverable by reading the table"
+      }
+    },
+    {
+      "name": "the-requester-is-the-authenticated-key-not-the-body",
+      "ok": true,
+      "evidence": {
+        "requested_by_label": "key:01a0fb69-1a55-716b-9fa2-83f7cf692c4f",
+        "requested_by_key_id": "01a0fb69-1a55-716b-9fa2-83f7cf692c4f",
+        "request_digest_matches": true
+      }
+    },
+    {
+      "name": "no-key-can-approve-its-own-request-however-wide-its-scopes",
+      "ok": true,
+      "evidence": {
+        "narrow_key_status": 403,
+        "all_scopes_own_ask_status": 200,
+        "self_ask_requester_matches_decider": true,
+        "all_scopes_own_decision_status": 409,
+        "still_pending": 2,
+        "note": "403 is refused the scope; 409 reached the check and was refused on identity"
+      }
+    },
+    {
+      "name": "an-operator-grant-is-recorded-against-a-different-identity",
+      "ok": true,
+      "evidence": {
+        "status": 200,
+        "state": "granted",
+        "requested_by_key_id": "01a0fb69-1a55-716b-9fa2-83f7cf692c4f",
+        "decided_by_key_id": "01a0fb69-1a60-73a9-91ca-4abf52c5d64c"
+      }
+    },
+    {
+      "name": "the-approved-call-is-allowed-once",
+      "ok": true,
+      "evidence": {
+        "status": 200,
+        "answer": {
+          "approved": true,
+          "reason": null,
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "the-replay-of-an-approved-call-is-refused",
+      "ok": true,
+      "evidence": {
+        "status": 200,
+        "answer": {
+          "approved": false,
+          "reason": "sandbox.write_file has no operator approval for this exact call",
+          "required": true
+        },
+        "note": "an approval authorises one invocation, not a capability"
+      }
+    },
+    {
+      "name": "a-grant-does-not-cover-different-content-at-the-same-path",
+      "ok": true,
+      "evidence": {
+        "status": 200,
+        "approved": false,
+        "digests_differ": true
+      }
+    },
+    {
+      "name": "a-denial-is-not-spendable-and-cannot-be-overturned",
+      "ok": true,
+      "evidence": {
+        "deny_status": 200,
+        "spend_after_denial": false,
+        "overturn_status": 409,
+        "state_after": "denied"
+      }
+    },
+    {
+      "name": "an-ask-without-a-digest-is-refused",
+      "ok": true,
+      "evidence": {
+        "missing_digest_status": 400,
+        "malformed_digest_status": 400
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "summary": {
+    "total": 10,
+    "passed": 10,
+    "failed": 0,
+    "cleanup_errors": 0
+  }
+}

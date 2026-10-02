@@ -9,8 +9,9 @@ mod run_queue;
 mod snapshots;
 
 use aiec_core::{
-    ApiKeyRecord, CoreError, GuardProposal, ImageRecord, Node, Sandbox, SandboxState, Snapshot,
-    UsageEvent, UsageSummary,
+    ApiKeyRecord, ApprovalDecisionRequest, ApprovalState, CoreError, GuardProposal,
+    GuardToolApproval, ImageRecord, Node, Sandbox, SandboxState, Snapshot, UsageEvent,
+    UsageSummary,
     storage::{
         AuditEvent, BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
         MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
@@ -19,7 +20,7 @@ use aiec_core::{
     },
 };
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 pub use images::{SignedImageResolver, StandardImageResolver};
 pub use object_store::{FilesystemObjectStore, S3Config, S3ObjectStore};
 pub use postgres::PostgresScheduler;
@@ -129,6 +130,7 @@ struct MemoryData {
     guard_incidents: HashMap<Uuid, GuardIncident>,
     guard_proposals: HashMap<Uuid, GuardProposal>,
     leases: HashMap<Uuid, WorkerLease>,
+    guard_tool_approvals: HashMap<Uuid, GuardToolApproval>,
 }
 
 #[derive(Default)]
@@ -464,6 +466,134 @@ impl MemoryRepository {
             .cloned()
             .collect())
     }
+
+    /// Records a request for one high-risk call.
+    ///
+    /// What is asked is fixed once written, matching the trigger on the
+    /// Postgres table. An in-memory store that let a request be rewritten
+    /// would make the API tests pass against a guarantee production does not
+    /// have.
+    pub async fn put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, StoreError> {
+        if approval.request_digest.len() != 64
+            || !approval
+                .request_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(StoreError::Conflict(
+                "approval digest must be 64 lowercase hex characters".into(),
+            ));
+        }
+        if approval.expires_at <= approval.created_at {
+            return Err(StoreError::Conflict(
+                "an approval must expire after it was made".into(),
+            ));
+        }
+        let mut data = self.data.write().await;
+        if data.guard_tool_approvals.contains_key(&approval.id) {
+            return Err(StoreError::Conflict(
+                "approval request already exists".into(),
+            ));
+        }
+        data.guard_tool_approvals
+            .insert(approval.id, approval.clone());
+        Ok(approval)
+    }
+
+    /// Applies an operator's decision, refusing the cases that must never
+    /// succeed: a decision by the requester, a decision on something already
+    /// decided, and a decision naming an unknown request.
+    ///
+    /// Each refusal is `Ok(None)` rather than an error, because the caller
+    /// answers all three the same way and an error would invite a retry of a
+    /// request that is never going to be allowed.
+    pub async fn decide_guard_tool_approval(
+        &self,
+        request: ApprovalDecisionRequest<'_>,
+    ) -> Result<Option<GuardToolApproval>, StoreError> {
+        if request.decision == ApprovalState::Pending {
+            return Ok(None);
+        }
+        let mut data = self.data.write().await;
+        let Some(approval) = data.guard_tool_approvals.get_mut(&request.request_id) else {
+            return Ok(None);
+        };
+        if approval.tenant_id != request.tenant
+            || approval.sandbox_id != request.sandbox
+            || approval.state != ApprovalState::Pending
+            || approval.requested_by_key_id == request.decided_by_key_id
+            || request.at < approval.created_at
+        {
+            return Ok(None);
+        }
+        approval.state = request.decision;
+        approval.decided_by_key_id = Some(request.decided_by_key_id);
+        approval.decided_by_label = Some(request.decided_by_label.to_string());
+        approval.decided_at = Some(request.at);
+        Ok(Some(approval.clone()))
+    }
+
+    /// Spends a grant, once, for exactly the call it was made for.
+    ///
+    /// The whole check and the write happen under one write lock, which is
+    /// what makes it single-use rather than merely "checked then set". A
+    /// requester that does not match spends nothing: an approval belongs to
+    /// the call that asked for it, not to whoever repeats it.
+    pub async fn consume_guard_tool_approval(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        tool: &str,
+        request_digest: &str,
+        requested_by_key_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<GuardToolApproval>, StoreError> {
+        let mut data = self.data.write().await;
+        let candidate = data
+            .guard_tool_approvals
+            .values()
+            .filter(|approval| {
+                approval.tenant_id == tenant
+                    && approval.sandbox_id == sandbox
+                    && approval.tool == tool
+                    && approval.request_digest == request_digest
+                    && approval.requested_by_key_id == requested_by_key_id
+                    && approval.state == ApprovalState::Granted
+                    && approval.consumed_at.is_none()
+                    && approval.expires_at > now
+                    && approval.decided_at.is_some_and(|decided| decided <= now)
+            })
+            .max_by_key(|approval| (approval.decided_at, approval.id))
+            .map(|approval| approval.id);
+        let Some(id) = candidate else {
+            return Ok(None);
+        };
+        let approval = data
+            .guard_tool_approvals
+            .get_mut(&id)
+            .expect("the candidate was just found under the same lock");
+        approval.consumed_at = Some(now);
+        Ok(Some(approval.clone()))
+    }
+
+    pub async fn list_guard_tool_approvals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardToolApproval>, StoreError> {
+        let data = self.data.read().await;
+        let mut listed: Vec<GuardToolApproval> = data
+            .guard_tool_approvals
+            .values()
+            .filter(|approval| approval.tenant_id == tenant && approval.sandbox_id == sandbox)
+            .cloned()
+            .collect();
+        listed.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(listed)
+    }
 }
 
 #[async_trait]
@@ -524,6 +654,56 @@ impl MetadataStore for MemoryRepository {
         id: Uuid,
     ) -> Result<GuardProposal, CoreError> {
         Self::get_guard_proposal(self, tenant, sandbox, id)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn put_guard_tool_approval(
+        &self,
+        approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Self::put_guard_tool_approval(self, approval)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn decide_guard_tool_approval(
+        &self,
+        request: ApprovalDecisionRequest<'_>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Self::decide_guard_tool_approval(self, request)
+            .await
+            .map_err(core_error)
+    }
+
+    async fn consume_guard_tool_approval(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+        tool: &str,
+        request_digest: &str,
+        requested_by_key_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Self::consume_guard_tool_approval(
+            self,
+            tenant,
+            sandbox,
+            tool,
+            request_digest,
+            requested_by_key_id,
+            now,
+        )
+        .await
+        .map_err(core_error)
+    }
+
+    async fn list_guard_tool_approvals(
+        &self,
+        tenant: Uuid,
+        sandbox: Uuid,
+    ) -> Result<Vec<GuardToolApproval>, CoreError> {
+        Self::list_guard_tool_approvals(self, tenant, sandbox)
             .await
             .map_err(core_error)
     }

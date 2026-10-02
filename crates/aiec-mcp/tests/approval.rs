@@ -13,9 +13,18 @@ use aiec_mcp::approval::{
 };
 use async_trait::async_trait;
 
+/// A stand-in for the digest `aiec_core::approval_request_digest` produces.
+/// The gate does not compute it - the caller does, from the whole call - so
+/// these tests only care that whatever the caller computed is what is asked
+/// about.
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 struct Scripted {
     answer: Option<ApprovalDecision>,
     calls: AtomicUsize,
+    /// The digest of the most recent ask, so a test can assert the gate
+    /// forwards the call's own identity rather than a summary of it.
+    last_digest: parking_lot::Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -28,8 +37,10 @@ impl Approver for Scripted {
         &self,
         _sandbox: uuid::Uuid,
         _tool: &str,
+        request_digest: &str,
         _detail: Option<&str>,
     ) -> Option<ApprovalDecision> {
+        *self.last_digest.lock() = Some(request_digest.to_string());
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.answer.clone()
     }
@@ -39,6 +50,7 @@ fn scripted(answer: Option<ApprovalDecision>) -> Arc<Scripted> {
     Arc::new(Scripted {
         answer,
         calls: AtomicUsize::new(0),
+        last_digest: parking_lot::Mutex::new(None),
     })
 }
 
@@ -57,7 +69,7 @@ async fn a_read_needs_no_answer_and_is_never_asked() {
         true,
     );
     let outcome = gate
-        .check(uuid::Uuid::nil(), "read.get", None)
+        .check(uuid::Uuid::nil(), "read.get", DIGEST, None)
         .await
         .expect("a read is not high risk");
     assert_eq!(outcome, Allowance::NotRequired);
@@ -68,7 +80,7 @@ async fn a_read_needs_no_answer_and_is_never_asked() {
 async fn a_high_risk_call_with_an_unreachable_service_is_refused() {
     let (gate, approver) = gate(None, true);
     let refusal = gate
-        .check(uuid::Uuid::nil(), "destructive.destroy", None)
+        .check(uuid::Uuid::nil(), "destructive.destroy", DIGEST, None)
         .await
         .expect_err("an unreachable approval service is not an approval");
     assert_eq!(refusal, ApprovalRefusal::Unavailable);
@@ -86,7 +98,7 @@ async fn an_operator_refusal_and_an_unreachable_service_are_different_refusals()
         true,
     );
     let refusal = denied
-        .check(uuid::Uuid::nil(), "destructive.destroy", None)
+        .check(uuid::Uuid::nil(), "destructive.destroy", DIGEST, None)
         .await
         .expect_err("the operator said no");
     assert_eq!(
@@ -107,7 +119,7 @@ async fn an_approved_high_risk_call_carries_the_reason_it_was_allowed() {
         true,
     );
     let allowance = gate
-        .check(uuid::Uuid::nil(), "destructive.destroy", None)
+        .check(uuid::Uuid::nil(), "destructive.destroy", DIGEST, None)
         .await
         .expect("approved");
     assert_eq!(
@@ -131,10 +143,38 @@ impl Approver for Permissive {
         &self,
         _sandbox: uuid::Uuid,
         _tool: &str,
+        _request_digest: &str,
         _detail: Option<&str>,
     ) -> Option<ApprovalDecision> {
         None
     }
+}
+
+/// The gate must forward the digest of the call it is deciding, not the
+/// lossy summary next to it. An approval bound to a summary is bound to a tool
+/// name rather than to a call, which is the thing §44 exists to prevent.
+#[tokio::test]
+async fn the_ask_carries_the_digest_of_this_exact_call() {
+    let (gate, approver) = gate(
+        Some(ApprovalDecision {
+            approved: true,
+            reason: None,
+        }),
+        true,
+    );
+    gate.check(
+        uuid::Uuid::nil(),
+        "destructive.destroy",
+        DIGEST,
+        Some("/etc/rc"),
+    )
+    .await
+    .expect("approved");
+    assert_eq!(
+        approver.last_digest.lock().as_deref(),
+        Some(DIGEST),
+        "the digest the caller passed is the digest the control plane is asked about"
+    );
 }
 
 #[tokio::test]

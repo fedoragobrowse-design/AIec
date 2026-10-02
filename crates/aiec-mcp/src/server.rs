@@ -102,11 +102,23 @@ impl AiecMcp {
     /// compares against. A deployment with no gate is unaffected; a
     /// deployment with one gets a refusal, not a retry, when the service
     /// cannot answer.
-    async fn approve(&self, tool: &str, sandbox: Uuid, detail: Option<&str>) -> ToolResult<()> {
+    async fn approve(
+        &self,
+        tool: &str,
+        sandbox: Uuid,
+        arguments: &serde_json::Value,
+    ) -> ToolResult<()> {
         let Some(gate) = self.approval.as_ref() else {
             return Ok(());
         };
-        gate.check(sandbox, tool, detail)
+        // The digest is taken from the complete call, here, immediately before
+        // dispatch — not from whatever summary the caller passed in. A summary
+        // is a lossy thing to authorise: approving `write_file("/etc/rc")` says
+        // nothing about the bytes written there, so a grant bound to it would
+        // carry over to any content written next.
+        let digest = aiec_core::approval_request_digest(tool, arguments);
+        let detail = arguments_summary(tool, arguments);
+        gate.check(sandbox, tool, &digest, detail.as_deref())
             .await
             .map(|_| ())
             .map_err(|refusal| {
@@ -126,6 +138,36 @@ impl AiecMcp {
                 }))
             })
     }
+}
+
+/// A short, human-readable description of one call, for the operator's queue.
+///
+/// Only what an operator needs to recognise the call, and bounded: this is
+/// shown to a person deciding, not an audit record, and the durable record is
+/// the row this request produces. File content is deliberately reduced to a
+/// length rather than quoted — an operator needs to know a large body is about
+/// to be written, not to read it here, and content can be anything at all.
+fn arguments_summary(tool: &str, arguments: &serde_json::Value) -> Option<String> {
+    let object = arguments.as_object()?;
+    match tool {
+        "sandbox.write_file"
+        | "sandbox.delete_file"
+        | "sandbox.make_directory"
+        | "sandbox.import_workspace_archive" => {
+            let path = object.get("path").and_then(|p| p.as_str())?;
+            match object.get("content").and_then(|c| c.as_str()) {
+                Some(content) => Some(format!("{path} ({} bytes)", content.len())),
+                None => Some(path.to_string()),
+            }
+        }
+        "sandbox.exec" => {
+            let command = object.get("command").and_then(|c| c.as_str())?;
+            Some(format!("exec {command}"))
+        }
+        "sandbox.destroy" => Some("destroy sandbox".to_string()),
+        _ => None,
+    }
+    .map(|summary| summary.chars().take(256).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +466,7 @@ confirmed. Safe to call on an already-destroyed sandbox.",
     ) -> Result<CallToolResult, McpErrorData> {
         let id = self.sandbox_id(&args.sandbox_id)?;
         // Asked before anything is torn down, not after.
-        self.approve("sandbox.destroy", id, None).await?;
+        self.approve("sandbox.destroy", id, &json!({})).await?;
         self.report("aiec_destroy_sandbox", async {
             Ok(json!({ "sandbox_id": id.to_string(), "state": self.aiec.destroy_sandbox(id).await? }))
         })
@@ -510,8 +552,15 @@ needed. Paths are confined to the sandbox filesystem.",
         let id = self.sandbox_id(&args.sandbox_id)?;
         // The path is the detail an operator needs to judge the call, and it is
         // a path inside a disposable sandbox, not a credential.
-        self.approve("sandbox.write_file", id, Some(&args.path))
-            .await?;
+        // Both the target and the bytes are in the digest. The operator judges
+        // the path; the control plane binds the content, so an approval cannot
+        // be carried over to different bytes at the same path.
+        self.approve(
+            "sandbox.write_file",
+            id,
+            &json!({ "path": args.path, "content": args.content }),
+        )
+        .await?;
         self.report("aiec_write_file", async {
             self.aiec.write_file(id, &args.path, &args.content).await?;
             Ok(json!({ "path": args.path, "written": true }))
@@ -1127,7 +1176,7 @@ mod tests {
         // The control plane is unreachable, so an ask would surface as a
         // refusal. Not getting one proves the ask did not happen.
         let outcome = gated_server()
-            .approve("sandbox.get", Uuid::now_v7(), None)
+            .approve("sandbox.get", Uuid::now_v7(), &json!({}))
             .await;
         assert!(
             outcome.is_ok(),
@@ -1169,6 +1218,7 @@ mod tests {
             &self,
             _sandbox: Uuid,
             _tool: &str,
+            _request_digest: &str,
             _detail: Option<&str>,
         ) -> Option<crate::approval::ApprovalDecision> {
             None

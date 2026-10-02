@@ -33,7 +33,19 @@ The Python SDK exposes the same size-guarded partial path as `Sandbox.upload_art
 
 - `POST /v1/runs` — create and drive a run to a terminal state, returning the settled run. Body: `workload` (`image`, `command`, `setup`, `validations`, `artifacts`, `environment`, `secrets`, `timeout_seconds`, `git_evidence`, `repo`), `resources`, `requirements`, `retention`, `max_attempts`, `idempotency_key`, `requested_runtime`, `retained_seconds`. The handler is synchronous on purpose: it places a machine, runs the work, collects artifacts and reclaims the machine before answering, so the response is the record of what happened.
 
-  `resources.guard` selects an out-of-guest policy: either
+  High-risk tool calls are approved in two phases by different principals.
+`POST /v1/sandboxes/{id}/guard/approval` (scope `SandboxesWrite`) asks about
+one call and always answers immediately with `approved: false` when nothing has
+decided it, recording the request as `pending`. `GET` and `POST
+/v1/sandboxes/{id}/guard/tool-approvals` (scope `GuardApprove`) are the
+operator's queue and the decision itself. The ask carries `digest`, a SHA-256
+over the canonical JSON of the call's arguments; it is required, because an
+approval that is not bound to one call is a capability rather than an approval.
+A grant is spendable once, only for the digest it was made for, and only by the
+key that asked. Self-approval is refused however much authority the key holds.
+See [GUARD.md](GUARD.md#approving-a-high-risk-call).
+
+`resources.guard` selects an out-of-guest policy: either
   `{"policy_template": "no-network" | "model-only" | "model-plus-allowlist" | "read-only-api"}`
   with optional `model_endpoint` and `allowlist` inputs, or a full
   `{"policy": {...}}` document. It replaces `resources.network` rather than

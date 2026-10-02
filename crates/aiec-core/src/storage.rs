@@ -1,8 +1,8 @@
 //! Metadata persistence and large artifact storage boundaries.
 
 use crate::{
-    ApiKeyRecord, CoreError, ImageRecord, Node, QuotaLimits, QuotaUsage, RuntimeKind, Sandbox,
-    SandboxState, Snapshot, UsageEvent, UsageSummary,
+    ApiKeyRecord, ApprovalState, CoreError, GuardToolApproval, ImageRecord, Node, QuotaLimits,
+    QuotaUsage, RuntimeKind, Sandbox, SandboxState, Snapshot, UsageEvent, UsageSummary,
     run::{Placement, Run, RunArtifactRef, RunAttempt, RunEvent, RunResults, RunSandbox, RunState},
     run_queue::{RunQueueClaim, RunQueueLimits},
     runtime::RuntimeCapabilities,
@@ -471,6 +471,28 @@ pub struct OrphanedLeaseRelease {
     pub already_released: u32,
 }
 
+/// One operator's decision about one pending high-risk call.
+///
+/// Grouped because the fields are not independent inputs: a decision without a
+/// decider is anonymous, and one without a timestamp has no audit value. As
+/// separate parameters it was possible to assemble a decision and leave the
+/// identity unbound, which is the one thing §44 must not allow.
+#[derive(Debug, Clone)]
+pub struct ApprovalDecisionRequest<'a> {
+    pub tenant: TenantId,
+    pub sandbox: SandboxId,
+    /// The request being decided, as recorded by the asker.
+    pub request_id: Uuid,
+    /// `Granted` or `Denied`. `Pending` is refused rather than treated as a
+    /// decision.
+    pub decision: ApprovalState,
+    /// From the authenticated principal, never from the request body.
+    pub decided_by_key_id: Uuid,
+    /// Audit-only label for the deciding key.
+    pub decided_by_label: &'a str,
+    pub at: DateTime<Utc>,
+}
+
 /// Persists AIec domain metadata with tenant-scoped access semantics.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
@@ -582,6 +604,54 @@ pub trait MetadataStore: Send + Sync {
         _id: Uuid,
     ) -> Result<GuardProposal, CoreError> {
         Err(CoreError::Unsupported("get_guard_proposal".into()))
+    }
+    /// Records the asker's request for one high-risk tool call.
+    ///
+    /// Implementations must store the row `pending` and take `requested_by_key_id`
+    /// from the caller — which the route fills from the authenticated principal.
+    /// A store that accepted an asker-chosen identity could be used to approve
+    /// one's own call by nominating a second key.
+    async fn put_guard_tool_approval(
+        &self,
+        _approval: GuardToolApproval,
+    ) -> Result<GuardToolApproval, CoreError> {
+        Err(CoreError::Unsupported("put_guard_tool_approval".into()))
+    }
+    /// Applies an operator's decision to one pending request.
+    ///
+    /// Returns `None` when there was nothing to decide: unknown, already
+    /// decided, or asked by the deciding key. Implementations must refuse all
+    /// three rather than telling the caller which occurred.
+    async fn decide_guard_tool_approval(
+        &self,
+        _request: ApprovalDecisionRequest<'_>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Err(CoreError::Unsupported("decide_guard_tool_approval".into()))
+    }
+    /// Spends a granted, unspent, unexpired approval for exactly this call by
+    /// exactly this requester. `None` is a refusal.
+    ///
+    /// Implementations must make the spend atomic and single-use: two callers
+    /// racing for one approval must produce one grant and one refusal, or a
+    /// single human decision silently authorises two calls.
+    async fn consume_guard_tool_approval(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+        _tool: &str,
+        _request_digest: &str,
+        _requested_by_key_id: Uuid,
+        _now: DateTime<Utc>,
+    ) -> Result<Option<GuardToolApproval>, CoreError> {
+        Err(CoreError::Unsupported("consume_guard_tool_approval".into()))
+    }
+    /// Every request recorded against a sandbox, newest first.
+    async fn list_guard_tool_approvals(
+        &self,
+        _tenant: TenantId,
+        _sandbox: SandboxId,
+    ) -> Result<Vec<GuardToolApproval>, CoreError> {
+        Err(CoreError::Unsupported("list_guard_tool_approvals".into()))
     }
     /// Creates a sandbox.
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError>;

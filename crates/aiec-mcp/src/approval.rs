@@ -72,6 +72,9 @@ pub struct ApprovalDecision {
 struct ApprovalRequest<'a> {
     sandbox_id: Uuid,
     tool: &'a str,
+    /// Digest of the call's own arguments. Required by the control plane: an
+    /// approval is for one call, so there has to be something to bind it to.
+    digest: &'a str,
     detail: Option<&'a str>,
 }
 
@@ -81,12 +84,14 @@ pub trait Approver: Send + Sync {
     /// Whether this tool needs an approval.
     fn requires_approval(&self, tool: &str) -> bool;
 
-    /// Asks. `None` means the service could not be reached; the caller decides,
-    /// and under a fail-closed policy that decision is a denial.
+    /// Asks about one specific call. `None` means the service could not be
+    /// reached; the caller decides, and under a fail-closed policy that
+    /// decision is a denial.
     async fn approve(
         &self,
         sandbox_id: Uuid,
         tool: &str,
+        request_digest: &str,
         detail: Option<&str>,
     ) -> Option<ApprovalDecision>;
 }
@@ -113,6 +118,7 @@ impl Approver for ControlPlaneApprover {
         &self,
         sandbox_id: Uuid,
         tool: &str,
+        request_digest: &str,
         detail: Option<&str>,
     ) -> Option<ApprovalDecision> {
         let response = self
@@ -122,6 +128,7 @@ impl Approver for ControlPlaneApprover {
                 &serde_json::to_value(ApprovalRequest {
                     sandbox_id,
                     tool,
+                    digest: request_digest,
                     detail,
                 })
                 .ok()?,
@@ -160,12 +167,17 @@ impl ApprovalGate {
         &self,
         sandbox_id: Uuid,
         tool: &str,
+        request_digest: &str,
         detail: Option<&str>,
     ) -> Result<Allowance, ApprovalRefusal> {
         if !self.approver.requires_approval(tool) {
             return Ok(Allowance::NotRequired);
         }
-        match self.approver.approve(sandbox_id, tool, detail).await {
+        match self
+            .approver
+            .approve(sandbox_id, tool, request_digest, detail)
+            .await
+        {
             Some(decision) if decision.approved => Ok(Allowance::Approved {
                 reason: decision.reason,
             }),

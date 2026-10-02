@@ -104,6 +104,108 @@ aiec doctor --json | grep network_policy
 nft list tables | grep aiec_guard
 ```
 
+## Approving a high-risk call
+
+Guard refuses by default. A small number of calls are refused *pending a human
+decision*, and those go through a two-phase exchange so that the answer comes
+from a person rather than from the caller.
+
+The two phases are separate endpoints with separate scopes, on purpose. Asking
+needs only `SandboxesWrite`, because a harness must be able to ask; deciding
+needs `GuardApprove`, because deciding is an operator's act and not a caller's.
+
+```
+POST /v1/sandboxes/{id}/guard/approval              # ask, needs SandboxesWrite
+GET  /v1/sandboxes/{id}/guard/tool-approvals        # the operator's queue, needs GuardApprove
+POST /v1/sandboxes/{id}/guard/tool-approvals        # decide, needs GuardApprove
+```
+
+An ask carries the sandbox, the tool, and `digest` — a SHA-256 over the
+canonical JSON of that one call's arguments, hex encoded. The digest is what
+makes an approval an approval *of a call* rather than of a tool. An operator
+who permitted `write_file("/etc/rc", A)` did not permit `write_file("/etc/rc",
+B)`, and the request body has no field that could persuade the control plane
+otherwise. `digest` is required, and a request without one is refused.
+
+Asking returns a refusal, never a wait: the caller is told `approved: false`,
+and the request is recorded as `pending`. Nothing polls.
+
+Deciding takes the `request_id` from the queue and a `decision` of `granted` or
+`denied`. The recorded requester comes from the authenticated principal, never
+from the body, so a caller cannot nominate who decides for it.
+
+Three properties are enforced in the database, beneath the API:
+
+- **Self-approval is refused.** A key holding both `SandboxesWrite` and
+  `GuardApprove`, or `Admin`, still cannot decide its own request. This is a
+  constraint on `requested_by_key_id`, not on scope names, because one
+  principal can hold both scopes. The API returns one `409` for unknown,
+  already-decided and self-approval alike, so probing for authority reveals
+  nothing.
+- **A grant is spent once.** Spending is a single conditional `UPDATE` that
+  requires the row to be unconsumed, granted, unexpired and written by this
+  requester. Two concurrent spends cannot both match the same row.
+- **A grant belongs to the key that asked.** Another key in the same tenant
+  holding `SandboxesWrite` cannot spend an approval a different harness
+  requested.
+
+The digest is defined once, in `aiec_core::approval_request_digest`: the tool
+name, a NUL byte, and the canonical JSON of the arguments, SHA-256'd and hex
+encoded. A pinned test holds the expected value for a fixed call, because the
+acceptance suite implements the same rule in Python and is only meaningful as
+an independent check if the two cannot drift apart silently. The separator is
+spelled out because getting it wrong is not a loud failure — a client that
+guessed a newline would present a digest no call ever matches, and its grant
+would simply never be spendable.
+
+The queue is readable only with `GuardApprove`. It has to be: an operator
+cannot decide what they cannot see, and without it `request_id` would only be
+discoverable by reading the table directly.
+
+### What has actually been run
+
+`benchmarks/guard-approval-acceptance.json` — 10 cases, all passing, no
+cleanup errors, against the release binaries over HTTPS with PostgreSQL as the
+store. The suite runs the control plane and a worker on a database of its own
+and drives the flow over HTTP only; no case reads the table to decide whether
+it passed, because "the row says so" is a weaker claim than "the next call was
+allowed and the one after it was refused".
+
+It mints its keys per run, so the scope and identity properties are tested
+against the narrowest keys that can play each part: a harness holding only
+`SandboxesWrite`, an operator holding only `GuardApprove`, and one holding
+every scope. Three properties are worth recording, because each is a way the
+suite would otherwise have passed for the wrong reason.
+
+- The self-approval case asserts that the decider's key id **equals the
+  requester's recorded key id**, read back from the account API rather than
+  assumed from the mint. Approving another key's request is an operator's job,
+  not a self-approval; a test that reused another harness's request would pass
+  with the constraint removed.
+- The all-scopes key is refused `409` on a request it raised itself, and
+  refused `403` by the narrow key before reaching the approval check at all.
+  Two different refusals, and conflating them would hide which one is doing
+  the work.
+- Replay and changed-content are separate cases. An approval that survived a
+  replay, or that covered a changed payload, would each pass while looking
+  like a successful grant.
+
+Underneath, `crates/aiec-storage/src/postgres/guard/approvals.rs` runs eleven
+cases against a real PostgreSQL, two of which write directly to the table so
+the only thing that can refuse them is the migration's own trigger: a
+self-approval, and a requester rewritten after the fact.
+
+Tools not classified as safe are refused until somebody classifies them. The
+allowlist is small and explicit (`sandbox.get`, `sandbox.read_file`,
+`sandbox.list_files`, `sandbox.list_owned`, `secret.list`, `snapshot.list`), so
+a tool added tomorrow fails closed rather than open.
+
+The MCP server opts into this with `AIEC_MCP_APPROVAL_REQUIRED=1`. It is off by
+default because switching it on denies destructive tools to every existing MCP
+client at once. Once enabled it fails closed: an unreachable control plane is a
+refusal, and the refusal distinguishes an unanswered request (`unreachable:
+true`) from an explicit denial so an operator can tell the two apart.
+
 ## Hardware
 
 The gate compiles the whole workspace for `aarch64-unknown-linux-gnu` as well

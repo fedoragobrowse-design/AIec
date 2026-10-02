@@ -139,6 +139,14 @@ control plane did not approve the call. Its details carry
 `unreachable: true` when nobody answered, which is not the same as a refusal
 and is not retryable.
 
+The ask carries a SHA-256 digest of the whole call, not of its name, so an
+operator's approval covers one invocation rather than a tool. `aiec_write_file`
+digests `path` and `content` together: an approval to write one payload at a
+path is not an approval to write another. For `aiec_write_file` the digest
+covers every argument the tool accepts, and the operator queue shows the path
+with a content length rather than the content itself — enough to recognise the
+call, without printing an arbitrary payload into an approval queue.
+
 ---
 
 ## Configuration
