@@ -89,8 +89,8 @@ states what this does and does not defend.
 
 ## Evidence
 
-**Phase 1 — `benchmarks/guard-core-acceptance.json`: PASS, 47 cases, 111.5
-seconds, no cleanup errors.**
+**Phase 1 and §49 — `benchmarks/guard-core-acceptance.json`: PASS, 48 cases,
+97.9 seconds, no cleanup errors.**
 Real Firecracker microVMs, real nftables, local mocks only. Includes the
 secret-scan (13.4 GB of memory, state and disk with no copy of the real model
 credential) and a case proving an attachment carries traffic only after a
@@ -208,11 +208,12 @@ where Guard is injected into every request; the branch it actually guards —
 is not exercised where it takes effect. And `AIEC_ALLOW_REDUCED_ISOLATION` is
 not tested here at all.
 
-**Static gates.** `scripts/gate.sh` passes: `fmt`, clippy with `-D warnings`,
-the full workspace test suite (875 tests) including the Postgres paths, the SDK
-import contract, 44 Python SDK tests, and an `aarch64-unknown-linux-gnu`
-cross-check of every target. A step that cannot run reports `SKIPPED` rather
-than `ok`.
+**Static gates.** The final serial run of `scripts/gate.sh` with
+`RUST_TEST_THREADS=1` passed in 153.44 seconds: `fmt`, clippy with `-D warnings`,
+the workspace tests including PostgreSQL, the SDK import contract, Python SDK
+tests, and the `aarch64-unknown-linux-gnu` cross-check. The parallel run failed
+in `a_workspace_snapshot_is_storable_and_restorable`; that test passed alone.
+This establishes a concurrency-sensitive failure, not its root cause.
 
 ### What is not backward compatible, stated plainly
 
@@ -339,22 +340,28 @@ Every figure below comes from the live runs whose artifacts are in
 `benchmarks/`, on one host, stated with the method that produced them. Nothing
 here is projected from a smaller or different run.
 
-**Host.** Intel Core 7 240H, x86_64, Linux 7.0.0-34-generic. Every guest is a
-real Firecracker microVM; the model is a local mock, so no figure here includes
+**Host.** Intel Core 7 240H, x86_64, Linux 7.0.0-34-generic, recorded in the
+core artifact's `cpu_model` and `kernel_arch` fields. Every guest is a real
+Firecracker microVM; the model is a local mock, so no figure here includes
 real internet latency.
+
+Streaming values below are medians of each side's three samples; added latency
+is the difference of those medians, not the artifact's mean paired difference.
+The DNS driver selects index `n/2` after sorting: for ten samples that is the
+upper-middle value, not the average of the two middle values.
 
 | measurement | guarded | unguarded baseline | added | samples |
 |---|---:|---:|---:|---:|
-| guest DNS A lookup, median | 2.963 ms | 0.024 ms | 2.939 ms | 10 per side |
-| model stream, first byte | 12.01 ms | 6.63 ms | 6.44 ms | 3 |
-| model stream, total duration | 784.68 ms | 786.25 ms | −2.39 ms | 3 |
+| guest DNS A lookup, upper median | 2.963 ms | 0.024 ms | 2.939 ms | 10 per side |
+| model stream, first byte, median | 13.26 ms | 6.63 ms | 6.62 ms | 3 per side |
+| model stream, total duration, median | 790.68 ms | 786.25 ms | 4.43 ms | 3 per side |
 
-**Stream throughput.** A 4 194 318-byte response arrived at the guest as 516
-chunks in 784.7 ms, against 132 chunks in 786.2 ms to a host-side client
-bypassing Guard. End to end that is ~5.2 MiB/s including the guest's own read
-loop. Guard roughly quadruples the chunk count and costs 0.3% of wall time.
-The amplification is the price of never handing the guest an unbounded buffer,
-and it is deliberate.
+**Stream throughput.** Each response contains 4 194 318 bytes. The guarded
+median duration is 790.68 ms with a median 515 chunks, against 786.25 ms and
+132 chunks for a host-side client bypassing Guard. End-to-end throughput is
+5.06 MiB/s guarded versus 5.09 MiB/s direct, including the client read loops.
+The chunk counts describe these clients and transports; they do not establish
+a general chunk-amplification ratio or attribute buffering to Guard alone.
 
 **What the DNS figure does not say.** It is an upper bound, not the cost of the
 policy engine. The guarded side is a real guest resolver lookup and the
@@ -362,17 +369,21 @@ unguarded side the identical query to a policy-free resolver in the same
 namespace, so the difference also carries the vsock hop and the guest's
 resolver stack.
 
-**What the total-duration figure does not say.** −2.39 ms is inside the run-to-
-run spread of three samples and must not be read as Guard making streaming
-faster. Only the first-byte difference (+6.44 ms) is a cost with a plausible
-mechanism behind it.
+**What the streaming comparison does not say.** The 4.43 ms median duration
+difference is inside the observed spread of three samples (guarded:
+784.68–792.94 ms; direct: 784.89–789.99 ms). Neither a speedup nor a stable
+percentage overhead is established. The first-byte difference is 6.62 ms, but
+the guest and host clients use different stacks, so it is not an isolated
+policy-engine cost.
 
 **Aggregate process cost.** The §49 run reports 59.12 s of CPU and a 30 376 KiB
-peak RSS for the acceptance driver process. This is an aggregate over the
-driver, the gateway and the mocks for a 97.9 s run — it is **not** an isolated
-gateway or guarded-VM cost, and the Firecracker processes are outside it. It
-bounds total orchestration overhead; it does not attribute that overhead to
-any component.
+peak RSS for the acceptance driver process. This covers the driver, gateway,
+and mocks during a 97.9 s run; Firecracker and guest processes are outside it.
+The model-only leg separately records 0.04 s CPU (0.03 s harness upload,
+0.01 s tool loop) and 32 KiB resident-set growth in that shared process.
+These are measured usage, not isolated gateway overhead versus a baseline.
+The 0.01 s loop sample has coarse CPU-clock resolution; it establishes no
+per-request cost distribution.
 
 **Model-only leg (§49).** One real four-turn tool loop ran in a real VM
 (`read` → `write` → `bash` → final), observed as 4 authenticated model requests
@@ -394,8 +405,9 @@ holding the attachment live. It is not a distribution and no percentile is
 claimed from it.
 
 **Not measured.** The gateway's CPU and memory cost in isolation against a
-host-served path, and any aarch64 figure of any kind. Both are absent rather
-than estimated; only cross-compilation to aarch64 has been exercised.
+host-served path, and any aarch64 runtime/performance figure. Only
+cross-compilation to aarch64 has been exercised. §51 therefore has bounded
+partial evidence, not a complete overhead characterization.
 
 ## Known limitations
 
@@ -431,11 +443,11 @@ than estimated; only cross-compilation to aarch64 has been exercised.
 5. **Layer 7 rules need interception to see a request.** In the default SNI
    mode Guard matches the requested name and forwards the tunnel; a CONNECT
    tunnel to a governed host is refused rather than forwarded ungoverned.
-6. **The approval hook is wired; no approval is ever granted.** The gate is
-   now in the production dispatch path, fail-closed, and its refusal is
-   distinguishable from an unanswered ask. What does not exist is the other
-   half: the control plane has no queue for a human to answer, so every
-   high-risk tool is refused. The hook is proven to deny, not to admit.
+6. **Resolved: human tool approval can admit one invocation.** The live §44
+   suite observed a grant by a different authenticated identity, one successful
+   consumption, and replay refusal. PostgreSQL regressions additionally cover
+   retries after pending expiry and preservation of a still-open deadline.
+   Approval gating remains an explicit MCP opt-in.
 7. **Multi-host deployment modes are documented, not validated.** The hardening
    decision for a separate gateway host is untested.
 8. **aarch64 is compile-verified, not run-verified.** The gate cross-checks the
@@ -506,25 +518,43 @@ P2_DRIVER=$PWD/scripts/guard-phase2-acceptance.py \
 bash scripts/build-firecracker-guest.sh
 ```
 
+## §60 definition-of-done audit
+
+| required area | evidence and disposition |
+|---|---|
+| Phase 1 enforcement, DNS, model credentials, telemetry | Live core suite: 48/48. Includes §49's model-only in-guest tool loop. Local mock providers only. |
+| Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29. The durable lifetime reaper itself has not been observed firing. |
+| Phase 3 MCP/GraphQL policy, proposals, human approval | Implemented and test-covered; §44 additionally proves the live approval API lifecycle. This is not a complete live MCP/GraphQL policy acceptance. |
+| Optional Phase 4 watcher | Implemented and test-covered; no complete live optional-watcher acceptance is claimed. |
+| Phase 5 canaries, image trust, identity, red-team CI | Implemented and test-covered; image verification and per-VM identity participate in the live VM suites. Full Phase 5 live acceptance remains absent. |
+| Topologies A and B | §49 completes a real in-guest tool loop; §50 completes an external loop with positive-control-validated host capture and counters (15/15). |
+| Existing lifecycle, snapshots, fencing, MCP, eval | Workspace regressions passed in the serial gate; compatibility suite passes 8/8 within its documented coverage. Untested legacy branches and strict response deserializers remain excluded. |
+| §51 performance | DNS, streaming, and shared-process CPU/RSS are recorded with hardware, kernel, architecture, and bounded sample sizes. Controlled gateway resource overhead remains absent. |
+| Static quality gate | Serial gate passes. Parallel storage-test reliability remains unresolved; serial success does not prove the failure's cause. |
+
+This audit separates implementation and regression coverage from live proof.
+The full non-deferred definition of done is not satisfied.
+
 ## Verdict
 
 **AIEC GUARD: PHASES 1-2 PROVEN LIVE; PHASES 3-5 IMPLEMENTED, NOT YET PROVEN LIVE**
 
-Phases 1 and 2 run on real Firecracker machines against one image whose digest
-is a consequence of the build that wrote it: 41/41 and 28/28, no cleanup
-errors. That includes the packet path that was previously undecided - a guest
-packet reaches `GuardNetworkManager::create_guard`'s own attachment and is
-denied there - and the guest identity path that was previously unbootable.
+Phases 1 and 2 run on real Firecracker machines against the image produced by
+the build: 48/48 and 29/29, no cleanup errors. §49 proves the in-guest model-only
+tool loop; §50 independently proves the external loop and its bounded
+zero-egress window (15/15). The guest identity and host attachment paths are
+included in the live evidence.
 
 Phases 3 to 5 are implemented and covered by unit and integration tests, with
 their acceptance exercised against local mocks rather than real machines. Two
 green artifacts do not make that whole surface proven, and the two are kept
 apart on purpose.
 
-Still outstanding, from the limitations above: items 2 to 8 - the lifetime
-reaper has never fired in a live run, `CAP_NET_ADMIN` is absent from the
-production worker on this host, layer 7 needs interception to govern a
-tunnelled request, the approval hook denies but has never admitted, multi-host
-deployment modes are documented but unvalidated, and aarch64 is compiled but
-never run. Two of those are operator actions rather than code: deploying the
-rebuilt image, and granting the worker `CAP_NET_ADMIN`.
+Still outstanding: the lifetime reaper has never fired in a live run;
+`CAP_NET_ADMIN` is absent from the production worker on this host; Layer 7
+needs interception to govern a tunnelled request; multi-host deployment modes
+are unvalidated; and aarch64 is compiled but never run. §51 lacks controlled
+gateway resource overhead. Parallel test reliability is unresolved.
+Operator actions include deploying the rebuilt
+image and granting the worker `CAP_NET_ADMIN`. The live approval lifecycle is
+no longer a blocker.
