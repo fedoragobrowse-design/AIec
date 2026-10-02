@@ -285,10 +285,10 @@ async fn median_dns_round_trip(server: &str, query: &[u8], samples: usize) -> Re
         // comparison that cannot be debugged.
         let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
             .await
-            .map_err(|_| failure(&format!("DNS round trip to {server} timed out")))?
-            .map_err(|error| failure(&format!("DNS round trip to {server} failed: {error}")))?;
+            .map_err(|_| failure(format!("DNS round trip to {server} timed out")))?
+            .map_err(|error| failure(format!("DNS round trip to {server} failed: {error}")))?;
         if n < 12 {
-            return Err(failure(&format!("{server} replied with {n} bytes")));
+            return Err(failure(format!("{server} replied with {n} bytes")));
         }
         timings.push(started.elapsed().as_secs_f64() * 1000.0);
     }
