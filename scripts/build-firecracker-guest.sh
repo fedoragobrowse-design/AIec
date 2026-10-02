@@ -69,8 +69,39 @@ fi
 GUEST_PROTOCOL_VERSION=$(awk '/^pub const PROTOCOL_VERSION:/{gsub(/;/,"",$NF); print $NF}' "$ROOT/crates/aiec-core/src/protocol.rs")
 [[ "$GUEST_PROTOCOL_VERSION" =~ ^[0-9]+$ ]] || fail "could not read the guest wire protocol version"
 step "building aiec-guest $GUEST_AGENT_VERSION (musl)"
-cargo build --release -p aiec-guest --target x86_64-unknown-linux-musl
-[ -x "$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest" ] || fail "guest agent binary was not produced"
+GUEST_BIN="$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest"
+if [ -n "${AIEC_GUEST_BINARY:-}" ]; then
+  # A prebuilt guest agent is allowed, and its digest is recorded in the
+  # manifest, because the image is a product of this script and the only
+  # thing that may write the recorded digests is this script. This is the path
+  # for a CI builder whose musl toolchain is not the host's.
+  [ -f "$AIEC_GUEST_BINARY" ] || fail "AIEC_GUEST_BINARY does not exist: $AIEC_GUEST_BINARY"
+  file "$AIEC_GUEST_BINARY" 2>/dev/null | grep -qE 'ELF .*(static(-pie)? linked|statically linked)' \
+    || fail "AIEC_GUEST_BINARY is not a statically linked ELF: $AIEC_GUEST_BINARY"
+  # A dynamically linked agent cannot exec inside the microVM, and that failure
+  # looks like a transport fault rather than a missing loader, which is why
+  # `ldd` is not the test: it prints "statically linked" for some static-PIE
+  # binaries and is absent entirely on some hosts.
+  # An agent that predates the per-sandbox control identity reads the shared
+  # build-time secret instead of the one planted for it, and the machine then
+  # fails to boot with an early EOF that looks like a transport fault. The
+  # planted path is the marker for an agent that can read what the runtime
+  # writes, and a stale agent is exactly what must never be baked into an image
+  # whose digests are about to be recorded.
+  # A pipe into `grep -q` is not usable here: `grep` exits at the first match,
+  # `strings` dies of SIGPIPE, and under `pipefail` that non-zero status reads
+  # as a failed check on a perfectly good binary. Reading the file directly
+  # needs no binutils and cannot lose the match.
+  grep -a -qF '/etc/aiec-guest-secret' "$AIEC_GUEST_BINARY" \
+    || fail "AIEC_GUEST_BINARY does not read the planted control identity: $AIEC_GUEST_BINARY"
+  step "using the prebuilt guest agent from $AIEC_GUEST_BINARY"
+  mkdir -p "$(dirname "$GUEST_BIN")"
+  install -m 0755 "$AIEC_GUEST_BINARY" "$GUEST_BIN"
+else
+  cargo build --release -p aiec-guest --target x86_64-unknown-linux-musl
+fi
+[ -x "$GUEST_BIN" ] || fail "guest agent binary was not produced"
+GUEST_AGENT_SHA=$(sha256sum "$GUEST_BIN" | awk '{print $1}')
 
 # ------------------------------------------------------------ base image ----
 if ! docker_cmd pull "$BASE_IMAGE" >/dev/null 2>&1; then
@@ -124,6 +155,10 @@ docker_cmd export "$CONTAINER" | tar -x -C "$TMP/rootfs"
 # directory that collides with such a symlink must not replace it, and a
 # skeleton file must be written through the symlink.
 overlay_skeleton() {
+  # Without this the find below yields nothing, the loop body never runs, and
+  # the build reports success while silently omitting everything the skeleton
+  # contributes.
+  [ -d "$ROOT/guest/rootfs" ] || fail "the guest rootfs skeleton is missing: $ROOT/guest/rootfs"
   local entry rel target
   while IFS= read -r -d '' entry; do
     rel=${entry#"$ROOT/guest/rootfs"/}
@@ -167,7 +202,7 @@ else
 fi
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cat > "$OUT/guest-capabilities.json" <<EOF
-{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"coding","capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","guest_protocol_version":$GUEST_PROTOCOL_VERSION,"rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
+{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"coding","capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","guest_agent_sha256":"$GUEST_AGENT_SHA","guest_protocol_version":$GUEST_PROTOCOL_VERSION,"rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
 EOF
 if command -v python3 >/dev/null 2>&1; then
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/guest-capabilities.json" || fail "guest-capabilities.json is not valid JSON"

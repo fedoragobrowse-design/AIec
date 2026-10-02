@@ -113,32 +113,35 @@ inverted so that subdomains did not match and unrelated domains did.
 
 ## Known limitations
 
-1. **Deployed guest images predate per-sandbox identities, and both artifacts
-   are stale for that one reason.** The code is correct on both sides and
-   unit-tested, but `agentforge-rootfs.ext4` contains the old `aiec-guest`,
-   which authenticates with the shared build-time secret while the host uses the
-   per-sandbox one, so a guarded machine now fails to boot with `early eof`.
-   This is one blocker, not two: `benchmarks/guard-core-acceptance.json` and
-   `benchmarks/guard-phase2-acceptance.json` were both produced by builds that
-   predate the identity change reaching the boot path, and re-running either
-   against the deployed image will fail the same way until the image is
-   rebuilt. `scripts/guest-musl-build.Dockerfile` builds the guest statically,
-   but two crates in the guest's graph - `ring` and `portable-atomic` - still
-   need a musl C toolchain under that image, so the rebuild is not yet
-   turnkey.
+1. **Resolved: the deployed guest image was rebuilt and both phases re-proved
+   on it.** The deployed `agentforge-rootfs.ext4` carries a guest agent that
+   predates the per-sandbox control identity, so a guarded machine failed to
+   boot with `early eof` against the new host. A new image was built with
+   `scripts/build-firecracker-guest.sh` - the script remains the only writer of
+   the recorded digests - using `AIEC_GUEST_BINARY` for a guest agent compiled by
+   `scripts/guest-musl-build.Dockerfile`, because this workstation has the musl
+   target but no musl C toolchain for the two crates in the guest's graph that
+   compile C in their build scripts. Root filesystem
+   `4af9ced62fe8f0fcaa6baef1a63fc68b46baf2fd5f442cf6174443373cd26eff`, guest
+   agent `d6996c41b774b3c810a6ba195b49803e2241a4a768d27694ac4c4979f1306775`,
+   built 2026-10-02T02:48:56Z. **The still-deployed
+   `agentforge-rootfs.ext4` was not replaced**: the image built here lives
+   beside it, and deploying it is the operator's step.
 2. **The lifetime reaper has never been observed firing.** The ceilings are
    durable and restart-proof (Postgres tests); the reaper's action is untested
    against a live run, and the in-process timer still races it for the guest VM.
 3. **The production Firecracker worker on this host cannot enforce Guard.**
    `aiec-worker.service` runs as an unprivileged user with no `CAP_NET_ADMIN`,
    so every governed placement is refused and `network_policy` reads false.
-4. **The phase-2 acceptance namespace cannot reliably move a guest packet to
-   its attachment, and which side is at fault is still unresolved.** The driver
-   now captures the TAP's link state, addresses and neighbours alongside the
-   attachment's nft table, so one run settles it - but no such run can complete
-   until the guest image is rebuilt (blocker 1), because nothing boots. Phase 1
-   exercises the counters on driver-created TAPs, not on
-   `GuardNetworkManager::create_guard`, so that path has no live coverage yet.
+4. **Resolved: a guest packet reaches `GuardNetworkManager::create_guard`'s
+   attachment and is denied there.** The driver records the host's own view of
+   the attachment alongside the counters. In the 28/28 run the TAP was
+   `UP,LOWER_UP`, carried its /30 address, and had a neighbour entry for the
+   guest, while Guard's own table counted `blocked_range: 3` - so the packets
+   arrived, were denied by the ruleset, and the denial was what the watchdog
+   then acted on. Phase 1 still exercises its counters on driver-created TAPs;
+   this is the first run in which the manager's own attachment is the one under
+   test.
 5. **Layer 7 rules need interception to see a request.** In the default SNI
    mode Guard matches the requested name and forwards the tunnel; a CONNECT
    tunnel to a governed host is refused rather than forwarded ungoverned.
@@ -155,17 +158,35 @@ inverted so that subdomains did not match and unrelated domains did.
 - Local build artifacts reached 156 GB; the incremental cache has since been
   purged and builds run with `CARGO_INCREMENTAL=0`.
 
-## To close the first blocker
+## Rebuilding the guest image
+
+The path that produced the artifacts above, and the one to repeat when the
+guest agent changes:
 
 ```bash
-# 1. Build the guest statically (needs a musl C toolchain for ring and
-#    portable-atomic; see the note above).
+# 1. Compile the guest statically. The image needs a C compiler as well as
+#    musl-tools: two crates in the guest's graph compile C in their build
+#    scripts, and without one the build dies at portable-atomic before any
+#    guest code is reached.
 docker build -f scripts/guest-musl-build.Dockerfile -t aiec-guest-musl .
+docker create --name af-guest aiec-guest-musl
+docker cp af-guest:/out-aiec-guest ./aiec-guest
+docker rm af-guest
+file ./aiec-guest        # must say static(-pie) linked
 
-# 2. Put the new agent and a fresh placeholder identity into a copy of the
-#    acceptance rootfs, never the deployed one.
+# 2. Build the image with the script that owns the recorded digests. It
+#    refuses a binary that is not statically linked, and one that cannot read
+#    the planted control identity, so a stale agent cannot be baked into an
+#    image whose digest is about to be trusted.
+AIEC_GUEST_BINARY=$PWD/aiec-guest \
+AIEC_GUEST_SECRET=$(openssl rand -hex 32) \
+AIEC_KERNEL=/path/to/vmlinux \
+AIEC_OUT=$PWD/out \
+  bash scripts/build-firecracker-guest.sh
 
-# 3. Re-run both acceptances and replace the two artifacts.
+# 3. Point the acceptances at the new image and its manifest together.
+export AIEC_ROOTFS=$PWD/out/aiec-rootfs.ext4
+export AIEC_GUEST_ARTIFACT_DIR=$PWD/out
 ```
 
 ## Exact commands

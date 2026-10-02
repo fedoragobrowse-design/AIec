@@ -11,8 +11,13 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
+# `gcc` is not optional: two crates in the guest's graph compile C in their build
+# scripts, and without a working `cc` the build fails at `portable-atomic` long
+# before any of the guest's own code is reached. `musl-tools` supplies the musl
+# linker the target needs.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl musl-tools pkg-config \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl gcc libc6-dev musl-tools pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

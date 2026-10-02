@@ -1,0 +1,9 @@
+# Build contexts for the container images. The acceptance target directory holds
+# root-owned build detritus that the daemon cannot read, and neither a local
+# target tree nor version control belongs in an image.
+.agentforge
+target
+.git
+.gitignore
+*.pdf
+web/node_modules

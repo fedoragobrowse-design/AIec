@@ -344,20 +344,6 @@ def main() -> int:
     # Blocked-range attempts: the guest tries addresses the operator boundary
     # blocks. These are the attempts the watchdog's first rule watches for.
     status, pre = telemetry(0)
-    # The host side of this attachment, captured while the counters are read:
-    # whether the TAP exists, is up, carries the gateway address and has a
-    # neighbour for the guest is what distinguishes "the guest had no link"
-    # from "Guard dropped the packet".
-    host_view = {}
-    if attachment.get("interface"):
-        interface = attachment["interface"]
-        for name, args in (
-            ("link", ["ip", "-o", "link", "show", interface]),
-            ("address", ["ip", "-o", "addr", "show", "dev", interface]),
-            ("neighbour", ["ip", "neigh", "show", "dev", interface]),
-        ):
-            listed = subprocess.run(args, capture_output=True, text=True, timeout=20)
-            host_view[name] = (listed.stdout or listed.stderr).strip()[:400]
     before = ((first or {}).get("counters") or {}).get("blocked_range", 0)
     cut_before = bool((pre or {}).get("network_cut"))
     case("attachment-is-not-cut-while-a-watchdog-reports", not cut_before,
@@ -455,6 +441,20 @@ def main() -> int:
     case("authoritative-denials-reach-the-watchdog",
          moved.get("blocked_range", 0) > 0,
          {"counters": moved, "attempts": attempts[:2]})
+    host_view = {}
+    for name, args in (
+        ("link", ["ip", "-o", "link", "show", attachment["interface"]]),
+        ("address", ["ip", "-o", "addr", "show", "dev", attachment["interface"]]),
+        ("neighbour", ["ip", "neigh", "show", "dev", attachment["interface"]]),
+    ):
+        listed = subprocess.run(args, capture_output=True, text=True, timeout=20)
+        host_view[name] = (listed.stdout or listed.stderr).strip()[:400]
+    # The host's own view of the attachment is part of the evidence for this
+    # case: whether the TAP was up, addressed and had a neighbour for the guest
+    # is what separates "the packet never reached Guard" from "Guard denied it".
+    # Read after the attempts, because a neighbour entry exists only because a
+    # packet was sent.
+    CASES[-1]["evidence"]["host_view"] = host_view
 
     # Repeated denials are the quarantine trigger; the watchdog decides, the
     # control plane acts.
