@@ -1408,6 +1408,15 @@ pub struct FirecrackerRuntime {
     /// is a sibling of `vms/` and `snapshots/` and inside neither, so an
     /// identity is not carried by a snapshot of either.
     identities: Arc<control_identity::LazyControlIdentityStore>,
+    /// The [`Sandbox`] each live VM was published for.
+    ///
+    /// Every other teardown arrives as a request that already holds one. The
+    /// worker's exit does not: a shutdown has to release an attachment and
+    /// revoke an identity for machines nobody is asking about, and both of
+    /// those are checked against the identity the machine was created under.
+    /// Entries are written by [`Self::publish_vm`] and dropped by the teardown
+    /// that takes the VM out of [`Self::vms`].
+    owners: Arc<Mutex<HashMap<Uuid, Sandbox>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -1826,6 +1835,7 @@ impl FirecrackerRuntime {
             network,
             lifecycle: Arc::new(SandboxLifecycle::new()),
             pressure: Arc::new(MeasuredHostPressure),
+            owners: Arc::new(Mutex::new(HashMap::new())),
             identities: Arc::new(identities),
         }
     }
@@ -2441,6 +2451,10 @@ impl FirecrackerRuntime {
     async fn publish_vm(&self, sandbox: &Sandbox, vm: FirecrackerVm) {
         let token = vm.start_token;
         let displaced = self.vms.lock().await.insert(sandbox.id, vm);
+        // The record of what this VM belongs to, so a teardown that happens
+        // without a request in hand - the worker shutting down - can still
+        // release an attachment under the identity it was created with.
+        self.owners.lock().await.insert(sandbox.id, sandbox.clone());
         if let Some(displaced) = displaced {
             self.lifetimes.lock().await.remove(&displaced.start_token);
         }
@@ -2507,14 +2521,48 @@ impl FirecrackerRuntime {
         self.stop_if_token(sandbox, token).await;
     }
 
-    async fn terminate_vm(&self, sandbox: &Sandbox, mut vm: FirecrackerVm) {
-        let _ = self
-            .guest_call(sandbox.id, Operation::Shutdown, RequestPayload::None)
-            .await;
+    /// Ends one machine: the process is killed and reaped, the attachment is
+    /// released, and the guest is asked to stop first only when a request is
+    /// waiting on the answer.
+    ///
+    /// `owner` is the sandbox the attachment was created for. It can be absent
+    /// only on the worker's exit, where nothing is asking about this machine.
+    /// The process still goes: a guest left running with no controller is the
+    /// worse outcome, and an attachment record that cannot be released is inert
+    /// without the guest behind it. Only the release is skipped, and it says so.
+    async fn terminate_vm(
+        &self,
+        id: Uuid,
+        owner: Option<&Sandbox>,
+        mut vm: FirecrackerVm,
+        graceful: Graceful,
+    ) {
+        // Only a request may wait on a guest that has to answer. On the exit
+        // path a machine is often paused - a quarantined one always is - and a
+        // paused guest has no agent scheduled to reply, so the write would sit
+        // on the vsock until the call timeout, once per machine this process
+        // still holds. The disk is deleted either way, so there is nothing for
+        // a flushed guest to protect.
+        if graceful == Graceful::Yes {
+            let _ = self
+                .guest_call(id, Operation::Shutdown, RequestPayload::None)
+                .await;
+        }
         let _ = vm.child.start_kill();
         let _ = vm.child.wait().await;
         if let Some(network) = &vm.network {
-            let _ = self.network.release(sandbox, network).await;
+            match owner {
+                Some(sandbox) => {
+                    let _ = self.network.release(sandbox, network).await;
+                }
+                None => tracing::warn!(
+                    sandbox_id = %id,
+                    resource = %network.resource,
+                    stage = "attachment_release_skipped",
+                    "reclaimed a machine with no owner record; its attachment \
+                     record is left for operator review"
+                ),
+            }
         }
     }
 
@@ -2531,9 +2579,21 @@ impl FirecrackerRuntime {
         // fails or blocks still leaves no sleeping task behind.
         self.lifetimes.lock().await.remove(&token);
         if let Some(vm) = vm {
-            self.terminate_vm(sandbox, vm).await;
+            self.terminate_vm(sandbox.id, Some(sandbox), vm, Graceful::Yes)
+                .await;
         }
     }
+}
+
+/// Whether a teardown may wait on a guest that has to answer before killing it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Graceful {
+    /// A request is waiting on the outcome, and a running guest is told to
+    /// stop itself first.
+    Yes,
+    /// The worker is exiting and nothing is waiting: the process is killed
+    /// outright.
+    No,
 }
 
 fn frame_bytes(secret: &[u8], body: &[u8]) -> Vec<u8> {
@@ -2871,7 +2931,7 @@ impl FirecrackerRuntime {
 
     async fn stop(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
         let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
-        self.stop_vm(sandbox).await
+        self.stop_vm(sandbox.id, Some(sandbox)).await
     }
 
     /// Takes the running VM out of the map and terminates it.
@@ -2879,11 +2939,11 @@ impl FirecrackerRuntime {
     /// Ungated, so the gated operations above can reach it: a destroy stops the
     /// VM it is about to remove the state of, rather than queueing behind a
     /// second gate for the same sandbox.
-    async fn stop_vm(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
-        let vm = self.vms.lock().await.remove(&sandbox.id);
+    async fn stop_vm(&self, id: Uuid, owner: Option<&Sandbox>) -> Result<(), RuntimeError> {
+        let vm = self.vms.lock().await.remove(&id);
         if let Some(vm) = vm {
             self.lifetimes.lock().await.remove(&vm.start_token);
-            self.terminate_vm(sandbox, vm).await;
+            self.terminate_vm(id, owner, vm, Graceful::Yes).await;
         }
         Ok(())
     }
@@ -3730,13 +3790,36 @@ impl FirecrackerRuntime {
     }
 
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), RuntimeError> {
+        self.reclaim(sandbox.id, Some(sandbox), Graceful::Yes).await
+    }
+
+    /// Removes everything one machine leaves on this host: the process, the
+    /// attachment, the control identity and both of its directories.
+    ///
+    /// `owner` is absent only on the worker's exit, where the attachment
+    /// cannot be released under an identity nobody is holding. The machine is
+    /// reclaimed either way.
+    async fn reclaim(
+        &self,
+        id: Uuid,
+        owner: Option<&Sandbox>,
+        graceful: Graceful,
+    ) -> Result<(), RuntimeError> {
         // Held until the state and socket directories are gone. This is the
         // operation the create above has to be behind: a destroy that returned
         // while a create was still copying would be reporting a machine that
         // does not exist and a create that finished afterwards would leave it
         // behind. Neither failure is visible in the response the caller got.
-        let _lifecycle = self.enter_lifecycle(sandbox.id).await?;
-        self.stop_vm(sandbox).await?;
+        let _lifecycle = self.enter_lifecycle(id).await?;
+        let vm = self.vms.lock().await.remove(&id);
+        if let Some(vm) = vm {
+            // The VM is out of the map, so its timer has nothing left to stop.
+            // End it before the teardown rather than after it: a teardown that
+            // fails or blocks still leaves no sleeping task behind.
+            self.lifetimes.lock().await.remove(&vm.start_token);
+            self.terminate_vm(id, owner, vm, graceful).await;
+        }
+        self.owners.lock().await.remove(&id);
         // The secret stops being usable before the disk it was planted in is
         // removed. Reversing that order would leave a window where the identity
         // is dead on this host but a copy of the image - a snapshot, a backup -
@@ -3746,20 +3829,16 @@ impl FirecrackerRuntime {
         // the guest is already stopped and the directories still go, so the
         // sandbox is unreachable either way. Failing the whole destroy over it
         // would report a machine that no longer exists as still existing.
-        if let Err(error) = self
-            .identities
-            .get()
-            .and_then(|store| store.revoke(sandbox.id))
-        {
+        if let Err(error) = self.identities.get().and_then(|store| store.revoke(id)) {
             tracing::warn!(
-                sandbox_id = %sandbox.id,
+                sandbox_id = %id,
                 error = %error,
                 stage = "control_identity_revoke_failed",
                 "could not revoke the control identity of a destroyed sandbox"
             );
         }
-        let state = self.config.vm_dir(sandbox.id);
-        let socket = self.config.socket_dir(sandbox.id);
+        let state = self.config.vm_dir(id);
+        let socket = self.config.socket_dir(id);
         match tokio::fs::remove_dir_all(&state).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -3770,6 +3849,56 @@ impl FirecrackerRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Reclaims every machine this runtime still holds, for a worker on its
+    /// way out.
+    ///
+    /// Nothing adopts a VM directory left behind by a process that has exited:
+    /// [`Self::reconcile_local`] reports one as an orphan candidate for an
+    /// operator, and [`Self::resume`] finds a machine only in this process's
+    /// own map. So a rootfs that outlives the worker is not a machine anyone
+    /// can return to - it is the disk of a guest still running on the host,
+    /// held by a process and a file that no owner will ever reclaim again.
+    ///
+    /// A forensic capture is a different directory and is deliberately left
+    /// alone: it is the evidence an operator investigates, and it is the copy
+    /// that survives this call on purpose.
+    ///
+    /// One machine failing does not strand the others - an exiting worker that
+    /// stopped at the first error would leave every machine behind it - and
+    /// they are reclaimed together rather than one after another, so the cost
+    /// of a host with many machines is one teardown and not one per machine.
+    pub async fn shutdown(&self) -> Vec<Uuid> {
+        let live: Vec<Uuid> = self.vms.lock().await.keys().copied().collect();
+        let owners = self.owners.lock().await.clone();
+        let runtime = self.clone();
+        let outcomes = futures_util::future::join_all(live.into_iter().map(|id| {
+            let runtime = runtime.clone();
+            let owner = owners.get(&id).cloned();
+            async move {
+                // A missing owner record costs the attachment its release and
+                // nothing else. The guest still stops and the disk still goes:
+                // a machine nobody can identify is still a machine running on
+                // the host, and the record left behind is inert without it.
+                let outcome = runtime.reclaim(id, owner.as_ref(), Graceful::No).await;
+                (id, outcome)
+            }
+        }))
+        .await;
+        let mut reclaimed = Vec::with_capacity(outcomes.len());
+        for (id, outcome) in outcomes {
+            match outcome {
+                Ok(()) => reclaimed.push(id),
+                Err(error) => tracing::warn!(
+                    sandbox_id = %id,
+                    %error,
+                    stage = "shutdown_reclaim_failed",
+                    "could not reclaim a VM while the worker was exiting"
+                ),
+            }
+        }
+        reclaimed
     }
     fn health(&self) -> bool {
         self.config.check().is_ok()
@@ -3914,6 +4043,9 @@ impl SandboxRuntime for FirecrackerRuntime {
     }
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
         Self::destroy(self, sandbox).await.map_err(into_core)
+    }
+    async fn shutdown(&self) -> Vec<Uuid> {
+        Self::shutdown(self).await
     }
     async fn health(&self) -> RuntimeHealth {
         if Self::health(self) {
@@ -4214,6 +4346,61 @@ mod tests {
         let mut vm = runtime.vms.lock().await.remove(&sandbox.id).unwrap();
         let _ = vm.child.start_kill();
         let _ = vm.child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_reclaims_the_machines_the_worker_was_running() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let state = std::env::temp_dir().join(format!("af-shutdown-{}", Uuid::now_v7()));
+        config.state_dir = state.clone();
+        let runtime = FirecrackerRuntime::new(config);
+        let sandbox = sandbox(Uuid::now_v7(), 600);
+        let vm = running_vm(Uuid::now_v7());
+        let pid = vm.child.id().expect("test VM has a pid");
+        runtime.publish_vm(&sandbox, vm).await;
+        // The writable disk a create leaves behind is the thing that actually
+        // accumulates: the process dies with the worker either way, the file
+        // does not.
+        let disk = runtime.config.vm_dir(sandbox.id);
+        tokio::fs::create_dir_all(&disk).await.unwrap();
+        tokio::fs::write(disk.join("rootfs.ext4"), b"guest")
+            .await
+            .unwrap();
+        let reclaimed = runtime.shutdown().await;
+        assert_eq!(reclaimed, vec![sandbox.id]);
+        assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
+        assert!(!tokio::fs::try_exists(&disk).await.unwrap());
+        assert!(!process_running(pid));
+        let _ = tokio::fs::remove_dir_all(&state).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_reclaims_a_machine_it_cannot_identify() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(5);
+        let state = std::env::temp_dir().join(format!("af-shutdown-unknown-{}", Uuid::now_v7()));
+        config.state_dir = state.clone();
+        let runtime = FirecrackerRuntime::new(config);
+        let sandbox = sandbox(Uuid::now_v7(), 600);
+        let vm = running_vm(Uuid::now_v7());
+        let pid = vm.child.id().expect("test VM has a pid");
+        runtime.vms.lock().await.insert(sandbox.id, vm);
+        let disk = runtime.config.vm_dir(sandbox.id);
+        tokio::fs::create_dir_all(&disk).await.unwrap();
+        tokio::fs::write(disk.join("rootfs.ext4"), b"guest")
+            .await
+            .unwrap();
+        // Releasing an attachment needs the identity it was created under, and
+        // no other identity may be substituted for a missing one. That costs
+        // the attachment its release and nothing else: a machine nobody can
+        // name is still a guest running on the host, so it is stopped and its
+        // disk removed. The record left behind is inert without it.
+        assert_eq!(runtime.shutdown().await, vec![sandbox.id]);
+        assert!(!runtime.vms.lock().await.contains_key(&sandbox.id));
+        assert!(!process_running(pid));
+        assert!(!tokio::fs::try_exists(&disk).await.unwrap());
+        let _ = tokio::fs::remove_dir_all(&state).await;
     }
 
     #[test]

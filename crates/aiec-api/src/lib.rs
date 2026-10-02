@@ -4149,9 +4149,27 @@ pub async fn serve_worker(
     service: WorkerService,
     addr: std::net::SocketAddr,
 ) -> Result<(), std::io::Error> {
+    serve_worker_until(service, addr, std::future::pending()).await
+}
+
+/// Serves the worker until `shutdown` resolves, and not before the requests
+/// already in flight have finished.
+///
+/// The distinction is the whole point. A worker that drops its listener on the
+/// signal leaves a half-served create holding that sandbox's lifecycle gate,
+/// and anything that then waits on the same gate - reclaiming the machines
+/// this process is still running - waits behind it. Draining first means the
+/// process is finished serving before it starts tidying up.
+pub async fn serve_worker_until(
+    service: WorkerService,
+    addr: std::net::SocketAddr,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
     // A worker holds no leases of its own, so it gets no sweeper.
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, service.router()).await
+    axum::serve(listener, service.router())
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 pub async fn serve_worker_tls(
@@ -4160,8 +4178,31 @@ pub async fn serve_worker_tls(
     cert_path: impl AsRef<std::path::Path>,
     key_path: impl AsRef<std::path::Path>,
 ) -> Result<(), std::io::Error> {
+    serve_worker_tls_until(service, addr, cert_path, key_path, std::future::pending()).await
+}
+
+/// Serves the worker over TLS until `shutdown` resolves, bounded by how long a
+/// request already in flight may hold the process open.
+pub async fn serve_worker_tls_until(
+    service: WorkerService,
+    addr: std::net::SocketAddr,
+    cert_path: impl AsRef<std::path::Path>,
+    key_path: impl AsRef<std::path::Path>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), std::io::Error> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
+    let handle = axum_server::Handle::new();
+    let trigger = handle.clone();
+    // Bounded, because the exit path that follows this one has to finish too:
+    // a drain with no end would let one long request keep a worker's machines
+    // on the host indefinitely, which is the leak this ordering exists to
+    // close.
+    tokio::spawn(async move {
+        shutdown.await;
+        trigger.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
     axum_server::bind_rustls(addr, config)
+        .handle(handle)
         .serve(
             service
                 .router()

@@ -5,7 +5,7 @@ use image::{ImageCommand, image_command};
 
 use aiec_api::{
     HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
-    WorkerStatus, serve_worker_tls,
+    WorkerStatus, serve_worker_tls_until,
 };
 use aiec_client::{
     AIecClient, BatchOptions, CreateRunRequest, EvalBatchRequest, EvalMatrixSpec,
@@ -1091,6 +1091,10 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         std::env::var("AIEC_ALLOW_LOOPBACK_HTTP").as_deref() == Ok("1"),
     );
     let budget_target = runtime.clone();
+    // The service takes ownership of the runtime, but the shutdown path needs
+    // its own handle: reclaiming the machines left running is the last thing
+    // this process does, and it is not a request the service could carry.
+    let shutdown_runtime = runtime.clone();
     let mut service = WorkerService::new(
         runtime,
         runtime_kind,
@@ -1313,14 +1317,46 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         }
     });
     let bind = args.bind.parse().context("invalid worker bind address")?;
-    if let Some((cert, key)) = tls_config {
-        serve_worker_tls(service, bind, cert, key)
+    // The signal ends the listener and the server reports itself drained; the
+    // machines are reclaimed after that, not in parallel with it. A request
+    // still in flight holds its sandbox's lifecycle gate, and a reclaim that
+    // waited on the same gate would be reclaiming under a create that is still
+    // copying.
+    let serving = if let Some((cert, key)) = tls_config {
+        serve_worker_tls_until(service, bind, cert, key, termination_signal())
             .await
             .context("serve worker operations over TLS")
     } else {
-        aiec_api::serve_worker(service, bind)
+        aiec_api::serve_worker_until(service, bind, termination_signal())
             .await
             .context("serve worker operations")
+    };
+    // A worker's machines are process-local: no other process adopts a VM
+    // directory this one stops tracking, so anything still running now would
+    // be a guest nobody owns, holding a rootfs on the host for as long as the
+    // disk lasts. Reclaiming them is the last thing this process owes the host
+    // it ran on, and it happens whether the server stopped cleanly or not.
+    let reclaimed = shutdown_runtime.shutdown().await;
+    tracing::info!(
+        reclaimed = reclaimed.len(),
+        "reclaimed the machines this worker was still running"
+    );
+    serving
+}
+
+/// Resolves on the first `SIGTERM` or `SIGINT`.
+///
+/// The default disposition of either signal ends the process without running a
+/// single destructor, so a worker that only waited on its listener would leave
+/// every machine it was running on the host. Waiting for the signal is what
+/// gives the runtime the chance to destroy them.
+async fn termination_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
     }
 }
 

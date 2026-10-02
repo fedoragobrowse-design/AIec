@@ -595,6 +595,19 @@ pub trait SandboxRuntime: Send + Sync {
     ) -> Result<(), crate::CoreError>;
     /// Releases all resources owned by a sandbox.
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), crate::CoreError>;
+    /// Reclaims every machine this runtime still holds, for a process that is
+    /// exiting rather than serving.
+    ///
+    /// A runtime whose machines are process-local cannot hand them to the next
+    /// process, so this is the only point at which they can be released: the
+    /// caller has no request to carry a sandbox id, and nothing reclaims a
+    /// machine this process stops tracking. Returns the ids it reclaimed, so
+    /// the caller can say what went instead of assuming everything did.
+    ///
+    /// The default is a backend with nothing host-owned to reclaim.
+    async fn shutdown(&self) -> Vec<SandboxId> {
+        Vec::new()
+    }
     /// Reports current runtime health.
     async fn health(&self) -> RuntimeHealth;
     /// Reports immutable backend capabilities.

@@ -907,16 +907,18 @@ def main() -> int:
         log(f"phase 5 driver error: {type(error).__name__}: {error}")
 
     stop_all()
-    # A quarantined machine is kept on purpose: the forensic copy under
-    # guard-forensics is the evidence an operator investigates. What must not
-    # survive is an ordinary sandbox's disk, and a forensic copy belonging to a
-    # sandbox whose journal never recorded a quarantine.
+    # The worker is stopped, so nothing can reach a VM directory left in its
+    # state tree: no other process adopts one, and resume only ever finds a
+    # machine in the process that is running. A quarantined sandbox is held
+    # while its worker lives - the evidence an operator investigates is the
+    # forensic copy under guard-forensics - but its writable disk does not
+    # survive the worker, and a disk with no quarantine behind it never does.
     live_disks = list((ROOT / "state-vms").glob("vms/**/rootfs.ext4"))
     forensic = {path.parts[-3]: path for path in
                 (ROOT / "state-vms").glob("guard-forensics/*/*/rootfs.ext4")}
-    unexplained = [path.parts[-3] for path in forensic.values()
+    unexplained = [sandbox for sandbox in forensic
                    if not any(row.get("category") == "quarantine"
-                              for row in journal(path.parts[-3]))]
+                              for row in journal(sandbox))]
     case("worker left no VM disk behind",
          not live_disks and not unexplained,
          {"live_rootfs_copies": len(live_disks),

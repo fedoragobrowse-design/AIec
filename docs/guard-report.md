@@ -812,6 +812,57 @@ outcome names an action the host has actually taken. The window is not
 reviewed twice, which would otherwise spend a second reviewer request on
 evidence that had already been judged.
 
+## What the Phase 5 rerun changed in the product
+
+The Phase 5 suite asserts, after the worker is stopped, that no writable
+rootfs is left in its state tree. On the first run against the current tree it
+failed with exactly two disks, and both belonged to the two machines the
+canaries had quarantined.
+
+**A quarantined sandbox's writable disk outlived the worker, along with its
+guest.** Nothing in the worker reclaims machines on exit. The listener was
+awaited alone, so the process ended on `SIGTERM` with no teardown at all — and
+the default disposition of that signal runs no destructor either, so the
+`kill_on_drop(true)` on each Firecracker child never fired. The guest process
+survived its controller, and with it a 4 GiB writable disk under
+`state-vms/vms/<id>/`, per sandbox, for as long as the filesystem did.
+
+The quarantine is what made this look like intended behaviour rather than a
+leak, and it is worth stating plainly why the machine cannot be resumed after
+the worker exits: `resume()` looks the sandbox up in the running process's
+`vms` map, and `reconcile_local` only *reports* a surviving VM directory as an
+orphan candidate for an operator — it never adopts one. A held machine is
+resumable for exactly as long as the process that created it is alive. The
+forensic capture under `guard-forensics` is the copy that survives on purpose,
+and the census already allowed it.
+
+Three changes, each with the ordering it needs:
+
+- **The worker drains, then reclaims.** `serve_worker_tls_until` takes the
+  termination signal and gives it to the server, which stops accepting and
+  waits (bounded at five seconds) for in-flight requests before returning. Only
+  then does the runtime reclaim. The reverse order deadlocks in practice rather
+  than in theory: an in-flight create holds its sandbox's lifecycle gate for the
+  length of a rootfs copy, and `reclaim` waits on that same gate.
+- **Reclamation does not wait on a guest.** `terminate_vm` asks the guest to
+  shut itself down only when a request is waiting for the answer. A quarantined
+  machine is paused, a paused guest has no agent scheduled to reply, and the
+  write would sit on the vsock until `guest_call_timeout` — once per machine,
+  serially. The disk is deleted either way, so a flush has nothing to protect.
+  Machines are reclaimed concurrently.
+- **A missing owner record costs the attachment its release and nothing
+  else.** Releasing an attachment is checked against the identity it was
+  created under, and a shutdown holds no `Sandbox` to check. `publish_vm` now
+  records one per live VM; where it is absent the guest is still stopped and
+  the disk still removed, because an unidentifiable machine is still a guest
+  running on the host, and the attachment record left behind is inert without
+  it. No identity is ever guessed.
+
+The census is unchanged in strength: `live_rootfs_copies: 0`, with the two
+quarantined forensic captures retained. The worker log for that run records
+`reclaimed=2`, so the two disks are gone because the worker took them with it,
+not because the assertion was relaxed.
+
 ### Reading the logs when a request seems to vanish
 
 `tracing::info!("api request")` is emitted after the handler returns, so a

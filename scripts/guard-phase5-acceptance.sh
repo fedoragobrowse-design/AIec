@@ -32,7 +32,9 @@ if [[ ${1:-} != --inside ]]; then
   for tool in unshare ip nft python3 setsid; do command -v "$tool" >/dev/null; done
   : "${AIEC_FIRECRACKER_BIN:?load the Firecracker environment first}"
   : "${AIEC_KERNEL:?}" "${AIEC_ROOTFS:?}" "${AIEC_GUEST_SECRET:?}"
-  : "${P5_DRIVER:?set P5_DRIVER to scripts/guard-phase5-acceptance.py}"
+  # Defaulted to the driver beside this script: a suite that has to be told
+  # where its own driver lives fails before it has proved anything.
+  P5_DRIVER=${P5_DRIVER:-$(dirname "$(realpath "${BASH_SOURCE[0]}")")/guard-phase5-acceptance.py}
   root=${P5_ROOT:-$HOME/aiec/phase5}
   mkdir -p "$root"
   chmod 700 "$root"
