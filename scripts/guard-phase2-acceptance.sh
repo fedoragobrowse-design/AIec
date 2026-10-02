@@ -60,7 +60,17 @@ if [[ ${1:-} != --inside ]]; then
   # The bundled server has no client binaries, so the acceptance uses the
   # database `initdb` already created rather than one it cannot ask for.
   export DATABASE_URL="postgresql://aiec@localhost/postgres?host=$sock"
-  stop_db() { "$pg_bin/pg_ctl" -D "$pg" -m immediate stop >/dev/null 2>&1 || true; }
+  # Reap anything this run started before stopping the database. The drivers
+  # launch a control plane and a worker, and `unshare --kill-child` only kills
+  # the direct child, so an interrupted run otherwise leaves servers bound to
+  # this run's directory and ports. They then hold the database cluster open
+  # and make the next run fail on a stale fixture rather than on a real fault.
+  # Matching is on this run's own root, which is unique per run, so nothing
+  # belonging to another run can be caught by it.
+  stop_db() {
+    pkill -9 -f -- "$root" >/dev/null 2>&1 || true
+    "$pg_bin/pg_ctl" -D "$pg" -m immediate stop >/dev/null 2>&1 || true
+  }
   trap stop_db EXIT
   unshare --user --map-root-user --net --fork --kill-child=KILL bash "$self" --inside
   status=$?
@@ -100,6 +110,12 @@ export P2_WATCHDOG_TIMEOUT_MS=${P2_WATCHDOG_TIMEOUT_MS:-3000}
 # It is set explicitly here so a loaded operator environment cannot put
 # acceptance machines next to a running deployment's own.
 export AIEC_STATE_DIR=$root/state-vms
+# The image manifest carries the recorded digests the guest is verified
+# against. Defaulted to the build directory so a run does not depend on the
+# operator having exported them, while still allowing an explicit override.
+export AIEC_IMAGE_MANIFEST=${AIEC_IMAGE_MANIFEST:-${AGENTFORGE_IMAGE_MANIFEST:-$HOME/aiec/imgbuild/.aiec/images/manifest.json}}
+# The secret is the signing key's material, not a path to it.
+export AIEC_IMAGE_MANIFEST_SECRET=${AIEC_IMAGE_MANIFEST_SECRET:-${AGENTFORGE_IMAGE_MANIFEST_SECRET:-}}
 
 ip link set lo up
 # Namespace-scoped forwarding. A fresh network namespace has this off, and a
