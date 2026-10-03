@@ -30,6 +30,12 @@ The worker needs the privileges the existing network backend already required
 — `CAP_NET_ADMIN` and `CAP_NET_RAW` — because Guard installs nftables tables
 and TAP devices of its own.
 
+The packaged unit, `deploy/aiec-worker.service`, grants both as ambient
+capabilities, so a worker installed from it enforces Guard out of the box. A
+worker started some other way — a container, a hand-written unit, a
+supervisor — needs them granted by whatever starts it, and the startup probe
+below is what tells you whether it has them.
+
 That is checked rather than assumed. The worker probes `nft list ruleset` once
 at startup — a read, which does not modify the firewall — and advertises the
 `network_policy` capability only if it succeeds. A host without `nft`, or

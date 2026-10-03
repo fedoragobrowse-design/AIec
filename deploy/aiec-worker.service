@@ -11,6 +11,18 @@ EnvironmentFile=/etc/aiec/aiec.env
 ExecStart=/usr/local/bin/aiec worker
 Restart=on-failure
 NoNewPrivileges=false
+# Guard installs nftables tables and TAP devices of its own, so the worker needs
+# these two the way the network backend always has; docs/DEPLOYMENT.md states
+# the requirement and this unit was the one place that did not grant it, which
+# left a deployed worker reporting network_policy: false and refusing every
+# governed placement. Ambient rather than permitted-only, so they survive the
+# exec of the worker and reach the nft and ip invocations it makes.
+#
+# The bounding set is deliberately left at its default rather than narrowed
+# here. Firecracker needs capabilities this file has never enumerated, and a
+# bounding set is an upper limit: a wrong list would break the very runtime
+# this unit exists to run. Narrowing it is a separate, tested change.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/aiec /dev/kvm

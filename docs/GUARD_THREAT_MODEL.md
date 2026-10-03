@@ -92,6 +92,11 @@ host-level attacker can do afterwards; see 'What Guard does not defend' below.
 - **A watcher's judgement.** The optional watcher is a second reviewer. It can
   only be more restrictive; it can be wrong, and it can be manipulated by
   untrusted evidence. It never widens anything.
+- **The guest's own account of what happened.** Guest and harness logs are
+  untrusted input. A compromised guest can omit, reorder or forge them, so
+  every claim in this document rests on host-observed evidence instead:
+  counters, packet captures, listeners, process censuses and the Guard journal.
+  A guest log is context for an operator, never a security verdict.
 - **Hardware attestation.** AIec verifies hashes and, for guarded workloads,
   signed manifests. There is no TPM-backed attestation, and none is claimed.
 - **Multi-host security.** Guard's assumptions are about one worker host and its
