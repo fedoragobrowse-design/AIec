@@ -422,7 +422,7 @@ before/after snapshots enclosing each client invocation. RSS comes from
 `VmRSS` sampled every 5 ms; lifetime `VmHWM` is also retained. Sampling is not
 an absolute peak-memory guarantee, and RSS includes shared resident pages.
 A positive control allocated 32 MiB and burned CPU: the same instrument saw
-31 CPU ticks and 32 772 KiB RSS growth. A second control reached the authority,
+32 CPU ticks and 32 772 KiB RSS growth. A second control reached the authority,
 observed its HTTP 403 and the gateway's HTTP 503, and verified no provider call
 or durable debit. Failed runs do not replace the published artifact; a failed
 gateway-start smoke verified that behavior. Cleanup errors: none.
