@@ -1133,3 +1133,48 @@ a window does not mean no request was in flight - it means no request
 is why both blocked callers above had to be identified from the control plane's
 own stage timestamps and the worker's continued `ownership` polls rather than
 from the API access log.
+
+## Where each required report field is answered
+
+§61 names the fields this report has to carry. They are not all headings here;
+this table says where each one is answered, so a reader is not left looking.
+
+| field | answered in |
+|---|---|
+| Baseline before changes | `Baseline before the work` |
+| Architecture added | `Architecture added`, and the layer table under it, which names every Guard crate and binary and the trust zone each runs in |
+| Trust boundary | `Trust boundary` |
+| Guard crates/binaries | the layer table under `Architecture added`: `crates/aiec-guard/src/{policy,compiler,deployment}.rs`, `enforcement.rs` with `aiec-network-linux`, `{dns,gateway,gateway/connect}.rs`, `events{,/file,/remote}.rs`, `watchdog.rs`, `{l7,proposals,openshell}.rs`, `watcher.rs`, `canaries.rs`, `crates/aiec-core/src/image_trust.rs`, `crates/aiec-runtime/src/control_identity.rs`, and the binaries `src/bin/aiec-guard-{gateway,watchdog,watcher,import-openshell}.rs` |
+| Policy format | `What each layer does`, first bullet: versioned, canonicalized, content-hashed, unknown fields refused, set-like lists normalized, with the effective hash stored against the sandbox |
+| Built-in policies | same section: `no_network`, `model_only`, `model_plus_allowlist`, `read_only_api` |
+| Verifier | same section: compiles a policy against the operator boundary and refuses contradictions with a counterexample, and a proposal is verified before it is applied - exercised by the live suites, which submit real policies and show the refusals |
+| Enforcement backend | `crates/aiec-guard/src/enforcement.rs` on `aiec-network-linux`: nftables on the worker host, with a test backend for the assertions that are not about packet filtering |
+| DNS | `crates/aiec-guard/src/dns.rs`; host-observed canaries and rewritten answers in the Phase 3 and Phase 5 artifacts |
+| Model gateway | `crates/aiec-guard/src/gateway{,/connect}.rs`; §49 and §50 prove both topologies end to end |
+| Credential substitution | the gateway holds the real credential and the guest is given a placeholder; §50's zero-egress window is what proves the guest never held one |
+| Telemetry | `crates/aiec-guard/src/events{,/file,/remote}.rs`, hash-chained; guest-side logs are labelled contextual and never used as enforcement evidence |
+| Hash-chain | `crates/aiec-guard/src/events/tests.rs`: a tampered, reordered, missing, truncated or blank record is rejected, a journal that does not verify is not extended, tail truncation needs an external anchor, and rotation refuses to move evidence that does not verify |
+| Watchdog | `crates/aiec-guard/src/watchdog.rs` and the separate host process `crates/aiec-guard/src/bin/aiec-guard-watchdog.rs`; Phase 2, 29/29 |
+| Dead-man behavior | Phase 2's `killed-watchdog-cuts-egress`: the cut follows from the store clock when the watchdog stops renewing, not from anything the guest says, and `attachment-is-not-cut-while-a-watchdog-reports` is the paired negative |
+| Quarantine | Phase 2 and Phase 5: the durable cut, the preserved machine, and the recorded incident |
+| Budget/lifetime reaper | its own live suites, 16/16 and 16/16 over the external-database relay |
+| MCP policy | `crates/aiec-mcp` plus the control-plane approval path; Phase 3, 47/47 |
+| GraphQL policy | the same policy exposed over GraphQL; covered in the Phase 3 artifact |
+| Approvals | the live §44 suite, 10/10: one authenticated grant, one consumption, replay refused. PostgreSQL regressions cover retry and window handling |
+| Watcher | `crates/aiec-guard/src/watcher.rs`; Phase 4, 51/51 on real guests |
+| Canaries | `crates/aiec-guard/src/canaries.rs`; host-observed DNS, credential and file canaries in Phase 5 |
+| Image signing | `crates/aiec-core/src/image_trust.rs`: unsigned, untrusted, tampered and expired images refused, kernel and rootfs digests enforced, with a real rebuild signed by `scripts/build-firecracker-guest.sh` |
+| Per-VM identity | `crates/aiec-runtime/src/control_identity.rs`; distinct identities and cross-sandbox frame refusal |
+| Harness integration | the in-guest harness in Topology A and the external loop in Topology B, §49 and §50 |
+| Topology A result | §49 completes a real in-guest model-only tool loop |
+| Topology B result | §50, 15/15, with a positive-control-validated capture and a bounded zero-egress window |
+| Escape-matrix result | the Phase 1 core suite (`benchmarks/guard-core-acceptance.json`, 48/48), which refuses each escape in turn on a real guest: direct public IPv4, RFC1918, link-local, cloud metadata, the worker management and control-plane endpoints, external TCP/UDP DNS and DoT, IPv6 bypass, direct IP to the model upstream, another destination behind the placeholder, proxy-environment changes and raw sockets - each paired with the model still reachable afterwards, so the refusals are the policy and not a broken network |
+| Incident replay result | the Phase 1 core suite's four `incident-reproduction-*` cases, including that the recording is made outside the guest, and Phase 5's completed incident taken through cut, pause, snapshot and report with timestamps |
+| Existing regression tests | `Exact commands`, static gates: `fmt`, clippy `-D warnings`, the whole workspace suite, the SDK import contract, the Python SDK tests, the aarch64 cross-check |
+| Benchmark environment | `What Guard costs`: the host, the kernel, the mock model, and the sample counts behind every figure |
+| DNS overhead | the lookup table in `What Guard costs`, 10 samples per side, with what the figure does not establish stated next to it |
+| Gateway overhead | the streaming table and the isolated CPU/RSS pairs, 7 matched pairs |
+| Quarantine latency | Phase 2: alert to network cut, from the incident timestamps, n=1 and labelled as such |
+| Known limitations | `Known limitations`, and the open list under `Verdict` |
+| Deferred items | `Known limitations`: Layer 7 interception, multi-host validation, aarch64 run evidence, and the unattributed soak refusals, each with why it is still open |
+| Exact commands to run it | `Exact commands`, plus `Rebuilding the guest image` for a host with no Rust toolchain |
