@@ -5,10 +5,8 @@ use aiec_core::{
     network::{NetworkAttachment, NetworkBackend, NetworkCapabilities, NetworkPolicy},
 };
 use async_trait::async_trait;
-use std::{collections::HashSet, process::Stdio};
+use std::{collections::HashSet, future::Future, net::Ipv4Addr, process::Stdio};
 use tokio::{io::AsyncWriteExt, process::Command};
-
-use std::net::Ipv4Addr;
 
 mod guard;
 pub use guard::GuardNetworkManager;
@@ -102,6 +100,42 @@ pub struct LinuxNetworkManager;
 /// reservation. That is recorded rather than claimed fixed.
 static TAP_RESERVATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Picks a free /30 for `id` and keeps it reserved until `assign` has returned.
+///
+/// The inventory is read and the assignment applied inside one hold of
+/// `TAP_RESERVATION`, which is the whole point: a slot that is free when it is
+/// probed must still be free when it is taken, or two sandboxes end up on one
+/// subnet and neither the allocator nor the kernel complains.
+///
+/// Both steps are parameters so the reservation can be exercised without
+/// creating real links on the machine running the tests. `assign` is what puts
+/// the address on the link; on success the caller holds a slot that is already
+/// taken, and on any error the slot is released back to the pool because the
+/// assignment never happened.
+pub(crate) async fn reserve_tap_plan<A, AFut, I, IFut>(
+    id: SandboxId,
+    inventory: I,
+    assign: A,
+) -> Result<TapAddressPlan, CoreError>
+where
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = Result<HashSet<Ipv4Addr>, CoreError>>,
+    A: FnOnce(TapAddressPlan) -> AFut,
+    AFut: Future<Output = Result<(), CoreError>>,
+{
+    let _reservation = TAP_RESERVATION.lock().await;
+    let assigned = inventory().await?;
+    let plan = choose_tap_plan(id, |candidate| {
+        [candidate.host, candidate.guest].iter().any(|address| {
+            address
+                .parse::<Ipv4Addr>()
+                .is_ok_and(|ip| assigned.contains(&ip))
+        })
+    })?;
+    assign(plan.clone()).await?;
+    Ok(plan)
+}
+
 impl LinuxNetworkManager {
     pub fn new() -> Self {
         Self
@@ -137,59 +171,67 @@ impl NetworkBackend for LinuxNetworkManager {
         // will actually reject: a duplicate address fails at `ip addr add`, and
         // a link whose guest half matches another sandbox's is never reported
         // as an error at all — it silently becomes two sandboxes on one subnet.
-        // Held until the address is actually on the link, so the probe below and
-        // the `ip addr add` after it cannot interleave with another placement.
-        let _reservation = TAP_RESERVATION.lock().await;
-        let assigned = assigned_ipv4().await?;
-        let plan = choose_tap_plan(sandbox.id, |candidate| {
-            [candidate.host, candidate.guest].iter().any(|address| {
-                address
-                    .parse::<std::net::Ipv4Addr>()
-                    .is_ok_and(|ip| assigned.contains(&ip))
-            })
-        })?;
+        //
+        // The probe and the assignment are one reservation rather than two
+        // steps, so two placements admitted at once cannot both find a slot
+        // free. `reserve_tap_plan` holds that reservation across both.
         let suffix = &sandbox.id.to_string()[..12];
         let tap = format!("af{suffix}");
+        // A partially applied set of commands leaves a real link behind: the
+        // tuntap exists even if the address or the up-step failed. So the
+        // teardown moves inside the assignment, where the failure happens —
+        // once `reserve_tap_plan` returned, a failure would be too late to
+        // name the device that had to be released.
+        let manager = *self;
+        let link_name = tap.clone();
+        let plan = reserve_tap_plan(sandbox.id, assigned_ipv4, move |plan| {
+            let tap = link_name.clone();
+            async move {
+                let device = NetworkAttachment {
+                    resource: tap.clone(),
+                    addresses: vec![plan.host.clone()],
+                    guest_addresses: vec![plan.guest.clone()],
+                };
+                let commands: Vec<Vec<String>> = vec![
+                    vec![
+                        "tuntap".into(),
+                        "add".into(),
+                        "dev".into(),
+                        tap.clone(),
+                        "mode".into(),
+                        "tap".into(),
+                    ],
+                    vec![
+                        "addr".into(),
+                        "add".into(),
+                        format!("{}/{}", plan.host, TAP_PREFIX),
+                        "dev".into(),
+                        tap.clone(),
+                    ],
+                    vec![
+                        "link".into(),
+                        "set".into(),
+                        "dev".into(),
+                        tap.clone(),
+                        "up".into(),
+                    ],
+                ];
+                for args in commands {
+                    if let Err(error) = run_ip(&args).await {
+                        let _ = manager.release(sandbox, &device).await;
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await?;
         let table = format!("aiec_{suffix}");
         let device = NetworkAttachment {
             resource: tap.clone(),
             addresses: vec![plan.host.clone()],
             guest_addresses: vec![plan.guest.clone()],
         };
-
-        let commands: Vec<Vec<String>> = vec![
-            vec![
-                "tuntap".into(),
-                "add".into(),
-                "dev".into(),
-                tap.clone(),
-                "mode".into(),
-                "tap".into(),
-            ],
-            vec![
-                "addr".into(),
-                "add".into(),
-                format!("{}/{}", plan.host, TAP_PREFIX),
-                "dev".into(),
-                tap.clone(),
-            ],
-            vec![
-                "link".into(),
-                "set".into(),
-                "dev".into(),
-                tap.clone(),
-                "up".into(),
-            ],
-        ];
-        for args in commands {
-            if let Err(error) = run_ip(&args).await {
-                let _ = self.release(sandbox, &device).await;
-                return Err(error);
-            }
-        }
-        // The address is assigned and the link is up, so the reservation is
-        // spent and the next placement may probe again.
-        drop(_reservation);
 
         if let Err(error) = enable_ip_forwarding().await {
             let _ = self.release(sandbox, &device).await;
@@ -664,6 +706,86 @@ mod tests {
             a.network, b.network,
             "two live sandboxes were placed on one /30"
         );
+    }
+
+    /// The occupancy probe and the assignment used to be two separate steps, so
+    /// two placements admitted together could both read a free slot and both
+    /// take it — the kernel accepts a duplicate address on a second interface,
+    /// so nothing reported it and the result was two live sandboxes on one
+    /// subnet. This drives the real `reserve_tap_plan` concurrently against an
+    /// inventory that reflects what has actually been assigned, which is the
+    /// only way to show the reservation is held across both halves rather than
+    /// around them.
+    #[tokio::test]
+    async fn concurrent_placements_never_share_a_subnet() {
+        let assigned = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+        // Every one of these starts on the same slot: `choose_tap_plan` begins at
+        // `id % TAP_SLOTS`, so ids a whole pool apart are indistinguishable to
+        // it. That is the case the probe has to notice, and it is what a random
+        // draw produces often enough to matter — but it also means the test
+        // only has teeth if the starts genuinely collide. Spacing them by 100
+        // would not: those are eight distinct slots, and the test would pass
+        // with the reservation deleted.
+        let ids: Vec<SandboxId> = (0..8u128)
+            .map(|n| SandboxId::from_u128(n * u128::from(TAP_SLOTS)))
+            .collect();
+
+        let mut futures = Vec::new();
+        for id in ids {
+            let assigned = assigned.clone();
+            futures.push(async move {
+                let read = assigned.clone();
+                let write = assigned.clone();
+                reserve_tap_plan(
+                    id,
+                    move || {
+                        let read = read.clone();
+                        async move { Ok(read.lock().expect("inventory lock").clone()) }
+                    },
+                    move |plan| {
+                        let write = write.clone();
+                        async move {
+                            // Force a scheduling point between the probe above
+                            // and the claim below. Without it each future runs
+                            // straight through and the test passes whether or
+                            // not the reservation exists; with it, an
+                            // unreserved probe-then-claim lets every placement
+                            // read the same empty inventory first and collide.
+                            tokio::task::yield_now().await;
+                            let mut guard = write.lock().expect("inventory lock");
+                            for address in [&plan.host, &plan.guest] {
+                                let address: Ipv4Addr = address.parse().expect("a planned address");
+                                assert!(
+                                    guard.insert(address),
+                                    "the reservation let two placements take {address}"
+                                );
+                            }
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            });
+        }
+        let mut plans = tokio::task::JoinSet::new();
+        for future in futures {
+            plans.spawn(future);
+        }
+        let mut collected = Vec::new();
+        while let Some(joined) = plans.join_next().await {
+            collected.push(
+                joined
+                    .expect("placement task joined")
+                    .expect("a placement succeeded"),
+            );
+        }
+        let plans = collected;
+
+        let mut networks: Vec<String> = plans.into_iter().map(|plan| plan.network).collect();
+        networks.sort();
+        let count = networks.len();
+        networks.dedup();
+        assert_eq!(networks.len(), count, "two placements shared a /30");
     }
 
     #[test]

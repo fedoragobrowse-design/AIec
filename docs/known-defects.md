@@ -645,7 +645,6 @@ first with the write returning `Ok(())`.
   its share of the fix is defence in depth on a public function rather than a
   closed hole. Worth keeping anyway — the function is `pub` and a suite file is
   caller-authored — but it should not be read as the route an attacker took.
-
 - The CLI created Firecracker and Docker sandboxes through a bare
   `reqwest::Client::new()`, bypassing `AIEC_TLS_CA_CERT` and the 60 s timeout.
 - The worker skipped its heartbeat entirely when its own health probe failed,
@@ -676,6 +675,13 @@ mutability. What that lock does **not** cover is a second worker process on the
 same host: cross-process, the reservation is still the inventory probe rather
 than an atomic claim. Closing that needs a lockfile or a kernel-side
 reservation, which is not built.
+
+Regression:
+`concurrent_placements_never_share_a_subnet` drives the real reservation with
+eight identifiers that all start on the same slot, and yields between the probe
+and the claim so the window is actually open. Verified by deleting the
+reservation: the test then fails with `the reservation let two placements take
+172.30.8.1`.
 
 ## Open
 
