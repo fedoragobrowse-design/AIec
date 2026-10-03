@@ -216,6 +216,41 @@ refused on every deployment, including one whose runtime advertises those
 capabilities. There is no code path that can finish such a snapshot, so
 accepting one produced a failure after the work rather than an answer.
 
+### Restoring a machine snapshot tore a machine down it never owned
+
+`restore_snapshot` branched on the stored snapshot's kind. For a
+`virtual_machine` or `memory` row it allocated a machine, handed the worker's
+own provider snapshot to it, and then destroyed what it had just built. That
+teardown went through `schedule`, not through `provision_sandbox`, so the
+admission that decides whether a request owns the lease and the lease fencing
+every other dispatch uses were both absent from the one path that allocated and
+released a machine inside a single request. The bytes such a row names are not
+recorded anywhere the control plane can read, so there was nothing to restore
+either.
+
+Restore is now workspace-only: any other stored kind is refused with `409
+unsupported_snapshot_kind` before a machine is allocated, and a workspace
+restore is provisioned by `provision_sandbox`, so it holds the same admission
+and the same fencing as `POST /v1/sandboxes`. Rows of the older kinds exist in
+databases deployed before the cutover; the refusal is explicit rather than an
+assumption that they do not. Regression:
+`a_machine_kind_restore_is_refused_before_anything_is_allocated`, which plants a
+complete `virtual_machine` row and asserts the refusal, that the tenant's
+machine list still holds only the source machine, and that nothing was
+destroyed. The two unit tests that covered the removed branch are gone with it;
+the isolation-boundary check moved onto the surviving branch as
+`workspace_restore_respects_the_deployment_isolation_boundary`.
+
+**Operator-visible:** restoring a `virtual_machine` or `memory` snapshot now
+fails with `409 unsupported_snapshot_kind`. Recapture it as a workspace
+snapshot.
+
+Reproduced against `13f7d3e`, in that worktree with its own target directory, by
+`f4_baseline_a_stored_machine_snapshot_restore_is_refused`: the restore
+allocated a second machine in state `Restoring`, the runtime lookup for it
+failed, and the response was a `503 runtime_unavailable` whose message ended
+`cleanup failed`, with the new machine still in the store beside the source.
+
 ### A refused worker heartbeat still refreshed its row
 
 `heartbeat_worker` updated `nodes` first and checked active-lease ownership
@@ -423,10 +458,14 @@ down. The three now take the tenant and refuse, atomically and with no row
 written, when the named machine is not that tenant's own. `retain_run_sandbox`
 requires the run to have used the machine before it may keep it.
 
-Reproduced against the pushed revision `13f7d3e` with two PostgreSQL tests
-(`crates/aiec-storage/src/postgres.rs`, run in a worktree at that commit): a run
-accepted tenant B's machine and its link list then held the foreign id, and a
-run retained a machine it had never used.
+Reproduced against `13f7d3e`, in a worktree at that commit with its own target
+directory, by two PostgreSQL tests:
+
+- `f4_baseline_a_run_links_a_machine_from_another_tenant` — the link was
+  accepted and the run's link list then held the foreign id.
+- `f4_baseline_a_run_only_keeps_a_machine_it_used_once` — a run retained a
+  machine it had never used, and a second machine displaced the one already
+  retained.
 
 ### Deleting a run stranded the machines it still held
 
@@ -441,9 +480,15 @@ running with nothing left pointing at it — the same end state as the retention
 displacement above, reached by a different statement.
 
 The delete now refuses, in the same statement that deletes, while the run
-retains a machine or names one, and distinguishes refused from absent so a
-caller that already deleted its run still gets `NotFound`. Reproduced against
-`13f7d3e`: the delete returned `Ok` and the link list read `[]`.
+retains a machine or names one. The two are separate predicates rather than
+one: `runs.retained_sandbox_id` has no foreign key and no trigger tying it to
+`run_sandboxes`, so a row that retains a machine without the link would
+otherwise delete the sweeper's only index onto it. It also distinguishes
+refused from absent so a caller that already deleted its run still gets
+`NotFound`. Reproduced against `13f7d3e`, in that worktree with its own target
+directory, by
+`f4_baseline_deleting_a_run_keeps_the_machine_it_holds`: the delete succeeded,
+the link list read `[]` afterwards and the machine was still in the store.
 
 ### Retention could be handed to another machine
 

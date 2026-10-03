@@ -8434,6 +8434,23 @@ pub(crate) mod tests {
             "a run that still retains a machine was deleted before it was reclaimed"
         );
 
+        // A run row can carry a retention whose link is not there — a fixture,
+        // a row written before the link existed, or any writer that sets the
+        // column directly. Retention is the sweeper's only index onto that
+        // machine, so the guard reads the column itself rather than trusting
+        // the link to be present whenever the column is.
+        let mut unlinked = run(tenant);
+        unlinked.retained_sandbox_id = Some(sandbox_id);
+        unlinked.retained_until = Some(Utc::now() + chrono::Duration::hours(1));
+        repository.create_run(unlinked.clone()).await.unwrap();
+        assert!(
+            matches!(
+                store(&repository).delete_run(tenant, unlinked.id).await,
+                Err(CoreError::Conflict(_))
+            ),
+            "a run still retaining a machine was deleted, with no link to find it by"
+        );
+
         // Refused is not the same answer as absent.
         assert!(matches!(
             store(&repository).delete_run(tenant, new_id()).await,

@@ -4,7 +4,7 @@ use aiec_core::{
     policy::PolicyOperation,
     run::{CleanupReport, Run, RunArtifactRef, RunEvent, RunState},
     runtime::SandboxRuntime,
-    snapshots::{SnapshotKind, SnapshotMetadata, SnapshotRequest, verify_archive_checksum},
+    snapshots::{SnapshotKind, SnapshotRequest, verify_archive_checksum},
     storage::{ArtifactStore, GetObjectOptions, MetadataStore},
 };
 pub mod account;
@@ -3434,6 +3434,28 @@ async fn restore_snapshot(
         .await
         .map_err(ApiFailure::from)?;
     let kind = snapshot_kind(&stored.kind)?;
+    // Capture refuses a provider capture because this control plane cannot
+    // finish one, and restore has the same limit from the other end: the bytes
+    // a `virtual_machine` or `memory` row names are not recorded anywhere this
+    // path can read, so the only thing it could do is allocate a machine, boot
+    // whatever the provider still had, and then tear it down again - through
+    // `schedule` rather than owned admission, and with a teardown no state fence
+    // behind it. Rows of those kinds exist in older databases, so the refusal
+    // is explicit rather than an assumption that they never did.
+    if kind != SnapshotKind::Workspace {
+        let named = match kind {
+            SnapshotKind::VirtualMachine => "virtual_machine",
+            SnapshotKind::Memory => "memory",
+            SnapshotKind::Workspace => unreachable!("checked above"),
+        };
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "unsupported_snapshot_kind",
+            format!(
+                "restoring a {named} snapshot is not supported; this deployment restores workspace snapshots"
+            ),
+        ));
+    }
     if !stored.complete {
         return Err(ApiFailure::from(CoreError::Conflict(
             "snapshot is incomplete".into(),
@@ -3492,98 +3514,26 @@ async fn restore_snapshot(
         updated_at: now,
         runtime_path: None,
     };
-    if kind == SnapshotKind::Workspace {
-        // Use ordinary admission, readiness and rollback. Workspace bytes come
-        // from shared storage, never a provider's worker-local capture path.
-        x.state = SandboxState::Creating;
-        x.environment.workspace = WorkspaceSpec::Snapshot { snapshot_id: id };
-        let request_id = x.id;
-        let restored = provision_sandbox(
-            &s,
-            p.tenant_id,
-            request_id,
-            x,
-            aiec_core::runtime::RuntimeCapabilities {
-                portable_workspace: true,
-                workspace_snapshot: true,
-                ..Default::default()
-            },
-            None,
-            false,
-        )
-        .await?;
-        return Ok(Json(restored.sandbox));
-    }
-    if s.is_production() {
-        x = s
-            .scheduler()
-            .schedule(aiec_core::scheduler::ScheduleRequest {
-                tenant_id: p.tenant_id,
-                request_id: new_id(),
-                sandbox: x,
-                preferred_worker: None,
-                lease_ttl: std::time::Duration::from_secs(s.lease_ttl_seconds),
-                required_capabilities: Default::default(),
-                run_id: None,
-            })
-            .await
-            .map_err(|error| match error {
-                CoreError::QuotaExceeded(message) => {
-                    ApiFailure::new(StatusCode::TOO_MANY_REQUESTS, "quota_exceeded", message)
-                }
-                other => ApiFailure::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "scheduler_unavailable",
-                    other.to_string(),
-                ),
-            })?
-            .sandbox;
-    } else {
-        s.repository()
-            .create_sandbox(x.clone())
-            .await
-            .map_err(ApiFailure::from)?;
-    }
-    let restored = async {
-        s.runtime_for(&x)?
-            .create(&x)
-            .await
-            .map_err(ApiFailure::from)?;
-        s.platform
-            .snapshots()
-            .ok_or_else(|| {
-                ApiFailure::from(CoreError::Conflict("snapshots are not configured".into()))
-            })?
-            .restore(
-                &x,
-                &SnapshotMetadata {
-                    id: stored.id,
-                    kind,
-                    object_key: stored.object_key.clone(),
-                    checksum_sha256: stored.checksum_sha256.clone(),
-                },
-            )
-            .await
-            .map_err(ApiFailure::from)?;
-        s.commit_state(&x, SandboxState::Restoring, SandboxState::Running)
-            .await
-            .map_err(ApiFailure::from)
-    }
-    .await;
-    if let Err(error) = restored {
-        // Like ordinary provisioning, a restore owns compute until teardown
-        // succeeds. Never leave its new machine and reservation on an error.
-        if let Err(cleanup_error) = runs::destroy_with_retry(&s, p.tenant_id, x.id).await {
-            return Err(ApiFailure::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "runtime_unavailable",
-                format!("{}; cleanup failed: {cleanup_error}", error.message),
-            ));
-        }
-        return Err(error);
-    }
-    x.state = SandboxState::Running;
-    Ok(Json(x))
+    // Ordinary admission, readiness and rollback: workspace bytes come from
+    // shared storage, never a provider's worker-local capture path.
+    x.state = SandboxState::Creating;
+    x.environment.workspace = WorkspaceSpec::Snapshot { snapshot_id: id };
+    let request_id = x.id;
+    let restored = provision_sandbox(
+        &s,
+        p.tenant_id,
+        request_id,
+        x,
+        aiec_core::runtime::RuntimeCapabilities {
+            portable_workspace: true,
+            workspace_snapshot: true,
+            ..Default::default()
+        },
+        None,
+        false,
+    )
+    .await?;
+    Ok(Json(restored.sandbox))
 }
 async fn delete_snapshot(
     State(s): State<AppState>,
@@ -5895,75 +5845,20 @@ mod tests {
         );
     }
 
+    /// The isolation boundary applies to a restore that survives it. This used
+    /// to be asserted on the `memory` branch, which no longer exists: that
+    /// branch is refused before a runtime is chosen now, so a boundary it could
+    /// be caught by proves nothing about the branch that remains. What is
+    /// checked here is the surviving one, and it refuses before it allocates.
     #[tokio::test]
-    async fn failed_non_workspace_restore_reclaims_the_new_computer() {
-        let fixture = RecoveryFixture::new(b"archive".to_vec());
-        let tenant = new_id();
-        let source = fixture.sandbox(tenant).await;
-        let mut stored = fixture
-            .store_snapshot(&source, "snapshot", b"archive")
-            .await;
-        stored.id = new_id();
-        stored.kind = "memory".into();
-        stored.workspace_object_key = None;
-        fixture
-            .repository
-            .put_stored_snapshot(stored.clone())
-            .await
-            .unwrap();
-
-        assert!(
-            restore_snapshot(
-                State(fixture.state.clone()),
-                Extension(principal(tenant)),
-                Path(stored.id),
-                Json(RestoreSnapshotRequest {
-                    image: None,
-                    cpu: None,
-                    memory_mb: None,
-                    disk_mb: None,
-                    runtime: Some(RuntimeKind::Docker),
-                }),
-            )
-            .await
-            .is_err()
-        );
-        let sandboxes = fixture.repository.list_sandboxes(tenant).await.unwrap();
-        let restored = sandboxes
-            .iter()
-            .find(|sandbox| sandbox.id != source.id)
-            .unwrap();
-        assert_eq!(restored.state, SandboxState::Destroyed);
-        assert_eq!(
-            fixture.runtime.destroyed.lock().await.as_slice(),
-            &[restored.id]
-        );
-        assert_eq!(
-            sandboxes
-                .iter()
-                .find(|sandbox| sandbox.id == source.id)
-                .unwrap()
-                .state,
-            SandboxState::Running
-        );
-    }
-
-    #[tokio::test]
-    async fn non_workspace_restore_respects_the_deployment_isolation_boundary() {
+    async fn workspace_restore_respects_the_deployment_isolation_boundary() {
         let mut fixture = RecoveryFixture::new(b"archive".to_vec());
         fixture.state = fixture.state.clone().with_hosted_only(true);
         let tenant = new_id();
         let source = fixture.sandbox(tenant).await;
-        let mut stored = fixture
+        let stored = fixture
             .store_snapshot(&source, "snapshot", b"archive")
             .await;
-        stored.id = new_id();
-        stored.kind = "memory".into();
-        fixture
-            .repository
-            .put_stored_snapshot(stored.clone())
-            .await
-            .unwrap();
         let error = restore_snapshot(
             State(fixture.state.clone()),
             Extension(principal(tenant)),
@@ -5990,6 +5885,63 @@ mod tests {
                 .map(|sandbox| sandbox.id)
                 .collect::<Vec<_>>(),
             vec![source.id]
+        );
+    }
+
+    /// A machine-kind snapshot names bytes this control plane cannot read, so
+    /// the restore is refused before anything is allocated. The rollback it
+    /// used to run is the same one ordinary provisioning runs, and that is what
+    /// the surviving branch uses.
+    #[tokio::test]
+    async fn a_machine_kind_restore_is_refused_before_anything_is_allocated() {
+        let fixture = RecoveryFixture::new(b"archive".to_vec());
+        let tenant = new_id();
+        let source = fixture.sandbox(tenant).await;
+        let mut stored = fixture
+            .store_snapshot(&source, "snapshot", b"archive")
+            .await;
+        stored.id = new_id();
+        stored.kind = "virtual_machine".into();
+        stored.workspace_object_key = None;
+        stored.memory_object_key = Some("snapshot.memory".into());
+        stored.disk_object_key = Some("snapshot.disk".into());
+        fixture
+            .repository
+            .put_stored_snapshot(stored.clone())
+            .await
+            .unwrap();
+
+        let error = restore_snapshot(
+            State(fixture.state.clone()),
+            Extension(principal(tenant)),
+            Path(stored.id),
+            Json(RestoreSnapshotRequest {
+                image: None,
+                cpu: None,
+                memory_mb: None,
+                disk_mb: None,
+                runtime: Some(RuntimeKind::Docker),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "unsupported_snapshot_kind");
+        assert_eq!(
+            fixture
+                .repository
+                .list_sandboxes(tenant)
+                .await
+                .unwrap()
+                .iter()
+                .map(|sandbox| sandbox.id)
+                .collect::<Vec<_>>(),
+            vec![source.id],
+            "a refused restore allocated a machine to tear down again"
+        );
+        assert!(
+            fixture.runtime.destroyed.lock().await.is_empty(),
+            "a refused restore destroyed something"
         );
     }
     /// A workspace captured on a worker is worthless if the bytes die with that

@@ -56,7 +56,23 @@ WORKER_A_PID=''
 WORKER_B_PID=''
 FAILURES=0
 TENANT_ID=''
-INITIAL_TAPS=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l)
+# The TAP census needs `ip`. Under `set -o pipefail` a missing command would
+# abort the whole script before the first iteration, and the `|| echo 0` the
+# final census carried made it worse: it appended a second number to the first,
+# so a host without `ip` compared "0\n0". A census that cannot be taken is
+# reported as skipped, never as an empty census that matches.
+HAVE_IP=0
+if command -v ip >/dev/null 2>&1; then
+  HAVE_IP=1
+fi
+tap_census() {
+  if [ "$HAVE_IP" = 1 ]; then
+    ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l | tr -d ' '
+  else
+    printf 'unavailable'
+  fi
+}
+INITIAL_TAPS=$(tap_census)
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '[%s] %s\n' "$(now)" "$*"; }
@@ -582,7 +598,7 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   leftover_containers=$(managed_containers | wc -l)
 fi
 leftover_fc=$(count_matches "api-sock $OUT")
-leftover_taps=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l || echo 0)
+leftover_taps=$(tap_census)
 active_leases=$(sql "select count(*) from sandbox_leases where status='active' and tenant_id='$TENANT_ID'" | head -1)
 active_leases=${active_leases:-0}
 printf '%s\n' "processes=$leftover_procs containers=$leftover_containers firecracker=$leftover_fc taps=$leftover_taps active_leases=$active_leases"
@@ -591,7 +607,11 @@ if [ "$HAVE_DOCKER" = 1 ]; then
   check "no harness containers remain" test "$leftover_containers" -eq 0 || true
 fi
 check "no harness Firecracker processes remain" test "$leftover_fc" -eq 0 || true
-check "TAP census returned to baseline" test "$leftover_taps" -eq "$INITIAL_TAPS" || true
+if [ "$HAVE_IP" = 1 ]; then
+  check "TAP census returned to baseline" test "$leftover_taps" -eq "$INITIAL_TAPS" || true
+else
+  printf 'SKIPPED: TAP census returned to baseline (no ip command on this host)\n'
+fi
 check "no harness active leases remain" test "$active_leases" -eq 0 || true
 
 if [ "$FAILURES" -eq 0 ] && [ "$ITERATIONS" -ge 3 ]; then
