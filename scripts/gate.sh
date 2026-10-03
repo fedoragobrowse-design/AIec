@@ -65,12 +65,16 @@ cross_check() {
     rustup target add aarch64-unknown-linux-gnu >/dev/null 2>&1
   }
   local root="${CARGO_HOME:-$HOME/.cargo}"
+  # The container builds as root against a mount of this repository, so it
+  # gets a target directory of its own: writing into the host's `target` leaves
+  # root-owned artefacts behind, and the next non-root build then fails on them
+  # with a permission error rather than a compile error.
   docker run --rm \
     -v "$PWD":/src \
     -v "${RUSTUP_HOME:-$HOME/.rustup}":/rustup:ro \
     -v "$root":/cargo \
     -w /src \
-    -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo \
+    -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/cross-target \
     -e PATH=/cargo/bin:/usr/local/bin:/usr/bin:/bin \
     ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main \
     cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
