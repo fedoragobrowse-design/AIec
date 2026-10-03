@@ -291,6 +291,18 @@ fn firecracker_capabilities(
             && network.capabilities().restricted_allowlists,
         pause: true,
         pause_reclaims_resources: false,
+        // A workspace snapshot is captured from this runtime by
+        // `SnapshotProvider::capture` and put back by
+        // `import_workspace_snapshot`, both verified against the archive
+        // checksum, and the archive is portable between machines because it is
+        // read out of the guest's workspace rather than off the machine's own
+        // disk. Advertising otherwise makes the scheduler's
+        // `capabilities @> required` test refuse every placement a restore
+        // asks for - `portable_workspace` and `workspace_snapshot` - which is
+        // what it did: a workspace restore could not be placed on a microVM
+        // host at all, and the refusal was reported as missing capacity.
+        portable_workspace: true,
+        workspace_snapshot: true,
         vsock: true,
         coding_guest: artifact.is_some_and(guest_artifact::GuestArtifact::is_coding_guest),
         // Reported, not matched: `capabilities_satisfy` compares booleans, so
@@ -4242,6 +4254,23 @@ mod tests {
         let capabilities = firecracker_capabilities(&LinuxNetworkManager::new(), None, 0);
         assert!(capabilities.pause);
         assert!(!capabilities.pause_reclaims_resources);
+    }
+    #[test]
+    fn firecracker_advertises_what_a_workspace_restore_requires() {
+        // Exactly what a workspace restore provisions with. If either flag goes
+        // back to false the scheduler's containment test stops selecting any
+        // microVM host, and the restore fails as missing capacity forever.
+        let required = aiec_core::runtime::RuntimeCapabilities {
+            portable_workspace: true,
+            workspace_snapshot: true,
+            ..Default::default()
+        };
+        let capabilities = firecracker_capabilities(&LinuxNetworkManager::new(), None, 0);
+        assert!(aiec_core::runtime::capabilities_satisfy(
+            &capabilities,
+            &required,
+            None
+        ));
     }
 
     #[tokio::test]
