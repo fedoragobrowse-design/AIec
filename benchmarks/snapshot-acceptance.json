@@ -1,0 +1,176 @@
+{
+  "cases": [
+    {
+      "case": "worker-registers-and-stays-healthy",
+      "evidence": {
+        "health": {
+          "capabilities": {
+            "coding_guest": true,
+            "docker_image": false,
+            "exec": true,
+            "files": true,
+            "full_kernel_isolation": true,
+            "gpu": false,
+            "guest_agent": true,
+            "isolation": "micro_vm",
+            "memory_resume": true,
+            "network_policy": true,
+            "pause": true,
+            "pause_reclaims_resources": false,
+            "portable_workspace": true,
+            "pty": false,
+            "streaming": false,
+            "vm_snapshot": true,
+            "vsock": true,
+            "workspace_snapshot": true
+          },
+          "capacity": 4,
+          "guest_profile": {
+            "artifact_version": "1.0.0",
+            "base": "debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "capabilities": [
+              "sh",
+              "coreutils",
+              "git",
+              "ca-certificates",
+              "dns",
+              "https",
+              "tar",
+              "gzip",
+              "curl",
+              "python3"
+            ],
+            "git_version": "git version 2.39.5",
+            "guest_agent_version": "0.1.0",
+            "guest_protocol_version": 2,
+            "profile": "coding"
+          },
+          "healthy": true,
+          "in_flight": 0,
+          "node_id": "01a0ff50-fa66-77df-9c21-87c6a094c691",
+          "runtime": "firecracker",
+          "sandbox_count": 0
+        },
+        "registered": true
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "a-sandbox-is-created-on-the-firecracker-runtime",
+      "evidence": {
+        "runtime": "firecracker",
+        "sandbox_id": "01a0ff63-590a-705d-bc12-68b546532dee",
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-sandbox-reaches-running",
+      "evidence": {
+        "sandbox_id": "01a0ff63-590a-705d-bc12-68b546532dee",
+        "state": "running"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-marker-is-written-into-the-workspace",
+      "evidence": {
+        "path": "/workspace/snapshot-marker.txt",
+        "response": {
+          "status": "written"
+        },
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-marker-is-readable-before-any-snapshot",
+      "evidence": {
+        "matched": true,
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "a-workspace-snapshot-is-captured",
+      "evidence": {
+        "error": null,
+        "kind": null,
+        "snapshot_id": "01a0ff63-63fe-75a5-a87a-320e18dec032",
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-snapshot-is-recorded",
+      "evidence": {
+        "capture_seconds": 0.034,
+        "image_id": "afimg1_053250ff047cdcbbc43caa79c813c0def68e4abc7ed7ac8f77a66b05262630ae",
+        "listed": true,
+        "object_key": true,
+        "size_bytes": 177
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-original-sandbox-is-destroyed-before-the-restore",
+      "evidence": {
+        "state": "destroyed",
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-snapshot-restores-into-a-new-sandbox",
+      "evidence": {
+        "capacity_refusals": 0,
+        "distinct": true,
+        "error": null,
+        "original_id": "01a0ff63-590a-705d-bc12-68b546532dee",
+        "restore_attempts": 1,
+        "restored_id": "01a0ff63-64d1-75a3-9c31-34a1cf44c500",
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-restored-sandbox-reaches-running",
+      "evidence": {
+        "restore_seconds": 2.815,
+        "sandbox_id": "01a0ff63-64d1-75a3-9c31-34a1cf44c500",
+        "state": "running"
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "the-restored-workspace-carries-the-marker",
+      "evidence": {
+        "bytes": 53,
+        "matched": true,
+        "status": 200
+      },
+      "status": "PASS"
+    },
+    {
+      "case": "no-guest-process-for-this-run-survives",
+      "evidence": {
+        "censused_sandbox_ids": [
+          "01a0ff63-590a-705d-bc12-68b546532dee",
+          "01a0ff63-64d1-75a3-9c31-34a1cf44c500"
+        ],
+        "live_guest_processes": []
+      },
+      "status": "PASS"
+    }
+  ],
+  "cases_total": 12,
+  "cleanup_errors": [],
+  "elapsed_seconds": 13.694,
+  "failing": [],
+  "generated_at": "2026-10-03T01:31:42.210798Z",
+  "passed": 12,
+  "runtime": "firecracker",
+  "schema": "aiec.snapshot.acceptance.v1",
+  "status": "PASS",
+  "suite": "snapshot-acceptance"
+}
