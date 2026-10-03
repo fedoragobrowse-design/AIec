@@ -3058,7 +3058,7 @@ impl FirecrackerRuntime {
             .resize_to_requested_disk(sandbox, &destination, requested, base_image_bytes)
             .await
         {
-            rootfs::discard(&destination);
+            rootfs::discard_vm(&dir, &destination);
             return Err(error);
         }
         // The per-sandbox control identity is planted in this sandbox's own disk
@@ -3073,7 +3073,7 @@ impl FirecrackerRuntime {
         let identity = match self.install_sandbox_identity(sandbox.id, &destination) {
             Ok(identity) => identity,
             Err(error) => {
-                rootfs::discard(&destination);
+                rootfs::discard_vm(&dir, &destination);
                 return Err(error);
             }
         };
@@ -4173,16 +4173,26 @@ impl FirecrackerRuntime {
         }
         let state = self.config.vm_dir(id);
         let socket = self.config.socket_dir(id);
-        match tokio::fs::remove_dir_all(&state).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        match tokio::fs::remove_dir_all(&socket).await {
+        // Both directories are removed even when the first fails. Returning
+        // there left the Firecracker API socket directory behind: `reclaim`
+        // runs at the end of destroy, so the machine was already gone and the
+        // stale directory was the only thing still on the host — a leftover
+        // that no later `destroy` is guaranteed to revisit, because the row it
+        // belonged to is destroyed by then. The first error is the one
+        // returned, so the caller's retry still sees the real failure.
+        let state_result = match tokio::fs::remove_dir_all(&state).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+            Err(error) => Err(error),
+        };
+        let socket_result = match tokio::fs::remove_dir_all(&socket).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        state_result?;
+        socket_result?;
+        Ok(())
     }
 
     /// Reclaims every machine this runtime still holds, for a worker on its

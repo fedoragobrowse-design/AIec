@@ -692,6 +692,86 @@ other direction: a full pool refuses, and the guard has to be released anyway
 or every later placement on that worker blocks forever. Forgetting the guard on
 the error path makes it fail with `the reservation wedged`.
 
+## Fixed in the 2026-10-03 audit: lifecycle and rollback
+
+### A teardown that found no lease to release never deleted its row
+
+`tear_down_sandbox` stops the machine, hands the capacity back, and only then
+deletes the row, and that order is the point: capacity must not be credited
+against a machine that is still running. But the release step propagated
+`CoreError::NotFound`, and that is the *ordinary* answer when the lease already
+expired and the sweeper returned its capacity, or when a concurrent teardown got
+there first. The `?` aborted before `delete_sandbox`, so a machine that was
+genuinely gone kept a row in `Running` — and the quota counts
+`state NOT IN ('destroyed','failed')`, so that row consumed the tenant's
+active-sandbox budget until an operator noticed. `destroy_with_retry` could not
+cover it either: `NotFound` is not in `is_transient_destroy_error`, so the retry
+loop gave up on the first attempt and recorded `cleanup_failed` for a sandbox
+that was already stopped.
+
+`NotFound` is now treated as "already released" and the deletion proceeds. Any
+other release error still propagates, because a genuine failure to release must
+not be recorded as a clean teardown. Regression:
+`a_teardown_still_deletes_its_row_when_there_is_no_lease_left_to_release`, built
+on `AppState::new` because `AppState::development` skips the release branch
+entirely. It asserts the final state is `Destroyed` rather than that the row is
+absent, since `delete_sandbox` is a state transition and not a physical delete —
+asserting absence would have been a test that passes for the wrong reason.
+
+### The agent's `bash` tool leaked its process group when `wait` failed
+
+The function's own doc comment states the property: the command runs in its own
+process group so a timeout kills everything it started, because killing only the
+shell leaves a backgrounded grandchild running for the rest of the run. The
+timeout arm did that correctly. The `Ok(Err(_))` arm — `wait` itself failing —
+returned straight out, which meant the whole process group survived, neither
+drain task was awaited (dropping a `JoinHandle` detaches rather than cancels, so
+the bounded read silently stopped being bounded exactly when the tool failed),
+and the shell was never reaped. `kill_on_drop(true)` was absent, unlike the
+other four spawn sites in the tree.
+
+Both arms now run one `kill_group` helper that signals the group, reaps the
+shell and lets the caller drain the pipes. Regressions:
+`tearing_down_a_command_kills_what_it_backgrounded` drives the real helper
+against a shell that backgrounds a `sleep`; removing the group signal — so
+`start_kill` alone kills the shell and nothing else — makes it fail with
+`process N outlived the teardown`.
+
+### A failed Firecracker create left its VM directory and owner record
+
+`create` makes the per-sandbox directory and plants `owner.json` in it before it
+copies anything. When `resize2fs` or the control-identity install then failed,
+`rootfs::discard` removed the image and nothing else — leaving a directory that
+`reconcile_local` reads, so the host kept reporting an orphan candidate for a
+sandbox that was never created, and nothing revisited it because the row was
+destroyed by then. `discard_vm` now removes both. The directory is a parameter
+rather than the image's parent, because removing an inferred parent is how a
+shared base image sitting beside the sandbox gets deleted with it. Regression:
+`discarding_a_failed_create_takes_the_directory_and_spares_the_base`.
+
+### A reclaim that failed on the VM directory skipped the socket directory
+
+`reclaim` runs at the end of destroy, so the machine is already gone by the
+time it removes the two per-sandbox directories. Returning on the first failure
+left the Firecracker API socket directory behind with no later `destroy`
+guaranteed to revisit it. Both are now attempted and the first error is still
+the one returned, so the caller's retry sees the real failure.
+
+### A Guard release that could not stop the gateway stranded its interface
+
+`GuardNetworkManager::release` cuts the network, sets the interface down, stops
+the gateway, and only then deletes the `ag*` interface and its nftables table.
+A gateway that failed to shut down returned between those steps, leaving the
+interface and its policy on the host with nothing holding the attachment — the
+`running` entry had already been removed two statements earlier, and `prepare`
+gates only on that map. The network is cut by then, so what leaks is the
+interface and the rules rather than guest traffic, which is why this was a host
+hygiene defect rather than an isolation one. The shutdown error is now deferred
+and returned after the host cleanup completes, so a caller still learns the
+gateway did not stop cleanly but nothing is stranded. Not covered by a
+regression: reaching this arm needs a live Guard gateway and root-level `ip` and
+`nft`, so there is no deterministic seam to drive it from a test.
+
 ## Open
 
 ### Accepted, not fixed: placement holds a worker row lock while it waits
@@ -709,6 +789,34 @@ the reservation path this audit has already measured end to end. The bound is
 200 ms and it only occurs when two placements contend for one host, so this is
 recorded as a deliberate trade-off rather than fixed.
 
+### Investigated and deliberately left alone: a rollback that lost its state CAS
+
+The rollback's first step is a fenced state CAS marking the sandbox
+`Destroying`. When that CAS is refused the path returns without stopping
+anything, and `create` completes before `start` and before
+`prepare_environment`, so a failure in either leaves a materialised machine
+running on the worker. That reads like a leak, and it was worth the
+investigation — but closing it here is a fencing bug, not a fix.
+
+`Destroy` carries a sandbox id and nothing else, and the worker acts on it
+without checking the lease: `WorkerState::execute` passes the operation to
+`self.runtime.destroy(&sandbox)` and the machine is looked up by sandbox id.
+So a destroy issued from a path that has just been told it no longer owns the
+sandbox removes whichever machine that sandbox has *now* — which on a takeover
+is the replacement owner's, on the same node, which is the ordinary shape of a
+lease handover. The regression already in the tree,
+`replaced_owner_failure_never_destroys_the_new_lease_machine`, fails with
+`stale owner dispatched teardown` if the rollback is made to destroy
+unconditionally.
+
+The asymmetry is the point: the original owner cannot safely destroy, because
+it cannot prove the machine it would destroy is still its own. Cleanup for that
+machine belongs to recovery, which fences on the lease it holds. Recorded so
+the early return is a decision rather than an oversight. **The real fix is at
+the other end** — a `Destroy` that carries a lease id and generation the worker
+checks, which would make this rollback's destroy safe and would let every other
+teardown path stop trusting the dispatch scope to mean anything.
+
 ### A Docker exec that times out keeps running until its sandbox is destroyed
 
 `exec_raw` returns `exit_code: 124` with `timed_out: true` when its read loop
@@ -722,6 +830,26 @@ kill through the guest's own process group, which is a change to every exec's
 signal handling rather than a fix to the timeout path. Recorded because the
 bounded lifetime of the sandbox bounds this too, and because a caller reading
 exit code 124 should know the process it describes may still be there.
+
+### The worker ownership route is not tenant-scoped
+
+`GET /v1/workers/{node}/ownership/{sandbox_id}` resolves the sandbox by id
+alone — `sandbox_leases` is looked up with `WHERE sandbox_id=$1 AND
+status='active'`, with no `tenant_id` predicate. The handler then compares the
+returned `node_id` against the `{node}` path segment and returns
+`409 sandbox is owned by another worker` on a mismatch, so a caller who names
+the wrong node learns nothing; naming the right node returns that tenant's
+`lease_id`, `generation` and `expires_at`.
+
+**Not fixed, and the reason is the authentication model rather than the query.**
+Worker routes are authenticated by one shared control token with no tenant
+claim, so the handler has no tenant to scope the lookup with — adding a
+predicate would need a credential that does not exist yet. The practical
+exposure is correspondingly narrow: it requires already knowing both a
+v7 sandbox UUID and the UUID of the node holding it, and the response is lease
+bookkeeping rather than anything about the sandbox or its guest. This is
+recorded so the gap is a decision rather than an oversight; the fix belongs
+with per-tenant worker credentials.
 
 ### The `initialize` handshake never answers `2026-07-28`
 

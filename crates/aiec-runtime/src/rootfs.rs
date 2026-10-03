@@ -386,6 +386,22 @@ pub(crate) fn discard(destination: &Path) {
     let _ = std::fs::remove_file(destination);
 }
 
+/// Discards the image *and* the per-sandbox directory it was written into.
+///
+/// [`discard`] on its own left the directory behind, and `create` makes that
+/// directory before the copy and plants `owner.json` in it. `reconcile_local`
+/// reads those, so the host kept reporting an orphan candidate for a sandbox
+/// that was never created, and nothing revisited it because the row was
+/// destroyed by then.
+///
+/// The directory is passed rather than derived from the image's parent:
+/// removing an inferred parent is how a shared base image gets deleted along
+/// with one failed sandbox's leftovers.
+pub(crate) fn discard_vm(vm_dir: &Path, destination: &Path) {
+    discard(destination);
+    let _ = std::fs::remove_dir_all(vm_dir);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +726,40 @@ mod tests {
             "the base image is only ever read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A create that fails after the copy leaves nothing that looks like a
+    /// sandbox, and takes the base image with it if the caller guesses wrong.
+    ///
+    /// `create` makes the per-sandbox directory and writes `owner.json` before
+    /// it copies anything, so discarding only the image left a directory the
+    /// host reports as an orphan candidate for a sandbox that never existed.
+    /// Removing the image's parent instead would delete a shared base image
+    /// sitting next to it, which is why the directory is a parameter.
+    #[test]
+    fn discarding_a_failed_create_takes_the_directory_and_spares_the_base() {
+        let host = scratch("discard-vm");
+        let base = write_base(&host, vec![0x5a; COPY_CHUNK].as_slice());
+        let vm_dir = host.join("vms").join("sandbox-id");
+        std::fs::create_dir_all(&vm_dir).expect("vm directory");
+        std::fs::write(vm_dir.join("owner.json"), "node").expect("owner record");
+        let image = vm_dir.join("rootfs.ext4");
+        std::fs::write(&image, vec![0u8; COPY_CHUNK]).expect("partial image");
+
+        discard_vm(&vm_dir, &image);
+
+        assert!(
+            !vm_dir.exists(),
+            "a failed create left a directory the host reads as an orphan candidate"
+        );
+        assert_eq!(
+            std::fs::metadata(&base)
+                .expect("the base image must survive")
+                .len(),
+            COPY_CHUNK as u64,
+            "discarding a sandbox must not delete the shared base image beside it"
+        );
+        let _ = std::fs::remove_dir_all(&host);
     }
 
     /// A cancellation requested while the copy is already running is the case

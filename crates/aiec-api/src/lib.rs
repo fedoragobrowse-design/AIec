@@ -1890,6 +1890,17 @@ async fn provision_admitted_sandbox(
             commit_provision_state(s, &x, x.state, SandboxState::Destroying, dispatch.as_ref())
                 .await
         {
+            // Losing this CAS means another actor owns the sandbox now, so
+            // nothing may be stopped on its behalf: `Destroy` carries only a
+            // sandbox id and the worker acts on it without a lease fence, so a
+            // destroy issued from here would remove whichever machine that
+            // sandbox has *now* — including the replacement owner's, on the
+            // same node, which is the ordinary shape of a takeover. The
+            // original owner keeps its machine's cleanup to recovery, which
+            // fences on the lease it still holds.
+            //
+            // Regression:
+            // `replaced_owner_failure_never_destroys_the_new_lease_machine`.
             return Err(ApiFailure::new(
                 StatusCode::CONFLICT,
                 "sandbox_not_owned",
@@ -6277,6 +6288,133 @@ mod tests {
              which cannot name the lease it meant"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Scheduler whose `release` reports that there is nothing to release.
+    ///
+    /// This is the ordinary production answer when the lease already expired and
+    /// the sweeper returned its capacity, or when another teardown got there
+    /// first. It is not a failure of the teardown.
+    #[derive(Default, Clone)]
+    struct NoLeaseToReleaseScheduler;
+
+    #[async_trait::async_trait]
+    impl aiec_core::scheduler::Scheduler for NoLeaseToReleaseScheduler {
+        async fn schedule(
+            &self,
+            request: aiec_core::scheduler::ScheduleRequest,
+        ) -> Result<aiec_core::scheduler::ScheduledSandbox, CoreError> {
+            Ok(aiec_core::scheduler::ScheduledSandbox {
+                sandbox: request.sandbox,
+                worker_id: TenantId::nil(),
+                worker_endpoint: String::new(),
+                lease_id: SandboxId::nil(),
+                lease_generation: 0,
+            })
+        }
+
+        async fn dispatch_target(
+            &self,
+            _: TenantId,
+            _: SandboxId,
+        ) -> Result<aiec_core::scheduler::WorkerDispatch, CoreError> {
+            Err(CoreError::Unsupported("no dispatch".into()))
+        }
+
+        async fn release(&self, _: TenantId, _: SandboxId) -> Result<(), CoreError> {
+            Err(CoreError::NotFound("active sandbox lease not found".into()))
+        }
+    }
+
+    /// A teardown that stops the machine must not then leave its row behind.
+    ///
+    /// The order is deliberate: capacity is released only after the runtime
+    /// confirms the machine is stopped, so a failed stop cannot hand capacity
+    /// back against a machine that is still running. But `release` reporting
+    /// there is nothing to release is not a failed stop. It is the expected
+    /// answer when the lease already expired and the sweeper returned its
+    /// capacity, or when a concurrent teardown released it first. The row then
+    /// survived with a state the quota counts as active
+    /// (`state NOT IN ('destroyed','failed')`), so a machine that was genuinely
+    /// gone kept consuming the tenant's active-sandbox budget until an operator
+    /// noticed. The `?` here is what turned "already released" into "never
+    /// deleted".
+    #[tokio::test]
+    async fn a_teardown_still_deletes_its_row_when_there_is_no_lease_left_to_release() {
+        let repository = LeasedRepository::new();
+        let runtime = Arc::new(AdoptingRuntime {
+            imported: TestMutex::new(Vec::new()),
+            destroyed: TestMutex::new(Vec::new()),
+        });
+        let platform = Platform::builder()
+            .runtime(runtime.clone())
+            .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                RuntimeKind::Docker,
+                runtime.clone(),
+            )))
+            .metadata_store(repository.clone())
+            .scheduler(Arc::new(NoLeaseToReleaseScheduler))
+            .artifact_store(Arc::new(aiec_storage::FilesystemObjectStore::new(
+                std::env::temp_dir().join(format!("af-teardown-{}", new_id())),
+            )))
+            .snapshots(Arc::new(FixedSnapshotProvider {
+                archive: b"{\"version\":1,\"entries\":[]}".to_vec(),
+            }))
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        // `AppState::new`, not `development`: the lease release is production
+        // behaviour and a development state skips it entirely.
+        let state = AppState::new(platform);
+
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: new_id(),
+            node_id: Some(new_id()),
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        repository
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+
+        let outcome =
+            crate::runs::tear_down_sandbox(&state, sandbox.tenant_id, sandbox.id, &sandbox).await;
+
+        assert!(
+            !matches!(outcome, Err(CoreError::NotFound(_))),
+            "a stopped machine was reported as gone: {outcome:?}"
+        );
+        assert!(
+            runtime.destroyed.lock().await.contains(&sandbox.id),
+            "the machine was never stopped"
+        );
+        // `delete_sandbox` marks the row destroyed rather than removing it, and
+        // that is what stops it counting: the quota counts rows where
+        // `state NOT IN ('destroyed','failed')`. So the property under test is
+        // the state, not the absence of the row.
+        let after = state
+            .repository()
+            .get_sandbox(sandbox.tenant_id, sandbox.id)
+            .await
+            .expect("read back");
+        assert_eq!(
+            after.state,
+            SandboxState::Destroyed,
+            "the row was left in a state the tenant's active-sandbox quota counts"
+        );
     }
 
     /// A sandbox that was never captured has nothing to restore, which is a

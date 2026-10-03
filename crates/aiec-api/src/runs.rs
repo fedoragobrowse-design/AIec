@@ -1682,7 +1682,24 @@ pub(crate) async fn tear_down_sandbox(
     // Hosted capacity is never leased from a worker, so there is no lease to
     // release; asking the scheduler would fail for a lease that never existed.
     if state.is_production() && sandbox.runtime != RuntimeKind::Hosted {
-        state.scheduler().release(tenant, sandbox_id).await?;
+        // "There is no active lease" is the expected answer when the lease
+        // already expired and the sweeper returned its capacity, or when a
+        // concurrent teardown released it first. Neither is a failed stop, and
+        // propagating it skipped `delete_sandbox` and left a row that the
+        // quota counts as active for a machine that is genuinely gone.
+        //
+        // A release that fails for any other reason still propagates: capacity
+        // is only handed back once the machine is confirmed stopped, and a
+        // genuine failure to release must not be recorded as a clean teardown.
+        if let Err(error) = state.scheduler().release(tenant, sandbox_id).await {
+            if !matches!(error, CoreError::NotFound(_)) {
+                return Err(error);
+            }
+            tracing::info!(
+                %sandbox_id,
+                "teardown found no active lease to release; the row is still deleted"
+            );
+        }
     }
     let lease_release_ms = release_started.elapsed().as_millis() as u64;
     let metadata_started = Instant::now();

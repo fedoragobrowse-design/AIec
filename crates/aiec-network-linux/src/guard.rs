@@ -1256,13 +1256,23 @@ impl NetworkBackend for GuardNetworkManager {
         // Do not delete filtering while a guest still has a live interface.
         ip(&["link", "set", "dev", &guard.interface, "down"]).await?;
         let running = self.running.lock().await.remove(&sandbox.id);
+        let mut shutdown_error = None;
         if let Some(running) = running {
             running.released.store(true, Ordering::Release);
             let _ = running.control.cut();
             let gateway = running.gateway.lock().await.take();
             if let Some(gateway) = gateway {
                 let _ = gateway.cut();
-                gateway.shutdown().await.map_err(guard_error)?;
+                // A failed shutdown must not skip the host cleanup below.
+                // `running` dropped its entry above, so nothing is left holding
+                // this attachment: the `ag*` interface and its nftables table
+                // would outlive the sandbox with no owner and no path to
+                // retry. The network is already cut, so the guest cannot reach
+                // anything while this is outstanding — the interface and the
+                // rules are what leak, not traffic. The error is kept and
+                // returned once the host is clean, so a caller still learns
+                // the gateway did not stop cleanly.
+                shutdown_error = gateway.shutdown().await.err();
             }
         }
         ip(&["link", "del", "dev", &guard.interface]).await?;
@@ -1279,6 +1289,12 @@ impl NetworkBackend for GuardNetworkManager {
             .write()
             .map_err(|_| CoreError::Unavailable("Guard lease context poisoned".into()))?
             .remove(&sandbox.id);
+        // The host is clean by this point even if the gateway did not stop, so
+        // the caller learns about the shutdown only after the attachment that
+        // would otherwise have been stranded is gone.
+        if let Some(error) = shutdown_error {
+            return Err(guard_error(error));
+        }
         Ok(())
     }
 }

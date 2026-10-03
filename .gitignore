@@ -1,4 +1,5 @@
 /target
+/target-host
 /.aiec
 *.log
 .env

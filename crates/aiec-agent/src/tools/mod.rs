@@ -451,6 +451,12 @@ async fn bash(root: &Path, args: &Value) -> Result<String, HarnessError> {
         .stderr(std::process::Stdio::piped())
         // Its own group, so the timeout below reaches everything it started.
         .process_group(0)
+        // `kill_on_drop` so the child cannot outlive this function on any path
+        // that returns early. `bash` runs a model-supplied command, and the
+        // group above is only killed on the timeout arm; without this, an error
+        // from `wait` returns with the shell and every backgrounded grandchild
+        // it started still running for the rest of the run.
+        .kill_on_drop(true)
         .spawn()
         .map_err(|error| HarnessError::Tool(format!("spawning: {error}")))?;
     let group = child.id().map(|pid| pid as i32);
@@ -470,18 +476,24 @@ async fn bash(root: &Path, args: &Value) -> Result<String, HarnessError> {
             .await
         {
             Ok(Ok(status)) => Some(status),
-            Ok(Err(error)) => return Err(HarnessError::Tool(format!("{error}"))),
+            Ok(Err(error)) => {
+                // A `wait` error says nothing about whether the child is still
+                // running, so this arm gets the same teardown as the timeout.
+                // Returning straight out of here detached both reader tasks —
+                // dropping a `JoinHandle` detaches rather than cancels — so the
+                // bounded read above stopped being bounded exactly when the
+                // tool failed, and the whole process group outlived the call.
+                kill_group(&mut child, group).await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err(HarnessError::Tool(format!("{error}")));
+            }
             Err(_) => {
-                if let Some(group) = group {
-                    // Negative pid: the signal goes to the process group, so a
-                    // backgrounded job dies with the shell that started it.
-                    unsafe { libc::kill(-group, libc::SIGKILL) };
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                kill_group(&mut child, group).await;
                 None
             }
         };
+
     // The pipes close when the group is gone, so these finish promptly even on
     // the timeout path. Awaiting them is what makes the bound hold: a detached
     // reader would still be accumulating after the tool call returned.
@@ -497,6 +509,22 @@ async fn bash(root: &Path, args: &Value) -> Result<String, HarnessError> {
     rendered.push_str("--- stderr\n");
     push_stream(&mut rendered, &stderr, stderr_total, STDERR_CAP);
     Ok(rendered)
+}
+
+/// Kills a spawned command's entire process group and reaps the shell.
+///
+/// The negative pid is what reaches a backgrounded grandchild: signalling only
+/// the shell leaves whatever it started running for the rest of the run, which
+/// is what the doc comment on [`bash`] is about. Reaping the shell is just as
+/// necessary — an unreaped child is a zombie for the life of the harness,
+/// holding its pid and the pipes the drain tasks are still reading.
+async fn kill_group(child: &mut tokio::process::Child, group: Option<i32>) {
+    if let Some(group) = group {
+        // Negative pid: the signal goes to the process group.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 /// Reads a pipe to end of file, keeping at most `cap` bytes and counting the
@@ -1061,6 +1089,58 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(!alive, "process {pid} outlived the tool call");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tearing_down_a_command_kills_what_it_backgrounded() {
+        let root = scratch("bash-teardown");
+        let pid_file = root.join("bg.pid");
+        // `bash` reaches this on the timeout arm and on a `wait` failure, and
+        // the second one used to return without any teardown at all. Signalling
+        // only the shell is enough to make the tool call look finished while
+        // the sleep is still running: `start_kill` sends SIGKILL to one pid, so
+        // the group kill is the only thing that reaches a backgrounded child.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 120 & echo $! > {} ; sleep 120",
+                pid_file.display()
+            ))
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawning");
+        let group = child.id().map(|pid| pid as i32);
+
+        // Wait for the shell to record its child before tearing anything down,
+        // or this asserts on a pid that was never written.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the shell should have recorded its child")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the sleep should be up");
+
+        kill_group(&mut child, group).await;
+
+        let mut alive = true;
+        for _ in 0..50 {
+            alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!alive, "process {pid} outlived the teardown");
         let _ = std::fs::remove_dir_all(root);
     }
 }
