@@ -492,13 +492,49 @@ bounded measurements.
    built 2026-10-02T02:48:56Z. **The still-deployed
    `agentforge-rootfs.ext4` was not replaced**: the image built here lives
    beside it, and deploying it is the operator's step.
-2. **The lifetime reaper has never been observed firing.** The ceilings are
-   durable and restart-proof (Postgres tests); the reaper's action is untested
-   against a live run, and the in-process timer still races it for the guest VM.
-3. **The production Firecracker worker on this host cannot enforce Guard.**
-   `aiec-worker.service` runs as an unprivileged user with no `CAP_NET_ADMIN`,
-   so every governed placement is refused and `network_policy` reads false.
-4. **Resolved: a guest packet reaches `GuardNetworkManager::create_guard`'s
+2. **Resolved: the lifetime reaper is observed acting.** `scripts/guard-reaper-acceptance.sh`
+   runs 16 cases against real guests and a real worker, and publishes only on
+   a full pass; `scripts/guard-reaper-external-db` repeats it over the
+   Unix-socket relay, also 16/16. Both observe the reaper taking a sandbox
+   down against a real budget rather than asserting that it could.
+3. **Resolved for the packaged worker: the Guard capabilities are granted.**
+   `aiec-worker.service` now carries
+   `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`, which is what Guard needs to
+   build its nftables rules and TAP. `systemd-analyze verify` passes on the
+   unit. A worker started by any other launcher still has to be granted these
+   itself - the deploy document says so - and nothing was deployed here, so the
+   running service on any host is the operator's step.
+4. **A placement could refuse without cause; fixed, and not shown to be the
+    soak's cause.** After choosing a worker, the scheduler takes that host's
+    advisory headroom lock with `pg_try_advisory_xact_lock`. Losing that race
+    used to exclude the host for the rest of the call, so a placement could be
+    refused as `no schedulable worker has capacity` while the worker had room -
+    the lock holder being another placement a few milliseconds from committing.
+    It now waits for the lock, bounded, and only excludes the host if that wait
+    runs out; the headroom is still checked under the lock, so nothing is
+    placed without room. `a_placement_waits_for_another_placements_host_lock`
+    holds the lock from another connection and fails without the wait. What is
+    *not* established is that this caused the three refusals in the parallel
+    soak: a concurrency probe at the soak's own width reproduced no capacity
+    refusal either way, so the cause of those three remains unattributed.
+5. **Resolved: the intermittent storage failure was a fixture, not the
+   scheduler.** `a_workspace_snapshot_is_storable_and_restorable` failed three
+   times during full-workspace runs with a capacity refusal, always under
+   `cargo test --workspace` and never under `-p aiec-storage --lib`. It
+   registers its own worker and pins the placement to it, so nothing in the
+   product was placing on it - the database said otherwise. At the moment of a
+   reproduced failure its worker already showed `sandbox_count 1` with
+   `available_vcpus 1` of 32, a debit of exactly the 31 vCPUs / 60 GB / 3 GB
+   that the neighbouring test uses, and the debiting sandbox belonged to
+   another fixture tenant (`storage-invariant-*`) whose lease had expired 65 ms
+   after it was created. Lease recovery deliberately picks *any* healthy
+   worker, and three tests running recovery on the shared schema could take a
+   worker's node out from under a test running beside them. Those three now run
+   in their own PostgreSQL schema, as the reassignment tests beside them
+   already did. The cross-crate hypothesis was checked and is wrong:
+   `crates/aiec-api` has no database-backed test and takes `DATABASE_URL` only
+   in `main.rs`.
+6. **Resolved: a guest packet reaches `GuardNetworkManager::create_guard`'s
    attachment and is denied there.** The driver records the host's own view of
    the attachment alongside the counters. In the 28/28 run the TAP was
    `UP,LOWER_UP`, carried its /30 address, and had a neighbour entry for the
@@ -507,17 +543,17 @@ bounded measurements.
    then acted on. Phase 1 still exercises its counters on driver-created TAPs;
    this is the first run in which the manager's own attachment is the one under
    test.
-5. **Layer 7 rules need interception to see a request.** In the default SNI
+7. **Layer 7 rules need interception to see a request.** In the default SNI
    mode Guard matches the requested name and forwards the tunnel; a CONNECT
    tunnel to a governed host is refused rather than forwarded ungoverned.
-6. **Resolved: human tool approval can admit one invocation.** The live §44
+8. **Resolved: human tool approval can admit one invocation.** The live §44
    suite observed a grant by a different authenticated identity, one successful
    consumption, and replay refusal. PostgreSQL regressions additionally cover
    retries after pending expiry and preservation of a still-open deadline.
    Approval gating remains an explicit MCP opt-in.
-7. **Multi-host deployment modes are documented, not validated.** The hardening
+9. **Multi-host deployment modes are documented, not validated.** The hardening
    decision for a separate gateway host is untested.
-8. **aarch64 is compile-verified, not run-verified.** The gate cross-checks the
+10. **aarch64 is compile-verified, not run-verified.** The gate cross-checks the
    whole workspace for `aarch64-unknown-linux-gnu` and it is clean; that found
    and fixed a real bug, a `gethostname` buffer typed `i8` where aarch64's
    `c_char` is `u8`. No aarch64 machine is part of the evidence: nothing was
@@ -624,36 +660,55 @@ P5_DRIVER=scripts/guard-phase5-acceptance.py \
 | required area | evidence and disposition |
 |---|---|
 | Phase 1 enforcement, DNS, model credentials, telemetry | Live core suite: 48/48. Includes §49's model-only in-guest tool loop. Local mock providers only. |
-| Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29; alert→network-cut latency 23.656 ms (n=1), from the incident timestamps. The durable lifetime reaper itself has not been observed firing. |
+| Phase 2 watchdog, dead-man switch, quarantine, budgets, incident | Live Phase 2 suite: 29/29; alert→network-cut latency 23.656 ms (n=1), from the incident timestamps. The durable lifetime reaper now has its own live suite, 16/16 (`benchmarks/guard-reaper-acceptance.json`), and 16/16 again through the external-database Unix-socket relay (`benchmarks/guard-reaper-external-db-acceptance.json`); both observe the reaper acting, not only its ceilings. |
 | Phase 3 MCP/GraphQL policy, proposals, human approval | Live Phase 3 suite: 47/47, no cleanup errors (`benchmarks/guard-phase3-acceptance.json`), on real Firecracker guests inside a network namespace with an isolated PostgreSQL. Covers agent submission of a proposal, operator approval, the approved policy applying to a running attachment, the enforcement generation moving with it so heartbeats and budget reservations survive the change, allowlisted read authority reaching its destination live, DNS answers rewritten to the gateway, TLS with SNI matching, interception refused without credentials, blocked and private destinations denied, and an OpenShell import producing an enforced policy. |
-| Optional Phase 4 watcher | Implemented and test-covered; no complete live optional-watcher acceptance is claimed. |
-| Phase 5 canaries, image trust, identity, red-team CI | Live Phase 5 suite: 36/36 full-suite, no cleanup errors (`benchmarks/guard-phase5-acceptance.json`). Real Firecracker guests on a freshly rebuilt scratch image, an isolated PostgreSQL, a real worker and watchdog, all inside a network namespace. Covers unsigned/untrusted/tampered/expired image refusal, kernel and rootfs digest enforcement, distinct per-VM identities, cross-sandbox frame refusal, revocation and rotation, host-observed DNS, credential and file canaries with a durable cut and a preserved machine, and a completed incident with cut, pause, snapshot and report timestamps. |
+| Optional Phase 4 watcher | Live Phase 4 suite: 51/51 (`benchmarks/guard-phase4-acceptance.json`), on real guests. |
+| Phase 5 canaries, image trust, identity, red-team CI | Live Phase 5 suite: 37/37 full-suite, no cleanup errors (`benchmarks/guard-phase5-acceptance.json`). Real Firecracker guests on a freshly rebuilt scratch image, an isolated PostgreSQL, a real worker and watchdog, all inside a network namespace. Covers unsigned/untrusted/tampered/expired image refusal, kernel and rootfs digest enforcement, distinct per-VM identities, cross-sandbox frame refusal, revocation and rotation, host-observed DNS, credential and file canaries with a durable cut and a preserved machine, and a completed incident with cut, pause, snapshot and report timestamps. |
 | Topologies A and B | §49 completes a real in-guest tool loop; §50 completes an external loop with positive-control-validated host capture and counters (15/15). |
-| Existing lifecycle, snapshots, fencing, MCP, eval | Workspace regressions passed in the serial gate; compatibility suite passes 8/8 within its documented coverage. Untested legacy branches and strict response deserializers remain excluded. |
+| Existing lifecycle, snapshots, fencing, MCP, eval | Workspace regressions pass in the gate; the compatibility suite passes 8/8 within its documented coverage, and the live approval suite 10/10. **Snapshots are now proven end to end on a real guest**: a workspace snapshot captured from a running microVM, its source machine destroyed, and the archive restored into a fresh one that still holds a marker written for that run only - 12/12 (`benchmarks/snapshot-acceptance.json`), against a real S3 object store. Untested legacy branches and strict response deserializers remain excluded. |
 | §51 performance | DNS upper-middle order statistics (n=10 per side), conventional streaming medians (n=3 per side), quarantine alert→network-cut latency (n=1), and isolated gateway CPU/RSS (n=7 matched pairs) have published artifacts, hardware/kernel/architecture, explicit baselines, and scope. No aarch64 runtime/performance or deployment-wide resource claim. |
-| Static quality gate | Serial gate passes. Parallel storage-test reliability remains unresolved; serial success does not prove the failure's cause. |
+| Static quality gate | The gate passes in full: `fmt`, clippy with `-D warnings`, the whole workspace suite, the SDK import contract, the Python SDK tests and the aarch64 cross-check. The cross-check builds in a container as root; it was writing root-owned artifacts into the host `target/`, which broke later host builds with a permission error. It now uses a container-local target directory, and no root-owned path is left behind. |
 
 This audit separates implementation and regression coverage from live proof.
-The full non-deferred definition of done is not satisfied.
+The full non-deferred definition of done is not satisfied: see the limitations
+below for what is still open, none of it a phase that was skipped.
 
 ## Verdict
 
-**AIEC GUARD: PHASES 1-3 AND 5 PROVEN LIVE; PHASE 4 AND THE REAPER NOT YET**
+**AIEC GUARD: PHASES 1-5 PROVEN LIVE, WITH FOUR OPEN ITEMS AND TWO OPERATOR STEPS**
 
-Phases 1, 2, 3 and 5 run on real Firecracker machines against the image produced
-by the build: 48/48, 29/29, 47/47 and 36/36 full-suite, none with cleanup
-errors. §49 proves the in-guest model-only tool loop; §50 independently proves
-the external loop and its bounded zero-egress window (15/15). The guest
-identity, host attachment, approved-policy and OpenShell-import paths are all
-inside the live Phase 3 evidence.
+Phases 1, 2, 3, 4 and 5 run on real Firecracker machines against the image
+produced by the build: 48/48, 29/29, 47/47, 51/51 and 37/37 full-suite, none
+with cleanup errors. The durable reaper is observed acting, twice over and once
+again through the external-database relay, 16/16 each time. §49 proves the
+in-guest model-only tool loop; §50 independently proves the external loop and
+its bounded zero-egress window (15/15). Snapshots round-trip a workspace
+through a destroyed source machine into a fresh one, 12/12.
 
-Phase 4 is implemented and unit-covered but has no live run, and the lifetime
-reaper has never been observed firing. Also outstanding: `CAP_NET_ADMIN` is
-absent from the production worker on this host; Layer 7 needs interception to
-govern a tunnelled request; multi-host deployment modes are unvalidated; and
-aarch64 is compiled but never run. Parallel test reliability is unresolved.
-Operator actions remain deploying the rebuilt image and granting the worker
-`CAP_NET_ADMIN`.
+Building that snapshot proof found the defect that had been hiding behind it:
+the Firecracker worker never advertised `portable_workspace` or
+`workspace_snapshot`, so the scheduler's capability test excluded every microVM
+host and every restore was refused as having no capacity - against a worker
+holding 4 vCPUs, 4 GiB of memory and 40 GiB of disk free. The runtime implements
+both; it now says so, and a test asserts the exact set a restore requires.
+
+Still open, and stated as open rather than resolved by inference:
+
+- Layer 7 rules need interception to govern a tunnelled request; a CONNECT
+  tunnel to a governed host is refused rather than forwarded ungoverned.
+- Multi-host deployment modes are documented, not validated.
+- aarch64 is compiled but never run; no performance number was taken there.
+- The 80-run parallel soak finished 77/80 with three transient
+  `no schedulable worker has capacity` refusals. The census afterwards was the
+  census before, so nothing accumulated. The cause of those three is still not
+  established: a refusal path that could refuse without cause was found and
+  fixed in the meantime, but a concurrency probe at the soak's own width
+  reproduced no refusal either way, so the fix is not claimed as their cause
+  and the soak has not been rerun.
+- The two operator steps that cannot be done from here remain: deploying the
+  rebuilt guest image, and granting `CAP_NET_ADMIN`/`CAP_NET_RAW` to whichever
+  launcher runs the worker. The packaged unit now grants them; an alternate
+  launcher has to grant them itself.
 
 ## What Phase 3 changed in the product
 

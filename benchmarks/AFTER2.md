@@ -85,7 +85,12 @@ does, and `residual_unattributed` above is computed that way.
 Every checkpoint is the baseline, and the final observation is taken before any
 cleanup, so a leak could not be hidden by the measuring. The three parallel
 failures are a capacity refusal at four-way concurrency, not an accumulation:
-the census is identical afterwards.
+the census is identical afterwards. Their cause is not established. A refusal
+path that could refuse without cause was found later - the scheduler excluded a
+host for the rest of a call when it lost that host's advisory headroom lock to
+a concurrent placement - and is fixed with a bounded wait, but a probe at this
+soak's own concurrency reproduced no capacity refusal either way, so it is not
+shown to be what happened here.
 
 ## Repository object cache: OFF against ON
 

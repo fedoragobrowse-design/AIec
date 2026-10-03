@@ -943,6 +943,13 @@ fn sandbox_capacity_demand(sandbox: &Sandbox) -> Result<(i32, i64, i64), StoreEr
     ))
 }
 
+/// How long a placement waits for a sibling's host lock before it gives up on
+/// that host. The wait is bounded because the lock holder is another request,
+/// and the refusal that follows stays fail-closed: the host is excluded, the
+/// remaining ones are still tried, and nothing is placed without headroom.
+const HOST_LOCK_ATTEMPTS: u32 = 40;
+const HOST_LOCK_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Picks the worker a placement runs on, locking the chosen row for the transaction.
 ///
 /// Scheduling and lease recovery share this so recovery cannot drift from the scheduler
@@ -995,13 +1002,29 @@ async fn select_schedulable_node(
         let host = metadata["pressure"]["host_id"]
             .as_str()
             .ok_or_else(|| StoreError::Conflict("worker host identity is missing".into()))?;
-        let locked: bool = sqlx::query_scalar(
-            "SELECT pg_try_advisory_xact_lock(hashtextextended('host:' || $1::text, 0))",
-        )
-        .bind(host)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(database_error)?;
+        // Losing the race for this host's headroom lock is not evidence that the
+        // host is full: whoever holds it is another placement, mid-flight, and
+        // it commits in the time it takes to write a few rows. Treating that
+        // collision as a full host refuses a placement against a host with
+        // room in it, and reports it with the same `no schedulable worker has
+        // capacity` a genuinely full host produces. Wait for the lock instead,
+        // bounded, and keep the exclusion for when the wait is exhausted.
+        let mut locked = false;
+        for attempt in 0..HOST_LOCK_ATTEMPTS {
+            locked = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended('host:' || $1::text, 0))",
+            )
+            .bind(host)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_error)?;
+            if locked {
+                break;
+            }
+            if attempt + 1 < HOST_LOCK_ATTEMPTS {
+                tokio::time::sleep(HOST_LOCK_BACKOFF).await;
+            }
+        }
         if locked {
             // A new statement after the lock sees any reservation committed
             // since candidate selection, including debits on sibling workers.
@@ -4936,6 +4959,58 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    /// A placement is refused for capacity, not for having lost a race for the
+    /// host's headroom lock. A sibling placement holds that lock for the few
+    /// milliseconds its transaction takes, so losing it says nothing about how
+    /// much room the host has - and treating it as a full host turned ordinary
+    /// concurrency into `no schedulable worker has capacity`. The lock is held
+    /// here from another connection, so the collision is the condition under
+    /// test rather than something to hope for.
+    #[tokio::test]
+    async fn a_placement_waits_for_another_placements_host_lock() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_worker_with(
+            &repository,
+            tenant,
+            MEMORY_WORKER.0,
+            MEMORY_WORKER.1,
+            16_384,
+        )
+        .await;
+        let host = format!("test-host-{tenant}");
+        let mut holder = repository.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('host:' || $1::text, 0))")
+            .bind(&host)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let placement = tokio::spawn({
+            let repository = repository.clone();
+            async move {
+                schedule_test_sandbox(
+                    &repository,
+                    tenant,
+                    new_id(),
+                    sandbox(tenant),
+                    Some(node_id),
+                )
+                .await
+            }
+        });
+        // Held for a moment, then released inside the wait the fix allows.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        holder.commit().await.unwrap();
+        placement
+            .await
+            .unwrap()
+            .expect("a placement was refused for a lock its holder had already released");
+        let worker = repository.get_worker(node_id).await.unwrap();
+        assert_eq!(worker.registration.available_vcpus, MEMORY_WORKER.0 - 1);
+        assert_eq!(worker.sandbox_count, 1);
+    }
+
     #[tokio::test]
     async fn concurrent_quota_admission_is_serialized() {
         let Some((repository, tenant)) = repository_and_tenant().await else {
@@ -5671,7 +5746,11 @@ pub(crate) mod tests {
     /// recovery handed the sandbox to a replacement.
     #[tokio::test]
     async fn a_previous_owner_is_refused_even_at_its_replacements_generation() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        // Isolated: reassignment deliberately picks any healthy worker, so on
+        // the shared schema this test would take another test's node - and a
+        // test running beside it would then find its own worker already full.
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let (vcpus, memory_mb, disk_mb) = MEMORY_WORKER;
@@ -5732,7 +5811,11 @@ pub(crate) mod tests {
                 SandboxState::Creating
             );
         }
-        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            drop_test_schema(&repository, admin, schema),
+        )
+        .await;
     }
 
     /// An expired lease is not an owner, and the fence fails closed on it.
@@ -6163,7 +6246,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn reassignment_refuses_a_live_lease_and_an_unknown_lease() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        // Isolated: this test reassigns, and reassignment may pick any healthy
+        // worker. On the shared schema that is another test's node.
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
@@ -6203,7 +6289,7 @@ pub(crate) mod tests {
                 .node_id,
             Some(node_id)
         );
-        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+        drop_test_schema(&repository, admin, schema).await;
     }
 
     #[tokio::test]
@@ -6444,7 +6530,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_draining_worker_takes_no_new_work_and_keeps_the_work_it_holds() {
-        let Some((repository, tenant)) = repository_and_tenant().await else {
+        // Isolated: the reassignment below may land on any healthy worker, which
+        // on the shared schema is a node a test running beside this one owns.
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
             return;
         };
         let node_id = register_worker_with(&repository, tenant, 4, 256, 4_096).await;
@@ -6590,7 +6679,7 @@ pub(crate) mod tests {
                 .is_err(),
             "an unbounded drain reason is refused"
         );
-        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+        drop_test_schema(&repository, admin, schema).await;
     }
 
     #[tokio::test]
