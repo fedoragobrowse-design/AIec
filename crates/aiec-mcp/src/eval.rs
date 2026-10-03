@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
+use aiec_api::eval_matrix::MAX_EVAL_REPETITIONS;
 use aiec_api::omp::{OmpRunSpec, actual_omp_revision, to_run_request, wall_time_ms};
 use aiec_client::CreateRunRequest;
 use aiec_core::run::{
@@ -1378,6 +1379,10 @@ fn resolve_repetitions(repetitions: Option<u32>) -> Result<u32, McpError> {
         Some(0) => Err(McpError::invalid(
             "a comparison needs at least one repetition per side",
         )),
+        Some(count) if count > MAX_EVAL_REPETITIONS => Err(McpError::invalid(format!(
+            "a comparison asks for {count} repetitions per side, above the ceiling of \
+             {MAX_EVAL_REPETITIONS}"
+        ))),
         Some(count) => Ok(count),
         None => Ok(1),
     }
@@ -1885,6 +1890,19 @@ mod tests {
         assert_eq!(
             resolve_repetitions(Some(0)).unwrap_err().code,
             ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn a_comparison_above_the_repetition_ceiling_is_refused() {
+        assert_eq!(
+            resolve_repetitions(Some(MAX_EVAL_REPETITIONS)).expect("at the ceiling"),
+            MAX_EVAL_REPETITIONS
+        );
+        assert_eq!(
+            resolve_repetitions(Some(u32::MAX)).unwrap_err().code,
+            ErrorCode::InvalidArgument,
+            "an uncapped count is an allocation, not an evaluation"
         );
     }
 

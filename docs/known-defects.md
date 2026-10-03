@@ -461,6 +461,12 @@ requires the run to have used the machine before it may keep it.
 Reproduced against `13f7d3e`, in a worktree at that commit with its own target
 directory, by two PostgreSQL tests:
 
+The reproductions named below were run in a throwaway worktree that was
+removed afterwards, so they are not in the tree and cannot be re-run as
+written. They are recorded for what they observed, not as gates; the fixed
+behaviour each one describes is covered by a permanent regression at the same
+commit.
+
 - `f4_baseline_a_run_links_a_machine_from_another_tenant` — the link was
   accepted and the run's link list then held the foreign id.
 - `f4_baseline_a_run_only_keeps_a_machine_it_used_once` — a run retained a
@@ -620,9 +626,12 @@ first with the write returning `Ok(())`.
 
 - `POST /v1/keys` and `POST /v1/account` reported scopes as `sandboxesread` —
   the Debug formatting of `Scope`, not the `scope_wire_name` the API parses.
-- `run_repetitions` expanded a caller-supplied `u32` before validating it;
-  `u32::MAX` requested a 5 TB allocation and aborted the process. Bounded by
-  `MAX_EVAL_REPETITIONS`.
+- A repetition count was expanded before it was validated, in three places
+  rather than one: `run_repetitions`, `omp::compare` (two runs per repetition),
+  and the MCP comparison tool (which reserves capacity for both sides before
+  expanding). `u32::MAX` requested a multi-terabyte allocation and aborted the
+  process. All three now share `MAX_EVAL_REPETITIONS`.
+
 - The CLI created Firecracker and Docker sandboxes through a bare
   `reqwest::Client::new()`, bypassing `AIEC_TLS_CA_CERT` and the 60 s timeout.
 - The worker skipped its heartbeat entirely when its own health probe failed,
@@ -633,6 +642,19 @@ first with the write returning `Ok(())`.
 - `deploy/prometheus.yml` scrapes `host.docker.internal:8080`, which resolves to
   nothing under plain Docker Engine on Linux. The compose service now maps
   `host.docker.internal:host-gateway`.
+
+### The TAP allocation was still racy between two placements in one worker
+
+The occupancy-aware allocator reads the host's address inventory and then runs
+`ip addr add` as separate steps, so two placements overlapping exactly there —
+the normal case when a batch is admitted at once — could both see a slot free
+and both take it. The kernel does not reject the second: a second interface may
+carry an address already in use, so the duplicate becomes two live sandboxes on
+one subnet with no error raised anywhere. The probe and the assignment are now
+serialized within a worker. **Partially fixed:** this is a process-local lock,
+so a deployment running two workers against one host still depends on the
+inventory probe rather than on an atomic reservation. Closing that needs a
+lockfile or a kernel-side claim, which is not built.
 
 ## Open
 

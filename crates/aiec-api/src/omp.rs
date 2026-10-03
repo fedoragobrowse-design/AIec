@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::eval_matrix::{MatrixCell, MatrixSpec, run_matrix};
+use crate::eval_matrix::{MAX_EVAL_REPETITIONS, MatrixCell, MatrixSpec, run_matrix};
 use crate::runs::RunRequest;
 use crate::{AppState, CoreError};
 
@@ -426,6 +426,16 @@ pub async fn compare(
             "repetitions must be at least one".into(),
         ));
     }
+    // The same ceiling the repetition route applies, for the same reason: the
+    // loop below turns one scalar into two owned runs per repetition before any
+    // of them is admitted, so an uncapped count is an allocation a caller can
+    // ask for with a four-byte field.
+    if spec.repetitions > MAX_EVAL_REPETITIONS {
+        return Err(CoreError::InvalidRequest(format!(
+            "repetitions must be at most {MAX_EVAL_REPETITIONS}, asked for {}",
+            spec.repetitions
+        )));
+    }
     if spec.baseline.task != spec.candidate.task {
         return Err(CoreError::InvalidRequest(
             "a comparison must give both sides the same task".into(),
@@ -592,6 +602,7 @@ pub fn load_suite(contents: &str) -> Result<OmpComparisonSpec, CoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn spec() -> OmpRunSpec {
         OmpRunSpec {
@@ -722,5 +733,35 @@ mod tests {
         let loaded = load_suite(&json).expect("round-trips");
         assert_eq!(loaded.repetitions, 3);
         assert_eq!(loaded.baseline.omp_ref, "v18.3.5");
+    }
+
+    /// A comparison expands its repetition count into two owned run requests
+    /// each, before any of them is admitted, so a four-byte field in a suite
+    /// file reaches the same allocation the repetition route now refuses. The
+    /// count has to be bounded before that loop, not after it.
+    #[tokio::test]
+    async fn a_comparison_past_the_repetition_ceiling_is_refused_before_expanding() {
+        let platform = aiec_core::platform::Platform::builder()
+            .runtime(Arc::new(aiec_runtime::BubblewrapRuntime::new(
+                std::env::temp_dir().join(format!("aiec-omp-{}", Uuid::now_v7())),
+            )))
+            .metadata_store(aiec_storage::MemoryRepository::new())
+            .scheduler(Arc::new(crate::DevelopmentScheduler))
+            .build()
+            .expect("a platform with the three required components");
+        let state = crate::AppState::development(platform);
+        let comparison = OmpComparisonSpec {
+            baseline: spec(),
+            candidate: spec(),
+            repetitions: u32::MAX,
+            max_parallel: 2,
+        };
+        let error = compare(&state, aiec_core::new_id(), &comparison)
+            .await
+            .expect_err("an uncapped comparison is refused, not attempted");
+        assert!(
+            matches!(&error, CoreError::InvalidRequest(message) if message.contains("at most")),
+            "the refusal names the ceiling rather than failing later: {error}"
+        );
     }
 }

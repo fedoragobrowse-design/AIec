@@ -546,11 +546,14 @@ pub async fn run_batch_bounded(
 
 /// Ceiling on one request's repetitions, whatever the caller asks for.
 ///
-/// The expansion in `run_repetitions` allocates one owned `RunRequest` per
-/// repetition before any of them is admitted, and a `RunRequest` is over a
-/// kilobyte, so an uncapped `u32` turns a forty-byte request body into a
-/// five-terabyte allocation. That is an abort rather than a refusal a caller
-/// could read, so the bound belongs at the expansion and not only on the route.
+/// Every entry point that turns a repetition *count* into owned runs shares
+/// this ceiling: `run_repetitions` here, `omp::compare` (two runs per
+/// repetition), and the MCP comparison tool, which reserves capacity for both
+/// sides before it expands anything. Each allocates per repetition before any
+/// of them is admitted, and a `RunRequest` is over a kilobyte, so an uncapped
+/// `u32` turns a forty-byte request body into a multi-terabyte allocation.
+/// That is an abort rather than a refusal a caller could read, so the bound
+/// belongs at the expansion and not only on the route.
 pub const MAX_EVAL_REPETITIONS: u32 = 1000;
 
 /// Runs the same workload several times.

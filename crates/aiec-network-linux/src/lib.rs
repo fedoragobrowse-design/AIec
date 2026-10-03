@@ -87,6 +87,21 @@ fn choose_tap_plan(
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxNetworkManager;
 
+/// Serializes the read-occupancy-then-assign window inside this process.
+///
+/// Probing the host inventory and running `ip addr add` are separate steps, so
+/// two placements that overlap exactly there — which is the common case when a
+/// batch is admitted at once — can both find a slot free and both take it. The
+/// kernel does not reject the second: a second interface may carry an address
+/// that is already in use, so the duplicate becomes two live sandboxes on one
+/// subnet with no error anywhere. Holding this across the probe and the
+/// assignment closes that window for concurrent placements in one worker.
+///
+/// It does not close it across processes, and a deployment with two workers on
+/// one host still relies on the inventory probe rather than on an atomic
+/// reservation. That is recorded rather than claimed fixed.
+static TAP_RESERVATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 impl LinuxNetworkManager {
     pub fn new() -> Self {
         Self
@@ -122,6 +137,9 @@ impl NetworkBackend for LinuxNetworkManager {
         // will actually reject: a duplicate address fails at `ip addr add`, and
         // a link whose guest half matches another sandbox's is never reported
         // as an error at all — it silently becomes two sandboxes on one subnet.
+        // Held until the address is actually on the link, so the probe below and
+        // the `ip addr add` after it cannot interleave with another placement.
+        let _reservation = TAP_RESERVATION.lock().await;
         let assigned = assigned_ipv4().await?;
         let plan = choose_tap_plan(sandbox.id, |candidate| {
             [candidate.host, candidate.guest].iter().any(|address| {
@@ -169,6 +187,10 @@ impl NetworkBackend for LinuxNetworkManager {
                 return Err(error);
             }
         }
+        // The address is assigned and the link is up, so the reservation is
+        // spent and the next placement may probe again.
+        drop(_reservation);
+
         if let Err(error) = enable_ip_forwarding().await {
             let _ = self.release(sandbox, &device).await;
             return Err(error);
