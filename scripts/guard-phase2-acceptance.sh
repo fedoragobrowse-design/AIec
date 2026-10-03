@@ -47,6 +47,13 @@ if [[ ${1:-} != --inside ]]; then
     exit 2
   fi
   pg_bin=${P2_PG_BIN:-$HOME/.paperclip/cli/installs/npm/2026.916.1/node_modules/@embedded-postgres/linux-x64/native/bin}
+  # Armed before the database is prepared: a launcher pointed at missing
+  # binaries exits from inside that call, and a lock left behind by a
+  # misconfiguration makes every later run report that another run holds it.
+  stop_db() {
+    acceptance_stop_database "$root" "$pg" "$pg_bin"
+  }
+  trap stop_db EXIT
   acceptance_prepare_database "$root" "$pg" "$sock" "$pg_bin"
   # Reap anything this run started before stopping the database. The drivers
   # launch a control plane and a worker, and `unshare --kill-child` only kills
@@ -60,10 +67,6 @@ if [[ ${1:-} != --inside ]]; then
   # meant every run that got as far as starting the database leaked its lock
   # and the next run refused with "another run holds the lock" while nothing
   # was running. One trap releases both, in that order.
-  stop_db() {
-    acceptance_stop_database "$root" "$pg" "$pg_bin"
-  }
-  trap stop_db EXIT
   unshare --user --map-root-user --net --fork --kill-child=KILL bash "$self" --inside
   status=$?
   exit $status

@@ -1,9 +1,9 @@
 {
   "status": "PASS",
   "acceptance_scope": "full_suite",
-  "started_at": 1790981065.192582,
-  "elapsed_seconds": 110.7,
-  "passed": 36,
+  "started_at": 1790986869.6931677,
+  "elapsed_seconds": 125.7,
+  "passed": 37,
   "phases_run": [
     "identity",
     "file",
@@ -237,8 +237,8 @@
       "case": "attachment is live under a real watchdog process",
       "status": "PASS",
       "evidence": {
-        "sandbox": "01a0fecb-7958-7052-a283-87bb7d203f4d",
-        "pid": 3865458,
+        "sandbox": "01a0ff24-3a23-735f-9a64-37494661073f",
+        "pid": 3934120,
         "network_cut": false,
         "lifecycle_events": [
           "gateway started",
@@ -259,8 +259,8 @@
       "case": "attachment is live under a real watchdog process",
       "status": "PASS",
       "evidence": {
-        "sandbox": "01a0fecb-9acb-7083-a14f-8ed008e5f14b",
-        "pid": 3865514,
+        "sandbox": "01a0ff24-5f08-746f-a98f-76b11177aae7",
+        "pid": 3934206,
         "network_cut": false,
         "lifecycle_events": [
           "gateway started",
@@ -285,10 +285,10 @@
       "evidence": {
         "resolved_count": 1,
         "resolved": [
-          "172.30.13.45"
+          "172.30.19.157"
         ],
         "guest_resolvers": [
-          "172.30.13.45"
+          "172.30.19.157"
         ],
         "guest_error": null,
         "attachment_resolver": null,
@@ -318,7 +318,7 @@
             "decision": "cut",
             "reason": "canary file read, severity high, network cut",
             "destination": "file#0",
-            "current_hash": "27c950c56d6c53ac0be3fed1bb4a6b069250009ef849d5f39fadaad60b865dfa"
+            "current_hash": "5ff44999b795f70a8a26c5eb7898ddb2b12d64b023cd5c22f531c4d4f905af8c"
           }
         ],
         "planted_in": "sandbox workspace at boot; the base image is never written"
@@ -330,7 +330,7 @@
       "evidence": {
         "network_cut": true,
         "counters": {
-          "table": "aiec_guard_01a0fecb9acb7083a14f8ed008e5f14b",
+          "table": "aiec_guard_01a0ff245f08746fa98f76b11177aae7",
           "blocked_range": 0,
           "other_denied": 0,
           "ipv6": 0,
@@ -350,15 +350,15 @@
         "incident_paused_at": null,
         "incident_snapshot_id": null,
         "rootfs_present": true,
-        "rootfs": "/home/gobrowse/aiec/phase5/state-vms/vms/01a0fecb-9acb-7083-a14f-8ed008e5f14b/rootfs.ext4"
+        "rootfs": "/home/gobrowse/aiec/phase5/state-vms/vms/01a0ff24-5f08-746f-a98f-76b11177aae7/rootfs.ext4"
       }
     },
     {
       "case": "attachment is live under a real watchdog process",
       "status": "PASS",
       "evidence": {
-        "sandbox": "01a0fecb-a747-70bf-8ddd-d308e36af652",
-        "pid": 3865604,
+        "sandbox": "01a0ff24-6d54-76c6-85b5-46cc4b4bdd46",
+        "pid": 3934274,
         "network_cut": false,
         "lifecycle_events": [
           "gateway started",
@@ -374,7 +374,7 @@
         "probe": {
           "queried": "phase5-canary.invalid",
           "resolvers": [
-            "172.30.17.73"
+            "172.30.13.25"
           ],
           "direct": {
             "error": "TimeoutError"
@@ -385,7 +385,7 @@
         "model_probe": {
           "queried": "api.example-model.com",
           "resolvers": [
-            "172.30.17.73"
+            "172.30.13.25"
           ],
           "direct": {
             "error": "TimeoutError"
@@ -397,16 +397,16 @@
           "attachment": {
             "broker_port": 8443,
             "dns_port": 53,
-            "gateway_ip": "172.30.17.73",
-            "guest_ip": "172.30.17.74",
-            "interface": "ag0179b26ceac88",
-            "sandbox_id": "01a0fecb-a747-70bf-8ddd-d308e36af652",
-            "tenant_id": "5284ed51-620c-4d81-b54a-deba8774266c"
+            "gateway_ip": "172.30.13.25",
+            "guest_ip": "172.30.13.26",
+            "interface": "agd714d87c189b8",
+            "sandbox_id": "01a0ff24-6d54-76c6-85b5-46cc4b4bdd46",
+            "tenant_id": "7802dfc6-a197-4dc3-86f2-e4a6995f4a7d"
           },
           "node_id": "01a0fecb-5472-72ea-93f0-cb8bf3ffe986"
         },
-        "guest_net": "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000\n    inet 172.30.17.74/30 brd 172.30.17.75 scope global eth0\n       valid_lft forever preferred_lft forever\n---\ndefault via 172.30.17.73 dev eth0 \n172.30.17.72/30 dev eth0 proto kernel scope link src 172.30.17.74 \n---\nnameserver 172.30.17.73\noptions timeout:1 attempts:1\n",
-        "host_view": "4: ag0179b26ceac88: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    inet 172.30.17.73/30 scope global ag0179b26ceac88\n       valid_lft forever preferred_lft forever\nError: No such file or directory\nlist table inet aiec_guard_01a0fecba74770bf8dddd308e36af652\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+        "guest_net": "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000\n    inet 172.30.13.26/30 brd 172.30.13.27 scope global eth0\n       valid_lft forever preferred_lft forever\n---\ndefault via 172.30.13.25 dev eth0 \n172.30.13.24/30 dev eth0 proto kernel scope link src 172.30.13.26 \n---\nnameserver 172.30.13.25\noptions timeout:1 attempts:1\n",
+        "host_view": "4: agd714d87c189b8: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    inet 172.30.13.25/30 scope global agd714d87c189b8\n       valid_lft forever preferred_lft forever\nError: No such file or directory\nlist table inet aiec_guard_01a0ff246d5476c685b546cc4b4bdd46\n                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
         "live_journal": [
           {
             "category": "lifecycle",
@@ -433,12 +433,6 @@
             "destination": null
           },
           {
-            "category": "lifecycle",
-            "decision": "cut",
-            "reason": "watchdog or host fault latched network cut",
-            "destination": null
-          },
-          {
             "category": "dns",
             "decision": "cut",
             "reason": "canary hostname resolution, severity high, network cut",
@@ -449,11 +443,17 @@
             "decision": "deny",
             "reason": "DNS inbound byte budget exhausted",
             "destination": null
+          },
+          {
+            "category": "lifecycle",
+            "decision": "cut",
+            "reason": "watchdog or host fault latched network cut",
+            "destination": null
           }
         ],
-        "listeners": "Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                   \nudp   UNCONN 0      0       172.30.17.73:53         0.0.0.0:*    users:((\"aiec\",pid=3865304,fd=20))       \ntcp   LISTEN 0      128     172.30.17.73:53         0.0.0.0:*    users:((\"aiec\",pid=3865304,fd=19))       \ntcp   LISTEN 0      128        127.0.0.1:19445      0.0.0.0:*    users:((\"aiec\",pid=3865304,fd=10))       \ntcp   LISTEN 0      128        127.0.0.1:18445      0.0.0.0:*    users:((\"aiec-server\",pid=3865274,fd=13))\ntcp   LISTEN 0      128     172.30.17.73:8443       0.0.0.0:*    users:((\"aiec\",pid=3865304,fd=17))",
+        "listeners": "Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess                                   \nudp   UNCONN 0      0       172.30.13.25:53         0.0.0.0:*    users:((\"aiec\",pid=3933932,fd=19))       \ntcp   LISTEN 0      128        127.0.0.1:19445      0.0.0.0:*    users:((\"aiec\",pid=3933932,fd=10))       \ntcp   LISTEN 0      128        127.0.0.1:18445      0.0.0.0:*    users:((\"aiec-server\",pid=3933906,fd=14))\ntcp   LISTEN 0      128     172.30.13.25:53         0.0.0.0:*    users:((\"aiec\",pid=3933932,fd=18))       \ntcp   LISTEN 0      128     172.30.13.25:8443       0.0.0.0:*    users:((\"aiec\",pid=3933932,fd=16))",
         "counters": {
-          "table": "aiec_guard_01a0fecba74770bf8dddd308e36af652",
+          "table": "aiec_guard_01a0ff246d5476c685b546cc4b4bdd46",
           "blocked_range": 0,
           "other_denied": 3,
           "ipv6": 0,
@@ -486,12 +486,6 @@
             "destination": null
           },
           {
-            "category": "lifecycle",
-            "decision": "cut",
-            "reason": "watchdog or host fault latched network cut",
-            "destination": null
-          },
-          {
             "category": "dns",
             "decision": "cut",
             "reason": "canary hostname resolution, severity high, network cut",
@@ -502,6 +496,12 @@
             "decision": "deny",
             "reason": "DNS inbound byte budget exhausted",
             "destination": null
+          },
+          {
+            "category": "lifecycle",
+            "decision": "cut",
+            "reason": "watchdog or host fault latched network cut",
+            "destination": null
           }
         ],
         "events": [
@@ -510,7 +510,7 @@
             "decision": "cut",
             "reason": "canary hostname resolution, severity high, network cut",
             "destination": "hostname#0",
-            "current_hash": "c53f109f6403e38a8473e4c09d26337d39a7eb6700e2cd384058929791596407"
+            "current_hash": "4f6ea67def1a39c2c02b1477c71eaa5b3156f5e0467084caa4ecc3fb8a253152"
           }
         ]
       }
@@ -529,8 +529,8 @@
       "case": "attachment is live under a real watchdog process",
       "status": "PASS",
       "evidence": {
-        "sandbox": "01a0fecb-df11-7034-b19e-5b5ae9e565df",
-        "pid": 3865803,
+        "sandbox": "01a0ff24-a8c0-74bb-a503-13fdf0025ec5",
+        "pid": 3934497,
         "network_cut": false,
         "lifecycle_events": [
           "gateway started",
@@ -551,7 +551,7 @@
             "decision": "quarantine",
             "reason": "canary credential presented, severity critical, immediate quarantine",
             "destination": "credential#0",
-            "current_hash": "a2c34a6b0ca2e7c3f41d9b24bc9a6f48f4d7a4972779334dfc82ee4628e50db9"
+            "current_hash": "805b7be7582a1c28b287d2fb949a6ce4e507d3563fe29113232b70125975e386"
           }
         ]
       }
@@ -562,10 +562,10 @@
       "evidence": {
         "sandbox_state": "quarantined",
         "incident_id_present": true,
-        "network_cut_at": "2026-10-02T22:46:11.696730263Z",
-        "paused_at": "2026-10-02T22:46:15.213547305Z",
-        "snapshot_id": "01a0fecb-e9e0-7697-adcd-0e890f2463b3",
-        "completed_at": "2026-10-02T22:46:15.262319264Z",
+        "network_cut_at": "2026-10-03T00:23:11.172691657Z",
+        "paused_at": "2026-10-03T00:23:15.049023037Z",
+        "snapshot_id": "01a0ff24-b639-7763-a168-31730516d50b",
+        "completed_at": "2026-10-03T00:23:15.124869360Z",
         "stage_errors": [],
         "rules": [
           "canary.credential-presented"
@@ -586,7 +586,18 @@
       "evidence": {
         "live_rootfs_copies": 0,
         "quarantined_forensics_retained": 2,
+        "quarantined_forensics_from_earlier_runs": 6,
         "forensics_without_a_quarantine": []
+      }
+    },
+    {
+      "case": "worker left no guest process behind",
+      "status": "PASS",
+      "evidence": {
+        "live_guest_processes": 0,
+        "sandboxes_created": 4,
+        "sandboxes_censused": 28,
+        "pids": []
       }
     }
   ],

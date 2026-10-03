@@ -18,9 +18,11 @@ report, a log or stdout. Reports carry digests, counts and event metadata only.
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import os
+import signal
 import ssl
 import subprocess
 import sys
@@ -31,6 +33,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(os.environ["P5_ROOT"])
+SANDBOXES: set[str] = set()
 BIN = Path(os.environ["P5_BIN"])
 CA = Path(os.environ["P5_CA"])
 CP = os.environ["P5_CP"]
@@ -127,6 +130,16 @@ def spawn(name: str, argv: list[str], env: dict | None = None) -> subprocess.Pop
         argv, stdout=handle, stderr=subprocess.STDOUT, env=log_env, start_new_session=True
     )
     _started.append((name, process))
+    # Recorded for the launcher as well as for this process. Every service here
+    # is started in its own session so it survives nothing but being told to
+    # stop, which means a driver that dies without running its teardown - a
+    # killed harness job, an unhandled error between spawning the control plane
+    # and reaching it - leaves a control plane running against a database the
+    # launcher is about to stop. The launcher sweeps this file, so a lost
+    # driver still cannot leave a service behind.
+    record = ROOT / "services.pid"
+    with open(record, "a", encoding="utf-8") as handle_pid:
+        handle_pid.write(f"{name} {process.pid}\n")
     return process
 
 
@@ -146,6 +159,29 @@ def stop_all() -> None:
         if log_path.exists():
             os.chmod(log_path, 0o600)
     log("stopped: " + ", ".join(name for name, _ in _started))
+    if (ROOT / "services.pid").exists():
+        (ROOT / "services.pid").unlink()
+
+
+# Registered rather than called at the end of `main` alone: this is a process
+# that has already started a database-backed control plane and a Firecracker
+# worker, and every exit that is not the one it planned is a path that used to
+# leave them running. The report is written from the teardown-free path as
+# # before; this only adds the exits that had nothing running to stop.
+atexit.register(stop_all)
+
+
+def _signal_exit(number, _frame):
+    """Turn a signal into an ordinary exit so the atexit teardown runs.
+
+    `SIGKILL` cannot be caught and is handled by the launcher's sweep of
+    `services.pid`; everything gentler ends up here.
+    """
+    sys.exit(128 + number)
+
+
+signal.signal(signal.SIGTERM, _signal_exit)
+signal.signal(signal.SIGINT, _signal_exit)
 
 
 def wait_for_health(process: subprocess.Popen, url: str, token: str | None = None,
@@ -304,6 +340,33 @@ def journal(sandbox: str) -> list[dict]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def live_guest_processes(sandboxes: set[str]) -> dict[str, int]:
+    """Firecracker processes still on the host for sandboxes this run made.
+
+    The disk census above says a VM directory is gone; it says nothing about the
+    process that was using it. Firecracker is exec'd with its `--api-sock`
+    path as the only argument that names the machine, and that path carries
+    the sandbox id, so the id is what ties a live process back to this run and
+    keeps another run's guests out of the count. Without this the report has
+    to infer guest survival from the mechanism that leaves one behind; with it
+    the answer is read off the host.
+    """
+    found: dict[str, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "firecracker" not in argv:
+            continue
+        for sandbox in sandboxes:
+            if sandbox in argv:
+                found.setdefault(sandbox, int(entry.name))
+    return found
 
 
 def canary_events(sandbox: str, kind: str) -> list[dict]:
@@ -538,6 +601,7 @@ def guarded_sandbox(name: str, require_signed: bool = False) -> str:
     require(created.get("state") in ("running", "ready", "creating"),
             f"{name} did not start: {created.get('state')}")
     sandbox = created["id"]
+    SANDBOXES.add(sandbox)
     policy_hash = (created.get("environment") or {}).get("guard_policy_hash")
     require(policy_hash, f"{name} was created without a policy hash")
     start_watchdog(sandbox, policy_hash)
@@ -567,11 +631,15 @@ def identity_and_image_phase() -> None:
     )
     if completed.returncode != 0:
         # The harness's own message is the diagnosis, and the report is not
-        # written when it fails, so it reaches the console now.
+        # written when it fails, so it reaches the console now. Its stdout is
+        # kept with its stderr for the same reason: a failure reported only as
+        # "broken pipe" names a symptom the harness raised while talking to
+        # something else, and the line before it is what says what.
         log("  identity harness: " + (completed.stderr or "<no stderr>").strip()[-400:])
         case("signed image admission and per-VM identity acceptance", False,
              {"exit": completed.returncode,
               "stderr": (completed.stderr or "")[-600:],
+              "stdout_tail": (completed.stdout or "")[-600:],
               "note": "previous artifact preserved; no secret is emitted by the harness"})
         return
     report = json.loads(report_path.read_text())
@@ -916,14 +984,50 @@ def main() -> int:
     live_disks = list((ROOT / "state-vms").glob("vms/**/rootfs.ext4"))
     forensic = {path.parts[-3]: path for path in
                 (ROOT / "state-vms").glob("guard-forensics/*/*/rootfs.ext4")}
-    unexplained = [sandbox for sandbox in forensic
+    # A quarantined forensic capture is meant to outlive the run, so this
+    # directory accumulates them across runs. Counting all of them as this
+    # run's would report a number that grows by exactly the number of
+    # quarantines every time the suite is re-run, which is evidence about the
+    # past rather than about what this worker left behind.
+    #
+    # The invariant being checked - a surviving disk must have a quarantine
+    # behind it - is a claim about this worker, so it is checked against the
+    # captures whose ids this run was given. An earlier run's capture is
+    # counted separately rather than judged here: this worker did not write it,
+    # and failing the suite over it would make the run answer for state it does
+    # not control.
+    this_run = {sandbox: path for sandbox, path in forensic.items()
+                if sandbox in SANDBOXES}
+    unexplained = [sandbox for sandbox in this_run
                    if not any(row.get("category") == "quarantine"
                               for row in journal(sandbox))]
     case("worker left no VM disk behind",
          not live_disks and not unexplained,
          {"live_rootfs_copies": len(live_disks),
-          "quarantined_forensics_retained": len(forensic) - len(unexplained),
+          "quarantined_forensics_retained": len(this_run) - len(unexplained),
+          "quarantined_forensics_from_earlier_runs": len(forensic) - len(this_run),
           "forensics_without_a_quarantine": unexplained})
+
+    # The disk census is not the process census. A guest whose directory has
+    # been removed is still running, and the first run of this suite left four
+    # Firecracker processes reparented to systemd --user on the host, hours
+    # after the workers that started them had gone. So the processes are
+    # counted, after the worker has stopped, and matched to this run's sandbox
+    # ids: Firecracker is exec'd with only its `--api-sock` path to name the
+    # machine, and that path carries the sandbox id. They are the ids this run
+    # was given, not the ones a directory still happens to hold: a machine whose
+    # directory has been reclaimed takes its id out of that glob with it, and a
+    # census over an empty set reports zero survivors because it looked for
+    # nothing. An empty id set fails the case rather than passing it vacuously.
+    run_sandboxes = SANDBOXES | {path.name for path in (ROOT / "state-vms").glob("guard/*")}
+    run_sandboxes |= {path.name for path in
+                      (ROOT / "state-vms").glob("guard-forensics/*/*")}
+    live = live_guest_processes(run_sandboxes)
+    case("worker left no guest process behind", bool(run_sandboxes) and not live,
+         {"live_guest_processes": len(live),
+          "sandboxes_created": len(SANDBOXES),
+          "sandboxes_censused": len(run_sandboxes),
+          "pids": sorted(live.values())})
 
     report = {
         "status": "PASS" if not FAILURES and not CLEANUP_ERRORS else "FAIL",

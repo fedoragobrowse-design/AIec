@@ -52,11 +52,40 @@ if [[ ${1:-} != --inside ]]; then
     exit 2
   fi
   pg_bin=${P5_PG_BIN:-$HOME/.paperclip/cli/installs/npm/2026.916.1/node_modules/@embedded-postgres/linux-x64/native/bin}
-  acceptance_prepare_database "$root" "$pg" "$sock" "$pg_bin"
+  # Teardown is armed before the database is prepared, not after: a launcher
+  # pointed at missing binaries exits from inside that call, and a lock left
+  # behind by a misconfiguration makes every later run report that another run
+  # holds it. The sweep covers what the database trap alone does not - a driver
+  # killed before it can stop the control plane and worker it started.
+  sweep_services() {
+    local record=$root/services.pid pid name cmd
+    [[ -f $record ]] || return 0
+    while read -r name pid; do
+      [[ -n ${pid:-} && -r /proc/$pid/cmdline ]] || continue
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+      [[ $cmd == "$bin/"* ]] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in {1..50}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+      printf 'swept leftover %s (pid %s)\n' "$name" "$pid" >&2
+    done < "$record"
+    rm -f "$record"
+  }
   stop_db() {
+    sweep_services
     acceptance_stop_database "$root" "$pg" "$pg_bin"
   }
   trap stop_db EXIT
+  # A launcher killed outright - by a harness timeout, an operator's Ctrl-C on
+  # the wrong process group - leaves the record behind with the services still
+  # alive. Sweeping it here is what makes the next run start from a clean
+  # host: the same staged binaries, the same ports, and a control plane that
+  # would otherwise still be attached to this directory's database.
+  sweep_services
+  acceptance_prepare_database "$root" "$pg" "$sock" "$pg_bin"
   unshare --user --map-root-user --net --fork --kill-child=KILL bash "$self" --inside
   status=$?
   exit $status

@@ -4,7 +4,12 @@
 Run: python3 scripts/guard-phase3-acceptance.py
 Requires prebuilt target/release/{aiec,aiec-server}, PostgreSQL (psycopg), KVM,
 unshare, ip, nft, openssl and the deployed guest images. P3_BIN, P3_IMAGES,
-P3_FIRECRACKER, P3_PG_ADMIN_URL and P3_REPORT override their local defaults.
+P3_FIRECRACKER, P3_PG_ADMIN_URL, P3_ROOT and P3_REPORT override their local
+defaults. P3_ROOT ($HOME/aiec/phase3) is where the run's scratch tree is
+created and removed; a failed run's report, service logs and Guard journals
+are copied to a subdirectory there and the rest of the tree is discarded. It
+must be short enough for a Unix socket path (about 100 bytes to the database's
+socket), because everything inside is derived from it.
 The provider is deliberately permissive: only the production gateway denies.
 All runtime networking is confined to a disposable user/network namespace.
 Successful reports replace P3_REPORT atomically; failed runs never replace it.
@@ -692,6 +697,9 @@ class DatabaseRelay:
         self.thread.join(timeout=5)
 
 
+LOG_TAIL_BYTES = 1024 * 1024
+
+
 def outer():
     import psycopg
     from psycopg import sql
@@ -702,15 +710,34 @@ def outer():
     # evidence has to outlive the tree that produced it, so both the scratch
     # parent and the failure evidence are pinned under P3_ROOT.
     parent = Path(os.environ.get("P3_ROOT") or Path.home() / "aiec" / "phase3")
+    # Checked before anything is created. Every path this run derives from
+    # P3_ROOT ends at a Unix socket, which is limited to about 107 bytes, and a
+    # root that cannot hold one is an operator error worth naming - not a
+    # failure to discover inside PostgreSQL, and not a directory left behind for
+    # the operator to remove. The longest name mkdtemp can produce here is used
+    # as the estimate, so every later run name fits if this one does.
+    socket_path = parent.resolve() / ("aiec-p3-" + "x" * 8) / "pg" / ".s.PGSQL.5432"
+    if len(os.fsencode(str(socket_path))) > 100:
+        print(
+            "P3_ROOT is too long for a Unix socket path; use a shorter one",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    # Only a directory this run created is tightened to 0700: P3_ROOT may name
+    # a parent the operator shares with another suite, and quietly narrowing
+    # its permissions is not this suite's to do.
+    created_parent = not parent.exists()
     parent.mkdir(parents=True, exist_ok=True)
-    parent.chmod(0o700)
+    if created_parent:
+        parent.chmod(0o700)
     scratch = Path(tempfile.mkdtemp(prefix="aiec-p3-", dir=parent))
-    scratch.chmod(0o700)
     database = "aiec_p3_" + uuid.uuid4().hex
     admin = os.environ.get("P3_PG_ADMIN_URL", "postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec")
     parsed = urlsplit(admin)
     sock = scratch / "pg"
     sock.mkdir()
+    require(len(os.fsencode(str(sock / ".s.PGSQL.5432"))) <= 100,
+            "P3_ROOT is too long for a Unix socket path; use a shorter one")
     relay = None
     cleanup = []
     created = False
@@ -756,25 +783,39 @@ def outer():
         if cleanup:
             result["status"] = "FAIL"
     report = Path(os.environ.get("P3_REPORT", str(REPO / "benchmarks/guard-phase3-acceptance.json")))
-    evidence = None
+    evidence, residue = None, None
     if result["status"] != "PASS":
-        # The scratch tree is torn down either way, so the diagnostic has to be
-        # copied out of it first. What survives a failed run is the report and
-        # the service logs — small, and kept together under one name — and not
-        # the database, socket, manifests or rootfs copies that make the tree
-        # large enough to have been a problem in the first place.
+        # The scratch tree is torn down either way, so what is worth keeping is
+        # copied out of it first: the service logs and the host's own Guard
+        # journals. Everything else in the tree is either regenerable
+        # (manifests, TLS material, the database) or too large to keep (two
+        # 4 GiB rootfs copies), and keeping those is the growth this directory
+        # exists to avoid.
         evidence = parent / "failed" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8])
         evidence.mkdir(parents=True, exist_ok=True)
         evidence.chmod(0o700)
         for log in sorted(scratch.glob("*.log")):
-            shutil.copy2(log, evidence / log.name)
+            # spawn() gives a service the log for the whole run, and a run that
+            # fails late can leave a large one; the tail is what explains the
+            # failure, and an unbounded copy is the problem being fixed.
+            tail = log.read_bytes()[-LOG_TAIL_BYTES:]
+            (evidence / log.name).write_bytes(tail)
+            (evidence / log.name).chmod(0o600)
+        for journal_path in sorted(scratch.glob("vms/guard/*/events.jsonl")):
+            kept = evidence / journal_path.parent.name / journal_path.name
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(journal_path, kept)
+        result["evidence_retained"] = sorted(path.name for path in evidence.iterdir())
     try:
         shutil.rmtree(scratch)
     except OSError as error:
         # Residue that outlives the run is a cleanup failure rather than a
         # silent leftover, and a run that passed while leaving a tree behind
-        # has not cleaned up.
-        result.setdefault("cleanup_errors", []).append("scratch teardown: " + type(error).__name__)
+        # has not cleaned up. The path goes in the message so the operator
+        # knows which tree to look at, whatever else the report points at.
+        residue = scratch
+        result.setdefault("cleanup_errors", []).append(
+            f"scratch teardown: {type(error).__name__} ({scratch})")
         result["status"] = "FAIL"
         if evidence is None:
             evidence = scratch
@@ -786,9 +827,7 @@ def outer():
     print(json.dumps({"status": result["status"], "passed": result.get("passed", 0),
                       "cases": result.get("cases", 0), "cleanup_errors": result["cleanup_errors"],
                       "report": str(destination), "evidence": str(evidence) if evidence else None,
-                      # A tree that would not go is named, so the operator is
-                      # told where it is rather than left to find it.
-                      "residue": str(scratch) if evidence is scratch else None}))
+                      "residue": str(residue) if residue else None}))
     return 0 if result["status"] == "PASS" else 1
 
 

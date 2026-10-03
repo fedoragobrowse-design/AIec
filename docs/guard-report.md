@@ -530,6 +530,20 @@ bounded measurements.
   session while the acceptance was being set up. **Rotate it.**
 - Local build artifacts reached 156 GB; the incremental cache has since been
   purged and builds run with `CARGO_INCREMENTAL=0`.
+- **The deployed guest image at `/home/gobrowse/ga/images` is stale, and the
+  suites will not run against it.** It was built at 01:11 local, before the
+  guest write-path fix in `5f0aa43`; the agent inside it hashes to
+  `dc08a1a1…` and has none of that fix's strings, while the image the
+  acceptance evidence was produced with
+  (`/home/gobrowse/ga/p5-guest-fixed`, agent `9db0feb9…`) has them. Booting
+  the deployed image and planting a file canary fails as
+  `500 io: guest WriteFile: early eof`: the pre-fix guest propagated the write
+  error out of its inlined `match` and dropped the control connection instead
+  of answering it, which is precisely the "denied" versus "gone" distinction
+  that commit fixed. The image was not rebuilt or replaced here - a stale
+  deployment asset is reported, not silently overwritten - and Phase 5 was run
+  against the image the current tree builds. Rebuild it with the procedure
+  below before pointing any deployment at it.
 
 ## Rebuilding the guest image
 
@@ -747,14 +761,46 @@ RAM-backed. The tree was also only removed on success, so every failed run left
 its whole scratch tree behind.
 
 The scratch parent is now `P3_ROOT` (`$HOME/aiec/phase3` by default, matching
-`P4_ROOT`/`P5_ROOT`/`RP_ROOT`), and the tree is torn down on every run. A
-failed run copies `failure.json` and the service logs out to
-`$P3_ROOT/failed/<timestamp>-<id>/` before the tree goes, so the diagnostic
-outlives the scratch without the database, socket or rootfs copies outliving it
-too. A teardown that fails is a `cleanup_errors` entry and flips a passing run
-to failing, and the tree that would not go is named in the run's JSON as
-`residue` rather than left to be found later.
+`P4_ROOT`/`P5_ROOT`/`RP_ROOT`), and it has to be short enough for the
+database's Unix socket, since every path inside a run is derived from it. The
+tree is torn down on every run. A failed run copies `failure.json`, the
+service logs (capped at the last MiB each) and the host's own Guard journals
+into `$P3_ROOT/failed/<timestamp>-<id>/` before the tree goes, so the
+diagnostic outlives the scratch without the database, socket or rootfs copies
+outliving it too, and the report lists what was kept. A teardown that fails is
+a `cleanup_errors` entry naming the path, flips a passing run to failing, and
+is reported as `residue` rather than left to be found later. A directory the
+run did not create is not re-permissioned: `P3_ROOT` may be a parent the
+operator shares with another suite.
 
+Three more state defects were found by rerunning the suites against that
+arrangement, all of them cases where a retained file was trusted for existing
+rather than for describing what the run was about to use.
+
+**A signed image manifest from an earlier run described a different image.**
+`acceptance_prepare_image_manifest` keeps its manifest under the run root and
+minted a new one only when the files were absent, so a root that survived from
+a run which pointed `AIEC_ROOTFS` at scratch material kept its old digest. The
+next run over the deployed rootfs handed the control plane a manifest naming
+another suite's image, and the control plane failed closed with
+`403 signed image rootfs digest mismatch` — correct behaviour, and a harness
+state fault rather than a product one. The retained manifest is now reused only
+while it names this reference and this digest under its own signature; a stale,
+mis-referenced or tampered pair is re-minted. An operator-supplied
+`AIEC_IMAGE_MANIFEST` is still used as given, which is the point of naming it.
+
+**A launcher pointed at missing database binaries locked out every later run.**
+The Phase 5 lock is taken before the database is prepared and released by the
+exit trap installed after it, so an exit from inside the preflight left a lock
+behind and the next run reported that another run held it. The trap is armed
+before the database call.
+
+**A `P3_ROOT` too long for a socket created the tree it could not use.** The
+length check ran after `P3_ROOT` and the scratch directory had been made and
+outside the teardown, so an over-long root both left directories behind and
+exited with a traceback. It now runs first, on the resolved path, and exits 2
+with one sentence and nothing created; the post-creation check stays as a
+backstop.
 
 ## What Phase 4 changed in the product
 
@@ -879,19 +925,31 @@ failed with exactly two disks, and both belonged to the two machines the
 canaries had quarantined.
 
 **A quarantined sandbox's writable disk outlived the worker, along with its
-guest.** What the suite measured was the disk: two writable rootfs files were
-still in the state tree after the worker exited. That the Firecracker child
-was still running with them follows from the mechanism rather than from a
-reading. Nothing in the worker reclaims machines on exit. The listener was
-awaited alone, so the process ended on `SIGTERM` with no teardown at all — and
-the default disposition of that signal runs no destructor either, so the
-`kill_on_drop(true)` on each Firecracker child had no way to fire: it is an
-`impl Drop` on a `Child` in a process that is already terminating. A child that
-outlives its parent that way is left running, and with it a 4 GiB writable
-disk under `state-vms/vms/<id>/`, per sandbox, for as long as the filesystem
-did. The suite does not enumerate processes, so this is the reasoning that
-accounts for the disks it did find, and the disk census is what the fix is
-held to.
+guest.** Two writable rootfs files were still in the state tree after the
+worker exited. Nothing in the worker reclaimed machines on exit: the listener
+was awaited alone, so the process ended on `SIGTERM` with no teardown at all,
+and the default disposition of that signal runs no destructor either, so the
+`kill_on_drop(true)` on each Firecracker child had no way to fire — it is an
+`impl Drop` on a `Child` in a process that is already terminating. Each child
+is left running, and with it a 4 GiB writable disk under
+`state-vms/vms/<id>/`.
+
+Both halves of that were then read off the host rather than argued from the
+mechanism. Looking for processes left behind turned up four Firecracker
+processes still running under `systemd --user`, started at 15:24 and 15:28,
+whose sandbox ids appear in no live state tree and whose controllers were no
+longer running: guests that outlived their worker by hours, holding their
+memory. The Phase 5 suite now counts them rather than inferring them —
+`worker left no guest process behind` walks `/proc` after the worker has
+stopped and matches Firecracker command lines against this run's sandbox ids,
+which is what its `--api-sock` path carries. The ids come from the sandboxes
+this run was actually given, not from a glob over the state tree: a machine
+whose directory has been reclaimed takes its id out of that glob with it, so a
+census built from directories reports zero survivors because it looked for
+nothing, and an empty id set now fails the case instead of passing it
+vacuously. `live_guest_processes` sits next to `live_rootfs_copies` in the
+report, and a machine that survived without leaving a disk behind fails the
+run.
 
 The quarantine is what made this look like intended behaviour rather than a
 leak, and it is worth stating plainly why the machine cannot be resumed after
@@ -924,20 +982,50 @@ Three changes, each with the ordering it needs:
   running on the host, and the attachment record left behind is inert without
   it. No identity is ever guessed.
 
-The census is unchanged in strength: `live_rootfs_copies: 0`, with the two
-quarantined forensic captures retained. The worker log for that run records
-`reclaimed=2`, so the two disks are gone because the worker took them with it,
-not because the assertion was relaxed.
+The refreshed census reads `live_rootfs_copies: 0`, `live_guest_processes: 0`
+over 4 sandboxes created and 28 ids censused, and two quarantined forensic
+captures retained. The worker log records `reclaimed=2`, so the disks are gone
+because the worker took them with it, not because the assertion was relaxed.
 
-The same boundary applies to the process side of that finding, and it is worth
-being explicit about which half was observed. The Phase 5 suite censuses
-writable rootfs files and forensic captures; it does not take a process
-census, so "the guest survived its controller" is an account of the mechanism
-— a `SIGTERM` default disposition that runs no destructor, and therefore a
-`kill_on_drop` that cannot fire — rather than a reading the suite made. The
-disk was observed; the process is why the disk was there. Adding a process
-census to the suite would close that gap; nothing else in the finding depends
-on it, because the fix is judged on the files.
+The forensic count is now split. A quarantined capture is meant to outlive the
+run, so the directory accumulates across runs, and counting all of them as the
+current run's reported a number that grew by exactly the number of quarantines
+on every re-run - evidence about the past rather than about this worker. The
+report now separates this run's captures from earlier ones, and the
+"a surviving disk has a quarantine behind it" invariant is judged only over
+the ids this run was given: this worker did not write an earlier run's capture,
+and failing the suite over it would make the run answer for state it does not
+control.
+
+The four processes were reaped by hand. A worker that exits cleanly now takes
+its guests with it, and the census is what holds that; an orphaned guest from a
+run before the fix has no worker left to notice it.
+
+### A killed run used to leave its control plane running
+
+The rerun that produced the report above was itself preceded by a run whose
+harness job was killed rather than finishing. That run's `aiec-server` was
+still on the host an hour later, reparented to `systemd --user`, logging
+`pool timed out while waiting for an open connection` against a database the
+launcher had already stopped. Two things had been true at once: the driver's
+teardown was only reached from its planned exit, and the launcher's trap knew
+only about the database.
+
+Both are fixed at the layer that owns them. The driver registers `stop_all` as
+an `atexit` handler and turns `SIGTERM`/`SIGINT` into an ordinary exit, so an
+error between spawning the control plane and reaching the teardown still stops
+what it started. Every service the driver starts is also recorded by name and
+pid, and the launcher sweeps that record on exit and again at startup - which
+is what covers the case no handler in the driver can: a launcher killed
+outright, where the record outlives both processes. Verified against a real
+orphan rather than a synthetic one - two live services from a killed run, with
+its record intact, swept at the next run's start and confirmed gone by pid.
+
+Diagnosing it needed one more change. A probe run started while those orphans
+were still alive reported the identity harness failing with `Broken pipe` and
+nothing else, which names a symptom rather than a cause; the harness's stdout
+is now kept alongside its stderr, and the same phase re-run on the quiet host
+after the sweep passed 23/23.
 
 ### Reading the logs when a request seems to vanish
 

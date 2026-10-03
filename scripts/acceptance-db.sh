@@ -128,27 +128,61 @@ acceptance_prepare_image_manifest() {
   directory=$root/image-manifest
   mkdir -p "$directory"
   chmod 700 "$directory"
-  if [[ ! -f $directory/manifest.json || ! -f $directory/secret ]]; then
-    python3 - "$directory" "$reference" "$capabilities" <<'PY'
+  python3 - "$directory" "$reference" "$capabilities" <<'PY'
 import hashlib, hmac, json, os, secrets, sys
 
 directory, reference, capabilities = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(capabilities) as handle:
     digest = json.load(handle)["rootfs_sha256"]
-secret = secrets.token_hex(32)
-signature = hmac.new(
-    secret.encode(), reference.encode() + b"\0" + digest.encode(), hashlib.sha256
-).hexdigest()
-with open(os.path.join(directory, "manifest.json"), "w") as handle:
-    json.dump({"reference": reference, "rootfs_sha256": digest, "signature": signature}, handle)
-# Owner-only from the first byte: this file is the deployment signing secret for
-# the lifetime of the run, not something to create readable and tighten.
-fd = os.open(os.path.join(directory, "secret"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as handle:
-    handle.write(secret)
+manifest_path = os.path.join(directory, "manifest.json")
+secret_path = os.path.join(directory, "secret")
+
+
+def signature(secret):
+    return hmac.new(
+        secret.encode(), reference.encode() + b"\0" + digest.encode(), hashlib.sha256
+    ).hexdigest()
+
+
+def still_describes_these_bytes():
+    """A retained manifest is reused only while it names this reference and
+    digest under its own secret. Existence proves nothing: a run that pointed
+    AIEC_ROOTFS at different scratch material leaves a manifest behind that
+    describes those bytes, and reusing it makes the control plane hash this
+    run's rootfs against an image it never signed - which fails closed with a
+    digest mismatch that names neither the manifest nor the file."""
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+        with open(secret_path) as handle:
+            secret = handle.read().strip()
+    except (OSError, ValueError):
+        return False
+    return (
+        manifest.get("reference") == reference
+        and manifest.get("rootfs_sha256") == digest
+        and hmac.compare_digest(manifest.get("signature", ""), signature(secret))
+    )
+
+
+def mint():
+    secret = secrets.token_hex(32)
+    manifest = {"reference": reference, "rootfs_sha256": digest, "signature": signature(secret)}
+    fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(manifest, handle)
+    # Owner-only from the first byte: this file is the deployment signing secret
+    # for the lifetime of the run, not something to create readable and
+    # tighten. Written after the manifest it signs, so an interrupted mint
+    # leaves a pair the check above refuses and the next run replaces.
+    fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(secret)
+
+
+if not still_describes_these_bytes():
+    mint()
 PY
-    chmod 600 "$directory"/*
-  fi
   export AIEC_IMAGE_MANIFEST=$directory/manifest.json
   export AIEC_IMAGE_MANIFEST_SECRET=$(cat "$directory/secret")
 }
