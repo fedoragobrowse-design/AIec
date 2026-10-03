@@ -28,6 +28,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,8 +49,15 @@ REAP_INTERVAL_SECONDS = 15
 # suite runs with no watchdog process at all, so it never mints one. The
 # database password is included for the same reason Phase 3 includes it - the
 # report describes a run that connected to that database, and a connection
-# string is exactly the kind of thing a case's evidence would quote.
-SECRETS: list[str] = [API_KEY, WORKER_TOKEN, os.environ.get("AIEC_GUEST_SECRET", "").strip()]
+# string is exactly the kind of thing a case's evidence would quote. So is the
+# image manifest's HMAC secret, which the shared helper mints in the launcher:
+# a report that quoted it would let anyone mint a manifest this control plane
+# trusts.
+SECRETS: list[str] = [value for value in
+                      (API_KEY, WORKER_TOKEN,
+                       os.environ.get("AIEC_GUEST_SECRET", "").strip(),
+                       os.environ.get("AIEC_IMAGE_MANIFEST_SECRET", "").strip())
+                      if value]
 _password = urllib.parse.unquote(DATABASE_URL.split("://", 1)[1].split("@", 1)[0].partition(":")[2])
 if _password:
     SECRETS.append(_password)

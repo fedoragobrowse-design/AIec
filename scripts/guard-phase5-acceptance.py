@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -899,11 +900,23 @@ def publish(report, payload):
     """
     if report["status"] != "PASS":
         return None
+    # Everything this run mints, on the same principle as Phase 3's retained
+    # evidence: the guest secret, the image-signing key, every value in the
+    # guard credentials file, the manifest's HMAC secret (which the shared
+    # helper writes under the run root) and the database password. The last two
+    # are the ones a case's evidence is most likely to quote, since both
+    # describe something the run actually connected to or signed.
     secrets = [os.environ.get("AIEC_GUEST_SECRET", "").strip(),
+               os.environ.get("AIEC_IMAGE_MANIFEST_SECRET", "").strip(),
+               (ROOT / "image-manifest" / "secret").read_text().strip()
+               if (ROOT / "image-manifest" / "secret").exists() else "",
                (ROOT / "image-signing.key").read_text().strip() if (ROOT / "image-signing.key").exists() else ""]
     credentials = ROOT / "guard-credentials.json"
     if credentials.exists():
         secrets.extend(str(value).strip() for value in json.loads(credentials.read_text()).values())
+    _password = urllib.parse.unquote(DATABASE_URL.split("://", 1)[1].split("@", 1)[0].partition(":")[2])
+    if _password:
+        secrets.append(_password)
     if any(secret and secret in payload for secret in secrets):
         return "withheld: the report contains a credential from this run"
     destination = Path(os.environ.get(

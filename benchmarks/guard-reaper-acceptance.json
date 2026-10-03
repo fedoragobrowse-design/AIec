@@ -95,11 +95,11 @@
         "status": 200,
         "budget": {
           "identity": {
-            "sandbox_id": "01a0ff40-a107-7305-a789-3e8030c63f7c",
-            "tenant_id": "e7c6718f-201d-4281-bb18-5af7efbc03d1",
+            "sandbox_id": "01a0ff47-6d96-7482-a8d3-14e5a2d9865a",
+            "tenant_id": "dd541219-e0af-4198-8d3e-698c9d0c6a84",
             "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
           },
-          "expires_at": "2026-10-03T01:08:40.743561Z",
+          "expires_at": "2026-10-03T01:16:06.326723Z",
           "max_model_requests": 1,
           "max_bytes_in": 268435456,
           "max_bytes_out": 67108864,
@@ -134,8 +134,8 @@
         "rules": [
           "durable_budget_exhausted"
         ],
-        "observed_after_seconds": 14.086,
-        "network_cut_at": "2026-10-03T00:53:52.360193569Z",
+        "observed_after_seconds": 12.999,
+        "network_cut_at": "2026-10-03T01:01:16.899476645Z",
         "final_state": "quarantined",
         "author": "control-plane durable reaper; no watchdog and no quarantine caller in this run"
       }
@@ -144,7 +144,7 @@
       "case": "reaper-quarantine-cuts-egress",
       "status": "PASS",
       "evidence": {
-        "network_cut_at": "2026-10-03T00:53:52.360193569Z"
+        "network_cut_at": "2026-10-03T01:01:16.899476645Z"
       }
     },
     {
@@ -168,8 +168,8 @@
       "evidence": {
         "status": 200,
         "same_incident": true,
-        "completed_at": "2026-10-03T00:53:56.577736839Z",
-        "previous_completed_at": "2026-10-03T00:53:56.577736839Z"
+        "completed_at": "2026-10-03T01:01:20.998419659Z",
+        "previous_completed_at": "2026-10-03T01:01:20.998419659Z"
       }
     },
     {
@@ -185,9 +185,9 @@
       "case": "durable-budget-expiry-equals-the-sandbox-lifetime",
       "status": "PASS",
       "evidence": {
-        "expires_at": "2026-10-03T00:55:12.595654Z",
+        "expires_at": "2026-10-03T01:02:37.023610Z",
         "timeout_seconds": 45,
-        "created_at": "2026-10-03T00:54:27.595654Z"
+        "created_at": "2026-10-03T01:01:52.023610Z"
       }
     },
     {
@@ -197,7 +197,7 @@
         "rules": [
           "sandbox_lifetime_expired"
         ],
-        "observed_after_seconds": 57.188,
+        "observed_after_seconds": 58.249,
         "states_observed": [
           "quarantined",
           "running"
@@ -212,11 +212,11 @@
       "evidence": {
         "remaining": [
           {
-            "id": "01a0ff41-580b-7059-abf2-f902c76430b5",
+            "id": "01a0ff48-2017-70db-8ab9-a3282ff39f89",
             "state": "quarantined"
           },
           {
-            "id": "01a0ff40-a107-7305-a789-3e8030c63f7c",
+            "id": "01a0ff47-6d96-7482-a8d3-14e5a2d9865a",
             "state": "quarantined"
           }
         ]
@@ -227,6 +227,6 @@
   "cleanup_errors": [],
   "reap_interval_seconds": 15,
   "observation_provenance": "control-plane durable reaper; no watchdog process and no caller of POST /guard/quarantine exists in this run",
-  "elapsed_seconds": 110.931,
-  "finished_at": "2026-10-03T00:55:28.123494+00:00"
+  "elapsed_seconds": 111.283,
+  "finished_at": "2026-10-03T01:02:53.027351+00:00"
 }
