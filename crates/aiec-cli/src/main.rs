@@ -1174,20 +1174,49 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     let liveness_metadata = registration_metadata;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Carried across beats because a failed probe does not tell the worker
+        // how many sandboxes it holds, and guessing zero would have the control
+        // plane believe a machine is unassigned.
+        let mut last_reported_sandbox_count: Option<u32> = None;
         loop {
             interval.tick().await;
-            let Ok(status) = liveness_client
-                .get(&liveness_health_url)
-                .bearer_auth(&liveness_token)
-                .send()
-                .await
-            else {
-                continue;
+            // The control plane declares a node dead once its heartbeat is
+            // older than `NODE_HEARTBEAT_TTL_SECONDS`, and the only cure is a
+            // heartbeat. So a worker that could not answer its own `/health`
+            // probe still has to beat: skipping the beat on a failed probe is
+            // what made a running worker get reaped for a fault in the probe.
+            // The probe's failure is reported as `healthy: false` with the
+            // reason in `last_error`, which is exactly what those two fields
+            // are for. What a worker cannot know is its own sandbox count, so
+            // the last one it reported is carried rather than invented.
+            let probe = async {
+                let status = liveness_client
+                    .get(&liveness_health_url)
+                    .bearer_auth(&liveness_token)
+                    .send()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let status = status
+                    .error_for_status()
+                    .map_err(|error| error.to_string())?;
+                status
+                    .json::<WorkerStatus>()
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let (active, healthy, probe_error) = match probe {
+                Ok(status) => (status.sandbox_count as u32, status.healthy, None),
+                Err(error) => {
+                    tracing::warn!(%error, "worker health probe failed");
+                    (
+                        last_reported_sandbox_count.unwrap_or(0),
+                        false,
+                        Some(format!("health probe failed: {error}")),
+                    )
+                }
             };
-            let Ok(status) = status.json::<WorkerStatus>().await else {
-                continue;
-            };
-            let active = status.sandbox_count as u32;
+            last_reported_sandbox_count = Some(active);
             // Measured again on every beat, because the answer that mattered
             // when this worker registered is the answer now: a host that filled
             // up in the last five seconds has to be able to say so, and one
@@ -1219,10 +1248,10 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
                 // What an unmeasured or full host does is decline *new* work,
                 // through the pressure in this metadata and the claim gate
                 // below. The sandboxes already running are untouched.
-                healthy: status.healthy,
+                healthy,
                 version: liveness_version.fetch_add(1, Ordering::Relaxed) + 1,
                 metadata,
-                last_error: None,
+                last_error: probe_error,
             };
             if let Err(error) = liveness_client
                 .post(format!(
@@ -1713,7 +1742,6 @@ fn key_command(command: KeyCommand) -> Result<()> {
     Ok(())
 }
 async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand) -> Result<()> {
-    let raw_key = key.clone().or_else(|| std::env::var("AIEC_API_KEY").ok());
     let c = client(url, key).await?;
     match command {
         SandboxCommand::Create {
@@ -1744,19 +1772,11 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
                 environment: Default::default(),
             };
             let sandbox = if matches!(runtime.as_str(), "firecracker" | "docker") {
-                let api_key = raw_key.context("set --api-key or AIEC_API_KEY")?;
-                let mut payload = serde_json::to_value(&request)?;
-                payload["runtime"] = serde_json::json!(runtime);
-                let response = reqwest::Client::new()
-                    .post(format!("{}/v1/sandboxes", url.trim_end_matches('/')))
-                    .bearer_auth(api_key)
-                    .json(&payload)
-                    .send()
-                    .await?;
-                if !response.status().is_success() {
-                    anyhow::bail!("sandbox creation rejected: {}", response.text().await?);
-                }
-                response.json::<Sandbox>().await?
+                // Through `c`, which carries `AIEC_TLS_CA_CERT` and the request
+                // timeout. A bare `reqwest::Client::new()` here reached a
+                // deployment with a private certificate authority through no
+                // trust anchor at all, and waited forever when it did not.
+                c.create_sandbox_with_runtime(&request, &runtime).await?
             } else {
                 c.create_sandbox(&request).await?
             };

@@ -425,6 +425,41 @@ impl AppState {
             .await
     }
 
+    /// Commits a state transition that follows a worker-owned operation, fenced
+    /// by the lease that operation ran under.
+    ///
+    /// `commit_state` cannot be used on a recovery path. It looks up who owns
+    /// the sandbox *now* and fences against that, which is right for a worker
+    /// asking "may I still write?" and wrong for a recovery pass asking "may I
+    /// still write?" — both ask the same question of the store, but a recovery
+    /// pass already knows its own lease, and re-reading is a way of asking a
+    /// lease that is no longer its own. Between reading the reassignment and
+    /// committing, the sandbox can be reassigned again; the store would then
+    /// happily fence the stale pass against the *new* lease and the write
+    /// would succeed on a sandbox this caller no longer owns.
+    async fn commit_state_as(
+        &self,
+        sandbox: &Sandbox,
+        expected: SandboxState,
+        next: SandboxState,
+        lease_id: LeaseId,
+        generation: i64,
+    ) -> Result<Sandbox, CoreError> {
+        self.repository()
+            .update_state_with_lease(
+                sandbox.tenant_id,
+                sandbox.id,
+                expected,
+                next,
+                lease_id,
+                generation,
+            )
+            .await?;
+        self.repository()
+            .get_sandbox(sandbox.tenant_id, sandbox.id)
+            .await
+    }
+
     async fn secret_values(
         &self,
         tenant_id: TenantId,
@@ -1305,7 +1340,13 @@ async fn place_recovered_sandbox(
         return abandon_recovery(state, &sandbox, expected, generation, lease_id, error).await;
     }
     if let Err(error) = state
-        .commit_state(&sandbox, expected, SandboxState::Starting)
+        .commit_state_as(
+            &sandbox,
+            expected,
+            SandboxState::Starting,
+            lease_id,
+            generation,
+        )
         .await
     {
         return abandon_recovery(state, &sandbox, expected, generation, lease_id, error).await;
@@ -1319,7 +1360,13 @@ async fn place_recovered_sandbox(
         return abandon_recovery(state, &sandbox, expected, generation, lease_id, error).await;
     }
     match state
-        .commit_state(&sandbox, expected, SandboxState::Running)
+        .commit_state_as(
+            &sandbox,
+            expected,
+            SandboxState::Running,
+            lease_id,
+            generation,
+        )
         .await
     {
         Ok(_) => RecoveryOutcome {
@@ -1426,7 +1473,13 @@ async fn abandon_recovery(
         "recovered sandbox could not be placed"
     );
     if let Err(failure) = state
-        .commit_state(sandbox, expected, SandboxState::Failed)
+        .commit_state_as(
+            sandbox,
+            expected,
+            SandboxState::Failed,
+            lease_id,
+            generation,
+        )
         .await
     {
         tracing::warn!(
@@ -1435,16 +1488,27 @@ async fn abandon_recovery(
             "recovered sandbox could not be marked failed"
         );
     }
+    // Fenced, and named. `Scheduler::release` takes only a tenant and a
+    // sandbox, so the store picks whichever lease is newest — which for a
+    // pass that has already been superseded is somebody else's lease, and
+    // releasing it credits back capacity the new owner is still using while
+    // its sandbox is still live.
     if let Err(failure) = state
-        .scheduler()
-        .release(sandbox.tenant_id, sandbox.id)
+        .repository()
+        .release_worker_lease(
+            sandbox.tenant_id,
+            lease_id,
+            generation,
+            "recovery abandoned the placement",
+        )
         .await
     {
         tracing::warn!(
             sandbox_id = %sandbox.id,
+            %lease_id,
             %generation,
             %failure,
-            "replacement lease could not be released"
+            "the recovery lease could not be released"
         );
     }
     RecoveryOutcome {
@@ -6045,6 +6109,174 @@ mod tests {
 
         assert!(restore_workspace(&fixture.state, &sandbox).await.is_err());
         assert!(fixture.runtime.imported.lock().await.is_empty());
+    }
+
+    /// Scheduler double that records what it was asked to release.
+    ///
+    /// `Scheduler::release` takes only a tenant and a sandbox, so a caller that
+    /// has lost its lease cannot say which lease it meant: the store picks the
+    /// newest active one. That is what makes the recovery path's release
+    /// unbounded, and this records the observable consequence rather than
+    /// asserting on the argument list.
+    #[derive(Default, Clone)]
+    struct ReleaseRecordingScheduler {
+        released: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl aiec_core::scheduler::Scheduler for ReleaseRecordingScheduler {
+        async fn schedule(
+            &self,
+            request: aiec_core::scheduler::ScheduleRequest,
+        ) -> Result<aiec_core::scheduler::ScheduledSandbox, CoreError> {
+            Ok(aiec_core::scheduler::ScheduledSandbox {
+                sandbox: request.sandbox,
+                worker_id: TenantId::nil(),
+                worker_endpoint: String::new(),
+                lease_id: SandboxId::nil(),
+                lease_generation: 0,
+            })
+        }
+
+        async fn dispatch_target(
+            &self,
+            _: TenantId,
+            _: SandboxId,
+        ) -> Result<aiec_core::scheduler::WorkerDispatch, CoreError> {
+            Err(CoreError::Unsupported("no dispatch".into()))
+        }
+
+        async fn release(&self, _: TenantId, sandbox_id: SandboxId) -> Result<(), CoreError> {
+            self.released
+                .lock()
+                .map(|mut log| log.push(sandbox_id))
+                .map_err(|_| CoreError::Backend("release log poisoned".into()))
+        }
+    }
+
+    /// A recovery pass that has been superseded must not write state or
+    /// release a lease.
+    ///
+    /// Recovery is given a `Reassignment` — one lease, one generation. It then
+    /// placed the sandbox through `commit_state`, which looks up *whoever owns
+    /// the sandbox now* and fences against that. So if the sandbox is
+    /// reassigned again while the runtime is starting, the superseded pass
+    /// writes `Running` under the new owner's lease and marks it failed under
+    /// the new owner's lease too, and releases through `Scheduler::release`,
+    /// which cannot name a lease and therefore releases whichever one is
+    /// newest. Every one of those is an operation performed by a caller that no
+    /// longer holds the sandbox.
+    #[tokio::test]
+    async fn a_superseded_recovery_pass_neither_writes_state_nor_releases_a_lease() {
+        let root = std::env::temp_dir().join(format!("af-recovery-fence-{}", new_id()));
+        let repository = LeasedRepository::new();
+        let store: Arc<dyn ArtifactStore> =
+            Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
+        let runtime = Arc::new(AdoptingRuntime {
+            imported: TestMutex::new(Vec::new()),
+            destroyed: TestMutex::new(Vec::new()),
+        });
+        let scheduler = ReleaseRecordingScheduler::default();
+        let platform = Platform::builder()
+            .runtime(runtime.clone())
+            .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                RuntimeKind::Docker,
+                runtime.clone(),
+            )))
+            .metadata_store(repository.clone())
+            .scheduler(Arc::new(scheduler.clone()))
+            .artifact_store(store)
+            .snapshots(Arc::new(FixedSnapshotProvider {
+                archive: b"{\"version\":1,\"entries\":[]}".to_vec(),
+            }))
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        let state = AppState::development(platform);
+
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: new_id(),
+            node_id: Some(new_id()),
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Starting,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        repository
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+
+        // The lease this recovery pass was handed...
+        let mine = WorkerLease {
+            id: new_id(),
+            tenant_id: sandbox.tenant_id,
+            sandbox_id: sandbox.id,
+            node_id: sandbox.node_id.expect("node"),
+            generation: 1,
+            status: "active".into(),
+            expires_at: now + chrono::Duration::seconds(60),
+            created_at: now,
+            updated_at: now,
+            reason: Some("recovery".into()),
+        };
+        // ...and the lease that replaced it while the runtime was starting.
+        let theirs = WorkerLease {
+            id: new_id(),
+            generation: 2,
+            ..mine.clone()
+        };
+        repository.insert(mine.clone()).await;
+        repository.insert(theirs.clone()).await;
+        repository.leases.lock().await.insert(mine.id, {
+            let mut superseded = mine.clone();
+            superseded.status = "expired".into();
+            superseded
+        });
+
+        let outcome = place_recovered_sandbox(
+            &state,
+            aiec_core::storage::Reassignment {
+                sandbox: sandbox.clone(),
+                lease: mine.clone(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.status, "failed",
+            "a superseded recovery pass reported success"
+        );
+        assert_eq!(
+            state
+                .repository()
+                .get_sandbox(sandbox.tenant_id, sandbox.id)
+                .await
+                .expect("read back")
+                .state,
+            SandboxState::Starting,
+            "a superseded recovery pass wrote state on the new owner's lease"
+        );
+        assert!(
+            scheduler
+                .released
+                .lock()
+                .map(|log| log.is_empty())
+                .unwrap_or(false),
+            "a superseded recovery pass released a lease through the scheduler, \
+             which cannot name the lease it meant"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A sandbox that was never captured has nothing to restore, which is a

@@ -81,6 +81,14 @@ fn into_core(error: RuntimeError) -> CoreError {
 /// grow a map keyed by a request-supplied id.
 pub const MAX_CONCURRENT_LIFECYCLES: usize = 4_096;
 
+/// Largest Firecracker API response header this runtime will read, in bytes.
+const HEADER_LIMIT: usize = 64 * 1024;
+
+/// Largest Firecracker API response body this runtime will allocate for, in
+/// bytes. Bounded because the size comes off the wire: a `Content-Length` read
+/// straight from a response header sized a `Vec` before a byte was read.
+const BODY_LIMIT: usize = 8 * 1024 * 1024;
+
 /// One sandbox's lifecycle operations, taken one at a time.
 ///
 /// A sandbox's create, start, stop, restore and destroy all answer the same
@@ -414,6 +422,62 @@ impl BubblewrapRuntime {
             .to_owned();
         Ok(self.base(sandbox).join("workspace").join(relative))
     }
+
+    /// Resolves a request path against the workspace, refusing anything that
+    /// leaves it through a symlink.
+    ///
+    /// [`Self::path_for`] normalizes the request string, which is what stops
+    /// `..` in the request itself. It cannot see a symlink the guest planted in
+    /// its own workspace, because the host performs the file operation on the
+    /// joined path and every one of those follows links. A guest that ran
+    /// `ln -s /etc /workspace/etc` then had `put_file("/workspace/etc/passwd")`
+    /// write the host's `/etc/passwd`, and `get_file` read back host files the
+    /// request never named.
+    ///
+    /// So the check is on the resolved path, not the requested one: every
+    /// component from the workspace down is walked, and a component that is a
+    /// symlink pointing outside the workspace is refused. A symlink pointing
+    /// *within* the workspace is allowed, because that is a thing a guest
+    /// legitimately does with its own files.
+    async fn resolve_in_workspace(
+        &self,
+        sandbox: &Sandbox,
+        raw: &str,
+    ) -> Result<PathBuf, RuntimeError> {
+        let workspace = self.base(sandbox).join("workspace");
+        let target = self.path_for(sandbox, raw)?;
+        let Ok(relative) = target.strip_prefix(&workspace) else {
+            return Err(CoreError::Forbidden("outside workspace".into()).into());
+        };
+        let mut walked = workspace.clone();
+        for component in relative.components() {
+            let name = component.as_os_str();
+            let next = walked.join(name);
+            // `symlink_metadata` does not follow the link, so this reports the
+            // link itself rather than whatever it points at.
+            if let Ok(metadata) = tokio::fs::symlink_metadata(&next).await
+                && metadata.file_type().is_symlink()
+            {
+                let resolved = tokio::fs::canonicalize(&next).await.map_err(|error| {
+                    std::io::Error::other(format!("{error} resolving a workspace symlink"))
+                })?;
+                // Compared after canonicalization on both sides, so a link out
+                // to somewhere else entirely is caught by the prefix check and a link
+                // within the workspace is not.
+                let canonical_workspace = tokio::fs::canonicalize(&workspace)
+                    .await
+                    .unwrap_or_else(|_| workspace.clone());
+                if !resolved.starts_with(&canonical_workspace) {
+                    return Err(CoreError::Forbidden(
+                        "path leaves the workspace through a symlink".into(),
+                    )
+                    .into());
+                }
+            }
+            walked = next;
+        }
+        Ok(target)
+    }
     fn base(&self, sandbox: &Sandbox) -> PathBuf {
         self.root.join(sandbox.id.to_string())
     }
@@ -573,7 +637,7 @@ impl BubblewrapRuntime {
     }
     async fn put_file(&self, s: &Sandbox, r: PutFileRequest) -> Result<(), RuntimeError> {
         use base64::Engine;
-        let path = self.path_for(s, &r.path)?;
+        let path = self.resolve_in_workspace(s, &r.path).await?;
         if let Ok(meta) = tokio::fs::metadata(&path).await
             && meta.is_dir()
         {
@@ -601,7 +665,7 @@ impl BubblewrapRuntime {
     }
     async fn get_file(&self, s: &Sandbox, path: &str) -> Result<FileContent, RuntimeError> {
         use base64::Engine;
-        let p = self.path_for(s, path)?;
+        let p = self.resolve_in_workspace(s, path).await?;
         let meta = tokio::fs::metadata(&p).await?;
         if meta.len() > MAX_FILE as u64 {
             return Err(CoreError::LimitExceeded("file".into()).into());
@@ -613,7 +677,7 @@ impl BubblewrapRuntime {
         })
     }
     async fn list_files(&self, s: &Sandbox, path: &str) -> Result<Vec<FileEntry>, RuntimeError> {
-        let p = self.path_for(s, path)?;
+        let p = self.resolve_in_workspace(s, path).await?;
         let mut rd = tokio::fs::read_dir(p).await?;
         let mut out = vec![];
         while let Some(v) = rd.next_entry().await? {
@@ -636,7 +700,7 @@ impl BubblewrapRuntime {
         Ok(out)
     }
     async fn delete_file(&self, s: &Sandbox, path: &str) -> Result<(), RuntimeError> {
-        let p = self.path_for(s, path)?;
+        let p = self.resolve_in_workspace(s, path).await?;
         match tokio::fs::remove_file(p).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -644,7 +708,7 @@ impl BubblewrapRuntime {
         }
     }
     async fn make_directory(&self, s: &Sandbox, path: &str) -> Result<(), RuntimeError> {
-        tokio::fs::create_dir_all(self.path_for(s, path)?).await?;
+        tokio::fs::create_dir_all(self.resolve_in_workspace(s, path).await?).await?;
         Ok(())
     }
     pub async fn snapshot(&self, s: &Sandbox, key: &str) -> Result<u64, RuntimeError> {
@@ -2184,62 +2248,84 @@ impl FirecrackerRuntime {
                 }
             }
         };
-        // Every I/O failure on this exchange names the request that produced
-        // it. A bare `io: early eof` - which is what a server that closes
-        // mid-response looks like - says nothing about which of the six
-        // configuration calls it came from, and nothing in the process that
-        // receives it can recover the request afterwards.
-        let fail = |error: std::io::Error| {
-            RuntimeError::FirecrackerApi(format!("{method} {path}: {error}"))
+        // The deadline covers the whole exchange, not just the connect. It used
+        // to stop at a connected socket, so a Firecracker API that accepted the
+        // connection and then stopped responding blocked here forever - and
+        // this is called from paths that hold the sandbox's lifecycle gate, so
+        // one wedged VM froze every operation on it, including destroy.
+        let exchange = async {
+            // Every I/O failure on this exchange names the request that
+            // produced it. A bare `io: early eof` - which is what a server
+            // that closes mid-response looks like - says nothing about which of
+            // the six configuration calls it came from, and nothing in the
+            // process that receives it can recover the request afterwards.
+            let fail = |error: std::io::Error| {
+                RuntimeError::FirecrackerApi(format!("{method} {path}: {error}"))
+            };
+            let body = body.map(|value| serde_json::to_vec(&value)).transpose()?;
+            let body = body.unwrap_or_default();
+            let request = format!(
+                "{method} http://localhost{path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.map_err(fail)?;
+            stream.write_all(&body).await.map_err(fail)?;
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            while !header.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).await.map_err(fail)? == 0 {
+                    return Err(RuntimeError::FirecrackerApi(
+                        "API closed before response headers".into(),
+                    ));
+                }
+                header.push(byte[0]);
+                if header.len() > HEADER_LIMIT {
+                    return Err(RuntimeError::FirecrackerApi(
+                        "API response headers too large".into(),
+                    ));
+                }
+            }
+            let header_text = String::from_utf8_lossy(&header);
+            let status = header_text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .ok_or_else(|| RuntimeError::FirecrackerApi("malformed API response".into()))?;
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            // Checked against a bound before it is allocated. A
+            // `Content-Length` read straight off the wire sized a `Vec`, so a
+            // response that claimed a large body reserved it before a byte had
+            // been read.
+            if content_length > BODY_LIMIT {
+                return Err(RuntimeError::FirecrackerApi(format!(
+                    "API response body of {content_length} bytes exceeds the {BODY_LIMIT} byte limit"
+                )));
+            }
+            let mut response_body = vec![0; content_length];
+            stream.read_exact(&mut response_body).await.map_err(fail)?;
+            if !(200..300).contains(&status) {
+                return Err(RuntimeError::FirecrackerApi(format!(
+                    "{method} {path} returned {status}: {}",
+                    String::from_utf8_lossy(&response_body)
+                )));
+            }
+            Ok(response_body)
         };
-        let body = body.map(|value| serde_json::to_vec(&value)).transpose()?;
-        let body = body.unwrap_or_default();
-        let request = format!(
-            "{method} http://localhost{path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).await.map_err(fail)?;
-        stream.write_all(&body).await.map_err(fail)?;
-        let mut header = Vec::new();
-        let mut byte = [0u8; 1];
-        while !header.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).await.map_err(fail)? == 0 {
-                return Err(RuntimeError::FirecrackerApi(
-                    "API closed before response headers".into(),
-                ));
-            }
-            header.push(byte[0]);
-            if header.len() > 64 * 1024 {
-                return Err(RuntimeError::FirecrackerApi(
-                    "API response headers too large".into(),
-                ));
-            }
+        match tokio::time::timeout_at(deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::FirecrackerApi(format!(
+                "{method} {path} did not complete within 5s"
+            ))),
         }
-        let header_text = String::from_utf8_lossy(&header);
-        let status = header_text
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .ok_or_else(|| RuntimeError::FirecrackerApi("malformed API response".into()))?;
-        let content_length = header_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        let mut response_body = vec![0; content_length];
-        stream.read_exact(&mut response_body).await.map_err(fail)?;
-        if !(200..300).contains(&status) {
-            return Err(RuntimeError::FirecrackerApi(format!(
-                "{method} {path} returned {status}: {}",
-                String::from_utf8_lossy(&response_body)
-            )));
-        }
-        Ok(response_body)
     }
 
     /// The state Firecracker reports for this VM, in its own API's words.
@@ -3879,33 +3965,55 @@ impl FirecrackerRuntime {
         }
         let snapshot_result: Result<u64, RuntimeError> = async {
             let destination = self.config.snapshot_dir(key);
-            tokio::fs::create_dir_all(&destination).await?;
-            let state = destination.join("vmstate");
-            let memory = destination.join("memory");
-            self.api(
-                &socket,
-                "PUT",
-                "/snapshot/create",
-                Some(serde_json::json!({"snapshot_type":"Full", "snapshot_path":&state, "mem_file_path":&memory, "sync_snapshot_files":true})),
-            )
-            .await?;
-            let snapshot_disk = destination.join("rootfs.ext4");
-            tokio::fs::copy(&source_disk, &snapshot_disk).await?;
-            let rootfs_sha256 = disk_sha256(&snapshot_disk).await?;
-            let manifest = serde_json::json!({
-                "schema": 1,
-                "source_disk": source_disk,
-                "rootfs_sha256": rootfs_sha256,
-            });
-            tokio::fs::write(
-                destination.join("manifest.json"),
-                serde_json::to_vec(&manifest)?,
-            )
-            .await?;
-            let mut size = 0;
-            for file in [state, memory, snapshot_disk] {
-                size += tokio::fs::metadata(file).await?.len();
+            // Staged, then published. Writing into the destination directly
+            // meant two things at once: a failure partway left a directory of
+            // half a snapshot with nothing to say it was half a snapshot, and a
+            // re-capture overwrote `rootfs.ext4` under the previous
+            // `manifest.json`. That pair is the worst of both: the manifest
+            // checksum describes a disk that no longer exists, so a restore
+            // loads a memory state against a disk it does not belong to. The
+            // staging name is unique per attempt, so a concurrent capture
+            // cannot share it, and it is removed on every exit below.
+            let staging = destination.with_extension(format!("staging-{}", Uuid::now_v7()));
+            let staged = async {
+                tokio::fs::create_dir_all(&staging).await?;
+                let state = staging.join("vmstate");
+                let memory = staging.join("memory");
+                self.api(
+                    &socket,
+                    "PUT",
+                    "/snapshot/create",
+                    Some(serde_json::json!({"snapshot_type":"Full", "snapshot_path":&state, "mem_file_path":&memory, "sync_snapshot_files":true})),
+                )
+                .await?;
+                let snapshot_disk = staging.join("rootfs.ext4");
+                tokio::fs::copy(&source_disk, &snapshot_disk).await?;
+                let rootfs_sha256 = disk_sha256(&snapshot_disk).await?;
+                let manifest = serde_json::json!({
+                    "schema": 1,
+                    "source_disk": source_disk,
+                    "rootfs_sha256": rootfs_sha256,
+                });
+                tokio::fs::write(
+                    staging.join("manifest.json"),
+                    serde_json::to_vec(&manifest)?,
+                )
+                .await?;
+                let mut size = 0;
+                for file in [state, memory, snapshot_disk] {
+                    size += tokio::fs::metadata(file).await?.len();
+                }
+                Ok(size)
             }
+            .await;
+            let size = match staged {
+                Ok(size) => size,
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                    return Err(error);
+                }
+            };
+            Self::publish_snapshot(&staging, &destination).await?;
             Ok(size)
         }
         .await;
@@ -3981,6 +4089,37 @@ impl FirecrackerRuntime {
             }
         }
         self.publish_vm(sandbox, vm).await;
+        Ok(())
+    }
+
+    /// Moves a fully-written staging directory onto a snapshot key.
+    ///
+    /// Separate from the capture itself so the property it provides can be stated
+    /// directly: the key goes from one complete snapshot to the next, and never
+    /// through a state where it is neither. The previous snapshot is moved aside
+    /// first and only unlinked once the new one is in place, so a failure here
+    /// leaves the key with what it already had.
+    ///
+    /// The staging directory is removed on every failure path, so a capture that
+    /// did not complete leaves nothing behind that a later restore could read.
+    async fn publish_snapshot(staging: &Path, destination: &Path) -> Result<(), RuntimeError> {
+        let superseded = destination.with_extension(format!("superseded-{}", Uuid::now_v7()));
+        if tokio::fs::try_exists(destination).await.unwrap_or(false)
+            && tokio::fs::rename(destination, &superseded).await.is_err()
+        {
+            let _ = tokio::fs::remove_dir_all(staging).await;
+            return Err(RuntimeError::Unavailable(
+                "the previous snapshot for this key could not be moved aside".into(),
+            ));
+        }
+        if let Err(error) = tokio::fs::rename(staging, destination).await {
+            // Put the previous snapshot back before reporting the failure, so the
+            // key is left with what it had rather than nothing.
+            let _ = tokio::fs::rename(&superseded, destination).await;
+            let _ = tokio::fs::remove_dir_all(staging).await;
+            return Err(error.into());
+        }
+        let _ = tokio::fs::remove_dir_all(&superseded).await;
         Ok(())
     }
 
@@ -4852,6 +4991,270 @@ mod tests {
         assert!(!runtime.vms.lock().await.contains_key(&plain.id));
         assert!(!process_running(pid));
         let _ = tokio::fs::remove_dir_all(&runtime.config.state_dir).await;
+    }
+
+    /// The four files a complete snapshot has, so a test can tell one from a
+    /// half-written one.
+    fn write_complete_snapshot(dir: &Path, disk: &[u8]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("vmstate"), b"state").unwrap();
+        std::fs::write(dir.join("memory"), b"mem").unwrap();
+        std::fs::write(dir.join("rootfs.ext4"), disk).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(
+                r#"{{"schema":1,"source_disk":"/vms/x/rootfs.ext4","rootfs_sha256":"{}"}}"#,
+                hex::encode(Sha256::digest(disk))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn snapshot_manifest_digest(dir: &Path) -> Option<String> {
+        let manifest = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+        Some(value["rootfs_sha256"].as_str()?.to_string())
+    }
+
+    /// A snapshot key moves from one complete snapshot to the next, and a
+    /// recapture never leaves the previous manifest describing a disk that has
+    /// been overwritten underneath it.
+    ///
+    /// `snapshot` used to write into the destination directory itself. A
+    /// capture that failed partway left half a snapshot there with nothing to
+    /// mark it as half, and a recapture overwrote `rootfs.ext4` while the old
+    /// `manifest.json` stayed put. The restore path checks that manifest
+    /// against the disk, so the second case is a refused restore rather than a
+    /// wrong boot - but the key is broken, and the one good snapshot was
+    /// destroyed to break it.
+    #[tokio::test]
+    async fn a_snapshot_key_is_never_left_holding_a_half_written_capture() {
+        let root = std::env::temp_dir().join(format!("af-publish-{}", Uuid::now_v7()));
+        let destination = root.join("snapshots").join("key");
+        write_complete_snapshot(&destination, b"first disk");
+        let first = snapshot_manifest_digest(&destination).expect("manifest");
+
+        let staging = destination.with_extension(format!("staging-{}", Uuid::now_v7()));
+        write_complete_snapshot(&staging, b"second disk, longer than the first");
+        FirecrackerRuntime::publish_snapshot(&staging, &destination)
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            std::fs::read(destination.join("rootfs.ext4")).unwrap(),
+            b"second disk, longer than the first",
+            "the key must resolve to the new snapshot's disk"
+        );
+        assert_eq!(
+            snapshot_manifest_digest(&destination).unwrap(),
+            hex::encode(Sha256::digest(b"second disk, longer than the first")),
+            "the manifest must describe the disk that is actually there"
+        );
+        assert_ne!(snapshot_manifest_digest(&destination).unwrap(), first);
+        let entries: Vec<String> = std::fs::read_dir(root.join("snapshots"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["key".to_string()],
+            "publishing left a staging or superseded directory behind: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A symlink the guest planted in its own workspace must not become a way
+    /// out of it.
+    ///
+    /// The request path is normalized lexically, which stops `..` in the request
+    /// and nothing else. The guest, however, can run a command that creates
+    /// links inside its own workspace, and every host-side file operation then
+    /// follows them: `put_file("/workspace/escape")` wrote through a planted
+    /// link to a file outside the sandbox, and `get_file` read one back. The
+    /// request names nothing but `/workspace/escape`.
+    ///
+    /// A link pointing *within* the workspace is a guest arranging its own
+    /// files and is still allowed; only one that leaves is refused.
+    #[tokio::test]
+    async fn a_symlink_planted_in_the_workspace_cannot_be_used_to_leave_it() {
+        let root = std::env::temp_dir().join(format!("af-symlink-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+
+        let outside = root.join("host-secret.txt");
+        std::fs::write(&outside, b"do not read me").unwrap();
+        let workspace = root.join(target.id.to_string()).join("workspace");
+        // What `exec` lets the guest do to its own directory.
+        std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+
+        let write = runtime
+            .put_file(
+                &target,
+                PutFileRequest {
+                    path: "/workspace/escape".into(),
+                    content_base64: "b3ZlcndyaXR0ZW4=".into(),
+                    mode: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(&write, Err(RuntimeError::Core(CoreError::Forbidden(message))) if message.contains("symlink")),
+            "a write through a link out of the workspace was allowed: {write:?}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"do not read me",
+            "the file outside the workspace was modified"
+        );
+
+        let read = runtime.get_file(&target, "/workspace/escape").await;
+        assert!(
+            read.is_err(),
+            "a read through a link out of the workspace was allowed: {read:?}"
+        );
+        assert!(
+            runtime
+                .list_files(&target, "/workspace/escape")
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .delete_file(&target, "/workspace/escape")
+                .await
+                .is_err()
+        );
+        assert!(
+            outside.exists(),
+            "a link out of the workspace was followed to delete"
+        );
+
+        // A link inside the workspace is still a thing a guest may do.
+        std::fs::write(workspace.join("real.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink(workspace.join("real.txt"), workspace.join("alias")).unwrap();
+        let inside = runtime.get_file(&target, "/workspace/alias").await;
+        assert_eq!(
+            inside
+                .expect("a link within the workspace is the guest's own business")
+                .content_base64,
+            "Y29udGVudA=="
+        );
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A publish that cannot complete leaves the key with the snapshot it
+    /// already had, and leaves nothing of its own behind.
+    #[tokio::test]
+    async fn a_publish_that_cannot_complete_leaves_the_previous_snapshot_readable() {
+        let root = std::env::temp_dir().join(format!("af-publish-{}", Uuid::now_v7()));
+        let destination = root.join("snapshots").join("key");
+        write_complete_snapshot(&destination, b"first disk");
+        let before = snapshot_manifest_digest(&destination).unwrap();
+
+        // No staging directory was ever written, so the final rename cannot
+        // succeed. This is what a capture that lost its staging directory to a
+        // cleanup looks like at publish time.
+        let staging = destination.with_extension(format!("staging-{}", Uuid::now_v7()));
+        let outcome = FirecrackerRuntime::publish_snapshot(&staging, &destination).await;
+
+        assert!(outcome.is_err(), "publishing nothing must not succeed");
+        assert_eq!(
+            snapshot_manifest_digest(&destination).unwrap(),
+            before,
+            "a failed publish must leave the previous snapshot readable"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("rootfs.ext4")).unwrap(),
+            b"first disk"
+        );
+        let entries: Vec<String> = std::fs::read_dir(root.join("snapshots"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["key".to_string()], "{entries:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An API socket that accepts the connection and then never answers must
+    /// not hold the caller.
+    ///
+    /// The five-second deadline covered the connect loop only. Everything after
+    /// it - writing the request, reading headers, reading the body - was
+    /// unbounded, and every caller of this runs while holding the sandbox's
+    /// lifecycle gate. One Firecracker that accepted the connection and stopped
+    /// responding froze that sandbox entirely, including its destroy.
+    #[tokio::test]
+    async fn a_firecracker_api_that_stops_responding_is_given_up_on() {
+        let mut config = config();
+        config.readiness_timeout = Duration::from_millis(50);
+        let id = Uuid::now_v7();
+        let socket = config.api_socket(id);
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut stream, &mut sink).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let runtime = FirecrackerRuntime::new(config);
+
+        let started = Instant::now();
+        let result = runtime.api_response(&socket, "GET", "/", None).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "a stalled API must not report success");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "the exchange took {elapsed:?}; the deadline does not cover the I/O"
+        );
+        server.abort();
+        let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
+    }
+
+    /// A `Content-Length` read off the wire sizes a `Vec`, so a response
+    /// claiming a large body reserved that memory before a byte of it arrived.
+    #[tokio::test]
+    async fn a_response_body_larger_than_the_limit_is_refused_before_it_is_allocated() {
+        let config = config();
+        let id = Uuid::now_v7();
+        let socket = config.api_socket(id);
+        tokio::fs::create_dir_all(socket.parent().unwrap())
+            .await
+            .unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Headers only, claiming a body that never arrives. The client must
+            // refuse on the declared length rather than wait for bytes that are
+            // not coming.
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        u64::from(u32::MAX)
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .ok();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let runtime = FirecrackerRuntime::new(config);
+
+        let result = runtime.api_response(&socket, "GET", "/", None).await;
+
+        let error = result.expect_err("an oversized body must be refused");
+        assert!(
+            error.to_string().contains("exceeds"),
+            "unexpected error: {error}"
+        );
+        server.abort();
+        let _ = tokio::fs::remove_dir_all(runtime.config.state_dir).await;
     }
 
     #[tokio::test]

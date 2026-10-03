@@ -5,8 +5,10 @@ use aiec_core::{
     network::{NetworkAttachment, NetworkBackend, NetworkCapabilities, NetworkPolicy},
 };
 use async_trait::async_trait;
-use std::process::Stdio;
+use std::{collections::HashSet, process::Stdio};
 use tokio::{io::AsyncWriteExt, process::Command};
+
+use std::net::Ipv4Addr;
 
 mod guard;
 pub use guard::GuardNetworkManager;
@@ -32,15 +34,17 @@ struct TapAddressPlan {
     guest: String,
 }
 
-/// Derives a stable point-to-point subnet from a sandbox identifier.
+/// The /30 belonging to one slot of the pool.
 ///
 /// The /30 is aligned to four addresses, so the declared network is the network
 /// the kernel and nftables actually use, and the host always owns `.1` of it
-/// while the guest owns `.2`. No sandbox can be handed a network or broadcast
-/// address, an address outside its own subnet, or a subnet another sandbox
-/// already holds.
-fn tap_address_plan(id: SandboxId) -> TapAddressPlan {
-    let slot = (id.as_u128() % u128::from(TAP_SLOTS)) as u32;
+/// while the guest owns `.2`. No slot can be a network or broadcast address, or
+/// contain an address outside its own subnet.
+fn tap_address_plan_slot(slot: u32) -> TapAddressPlan {
+    // Wraps rather than running off the end, so an index one past the pool
+    // describes the same link as index zero. The pool is what the host has
+    // addresses for, so anything beyond it is the same slot.
+    let slot = slot % TAP_SLOTS;
     let third = 8 + (slot / 64) as u8;
     let fourth = (slot % 64) * 4;
     TapAddressPlan {
@@ -48,6 +52,35 @@ fn tap_address_plan(id: SandboxId) -> TapAddressPlan {
         host: format!("{TAP_BASE}.{third}.{}", fourth + 1),
         guest: format!("{TAP_BASE}.{third}.{}", fourth + 2),
     }
+}
+
+/// Picks a plan for this sandbox, skipping any slot already in use.
+///
+/// Deriving the /30 purely from the identifier is what makes a plan stable and
+/// also what made it collide: two identifiers sharing a slot mod `TAP_SLOTS`
+/// were handed one /30, so both guests configured the same address and the
+/// kernel held two identical connected routes whose selection depends on
+/// insertion order. Random identifiers make that a birthday collision rather
+/// than a rare event — about 87% across 64 concurrent sandboxes — so it was a
+/// property of the allocator being stateless, not of the pool being too small.
+///
+/// The probe starts at the sandbox's own slot and walks the whole pool, so an
+/// exhausted pool is refused rather than served a duplicate. `occupied` is
+/// given the plan under consideration and answers whether it is already live;
+/// the caller supplies it from the host's own address inventory.
+fn choose_tap_plan(
+    id: SandboxId,
+    occupied: impl Fn(TapAddressPlan) -> bool,
+) -> Result<TapAddressPlan, CoreError> {
+    let start = (id.as_u128() % u128::from(TAP_SLOTS)) as u32;
+    (0..TAP_SLOTS)
+        .map(|offset| tap_address_plan_slot((start + offset) % TAP_SLOTS))
+        .find(|plan| !occupied(plan.clone()))
+        .ok_or_else(|| {
+            CoreError::LimitExceeded(format!(
+                "TAP address capacity: all {TAP_SLOTS} /30s in {TAP_BASE}.0.0/16 are in use"
+            ))
+        })
 }
 
 /// Creates isolated TAP attachments and applies per-sandbox nftables policy.
@@ -84,7 +117,19 @@ impl NetworkBackend for LinuxNetworkManager {
             ));
         }
 
-        let plan = tap_address_plan(sandbox.id);
+        // Occupancy comes from the host's own address inventory rather than from
+        // a record this process keeps, because the inventory is what the kernel
+        // will actually reject: a duplicate address fails at `ip addr add`, and
+        // a link whose guest half matches another sandbox's is never reported
+        // as an error at all — it silently becomes two sandboxes on one subnet.
+        let assigned = assigned_ipv4().await?;
+        let plan = choose_tap_plan(sandbox.id, |candidate| {
+            [candidate.host, candidate.guest].iter().any(|address| {
+                address
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok_and(|ip| assigned.contains(&ip))
+            })
+        })?;
         let suffix = &sandbox.id.to_string()[..12];
         let tap = format!("af{suffix}");
         let table = format!("aiec_{suffix}");
@@ -190,6 +235,54 @@ impl NetworkBackend for LinuxNetworkManager {
             .await;
         Ok(())
     }
+}
+
+/// Every IPv4 address currently assigned on this host.
+///
+/// Read from the kernel rather than from a record either backend keeps, because
+/// the kernel is what decides whether an address is available and what a
+/// collision with another link actually does.
+async fn assigned_ipv4() -> Result<HashSet<Ipv4Addr>, CoreError> {
+    let output = Command::new("ip")
+        .args(["-j", "-4", "addr", "show"])
+        .output()
+        .await
+        .map_err(|error| {
+            CoreError::Unavailable(format!("address inventory unavailable: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(CoreError::Unavailable(
+            "address inventory unavailable: ip -j -4 addr show failed".into(),
+        ));
+    }
+    parse_assigned_ipv4(&output.stdout)
+}
+
+/// Pulls every assigned address out of `ip -j -4 addr show` output.
+///
+/// Interfaces without an IPv4 address carry no `addr_info`, and an address can
+/// be IPv6-only or malformed, so anything unparseable is skipped rather than
+/// failing the whole read — an inventory that is missing one address must not
+/// stop a sandbox from being placed, or it would be a denial of service rather
+/// than a safety check.
+fn parse_assigned_ipv4(stdout: &[u8]) -> Result<HashSet<Ipv4Addr>, CoreError> {
+    let values: Vec<serde_json::Value> = serde_json::from_slice(stdout)
+        .map_err(|_| CoreError::Unavailable("invalid ip address inventory".into()))?;
+    let mut assigned = HashSet::new();
+    for interface in values {
+        let Some(addresses) = interface["addr_info"].as_array() else {
+            continue;
+        };
+        for address in addresses {
+            if let Some(ip) = address["local"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+            {
+                assigned.insert(ip);
+            }
+        }
+    }
+    Ok(assigned)
 }
 
 async fn run_ip(args: &[String]) -> Result<(), CoreError> {
@@ -324,7 +417,7 @@ mod tests {
         // sandbox ends up with a usable host and guest address on its own /30.
         let mut seen = std::collections::HashSet::new();
         for index in 0..u128::from(TAP_SLOTS) {
-            let plan = tap_address_plan(uuid::Uuid::from_u128(index));
+            let plan = tap_address_plan_slot(index as u32);
             assert_valid(&plan);
             assert!(seen.insert(plan.network.clone()));
         }
@@ -333,18 +426,18 @@ mod tests {
         // different links, because that is exactly the case an unaligned plan
         // collapses.
         for index in 1..u128::from(TAP_SLOTS) {
-            let a = tap_address_plan(uuid::Uuid::from_u128(index - 1));
-            let b = tap_address_plan(uuid::Uuid::from_u128(index));
+            let a = tap_address_plan_slot((index - 1) as u32);
+            let b = tap_address_plan_slot(index as u32);
             assert_ne!(a.network, b.network);
             assert_ne!(a.host, b.host);
         }
         // And the pool wraps rather than running off the end of the address
         // space, so a sandbox beyond the last slot still gets a real link.
-        assert_valid(&tap_address_plan(uuid::Uuid::from_u128(u128::from(
-            TAP_SLOTS,
-        ))));
+        assert_valid(&tap_address_plan_slot(TAP_SLOTS));
         for _ in 0..256 {
-            assert_valid(&tap_address_plan(uuid::Uuid::now_v7()));
+            assert_valid(&tap_address_plan_slot(
+                (uuid::Uuid::now_v7().as_u128() % u128::from(TAP_SLOTS)) as u32,
+            ));
         }
     }
 
@@ -386,7 +479,7 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for index in 0..u128::from(TAP_SLOTS) {
-            let plan = tap_address_plan(uuid::Uuid::from_u128(index));
+            let plan = tap_address_plan_slot(index as u32);
             assert_eq!(
                 masked(&plan.network),
                 plan.network,
@@ -416,8 +509,8 @@ mod tests {
         // which is what the pool size buys: 1024 links against a cluster that
         // runs a few dozen sandboxes at once.
         assert_eq!(
-            tap_address_plan(uuid::Uuid::from_u128(0)).network,
-            tap_address_plan(uuid::Uuid::from_u128(u128::from(TAP_SLOTS))).network,
+            tap_address_plan_slot(0).network,
+            tap_address_plan_slot(TAP_SLOTS).network,
             "the pool wraps rather than running out of addresses"
         );
     }
@@ -425,7 +518,130 @@ mod tests {
     #[test]
     fn identical_sandbox_id_maps_to_identical_subnet() {
         let id = uuid::Uuid::now_v7();
-        assert_eq!(tap_address_plan(id), tap_address_plan(id));
+        assert_eq!(
+            choose_tap_plan(id, |_| false).expect("a free slot"),
+            choose_tap_plan(id, |_| false).expect("a free slot"),
+            "the same identifier must resolve to the same link"
+        );
+    }
+
+    /// Two *concurrently live* sandboxes must not be handed one /30.
+    ///
+    /// `tap_address_plan` is a pure modulo over 1024 slots, so it collides on
+    /// the birthday bound, not on the wrap: with 64 concurrent sandboxes the
+    /// chance that some pair shares a subnet is about 87%. A collision is not
+    /// merely untidy — both guests get the same address, so one can source
+    /// another's guest IP onto its own link, and the kernel holds two identical
+    /// connected routes whose selection depends on insertion order, so return
+    /// traffic for one link can leave the other.
+    ///
+    /// The existing distinctness tests only walked consecutive slot indices,
+    /// which never collide, so the pool looked collision-free. This is stated
+    /// against the allocator rather than the pure function, because the pure
+    /// function is deterministic and therefore cannot both collide and not
+    /// collide: what an operator depends on is that a *live* slot is skipped.
+    #[test]
+    fn a_chosen_slot_is_never_one_that_is_already_occupied() {
+        let id = uuid::Uuid::from_u128(700);
+        let occupied = tap_address_plan_slot((id.as_u128() % u128::from(TAP_SLOTS)) as u32);
+        let chosen =
+            choose_tap_plan(id, |candidate| candidate == occupied).expect("a free slot exists");
+        assert_ne!(
+            chosen, occupied,
+            "a sandbox was handed a subnet that is already live"
+        );
+    }
+
+    /// The probe has to walk the whole pool, not give up at the first hit.
+    #[test]
+    fn choosing_a_slot_walks_past_occupied_slots_to_find_a_free_one() {
+        let id = uuid::Uuid::from_u128(5);
+        let free = tap_address_plan_slot(TAP_SLOTS - 1);
+        let chosen = choose_tap_plan(id, |candidate| candidate != free)
+            .expect("the pool has one free slot left");
+        assert_eq!(
+            chosen, free,
+            "the probe stopped before the only free slot instead of looking for it"
+        );
+    }
+
+    /// Exhaustion is a refusal, never a collision.
+    #[test]
+    fn a_full_pool_refuses_rather_than_handing_out_a_duplicate_subnet() {
+        let result = choose_tap_plan(uuid::Uuid::from_u128(1), |_| true);
+        assert!(
+            matches!(result, Err(CoreError::LimitExceeded(_))),
+            "a full pool returned {result:?} instead of refusing"
+        );
+    }
+
+    /// The occupancy check reads the kernel, so it has to survive the shapes
+    /// `ip -j` actually emits. An interface with no IPv4 address has no
+    /// `addr_info` at all, a host address can be secondary, and a link-local
+    /// is still a link-local. Skipping rather than failing matters: an
+    /// inventory the reader cannot fully understand must not stop a sandbox
+    /// being placed, or it becomes a denial of service in place of a safety
+    /// check.
+    #[test]
+    fn the_address_inventory_reads_every_assigned_address_and_survives_odd_shapes() {
+        let inventory = br#"[{"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1"}]},
+            {"ifname":"eth0","flags":["BROADCAST"],"addr_info":[
+                {"family":"inet","local":"10.0.0.5"},
+                {"family":"inet","local":"10.0.0.5","secondary":true}]},
+            {"ifname":"af0123456789ab","addr_info":[{"family":"inet","local":"172.30.8.2"}]},
+            {"ifname":"tun0"},
+            {"ifname":"weird","addr_info":[{"family":"inet","local":"not-an-ip"}]}]"#;
+        let assigned = parse_assigned_ipv4(inventory).expect("readable inventory");
+        for expected in ["127.0.0.1", "10.0.0.5", "172.30.8.2"] {
+            assert!(
+                assigned.contains(&expected.parse().expect("ip")),
+                "{expected} is assigned but was not read: {assigned:?}"
+            );
+        }
+        assert_eq!(
+            assigned.len(),
+            3,
+            "a repeated address is one address, and unreadable ones are skipped: {assigned:?}"
+        );
+    }
+
+    /// A garbage inventory must be an error, not an empty set. An empty set
+    /// would make every slot look free and reintroduce the collision.
+    #[test]
+    fn an_unreadable_address_inventory_is_refused_rather_than_read_as_empty() {
+        let result = parse_assigned_ipv4(b"not json at all");
+        assert!(
+            matches!(&result, Err(CoreError::Unavailable(message)) if message == "invalid ip address inventory"),
+            "an unreadable inventory produced {result:?}"
+        );
+    }
+
+    /// The end-to-end property an operator depends on: a plan whose addresses
+    /// are already on the host is never handed out, even when the identifier's
+    /// own slot is exactly that one. This is the collision that was live.
+    #[test]
+    fn a_live_link_is_never_handed_to_a_second_sandbox() {
+        let first = uuid::Uuid::from_u128(700);
+        let second = uuid::Uuid::from_u128(700 + 1);
+        let mut assigned: HashSet<std::net::Ipv4Addr> = HashSet::new();
+        let mut place = |id: uuid::Uuid| {
+            let plan = choose_tap_plan(id, |candidate| {
+                [candidate.host, candidate.guest]
+                    .iter()
+                    .any(|address| assigned.contains(&address.parse().expect("ip")))
+            })
+            .expect("a free slot");
+            for address in [&plan.host, &plan.guest] {
+                assigned.insert(address.parse().expect("ip"));
+            }
+            plan
+        };
+        let a = place(first);
+        let b = place(second);
+        assert_ne!(
+            a.network, b.network,
+            "two live sandboxes were placed on one /30"
+        );
     }
 
     #[test]

@@ -248,7 +248,7 @@ pub async fn create_key(
             key: raw,
             scopes: scopes
                 .iter()
-                .map(|scope| format!("{scope:?}").to_lowercase().replace('_', ":"))
+                .map(|scope| scope_wire_name(scope.clone()))
                 .collect(),
             expires_at,
             created_at: now,

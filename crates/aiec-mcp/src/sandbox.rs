@@ -332,8 +332,17 @@ impl LocalAiec {
                     break;
                 }
                 Err(error) => {
-                    // Already gone is the outcome the caller wanted.
-                    if error.to_string().contains("404") {
+                    // Already gone is the outcome the caller wanted. Matched on
+                    // the wire status rather than on the formatted message:
+                    // "404" appears in any error whose text carries that number
+                    // anywhere, including a backend error that reported it, and
+                    // reporting a sandbox destroyed while it is still running is
+                    // worse than reporting the failure.
+                    if matches!(
+                        &error,
+                        aiec_client::ClientError::Api { status, .. }
+                            if status == &reqwest::StatusCode::NOT_FOUND
+                    ) {
                         last_error = None;
                         break;
                     }

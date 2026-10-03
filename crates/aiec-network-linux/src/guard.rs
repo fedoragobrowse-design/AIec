@@ -1,6 +1,6 @@
 //! Guarded attachment lifecycle. No ordinary forwarding or masquerade is used.
 
-use crate::{LinuxNetworkManager, TAP_PREFIX, TAP_SLOTS};
+use crate::{LinuxNetworkManager, TAP_PREFIX, TAP_SLOTS, assigned_ipv4};
 use aiec_core::{
     CoreError, Sandbox,
     network::{NetworkAttachment, NetworkBackend, NetworkCapabilities, NetworkPolicy},
@@ -1367,26 +1367,6 @@ fn io_kind_of(error: &CoreError) -> std::io::ErrorKind {
         CoreError::Io(inner) => inner.kind(),
         _ => std::io::ErrorKind::Other,
     }
-}
-
-async fn assigned_ipv4() -> Result<HashSet<Ipv4Addr>, CoreError> {
-    let bytes = tool("ip", &["-j", "-4", "addr", "show"]).await?;
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
-        .map_err(|_| CoreError::Unavailable("invalid ip address inventory".into()))?;
-    let mut assigned = HashSet::new();
-    for interface in values {
-        if let Some(addresses) = interface["addr_info"].as_array() {
-            for address in addresses {
-                if let Some(ip) = address["local"]
-                    .as_str()
-                    .and_then(|value| value.parse().ok())
-                {
-                    assigned.insert(ip);
-                }
-            }
-        }
-    }
-    Ok(assigned)
 }
 
 async fn ip(args: &[&str]) -> Result<(), CoreError> {

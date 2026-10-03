@@ -24,6 +24,10 @@ services:
     image: prom/prometheus:latest
     ports: ["127.0.0.1:9090:9090"]
     volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    # `host.docker.internal` is injected by Docker Desktop and is resolved by
+    # plain Docker Engine on Linux only when the host gateway is mapped. Without
+    # this the scrape target does not resolve and metrics are silently empty.
+    extra_hosts: ["host.docker.internal:host-gateway"]
 volumes:
   postgres-data:
   minio-data:

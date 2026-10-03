@@ -542,6 +542,98 @@ database backends: one holds the revocation open while the heartbeat is
 observed waiting on the lock in `pg_stat_activity`, and the refused heartbeat
 must leave `healthy` false and the observed count at zero.
 
+## Fixed in the 2026-10-03 audit: runtimes and networking
+
+### Two live sandboxes could share one `/30`
+
+`tap_address_plan` was a pure modulo of the sandbox id over 1024 slots, so two
+ids sharing a slot were handed the same `/30`: both guests configured the same
+address and the kernel held two identical connected routes whose selection
+depended on insertion order. With random identifiers this is a birthday
+collision, not a rare event — measured at 86.7% of 64-sandbox runs sharing a
+subnet — so it was a property of the allocator being stateless, not of the pool
+being too small. Allocation now probes the pool cyclically from the id's own
+slot and refuses with `LimitExceeded` when all 1024 are in use, with occupancy
+read from the host's own address inventory (`ip -j -4 addr show`) rather than
+from process-local state. Regressions cover an occupied slot, a pool that is
+occupied except for the last slot, and exhaustion.
+
+### A superseded recovery pass could write state and release another owner's lease
+
+Recovery is handed a `Reassignment` — one lease, one generation — but placed the
+sandbox through `commit_state`, which looks up *who owns the sandbox now* and
+fences against that. A sandbox reassigned again while its runtime was starting
+was therefore marked `Running`, then `Failed`, under the **new** owner's lease,
+by a pass that no longer held the sandbox. `abandon_recovery` then released
+through `Scheduler::release`, which takes only a tenant and a sandbox id and so
+cannot name a lease — the store picks whichever is newest, releasing capacity
+the new owner was still using while its sandbox was still live. Both paths now
+fence on the lease recovery holds (`update_state_with_lease`,
+`release_worker_lease`). Regression:
+`a_superseded_recovery_pass_neither_writes_state_nor_releases_a_lease`, which
+failed first with the superseded pass reporting `"recovered"`.
+
+### A failed Firecracker capture left half a snapshot at the key
+
+`snapshot` wrote into `snapshots/<digest>` directly. A capture that failed partway
+left a directory holding `vmstate` and no `memory`, no `rootfs.ext4` and no
+manifest, with nothing to mark it as half. Worse, a *recapture* overwrote
+`rootfs.ext4` in place while the previous `manifest.json` stayed put: if it
+failed between overwriting the disk and writing the new manifest, the key held a
+manifest whose `rootfs_sha256` describes a disk that no longer existed. Restore
+checks that digest, so the outcome is a refused restore rather than a wrong
+boot — but the key was broken and the one good snapshot destroyed to break it.
+Capture now stages into a uniquely-named directory and publishes by rename, with
+the previous snapshot moved aside first and only unlinked once the new one is in
+place. Regressions:
+`a_snapshot_key_is_never_left_holding_a_half_written_capture` and
+`a_publish_that_cannot_complete_leaves_the_previous_snapshot_readable`.
+
+### A wedged Firecracker API blocked every operation on its sandbox
+
+The five-second deadline in `api_response` covered the connect loop only.
+Writing the request, reading headers and reading the body were all unbounded,
+and every caller runs while holding the sandbox's lifecycle gate — so one VM that
+accepted the connection and stopped responding froze that sandbox entirely,
+including its destroy. Separately, `Content-Length` was read off the wire and
+used to size a `Vec`, so a response claiming a large body reserved that memory
+before a byte arrived. The deadline now covers the whole exchange, and the body
+is checked against a bound before it is allocated.
+
+### A symlink in a sandbox's workspace was a way out of it
+
+`path_for` normalized the *request* path lexically, which stops `..` in the
+request and nothing else. The guest can create links inside its own workspace via
+`exec`, and every host-side file operation then followed them: a guest that ran
+`ln -s /etc /workspace/etc` had `put_file("/workspace/etc/passwd")` write the
+host's `/etc/passwd`, and `get_file` read host files back. `put_file`,
+`get_file`, `list_files`, `delete_file` and `make_directory` now resolve each
+component with `symlink_metadata` and refuse one that resolves outside the
+workspace; a link pointing *within* the workspace is still allowed, because that
+is a guest arranging its own files. The Docker runtime already did this — its
+`read_workspace` opens with `O_NOFOLLOW` — so this was the bubblewrap path only.
+Regression:
+`a_symlink_planted_in_the_workspace_cannot_be_used_to_leave_it`, which failed
+first with the write returning `Ok(())`.
+
+### Smaller defects from the same audit
+
+- `POST /v1/keys` and `POST /v1/account` reported scopes as `sandboxesread` —
+  the Debug formatting of `Scope`, not the `scope_wire_name` the API parses.
+- `run_repetitions` expanded a caller-supplied `u32` before validating it;
+  `u32::MAX` requested a 5 TB allocation and aborted the process. Bounded by
+  `MAX_EVAL_REPETITIONS`.
+- The CLI created Firecracker and Docker sandboxes through a bare
+  `reqwest::Client::new()`, bypassing `AIEC_TLS_CA_CERT` and the 60 s timeout.
+- The worker skipped its heartbeat entirely when its own health probe failed,
+  so a running worker was reaped as dead. It now heartbeats `healthy: false`
+  with the probe error in `last_error`.
+- The MCP server inferred a 404 from formatted error text rather than matching
+  `ClientError::Api { status: 404 }`.
+- `deploy/prometheus.yml` scrapes `host.docker.internal:8080`, which resolves to
+  nothing under plain Docker Engine on Linux. The compose service now maps
+  `host.docker.internal:host-gateway`.
+
 ## Open
 
 ### Accepted, not fixed: placement holds a worker row lock while it waits
@@ -558,6 +650,20 @@ the candidate would have to be re-selected and re-validated after the host lock 
 the reservation path this audit has already measured end to end. The bound is
 200 ms and it only occurs when two placements contend for one host, so this is
 recorded as a deliberate trade-off rather than fixed.
+
+### A Docker exec that times out keeps running until its sandbox is destroyed
+
+`exec_raw` returns `exit_code: 124` with `timed_out: true` when its read loop
+expires, but the exec itself is left running inside the container — so a command
+that ignores its own timeout keeps consuming the sandbox's CPU and memory until
+the sandbox is destroyed. **Not fixed.** The Docker Engine API exposes no
+exec-kill endpoint at all (`bollard 0.21.1` has no `kill_exec`, and the daemon
+offers nothing to map it to), so closing this means either killing the whole
+container, which discards the sandbox a caller is still using, or driving the
+kill through the guest's own process group, which is a change to every exec's
+signal handling rather than a fix to the timeout path. Recorded because the
+bounded lifetime of the sandbox bounds this too, and because a caller reading
+exit code 124 should know the process it describes may still be there.
 
 ### The `initialize` handshake never answers `2026-07-28`
 

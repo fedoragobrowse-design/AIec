@@ -14,7 +14,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use parking_lot::Mutex;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::Digest;
 use std::sync::{Arc, LazyLock};
 use tower::ServiceExt;
@@ -1791,6 +1791,93 @@ async fn key_management_refuses_privilege_escalation() {
     assert!(
         !body.starts_with(b"af_live_"),
         "listing must never contain key material"
+    );
+}
+
+/// The scopes a key is reported with must be the scopes this API accepts.
+///
+/// `POST /v1/keys` and `POST /v1/account` reported scopes derived from the
+/// `Debug` spelling, which yields `sandboxesread` rather than the
+/// `sandboxes:read` that `Scope::parse` — and therefore the `scopes` field of
+/// the very request these endpoints document — accepts. A client that read a
+/// key's scopes and asked for a second key with them got `400 unknown scope`,
+/// while `GET /v1/keys`, which spells them correctly, disagreed with them.
+#[tokio::test]
+async fn the_scopes_a_key_is_reported_with_are_the_scopes_the_api_accepts() {
+    let repo = MemoryRepository::new();
+    let router = setup_with_invites(repo, &["alpha-one"]);
+
+    let signup = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/account")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"invite":"alpha-one","name":"Reported"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(signup.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let key = value["key"]["key"].as_str().expect("key").to_string();
+    let reported: Vec<String> = serde_json::from_value(value["key"]["scopes"].clone()).unwrap();
+    assert!(
+        !reported.is_empty(),
+        "a new key must report the scopes it holds"
+    );
+    for scope in &reported {
+        assert!(
+            Scope::parse(scope).is_ok(),
+            "the API reported scope {scope:?}, which it will not accept back on POST /v1/keys"
+        );
+    }
+
+    // The two endpoints that report scopes must agree, or a client cannot
+    // trust either one.
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::get("/v1/keys")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let from_list: Vec<String> =
+        serde_json::from_value(listed["keys"][0]["scopes"].clone()).unwrap();
+    assert_eq!(
+        from_list, reported,
+        "POST and GET disagree about the scopes of the same key"
+    );
+
+    // And the reported set is usable: asking for a second key with it works.
+    let second = router
+        .oneshot(
+            Request::post("/v1/keys")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "second", "scopes": reported }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::OK,
+        "scopes the API itself reported must be accepted back"
     );
 }
 

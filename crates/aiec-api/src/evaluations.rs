@@ -465,6 +465,33 @@ mod tests {
         assert_eq!(body["error"]["code"], "invalid_request");
     }
 
+    /// A repetition count is a `u32` with no ceiling, and it is expanded into
+    /// one owned `RunRequest` per repetition *before* any of them is admitted.
+    ///
+    /// `RunRequest` is 1176 bytes, so `{"repetitions": 4294967295}` asks a
+    /// ~40-byte request body for a five-terabyte allocation. The refusal has
+    /// to arrive before the expansion, because an allocation that large is an
+    /// abort, not an error a caller can read.
+    #[tokio::test]
+    async fn a_repetition_count_past_the_ceiling_is_refused_before_anything_is_expanded() {
+        let writer = eval_app(vec![Scope::SandboxesWrite]);
+        let (status, body) = post_json(
+            writer,
+            "/eval/repetitions",
+            json!({
+                "request": {"workload": {"command": ["true"]}},
+                "repetitions": u32::MAX,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an uncapped repetition count was accepted: {body}"
+        );
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
     /// A store that admits a run and settles it immediately, so a test can see
     /// how many cells a batch had in flight rather than what a machine did.
     ///

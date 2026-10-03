@@ -544,6 +544,15 @@ pub async fn run_batch_bounded(
     })
 }
 
+/// Ceiling on one request's repetitions, whatever the caller asks for.
+///
+/// The expansion in `run_repetitions` allocates one owned `RunRequest` per
+/// repetition before any of them is admitted, and a `RunRequest` is over a
+/// kilobyte, so an uncapped `u32` turns a forty-byte request body into a
+/// five-terabyte allocation. That is an abort rather than a refusal a caller
+/// could read, so the bound belongs at the expansion and not only on the route.
+pub const MAX_EVAL_REPETITIONS: u32 = 1000;
+
 /// Runs the same workload several times.
 ///
 /// Each repetition is its own sandbox and its own run, because an agent that
@@ -557,6 +566,11 @@ pub async fn run_repetitions(
 ) -> Result<Vec<Run>, CoreError> {
     if repetitions == 0 {
         return Ok(Vec::new());
+    }
+    if repetitions > MAX_EVAL_REPETITIONS {
+        return Err(CoreError::InvalidRequest(format!(
+            "repetitions must be at most {MAX_EVAL_REPETITIONS}, asked for {repetitions}"
+        )));
     }
     let mut requests = Vec::with_capacity(repetitions as usize);
     for number in 0..repetitions {
