@@ -124,7 +124,8 @@ impl PostgresRepository {
     ) -> Result<GuardProposal, CoreError> {
         let mut transaction = self.pool.begin().await.map_err(|e| map(e.into()))?;
         let existing = sqlx::query(
-            "SELECT agent_id, request, base_policy_hash, state, decided_by, decided_at, created_at \
+            "SELECT agent_id, request, base_policy_hash, state, decided_by, decided_at, \
+             created_at, tenant_id, sandbox_id \
              FROM guard_proposals WHERE id = $1 FOR UPDATE",
         )
         .bind(proposal.id)
@@ -132,6 +133,27 @@ impl PostgresRepository {
         .await
         .map_err(|e| map(e.into()))?;
 
+        // The row is located by id alone, so the insert and the update cannot
+        // race — which also means the row that comes back is not necessarily
+        // this tenant's. The in-memory store refuses that outright and this one
+        // has to as well, or the two backends disagree about who owns a
+        // proposal. The database trigger cannot catch it either: `tenant_id` is
+        // not in the SET clause, so a write aimed at someone else's row looks
+        // like a same-tenant update to it.
+        //
+        // The immutability check below is a separate thing and does not cover
+        // this: it fires on the fields a caller would otherwise have had to
+        // change to get here. A caller presenting another tenant's row
+        // unchanged and differing only in its own tenant id passes straight
+        // through it.
+        if let Some(row) = &existing {
+            let owner: uuid::Uuid = row.try_get("tenant_id").map_err(|e| map(e.into()))?;
+            let owner_sandbox: uuid::Uuid = row.try_get("sandbox_id").map_err(|e| map(e.into()))?;
+            if owner != proposal.tenant_id || owner_sandbox != proposal.sandbox_id {
+                // Indistinguishable from a proposal that does not exist.
+                return Err(map(StoreError::NotFound));
+            }
+        }
         let Some(row) = existing else {
             sqlx::query(
                 "INSERT INTO guard_proposals (id, tenant_id, sandbox_id, agent_id, request, \

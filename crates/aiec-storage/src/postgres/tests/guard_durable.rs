@@ -1,5 +1,7 @@
 use super::*;
+use aiec_core::GuardProposal;
 use aiec_core::storage::{BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident};
+use aiec_guard::proposals::{ProposalRequest, ProposalState};
 
 fn budget(tenant: Uuid, id: Uuid) -> GuardBudgetState {
     GuardBudgetState {
@@ -513,4 +515,107 @@ async fn postgres_guard_budget_rebinds_its_policy_hash_without_moving_ownership(
         Err(StoreError::Conflict(_))
     ));
     drop_test_schema(&repository, admin, schema).await;
+}
+
+/// A proposal id is looked up on its own, so the row that comes back need not
+/// belong to the caller. The in-memory store refuses that outright; the SQL
+/// write has to refuse it too, or the two backends disagree about who owns a
+/// proposal — and the database trigger cannot help, because `tenant_id` is not
+/// in the SET clause, so the update looks like a same-tenant write to it.
+///
+/// The attack here presents the owner's row exactly as the database returned it,
+/// changing only the tenant it claims to be writing as. That is the shape that
+/// matters, and it is the only one that reaches the update: the immutability
+/// check compares `agent_id`, `request`, `base_policy_hash` and `created_at`
+/// against the stored row, so anything else is refused for an unrelated reason.
+///
+/// `created_at` is the subtle one. It is built from `Utc::now()`, which is
+/// nanoseconds, and stored as `timestamptz`, which is microseconds — so a
+/// caller round-tripping the row gets a value that is no longer equal to the
+/// one it sent. Rebuilding from the stored proposal is not incidental: it is
+/// what a caller that read the row actually holds.
+#[tokio::test]
+async fn a_proposal_id_from_another_tenant_cannot_be_decided_through_it() {
+    let Some((repository, owner, _admin, _schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+
+    // A second, real tenant. It needs no sandbox of its own: the ownership
+    // check reads the row's tenant and sandbox, and a foreign tenant id alone
+    // is enough to make the write a stranger's, which is the case under test.
+    let stranger = new_id();
+    repository
+        .put_tenant(TenantRecord {
+            id: stranger,
+            name: format!("stranger-{stranger}"),
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+    let worker = super::register_test_worker(&repository, owner).await;
+    let sandbox_id =
+        schedule_test_sandbox(&repository, owner, new_id(), sandbox(owner), Some(worker))
+            .await
+            .unwrap()
+            .sandbox
+            .id;
+
+    let proposal = GuardProposal {
+        id: new_id(),
+        tenant_id: owner,
+        sandbox_id,
+        agent_id: "key:owner".into(),
+        request: ProposalRequest {
+            summary: "add an egress destination".into(),
+            allow: Vec::new(),
+        },
+        base_policy_hash: "b".repeat(64),
+        state: ProposalState::Pending,
+        decided_by: None,
+        decided_at: None,
+        created_at: Utc::now(),
+    };
+    let proposal_id = proposal.id;
+    repository.put_guard_proposal(proposal).await.unwrap();
+    // Re-read, because the insert returns the value it was handed rather than
+    // what the row now holds. Without this the caller is still holding the
+    // nanosecond `created_at` it sent, and the comparison below fails on
+    // precision rather than on ownership.
+    let stored = repository
+        .get_guard_proposal(owner, sandbox_id, proposal_id)
+        .await
+        .unwrap();
+    assert!(matches!(stored.state, ProposalState::Pending));
+
+    // The identical row, now presented by a different tenant, approving it.
+    // Only `tenant_id` differs, so nothing else refuses it.
+    let attempt = repository
+        .put_guard_proposal(GuardProposal {
+            tenant_id: stranger,
+            state: ProposalState::Approved {
+                policy_hash: "c".repeat(64),
+            },
+            decided_by: Some("operator".into()),
+            decided_at: Some(Utc::now()),
+            ..stored
+        })
+        .await;
+    assert!(
+        attempt.is_err(),
+        "a proposal id from another tenant was decided: {attempt:?}"
+    );
+
+    // And the owner's proposal is exactly as it was left.
+    let after = repository
+        .get_guard_proposal(owner, sandbox_id, stored.id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(after.state, ProposalState::Pending),
+        "the owner's proposal was moved to {:?}",
+        after.state
+    );
+    assert_eq!(after.decided_by, None, "a stranger wrote the operator name");
+    assert_eq!(after.decided_at, None, "a stranger wrote the decision time");
 }
