@@ -687,7 +687,7 @@ mod tests {
     fn a_live_link_is_never_handed_to_a_second_sandbox() {
         let first = uuid::Uuid::from_u128(700);
         let second = uuid::Uuid::from_u128(700 + 1);
-        let mut assigned: HashSet<std::net::Ipv4Addr> = HashSet::new();
+        let mut assigned: HashSet<Ipv4Addr> = HashSet::new();
         let mut place = |id: uuid::Uuid| {
             let plan = choose_tap_plan(id, |candidate| {
                 [candidate.host, candidate.guest]
@@ -726,8 +726,11 @@ mod tests {
         // only has teeth if the starts genuinely collide. Spacing them by 100
         // would not: those are eight distinct slots, and the test would pass
         // with the reservation deleted.
+        // `+ 1` because `SandboxId` is a bare `Uuid` alias, so `n = 0` would be
+        // the nil UUID — a value no sandbox ever has. Every id is still `1` mod
+        // `TAP_SLOTS`, so the starts still collide exactly as above.
         let ids: Vec<SandboxId> = (0..8u128)
-            .map(|n| SandboxId::from_u128(n * u128::from(TAP_SLOTS)))
+            .map(|n| SandboxId::from_u128(n * u128::from(TAP_SLOTS) + 1))
             .collect();
 
         let mut futures = Vec::new();
@@ -786,6 +789,54 @@ mod tests {
         let count = networks.len();
         networks.dedup();
         assert_eq!(networks.len(), count, "two placements shared a /30");
+    }
+
+    /// A reservation that is not released on failure does not lose the slot it
+    /// was holding — it wedges the worker. Every later TAP placement blocks
+    /// forever on the same mutex, so the machine stops being able to place
+    /// anything at all, which is a far worse failure than the race this lock
+    /// exists to prevent. `choose_tap_plan` returning `Err` is the reachable
+    /// way in: a full pool refuses, and `?` propagates it while the guard is
+    /// live.
+    #[tokio::test]
+    async fn a_refused_placement_releases_the_reservation_for_the_next_one() {
+        // Every slot in the pool marked live, so `choose_tap_plan` walks all
+        // 1024 and refuses. An empty inventory would do the opposite: nothing
+        // occupied, nothing to refuse, and the test would pass without ever
+        // reaching the error path it exists to check.
+        let full: HashSet<Ipv4Addr> = (0..TAP_SLOTS)
+            .flat_map(|slot| {
+                let plan = tap_address_plan_slot(slot);
+                [plan.host, plan.guest]
+            })
+            .filter_map(|address| address.parse::<Ipv4Addr>().ok())
+            .collect();
+        assert_eq!(full.len() as u32, TAP_SLOTS * 2, "pool not fully marked");
+        let refused = reserve_tap_plan(
+            SandboxId::from_u128(1),
+            || async { Ok(full) },
+            |_plan| async {
+                panic!("a full pool must refuse before assigning anything");
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(CoreError::LimitExceeded(_))),
+            "a full pool returned {refused:?} instead of refusing"
+        );
+
+        // If the guard survived the error this await would never return.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reserve_tap_plan(
+                SandboxId::from_u128(2),
+                || async { Ok(HashSet::new()) },
+                |_plan| async { Ok(()) },
+            ),
+        )
+        .await
+        .expect("the reservation wedged: a refused placement kept the lock");
+        assert!(next.is_ok(), "the following placement failed: {next:?}");
     }
 
     #[test]

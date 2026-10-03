@@ -723,6 +723,11 @@ impl GatewayControl {
         }
     }
 }
+
+/// How many times the DNS UDP bind is re-drawn after the TCP half wins the port
+/// and something else takes it. Each attempt is a fresh kernel draw, so this
+/// only has to outlast an ordinary scheduling race, not a busy host.
+const DNS_UDP_BIND_ATTEMPTS: u32 = 8;
 /// Binds a TCP listener, naming which one refused.
 async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener, GuardError> {
     TcpListener::bind(bind).await.map_err(|error| {
@@ -731,6 +736,66 @@ async fn labelled_bind(what: &str, bind: (Ipv4Addr, u16)) -> Result<TcpListener,
             format!("{what} listener on {}:{}: {error}", bind.0, bind.1),
         ))
     })
+}
+
+/// Binds the DNS listener's TCP and UDP halves onto one port.
+///
+/// DNS is bound twice and the two binds cannot be atomic. With port 0 the
+/// kernel picks the TCP port and hands it back, so the UDP bind of that same
+/// port is a separate claim that can lose to anything else on the host taking
+/// it in between — and when it does, `AddrInUse` fails the whole gateway at
+/// startup even though nothing is actually misconfigured. The retry drops the
+/// TCP listener first, so each attempt is a fresh draw rather than a collision
+/// with our own.
+///
+/// The binds are parameters so the collision can be produced on demand rather
+/// than waited for: it depends on what else on the host happens to be doing.
+pub(crate) async fn bind_dns_pair<T, U, TFut, UFut>(
+    bind: (Ipv4Addr, u16),
+    tcp_bind: impl Fn((Ipv4Addr, u16)) -> TFut,
+    udp_bind: impl Fn(SocketAddr) -> UFut,
+) -> Result<(T, U, SocketAddr), GuardError>
+where
+    TFut: Future<Output = std::io::Result<T>>,
+    UFut: Future<Output = std::io::Result<U>>,
+    T: BoundSocket,
+{
+    let mut attempts_left = DNS_UDP_BIND_ATTEMPTS;
+    loop {
+        let tcp = tcp_bind(bind).await.map_err(|error| {
+            GuardError::Io(std::io::Error::new(
+                error.kind(),
+                format!("DNS over TCP listener on {}:{}: {error}", bind.0, bind.1),
+            ))
+        })?;
+        let addr = tcp.local_addr().map_err(|e| {
+            GuardError::Io(std::io::Error::other(format!("DNS listener address: {e}")))
+        })?;
+        match udp_bind(addr).await {
+            Ok(udp) => return Ok((tcp, udp, addr)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts_left > 1 => {
+                // `tcp` drops here, releasing the port before the next draw.
+                attempts_left -= 1;
+            }
+            Err(e) => {
+                return Err(GuardError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("DNS over UDP listener on {addr}: {e}"),
+                )));
+            }
+        }
+    }
+}
+
+/// The one thing `bind_dns_pair` needs from a bound TCP listener.
+pub(crate) trait BoundSocket {
+    fn local_addr(&self) -> std::io::Result<SocketAddr>;
+}
+
+impl BoundSocket for TcpListener {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        TcpListener::local_addr(self)
+    }
 }
 
 impl GuardGateway {
@@ -792,16 +857,12 @@ impl GuardGateway {
                 "broker listener address: {e}"
             )))
         })?;
-        let dns_tcp = labelled_bind("DNS over TCP", (config.bind_ip, config.dns_port)).await?;
-        let dns_addr = dns_tcp.local_addr().map_err(|e| {
-            GuardError::Io(std::io::Error::other(format!("DNS listener address: {e}")))
-        })?;
-        let dns_udp = UdpSocket::bind(dns_addr).await.map_err(|e| {
-            GuardError::Io(std::io::Error::new(
-                e.kind(),
-                format!("DNS over UDP listener on {dns_addr}: {e}"),
-            ))
-        })?;
+        let (dns_tcp, dns_udp, dns_addr) = bind_dns_pair(
+            (config.bind_ip, config.dns_port),
+            TcpListener::bind,
+            UdpSocket::bind,
+        )
+        .await?;
         let (stop, _) = watch::channel(0);
         let (audit_tx, mut audit_rx) = mpsc::channel(128);
         let (audit_stop, mut audit_shutdown) = watch::channel(false);
@@ -2081,4 +2142,90 @@ where
         }
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A stand-in for the bound TCP listener, so the collision can be produced
+    /// on demand. Waiting for the real one means waiting for whatever else on
+    /// the host happens to be binding sockets at that instant.
+    struct FakeTcp(SocketAddr);
+
+    impl BoundSocket for FakeTcp {
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.0)
+        }
+    }
+
+    fn taken() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "injected collision")
+    }
+
+    fn addr_for(draw: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30_000 + draw)
+    }
+
+    /// The UDP half losing the port is a race with everything else on the host,
+    /// and losing it failed gateway startup outright even though nothing was
+    /// misconfigured. Losing it once has to be survivable.
+    #[tokio::test]
+    async fn a_dns_port_taken_between_the_two_binds_is_drawn_again() {
+        let draws = Cell::new(0u16);
+        let (_, udp, addr) = bind_dns_pair(
+            (Ipv4Addr::LOCALHOST, 0),
+            |_| {
+                let draw = draws.get() + 1;
+                draws.set(draw);
+                async move { Ok(FakeTcp(addr_for(draw))) }
+            },
+            |addr| async move {
+                if addr.port() == 30_001 {
+                    Err(taken())
+                } else {
+                    Ok(addr.port())
+                }
+            },
+        )
+        .await
+        .expect("one collision must not fail startup");
+
+        // The first draw was stolen, so the pair must be on the second.
+        assert_eq!(draws.get(), 2, "expected exactly one redraw");
+        assert_eq!(udp, 30_002, "the halves must land on one port");
+        assert_eq!(addr.port(), udp);
+    }
+
+    /// The retry is bounded: a port that is genuinely unavailable must still
+    /// fail, rather than spinning forever at startup.
+    #[tokio::test]
+    async fn a_dns_port_that_is_never_free_still_refuses() {
+        let draws = Cell::new(0u16);
+        let result = bind_dns_pair(
+            (Ipv4Addr::LOCALHOST, 0),
+            |_| {
+                let draw = draws.get() + 1;
+                draws.set(draw);
+                async move { Ok(FakeTcp(addr_for(draw))) }
+            },
+            |_addr| async { Err::<(), _>(taken()) },
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("an unavailable DNS UDP port must not succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(error, GuardError::Io(ref e) if e.kind() == std::io::ErrorKind::AddrInUse),
+            "an unavailable DNS UDP port returned {error:?} instead of AddrInUse"
+        );
+        assert_eq!(
+            u32::from(draws.get()),
+            DNS_UDP_BIND_ATTEMPTS,
+            "the retry must be bounded"
+        );
+    }
 }

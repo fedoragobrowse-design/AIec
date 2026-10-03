@@ -655,6 +655,12 @@ first with the write returning `Ok(())`.
 - `deploy/prometheus.yml` scrapes `host.docker.internal:8080`, which resolves to
   nothing under plain Docker Engine on Linux. The compose service now maps
   `host.docker.internal:host-gateway`.
+- The guard gateway bound its DNS listener twice — TCP, then UDP on whatever
+  port the TCP half had drawn — so a port taken in between failed the whole
+  gateway at startup with `AddrInUse`, on a correctly configured host. It now
+  redraws, bounded, and says so in the error rather than retrying forever.
+  Regressions: `a_dns_port_taken_between_the_two_binds_is_drawn_again` and
+  `a_dns_port_that_is_never_free_still_refuses`; removing the retry fails both.
 
 ### The TAP allocation was still racy between two placements in one worker
 
@@ -676,12 +682,15 @@ same host: cross-process, the reservation is still the inventory probe rather
 than an atomic claim. Closing that needs a lockfile or a kernel-side
 reservation, which is not built.
 
-Regression:
+Regressions, each verified by breaking the thing it describes:
 `concurrent_placements_never_share_a_subnet` drives the real reservation with
 eight identifiers that all start on the same slot, and yields between the probe
-and the claim so the window is actually open. Verified by deleting the
-reservation: the test then fails with `the reservation let two placements take
-172.30.8.1`.
+and the claim so the window is actually open. Deleting the reservation makes it
+fail with `the reservation let two placements take 172.30.8.5`.
+`a_refused_placement_releases_the_reservation_for_the_next_one` covers the
+other direction: a full pool refuses, and the guard has to be released anyway
+or every later placement on that worker blocks forever. Forgetting the guard on
+the error path makes it fail with `the reservation wedged`.
 
 ## Open
 
