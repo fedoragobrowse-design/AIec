@@ -8,9 +8,9 @@
       "case": "production-guest-gateway-and-nftables-attached",
       "status": "PASS",
       "evidence": {
-        "sandbox_id": "01a0ff22-7c37-70b2-b7b4-70593126ae5c",
+        "sandbox_id": "01a0ff2a-1bda-7138-b8ca-51872307d0d5",
         "effective_policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919",
-        "kernel_table": "aiec_guard_01a0ff227c3770b2b7b470593126ae5c"
+        "kernel_table": "aiec_guard_01a0ff2a1bda7138b8ca51872307d0d5"
       },
       "observation_provenance": "host/control-plane",
       "samples": 1
@@ -27,7 +27,7 @@
         "request_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
         "provider_receipts": [
           {
-            "nonce": "7704ee0dada240559346ec944e9ba17e",
+            "nonce": "e543188c78c14249b4d31bcd2302f5b4",
             "method": "POST",
             "path": "/v1/mcp",
             "host": "mcp.guard.test:18880",
@@ -36,7 +36,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.178
+        "elapsed_seconds": 0.148
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -53,7 +53,7 @@
         "request_sha256": "313def3abe10fea59275691330c984b077830db25a86d9a7f795f224652807e5",
         "provider_receipts": [
           {
-            "nonce": "91f15b4c5d114f1ebdf87c3478ead0be",
+            "nonce": "46ed8a49327947848802faadf8a72bf1",
             "method": "POST",
             "path": "/v1/mcp",
             "host": "mcp.guard.test:18880",
@@ -62,7 +62,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.1
+        "elapsed_seconds": 0.122
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -87,7 +87,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.091
+        "elapsed_seconds": 0.06
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -112,7 +112,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.08
+        "elapsed_seconds": 0.067
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -137,7 +137,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.099
+        "elapsed_seconds": 0.063
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -154,7 +154,7 @@
         "request_sha256": "6b8097b12ce9d3d9271d02e25e117ca5f89ebae03a09a164ed59e607c9abdc11",
         "provider_receipts": [
           {
-            "nonce": "558dbce4bc4c4353972fa5ba70d144a1",
+            "nonce": "2746584174554fbf83cd573960254605",
             "method": "POST",
             "path": "/v1/mcp",
             "host": "mcp.guard.test:18880",
@@ -163,7 +163,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.114
+        "elapsed_seconds": 0.078
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -180,7 +180,7 @@
         "request_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
         "provider_receipts": [
           {
-            "nonce": "2465b5de2c5947938d96d820bd9a5b9c",
+            "nonce": "76e6a38956f14ef2aa5946b274c73525",
             "method": "POST",
             "path": "/v1/graphql",
             "host": "graphql.guard.test:18880",
@@ -189,7 +189,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.123
+        "elapsed_seconds": 0.075
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -206,7 +206,7 @@
         "request_sha256": "6dc5f20274429c4618a075cf3cdc33d6709911340048a7e075c73521c18526be",
         "provider_receipts": [
           {
-            "nonce": "6856e3cf68e5473bb40eacb5f9a0b866",
+            "nonce": "1c9d6953748745b59e578c922ae8c8db",
             "method": "POST",
             "path": "/v1/graphql",
             "host": "graphql.guard.test:18880",
@@ -215,7 +215,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.108
+        "elapsed_seconds": 0.07
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -240,7 +240,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.092
+        "elapsed_seconds": 0.066
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -265,7 +265,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.11
+        "elapsed_seconds": 0.08
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -290,7 +290,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.115
+        "elapsed_seconds": 0.062
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -315,7 +315,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.083
+        "elapsed_seconds": 0.059
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -340,7 +340,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.092
+        "elapsed_seconds": 0.071
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -365,7 +365,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.082
+        "elapsed_seconds": 0.061
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -390,7 +390,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.078
+        "elapsed_seconds": 0.06
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -415,7 +415,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.088
+        "elapsed_seconds": 0.058
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -440,7 +440,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.077
+        "elapsed_seconds": 0.062
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -465,7 +465,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.078
+        "elapsed_seconds": 0.064
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -490,7 +490,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.133
+        "elapsed_seconds": 0.107
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -507,7 +507,7 @@
         "request_sha256": "f32fbcbbe47d48f35a9a63d238effd8e759c96745578cf1f97983e5dd337fd9a",
         "provider_receipts": [
           {
-            "nonce": "2e3c0525626e45dea8b9be8816d71636",
+            "nonce": "1fe17bb876314b309f6ff5e72c12345e",
             "method": "POST",
             "path": "/v1/graphql",
             "host": "graphql.guard.test:18880",
@@ -516,7 +516,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.136
+        "elapsed_seconds": 0.139
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -533,7 +533,7 @@
         "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "provider_receipts": [
           {
-            "nonce": "e24da3bad41c4e3ba414b5667bb35709",
+            "nonce": "6cc52ffb40ac4267a5a8c62874680dc7",
             "method": "GET",
             "path": "/v1/item",
             "host": "api.guard.test:18880",
@@ -542,7 +542,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.138
+        "elapsed_seconds": 0.152
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -567,7 +567,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.124
+        "elapsed_seconds": 0.136
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -592,7 +592,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.122
+        "elapsed_seconds": 0.102
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -617,7 +617,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.158
+        "elapsed_seconds": 0.194
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -653,7 +653,7 @@
             "policy_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
           }
         ],
-        "elapsed_seconds": 0.077
+        "elapsed_seconds": 0.061
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -662,7 +662,7 @@
       "case": "pending-proposal-preserves-effective-policy",
       "status": "PASS",
       "evidence": {
-        "proposal_id": "01a0ff22-9811-72ee-b887-4af7581dfde6",
+        "proposal_id": "01a0ff2a-3013-7655-b94b-e8209c460b32",
         "state": "pending",
         "effective_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919"
       },
@@ -722,23 +722,23 @@
         "status": 200,
         "previous_hash": "8fa9744b55d4d8cafe7de7a1612c420b86c802d2d6aecaafea8f15be26779919",
         "effective_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
-        "decided_by": "key:01a0ff22-97fb-7394-97f5-ebd8fd63820f",
+        "decided_by": "key:01a0ff2a-2fed-72ff-b282-7b078f549d3e",
         "events": [
           {
-            "timestamp": "2026-10-03T00:20:52.627365213Z",
-            "event_id": "df533fcf-e957-4818-95e3-668c7281330d",
-            "sandbox_id": "01a0ff22-7c37-70b2-b7b4-70593126ae5c",
-            "tenant_id": "a810eb7e-3b3c-469f-9685-e929fa612b92",
+            "timestamp": "2026-10-03T00:29:10.243022108Z",
+            "event_id": "d8a037cc-8692-4a3d-bbe6-665358ec18a7",
+            "sandbox_id": "01a0ff2a-1bda-7138-b8ca-51872307d0d5",
+            "tenant_id": "fd87878c-c193-4587-ab98-503ce4f23a97",
             "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
             "category": "policy",
             "decision": "allow",
-            "reason": "policy proposal 01a0ff22981172eeb8874af7581dfde6 applied by operator review",
+            "reason": "policy proposal 01a0ff2a30137655b94be8209c460b32 applied by operator review",
             "destination": "safe.guard.test:18880",
             "request_bytes": 0,
             "response_bytes": 0,
             "duration_ms": 0,
-            "previous_hash": "ca7c5b110088318c0de0dcb6303959fc81664e4cb4b9dec24c59a9519c32b038",
-            "current_hash": "9f3b922a1f3c7e062e5d2b7849bdfb96611aac4616c186b353e03c7a387e3ce4"
+            "previous_hash": "f6022d40c80ce3dd1e02337270324d582089e9cf29599bca03a69d3c8354f6b1",
+            "current_hash": "0e8778cf52a151125cecc05d25be1f2f8bf001949e822961374651669db9d10a"
           }
         ]
       },
@@ -757,7 +757,7 @@
         "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "provider_receipts": [
           {
-            "nonce": "d4f069fb2c404e5086814846835b5bc3",
+            "nonce": "957c8eb75167494085a8330d5d4841e8",
             "method": "GET",
             "path": "/v1/item",
             "host": "safe.guard.test:18880",
@@ -766,7 +766,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.133
+        "elapsed_seconds": 0.122
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -791,7 +791,7 @@
             "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c"
           }
         ],
-        "elapsed_seconds": 0.135
+        "elapsed_seconds": 0.122
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -808,7 +808,7 @@
         "request_sha256": "fe46a7b63441640a6cde10b8a745d42b767a4e6be8d58041cefa7db2d3da42a0",
         "provider_receipts": [
           {
-            "nonce": "301cf02747a94ad8962bd2259aad5d48",
+            "nonce": "b3880c32e33840d98ec44c2f15adf695",
             "method": "POST",
             "path": "/v1/mcp",
             "host": "mcp.guard.test:18880",
@@ -817,7 +817,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.168
+        "elapsed_seconds": 0.109
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -830,10 +830,10 @@
         "effective_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
         "verifier_events": [
           {
-            "timestamp": "2026-10-03T00:20:53.162514171Z",
-            "event_id": "d987ee98-77c2-491e-ba5b-b5478c816c33",
-            "sandbox_id": "01a0ff22-7c37-70b2-b7b4-70593126ae5c",
-            "tenant_id": "a810eb7e-3b3c-469f-9685-e929fa612b92",
+            "timestamp": "2026-10-03T00:29:10.700849109Z",
+            "event_id": "5f3d1353-34ba-466a-8748-90d58e14d60b",
+            "sandbox_id": "01a0ff2a-1bda-7138-b8ca-51872307d0d5",
+            "tenant_id": "fd87878c-c193-4587-ab98-503ce4f23a97",
             "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c",
             "category": "policy",
             "decision": "deny",
@@ -842,8 +842,8 @@
             "request_bytes": 0,
             "response_bytes": 0,
             "duration_ms": 0,
-            "previous_hash": "eedc877b3135ba0acfb0259fbe79b5fd41e72e880dfa0f3279b190ec39567e59",
-            "current_hash": "2d37dfb1f36d8f5961c5b7710ea5f09c3b1a815c8e806409108c6fac2dba19be"
+            "previous_hash": "b06925894b5024b2e61585d27c5d257a0e9371f1a2cb994f4608811e509ed8dc",
+            "current_hash": "faf178084ffff9bc790e277f390f3f1afac5e5f69a164a329f6aada12faa3542"
           }
         ],
         "error_code": "backend_unavailable"
@@ -871,7 +871,7 @@
             "policy_hash": "6a8242d3546f1b884bb80055fa8d138b0c4db42d708101f2ad220e61bfd7b99c"
           }
         ],
-        "elapsed_seconds": 0.122
+        "elapsed_seconds": 0.127
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -888,7 +888,7 @@
         "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "provider_receipts": [
           {
-            "nonce": "b08335c3965f4a2a80c73d6db9dfbcc5",
+            "nonce": "c2de0889fa104e768be77c3bd0d966e9",
             "method": "GET",
             "path": "/v1/item",
             "host": "safe.guard.test:18880",
@@ -897,7 +897,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.155
+        "elapsed_seconds": 0.128
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -980,7 +980,7 @@
         "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "provider_receipts": [
           {
-            "nonce": "7612d3b756464b08b54ef43b92d5a45b",
+            "nonce": "8eb0449f87854b588223a09114bbf989",
             "method": "GET",
             "path": "/anything",
             "host": "api.guard.test:18880",
@@ -989,7 +989,7 @@
           }
         ],
         "deny_events": [],
-        "elapsed_seconds": 0.144
+        "elapsed_seconds": 0.126
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -1014,7 +1014,7 @@
             "policy_hash": "683a8c34af8f38b55d21aced9f494f5c1fb6ea53fa7fa2cc59c2d8b2fd6cc1ba"
           }
         ],
-        "elapsed_seconds": 0.077
+        "elapsed_seconds": 0.066
       },
       "observation_provenance": "provider socket receipt + runtime host journal; guest status advisory",
       "samples": 1
@@ -1044,8 +1044,8 @@
   ],
   "cleanup_errors": [],
   "provider_requests": 43,
-  "elapsed_seconds": 22.66,
-  "finished_at": "2026-10-03T00:20:57.828215+00:00",
+  "elapsed_seconds": 16.417,
+  "finished_at": "2026-10-03T00:29:14.460550+00:00",
   "environment": {
     "runtime": "firecracker",
     "isolated_network_namespace": true,

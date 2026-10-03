@@ -767,11 +767,21 @@ tree is torn down on every run. A failed run copies `failure.json`, the
 service logs (capped at the last MiB each) and the host's own Guard journals
 into `$P3_ROOT/failed/<timestamp>-<id>/` before the tree goes, so the
 diagnostic outlives the scratch without the database, socket or rootfs copies
-outliving it too, and the report lists what was kept. A teardown that fails is
-a `cleanup_errors` entry naming the path, flips a passing run to failing, and
-is reported as `residue` rather than left to be found later. A directory the
-run did not create is not re-permissioned: `P3_ROOT` may be a parent the
-operator shares with another suite.
+outliving it too, and the report lists what was kept.
+
+Keeping a journal is keeping a record whose free-form fields a guest can shape
+a little, so the retained set is scanned against the run's own minted secrets
+and any file containing one is deleted, named in
+`evidence_withheld_for_secrets` rather than redacted. That check is what makes
+the claim hold as the journal's schema changes; by construction today the
+record is a closed set of ids, hashes, counters and a category, every `reason`
+is a static string with no request data interpolated into it, and the one
+guest-controlled field, the `host:port` destination, is recorded only after an
+authority containing `@` or an `authorization` header has already been
+refused. A teardown that fails is a `cleanup_errors` entry naming the path,
+flips a passing run to failing, and is reported as `residue` rather than left to
+be found later. A directory the run did not create is not re-permissioned:
+`P3_ROOT` may be a parent the operator shares with another suite.
 
 Three more state defects were found by rerunning the suites against that
 arrangement, all of them cases where a retained file was trusted for existing

@@ -527,6 +527,21 @@ def inside():
     command(["openssl", "x509", "-req", "-in", str(tls / "api.csr"), "-CA", str(tls / "ca.crt"),
              "-CAkey", str(tls / "ca.key"), "-CAcreateserial", "-days", "2", "-out", str(tls / "api.crt"),
              "-extfile", str(tls / "ext.cnf")])
+    # Key material and the database password are part of what a log must never
+    # carry, so the scan below is given them as well: a service that printed its
+    # own TLS key would otherwise pass a check that only knows about tokens.
+    # The PEM body is taken rather than the whole file, because a service that
+    # leaked a key prints the body. An empty password is not added at all: the
+    # empty string is a substring of every file, and adding it would report
+    # every retained log as leaking.
+    for key in ("api.key", "ca.key"):
+        body = (tls / key).read_text().strip().splitlines()[1:-1]
+        if body:
+            SECRETS.append("".join(body))
+    credentials = os.environ["P3_DATABASE_URL"].split("://", 1)[1].split("@", 1)[0]
+    password = urllib.parse.unquote(credentials.partition(":")[2])
+    if password:
+        SECRETS.append(password)
     CTX = ssl.create_default_context(cafile=str(tls / "ca.crt"))
     hasher = hashlib.sha256()
     with (images / "aiec-rootfs.ext4").open("rb") as handle:
@@ -805,7 +820,28 @@ def outer():
             kept = evidence / journal_path.parent.name / journal_path.name
             kept.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(journal_path, kept)
-        result["evidence_retained"] = sorted(path.name for path in evidence.iterdir())
+        # Retained evidence is checked against this run's own secrets before it
+        # is called evidence. The scan over service logs alone is not enough
+        # once journals are kept too, and "the schema has no secret field" is an
+        # argument about today's code rather than a property of what was
+        # copied. A file that does contain a secret is deleted rather than
+        # kept with a redaction: the report says which file it was, so the
+        # absence is visible, and nothing derived from it is left on disk.
+        withheld = []
+        retained = []
+        for kept in sorted(path for path in evidence.rglob("*") if path.is_file()):
+            if any(secret.encode() in kept.read_bytes() for secret in SECRETS):
+                withheld.append(str(kept.relative_to(evidence)))
+                kept.unlink()
+            else:
+                retained.append(str(kept.relative_to(evidence)))
+        # A journal's directory is the only subdirectory this copies into, and
+        # one left empty by a withheld file is a directory with nothing in it.
+        for stale in sorted(path for path in evidence.rglob("*") if path.is_dir()):
+            if not any(stale.iterdir()):
+                stale.rmdir()
+        result["evidence_retained"] = retained
+        result["evidence_withheld_for_secrets"] = withheld
     try:
         shutil.rmtree(scratch)
     except OSError as error:
