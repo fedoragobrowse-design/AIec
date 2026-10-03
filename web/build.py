@@ -94,11 +94,11 @@ DEFAULT_RAIL = """
       </dl>
     </div>
     <div class="rail__group">
-      <span class="rail__caption">Availability</span>
+      <span class="rail__caption">Deployment</span>
       <dl>
-        <dt>signup</dt><dd>invite only</dd>
-        <dt>regions</dt><dd>1</dd>
-        <dt>SLA</dt><dd>none in alpha</dd>
+        <dt>hosting</dt><dd>self-hosted</dd>
+        <dt>license</dt><dd>Apache 2.0</dd>
+        <dt>capacity</dt><dd>your hosts</dd>
       </dl>
     </div>
 """

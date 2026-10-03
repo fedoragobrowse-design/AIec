@@ -8,12 +8,13 @@
 </p>
 
 <h2>The boundary</h2>
-<pre><code>tenant A sandbox  ─┐
-                   ├─ microVM: own kernel, own filesystem, own netns
-tenant B sandbox  ─┘
-                        │
-                        ├─ vsock control channel (never on the network)
-                        └─ egress filtered by nftables policy</code></pre>
+<pre><code>tenant A sandbox ── microVM A: guest kernel + filesystem
+tenant B sandbox ── microVM B: guest kernel + filesystem
+                         │
+                         ├─ vsock control channel
+                         └─ host-owned network namespace + Guard gateway
+                              │
+                              └─ policy, credentials and journal outside guest</code></pre>
 
 <div class="grid-2">
   <div class="block">
@@ -24,10 +25,11 @@ tenant B sandbox  ─┘
        local development.</p>
   </div>
   <div class="block">
-    <h3>Nothing shared</h3>
-    <p>Each sandbox gets its own kernel, root filesystem and network namespace.
-       A bug in one guest does not reach another guest, and the host kernel is not
-       exposed to the workload at all.</p>
+    <h3>Separate guest kernels</h3>
+    <p>Each Firecracker sandbox has its own guest kernel, root filesystem and
+       network namespace. Workloads do not run directly in the host kernel as
+       containers do. The host, hypervisor and Guard processes remain trusted
+       components; host compromise defeats this boundary.</p>
   </div>
   <div class="block">
     <h3>Deny-all by default</h3>
@@ -45,10 +47,10 @@ tenant B sandbox  ─┘
        journal on the worker rather than in the machine. A guarded sandbox
        reaches exactly one path, its own gateway; model traffic carries a
        placeholder that the gateway swaps for a real credential the guest never
-       holds, and no policy selected means no network. Encrypted tunnels are not
-       inspected by default, so a rule needing method or path visibility is
-       refused unless the operator turns on interception and acknowledges that
-       Guard will then hold a key able to read the traffic it governs.</p>
+       holds, and no policy selected means no network. Encrypted tunnels do not
+       expose method or path to Guard. A CONNECT tunnel to a host requiring those
+       checks is refused rather than forwarded ungoverned; TLS interception is
+       not claimed as a validated deployment mode.</p>
   </div>
   <div class="block">
     <h3>Tenancy is enforced server-side</h3>
@@ -110,10 +112,11 @@ tenant B sandbox  ─┘
        undoes one.</p>
   </div>
   <div class="block">
-    <h3>Evidence that cannot be rewritten</h3>
-    <p>Every decision is a hash-chained record outside the guest, anchored in
-       the control plane. A guest that reports what happened is treated as
-       advice; only what Guard observed counts.</p>
+    <h3>Evidence outside the guest</h3>
+    <p>Guard records decisions in a hash-chained journal outside the guest,
+       anchored in the control plane. Verification detects tampering and gaps.
+       Guest and harness logs are context, not enforcement evidence; a host-level
+       attacker is outside this journal's trust boundary.</p>
   </div>
   <div class="block">
     <h3>A second reviewer that can only tighten</h3>
@@ -124,11 +127,11 @@ tenant B sandbox  ─┘
   </div>
   <div class="block">
     <h3>Tripwires, signed images, per-machine identity</h3>
-    <p>Synthetic canaries mark a fake file, hostname or credential so touching one
-       is caught outside the guest. Guarded workloads can require a signed image
-       manifest with verified kernel and rootfs digests and refuse to boot
-       without it, and each machine gets its own short-lived control identity
-       that no other sandbox can use and no snapshot carries.</p>
+    <p>Synthetic hostnames and credentials trigger host-observed tripwires.
+       File canaries cover reads through trusted file APIs, not arbitrary
+       in-guest <code>exec</code> reads. Guarded workloads can require signed
+       manifests with verified kernel and rootfs digests; each machine gets a
+       distinct short-lived control identity that no snapshot carries.</p>
   </div>
 </div>
 <p>
@@ -180,10 +183,16 @@ tenant B sandbox  ─┘
   <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>.
 </p>
 
-<h2>Known limitations</h2>
-<p>
-  We would rather list these than have you find them. The current ones, and what
-  is not yet enforced, are in
-  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>
-  and summarised on the <a href="/status">status</a> page.
-</p>
+<h2>Evidence and limits</h2>
+<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
+links live acceptance artifacts for all five phases, the durable lifetime
+reaper and workspace restore. They prove the cases exercised on those hosts,
+not universal production readiness. Local model mocks are not external-provider
+validation; aarch64 has build evidence only, and multi-host security is not
+validated.</p>
+<p>The <a href="/status">verification and limits page</a> lists the published
+results, the 77/80 parallel soak and remaining product bounds. Host compromise,
+gateway compromise and data sent to an allowed endpoint remain outside the
+protection Guard offers. Read
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>
+and the threat model before deploying untrusted workloads.</p>

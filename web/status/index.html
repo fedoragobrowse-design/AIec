@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Status — AIec</title>
-<meta name="description" content="AIec public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven.">
-<meta property="og:title" content="Status — AIec">
-<meta property="og:description" content="AIec public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven.">
+<title>Verification and limits — AIec</title>
+<meta name="description" content="Published AIec acceptance evidence, deployment requirements and known limits. Self-hosted software; this page is not a live cluster-health monitor.">
+<meta property="og:title" content="Verification and limits — AIec">
+<meta property="og:description" content="Published AIec acceptance evidence, deployment requirements and known limits. Self-hosted software; this page is not a live cluster-health monitor.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#edf0f4">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -41,89 +41,95 @@
       </dl>
     </div>
     <div class="rail__group">
-      <span class="rail__caption">Availability</span>
+      <span class="rail__caption">Deployment</span>
       <dl>
-        <dt>signup</dt><dd>invite only</dd>
-        <dt>regions</dt><dd>1</dd>
-        <dt>SLA</dt><dd>none in alpha</dd>
+        <dt>hosting</dt><dd>self-hosted</dd>
+        <dt>license</dt><dd>Apache 2.0</dd>
+        <dt>capacity</dt><dd>your hosts</dd>
       </dl>
     </div>
 
   </aside>
   <main class="content">
-<!-- meta:title=Status -->
-<!-- meta:description=AIec public alpha status: what works, what is limited, what is not yet implemented, and what is not yet proven. -->
+<!-- meta:title=Verification and limits -->
+<!-- meta:description=Published AIec acceptance evidence, deployment requirements and known limits. Self-hosted software; this page is not a live cluster-health monitor. -->
 
-<h1>Public alpha status</h1>
-<p class="lead">
-  What actually works today, and what does not. This page is deliberately
-  blunt: an unexercised capability is never reported as working.
-</p>
+<h1>Verification and limits</h1>
+<p class="lead">What has been exercised, where the evidence lives, and what is
+still unproven. AIec is self-hosted: this is a record of published verification,
+not a live monitor of your cluster.</p>
 
-<h2>Working</h2>
+<h2 id="evidence">Published live acceptance</h2>
+<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
+records the environment, commands and scope of each run. These suites use real
+Firecracker guests with isolated state and local mock model providers. A passing
+suite is evidence for its cases, not certification of every deployment.</p>
 <table class="kv">
-  <tr><th>Capability</th><th>Status</th></tr>
-  <tr><td>Firecracker microVM sandboxes</td><td>Working, exercised end to end</td></tr>
-  <tr><td>Docker runtime</td><td>Working, trusted deployments only</td></tr>
-  <tr><td>Exec, stdin, environment, cwd</td><td>Working, bounded by time and output size</td></tr>
-  <tr><td>File read/write/list/delete</td><td>Working, confined to the workspace</td></tr>
-  <tr><td>Coding guest image</td><td>Working — Git, CA certificates, Python, curl, tar</td></tr>
-  <tr><td>HTTPS Git clone, edit, diff</td><td>Working, verified inside a real microVM</td></tr>
-  <tr><td>Workspace snapshots</td><td>Working, portable between owners</td></tr>
-  <tr><td>PostgreSQL state, leases, quotas</td><td>Working</td></tr>
-  <tr><td>S3-compatible object storage</td><td>Working</td></tr>
-  <tr><td>Worker recovery and fencing</td><td>Working — reassignment at a higher generation, stale workers rejected</td></tr>
-  <tr><td>Guard packet enforcement, DNS and model gateway</td><td>Working — verified on real microVMs with real nftables, including a full-snapshot scan for the model credential</td></tr>
-  <tr><td>Watchdog and dead-man switch</td><td>Working — a guarded attachment carries no egress until an out-of-guest watchdog reports, and is cut when reporting stops</td></tr>
-  <tr><td>Quarantine, incident report, human release</td><td>Working — cut, pause, forensic capture, durable state and report, verified end to end on a real microVM</td></tr>
-  <tr><td>Durable lifetime and model budgets</td><td>Working — reserved in the control plane before traffic is forwarded</td></tr>
-  <tr><td>Layer 7 governance, proposals, canaries, signed images</td><td>Working — covered by unit and integration tests against local mocks</td></tr>
+  <thead><tr><th scope="col">Area</th><th scope="col">Published result and evidence</th></tr></thead>
+  <tbody>
+    <tr><td>Core network, DNS and model credentials</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-core-acceptance.json">48/48</a></td></tr>
+    <tr><td>Watchdog, dead-man switch and quarantine</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-phase2-acceptance.json">29/29</a></td></tr>
+    <tr><td>MCP/GraphQL policy and proposals</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-phase3-acceptance.json">47/47</a></td></tr>
+    <tr><td>Optional restrictive watcher</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-phase4-acceptance.json">51/51</a></td></tr>
+    <tr><td>Canaries, image trust and per-VM identity</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-phase5-acceptance.json">37/37, full suite</a></td></tr>
+    <tr><td>Durable lifetime reaper observed acting</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-reaper-acceptance.json">16/16</a> and <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-reaper-external-db-acceptance.json">16/16 through the external-database relay</a></td></tr>
+    <tr><td>Workspace snapshot, source destruction and restore</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/snapshot-acceptance.json">12/12 against real S3 storage</a></td></tr>
+    <tr><td>External model-only harness loop (Topology B)</td><td><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/guard-topology-b-acceptance.json">15/15</a>; the in-guest loop is in the core suite</td></tr>
+  </tbody>
 </table>
 
-<h2>Limited</h2>
-<table class="kv">
-  <tr><th>Capability</th><th>Limitation</th></tr>
-  <tr><td>Signup</td><td>Invite-only. No open registration during alpha.</td></tr>
-  <tr><td>Capacity</td><td>Limited by the hosted provider's free allowance. When it is exhausted, creation stops with <code>TEMPORARY_CAPACITY_UNAVAILABLE</code> rather than overage.</td></tr>
-  <tr><td>SLA</td><td>None. This is alpha software without a support commitment.</td></tr>
-  <tr><td>Regions</td><td>A single execution region during alpha.</td></tr>
-  <tr><td>API stability</td><td>Endpoints may change before 1.0.</td></tr>
-  <tr><td>Snapshots</td><td>Workspace archives are portable. VM memory snapshots are not.</td></tr>
-</table>
-
-<h2>Not yet implemented</h2>
-<p>Stated plainly so nobody plans around them:</p>
+<h2 id="product">Available product surfaces</h2>
 <ul class="tight">
-  <li>Per-tenant <strong>snapshot and persistent-storage byte quotas</strong>. Per-request size ceilings exist; aggregate accounting does not yet.</li>
-  <li>A control-plane <strong>lifetime reaper observed firing in a live run</strong>. For guarded sandboxes the ceilings and expiry are durable control-plane state and a worker restart cannot reset them; the reaper that acts on an expired budget is implemented and database-tested, but we have not watched it fire end to end.</li>
-  <li><strong>Method and path policy without TLS interception.</strong> In the default SNI mode Guard sees the hostname and forwards the tunnel; method and path rules require the operator to enable interception and acknowledge that Guard then holds a key able to read what it forwards.</li>
-  <li><strong>Multi-host</strong> validation with separate control and worker machines. Same-host multi-worker recovery is proven; genuinely distributed operation is not yet.</li>
-  <li>An <strong>audit log viewer</strong> in the dashboard. Events are recorded, the UI is not built.</li>
-  <li><strong>Usage is recorded but not billed.</strong> Every metric is exported for your own capacity planning; there is no payment path.</li>
+  <li><strong>Interactive sandboxes:</strong> bounded exec and workspace-confined
+      file operations through the Python SDK, CLI and local MCP server.</li>
+  <li><strong>Durable runs and evaluations:</strong> repository checkout,
+      commands, validations, artifacts, cancellation and bounded comparisons.</li>
+  <li><strong>Recovery:</strong> PostgreSQL leases and generation fencing, with
+      workspace archives in S3-compatible storage. Running VM memory is not the
+      portable recovery unit.</li>
+  <li><strong>Quality gate:</strong> formatting, clippy, workspace tests, SDK
+      documentation contracts, Python SDK tests and an aarch64 cross-build.</li>
 </ul>
 
-<h2>Hosting model</h2>
-<p>
-  AIec is open source and self-hosted. There is no hosted execution capacity
-  and no cloud provider in the path: the control plane, the workers and the
-  sandboxes are the ones you deploy. What is claimed below is what runs on
-  hardware you control.
-</p>
-<table class="kv">
-  <tr><th>Claim</th><th>Status</th></tr>
-  <tr><td>AIec native Firecracker runtime</td><td>Complete and verified</td></tr>
-  <tr><td>Self-hosted single-host operation</td><td>Proven end to end</td></tr>
-  <tr><td>Multi-host fleet across separate machines</td><td>Not validated</td></tr>
-  <tr><td>Hosted capacity from a provider</td><td>Does not exist, by design</td></tr>
-</table>
+<h2 id="limits">Known limits</h2>
+<div class="callout">
+  <strong class="callout__head">The parallel soak is not a clean 80/80.</strong>
+  <p>The dated run completed 77/80 with three transient
+  <code>no schedulable worker has capacity</code> refusals. Resource censuses
+  returned to baseline. Their cause remains unattributed, and the soak has not
+  been rerun after the scheduler fix. <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/AFTER2.md">Read the original measurement.</a></p>
+</div>
+<ul class="tight">
+  <li><strong>Multi-host security:</strong> separate control and worker hosts and
+      separate gateway modes are documented, not validated by the single-host evidence.</li>
+  <li><strong>aarch64:</strong> cross-build evidence only; no hardware runtime or
+      performance claim.</li>
+  <li><strong>Encrypted traffic:</strong> hostname visibility is not method or
+      path visibility. CONNECT to a governed host requiring Layer 7 checks is
+      refused, not forwarded ungoverned. TLS interception is not claimed as a
+      validated deployment mode.</li>
+  <li><strong>File canaries:</strong> trusted host file APIs can observe reads;
+      arbitrary in-guest <code>exec</code> reads are not observable through those APIs.
+      Guest and harness logs are contextual, not trusted enforcement evidence.</li>
+  <li><strong>Storage accounting:</strong> per-request size ceilings exist;
+      aggregate per-tenant snapshot and persistent-storage byte quotas remain absent.</li>
+  <li><strong>SDK and Run listings:</strong> <code>run_cells</code> chunking and
+      per-Run pagination for events, attempts and artifacts remain unimplemented.</li>
+  <li><strong>Operations:</strong> no SLA or hosted service. API endpoints may
+      change before 1.0; you own capacity, monitoring, upgrades and backups.</li>
+</ul>
 
-<h2>Security posture</h2>
-<p>
-  The full picture, including what is <em>not</em> yet enforced, is in
-  <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md">SECURITY.md</a>.
-  Report a vulnerability to <strong>security@gobrowse.dev</strong>, not to a
-  public issue.
-</p>
+<h2 id="deployment">Before you deploy</h2>
+<p>Build and deploy the guest image, configure image trust and TLS, protect
+credential files, and run the watchdog. Guard workers need
+<code>CAP_NET_ADMIN</code> and <code>CAP_NET_RAW</code>; the packaged systemd unit
+grants both, and another launcher must do so explicitly. Follow the
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>
+and reproduce the relevant acceptance suites on your hosts.</p>
+<p>For the threat boundary and vulnerability reporting, read
+<a href="/security">Security</a>. The report and
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/known-defects.md">known-defects record</a>
+keep measured limitations separate from fixed defects.</p>
 
   </main>
 </div>

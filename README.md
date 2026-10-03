@@ -2,15 +2,15 @@
 
 **AI elastic compute — isolated, disposable computers for autonomous agents.**
 
-AIec hands an AI agent a real machine: its own kernel, its own filesystem, its own
-network. The agent clones a repository, runs code, edits files, runs tests, reads
-the diff, and destroys the environment — thousands of times an hour — without ever
-touching the host.
+AIec gives an AI agent an isolated computer to clone a repository, run code,
+edit files, run tests and collect the diff. Firecracker provides the guest
+kernel; Guard governs network access and model credentials outside the guest.
+You run the control plane, workers, PostgreSQL and object storage yourself.
 
 ```python
 from agentforge import AIec
 
-af = AIec(api_key="af_live_...")
+af = AIec(base_url="https://your-control-plane.example", api_key="af_live_...")
 
 box = af.sandboxes.create(image="aiec-coding:latest")
 result = box.exec(["python", "-c", "print('hello from AIec')"])
@@ -131,7 +131,42 @@ policy format is [`docs/GUARD_POLICY.md`](docs/GUARD_POLICY.md), operating it is
 [`docs/GUARD.md`](docs/GUARD.md), and what it does and does not defend is
 [`docs/GUARD_THREAT_MODEL.md`](docs/GUARD_THREAT_MODEL.md).
 
+The four built-in policy templates are `no_network`, `model_only`,
+`model_plus_allowlist` and `read_only_api`. An optional watcher can request
+restrictive actions but cannot approve a proposal, loosen policy or release a
+quarantine. Signed-image admission checks kernel and rootfs digests; per-VM
+control identities and canaries add checks outside the guest.
+
 Details, including the limits we have not solved: [`SECURITY.md`](SECURITY.md).
+
+## Verified behavior and remaining limits
+
+The [Guard report](docs/guard-report.md) separates implementation, regression
+tests and live acceptance evidence. The published runs use real Firecracker
+guests, isolated state and local mock model providers—not a claim about every
+deployment or external model service.
+
+| Live acceptance | Published result |
+|---|---|
+| Core network, DNS and credential boundary | [48/48](benchmarks/guard-core-acceptance.json) |
+| Watchdog, dead-man switch and quarantine | [29/29](benchmarks/guard-phase2-acceptance.json) |
+| MCP/GraphQL rules and policy proposals | [47/47](benchmarks/guard-phase3-acceptance.json) |
+| Optional restrictive watcher | [51/51](benchmarks/guard-phase4-acceptance.json) |
+| Canaries, image trust and per-VM identity | [37/37, full suite](benchmarks/guard-phase5-acceptance.json) |
+| Durable lifetime reaper | [16/16](benchmarks/guard-reaper-acceptance.json), [16/16 through the external-database relay](benchmarks/guard-reaper-external-db-acceptance.json) |
+| Workspace snapshot, destroy and restore through real S3 storage | [12/12](benchmarks/snapshot-acceptance.json) |
+
+These results are not a blanket production certification. Multi-host security
+and aarch64 runtime/performance remain unvalidated; aarch64 has build evidence.
+The dated parallel soak remains **77/80**, with three unattributed capacity
+refusals and no accumulated resources; it has not been rerun after the scheduler
+fix. A CONNECT tunnel requiring Layer 7 visibility is refused rather than
+forwarded ungoverned. Arbitrary in-guest `exec` file reads are not observable
+through trusted host file APIs.
+
+SDK `run_cells` chunking and per-Run pagination for events, attempts and artifacts
+remain unimplemented. See the report for measurement scope, exact acceptance
+commands, and deployment steps.
 
 ---
 
@@ -153,6 +188,9 @@ box.destroy()
 ```
 
 There is no account to sign up for and no key to request from anyone.
+
+Set `base_url` to your deployed endpoint, or use `AIEC_URL`. The SDK's fallback
+is `http://127.0.0.1:8080` for a local control plane, not a hosted service.
 
 Available images: `aiec-coding:latest` (the default, with `git`, Python and a
 build toolchain), `python:3.13`, `node:24`, `rust:stable`, `ubuntu:24.04` and
@@ -352,17 +390,28 @@ KVM, PostgreSQL, and S3-compatible object storage.
 ```bash
 git clone https://github.com/fedoragobrowse-design/AIec.git
 cd AIec
-./scripts/build-firecracker-guest.sh     # build the coding guest image
-aiec doctor                        # check every prerequisite
+cargo build --release -p aiec-api -p aiec-cli -p aiec-mcp
+export PATH="$PWD/target/release:$PATH"
+export AIEC_KERNEL=/path/to/vmlinux
+export AIEC_GUEST_SECRET="$(openssl rand -hex 32)"
+./scripts/build-firecracker-guest.sh  # requires Docker and a compatible kernel
+aiec doctor                         # report missing host/configuration prerequisites
 ```
 
-`aiec doctor` validates KVM, the Firecracker binary, the guest artifact and
-its digest, the database, object storage, networking and TLS, and tells you
-exactly what is missing. Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+The image builder writes the rootfs and its digests; configure signed-image
+admission separately. Protect the guest secret and output image as credentials.
+`aiec doctor` validates KVM, the Firecracker binary, the guest artifact and its
+digest, the database, object storage, networking and TLS. It reports missing
+prerequisites; it does not configure or start a cluster.
+Full instructions: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-If you want Guard, the worker also needs `CAP_NET_ADMIN` for nftables and TUN/TAP.
-Without it a worker reports `network_policy: false` and refuses every governed
-placement, which is the honest outcome rather than a silent downgrade.
+Guard workers need `CAP_NET_ADMIN` and `CAP_NET_RAW` for network enforcement.
+The packaged [`deploy/aiec-worker.service`](deploy/aiec-worker.service) grants
+both; an alternate launcher must grant them explicitly. A worker that cannot
+use nftables reports `network_policy: false` and refuses governed placement,
+rather than silently downgrading it. Deploy a freshly built guest image and
+configure TLS, image trust, credentials and the watchdog as described in the
+deployment guide.
 
 ---
 
@@ -375,7 +424,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [Docs](https://aiec.gobrowse.dev/docs) | Quickstart, images, sandbox lifecycle, self-hosting |
 | [Pricing](https://aiec.gobrowse.dev/pricing) | What running it yourself costs |
 | [Security](https://aiec.gobrowse.dev/security) | The same threat model as [`SECURITY.md`](SECURITY.md) |
-| [Status](https://aiec.gobrowse.dev/status) | Live platform status |
+| [Status](https://aiec.gobrowse.dev/status) | Published verification results and known limits, not live cluster health |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Architecture, and how it maps onto the DSec paper |
 | [`docs/API.md`](docs/API.md) | Every endpoint, with request and response shapes |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Self-hosting, TLS, workers, object storage, backups |
@@ -383,6 +432,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | [`docs/GUARD.md`](docs/GUARD.md) | Operating Guard: the watchdog, budgets, quarantine and release |
 | [`docs/GUARD_POLICY.md`](docs/GUARD_POLICY.md) | The Guard policy format, templates and verifier |
 | [`docs/GUARD_THREAT_MODEL.md`](docs/GUARD_THREAT_MODEL.md) | What Guard defends, and what it does not |
+| [`docs/guard-report.md`](docs/guard-report.md) | Live acceptance evidence, benchmarks, remaining limits and exact commands |
 | [`docs/MCP.md`](docs/MCP.md) | The local-only MCP server: giving an agent a disposable machine |
 | [`docs/known-defects.md`](docs/known-defects.md) | Open defects, resolved findings, and the cluster notes that cost time |
 | [`docs/FIRECRACKER_GUEST.md`](docs/FIRECRACKER_GUEST.md) | How the coding guest image is built and verified |
@@ -403,7 +453,7 @@ Start at the website — <https://aiec.gobrowse.dev/docs> — or read it here:
 | `sdk/python` | Python SDK (`pip install agentforge-sdk`) |
 | `policies/guard` | Shipped Guard policy templates, selection examples and boundaries |
 | `guest/aiec-guest` | The in-guest agent serving the control channel |
-| `web` | Website and Cloud console |
+| `web` | Static documentation website, page fragments and shared build script |
 
 The Rust crate names keep the `aiec-` prefix: they are code identifiers that
 would break every consumer if renamed, and they are not the product's name.

@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AIec — isolated sandboxes for AI agents — AIec</title>
-<meta name="description" content="AIec gives AI agents disposable, isolated computers — each with its own kernel, filesystem and network — on hardware you control. Open source, self-hosted.">
-<meta property="og:title" content="AIec — isolated sandboxes for AI agents — AIec">
-<meta property="og:description" content="AIec gives AI agents disposable, isolated computers — each with its own kernel, filesystem and network — on hardware you control. Open source, self-hosted.">
+<title>Isolated computers for AI agents — AIec</title>
+<meta name="description" content="Self-hosted computers for AI agents: Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Published acceptance evidence and explicit limits.">
+<meta property="og:title" content="Isolated computers for AI agents — AIec">
+<meta property="og:description" content="Self-hosted computers for AI agents: Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Published acceptance evidence and explicit limits.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#edf0f4">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -41,23 +41,23 @@
       </dl>
     </div>
     <div class="rail__group">
-      <span class="rail__caption">Availability</span>
+      <span class="rail__caption">Deployment</span>
       <dl>
-        <dt>signup</dt><dd>invite only</dd>
-        <dt>regions</dt><dd>1</dd>
-        <dt>SLA</dt><dd>none in alpha</dd>
+        <dt>hosting</dt><dd>self-hosted</dd>
+        <dt>license</dt><dd>Apache 2.0</dd>
+        <dt>capacity</dt><dd>your hosts</dd>
       </dl>
     </div>
 
   </aside>
   <main class="content">
-<!-- meta:title=AIec — isolated sandboxes for AI agents -->
-<!-- meta:description=AIec gives AI agents disposable, isolated computers — each with its own kernel, filesystem and network — on hardware you control. Open source, self-hosted. -->
+<!-- meta:title=Isolated computers for AI agents -->
+<!-- meta:description=Self-hosted computers for AI agents: Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Published acceptance evidence and explicit limits. -->
 
 <h1>Computers for AI agents.</h1>
-<p class="lead">An agent needs somewhere to run code that nobody else can reach
-and nobody has to clean up. AIec hands it a real machine — its own kernel, its
-own filesystem, its own network — and takes it away when the work is done.</p>
+<p class="lead">Give your agent a machine to run code, not control over its
+boundary. AIec provides disposable Firecracker microVMs; Guard governs their
+network access and model credentials from outside the guest.</p>
 
 <p><strong>AIec is open source and self-hosted.</strong> There is no hosted
 version and no hosted API: the control plane, the workers and the sandboxes run
@@ -102,6 +102,35 @@ agent at it.</p>
   </div>
 </div>
 
+<h2>Run the task. Keep the record.</h2>
+<p>Use the Python SDK, CLI or local MCP server for an interactive sandbox, or
+submit a run that clones a repository, executes a command, validates the result,
+collects artifacts and reclaims its machine. Evaluations repeat tasks or compare
+revisions with bounded concurrency and a settled record for each run.</p>
+<pre><code>from agentforge import AIec
+
+af = AIec(base_url="https://your-control-plane.example", api_key="af_live_...")
+run = af.runs.create(
+    repo="https://github.com/me/fixture",
+    command=["pytest", "-q"],
+    requirements={"full_kernel_isolation": True},
+)
+print(run["state"])</code></pre>
+
+<h2>The agent does not own the boundary.</h2>
+<p>Guard owns DNS and the network gateway, substitutes model credentials the
+guest never receives, and records decisions outside the machine. A watchdog
+must verify the attachment before egress opens. Silence cuts the network;
+quarantine cuts, pauses and preserves evidence. Durable budgets survive worker
+restarts, and an agent can propose a policy change but cannot approve one.</p>
+<p>Start with no network, model-only access, a model plus an allowlist, or a
+read-only API policy. MCP and GraphQL rules apply where Guard can see the request;
+a governed encrypted tunnel is refused rather than forwarded without checks.</p>
+<div class="actions">
+  <a class="btn" href="/security">Understand the boundary</a>
+  <a class="btn" href="/status">See verification and limits</a>
+</div>
+
 <h2>Built on a published design</h2>
 <p>The architecture follows <strong>DeepSeek Elastic Compute (DSec)</strong> —
 <em>“A Sandbox Infrastructure for Effective Agentic Training at Scale”</em>,
@@ -118,9 +147,14 @@ today and nothing on this site depends on it. If it happens, the interface will
 be this one: the same API, the same SDK, the same runtime model, running on
 somebody else's machines. The source will stay open either way.</p>
 
-<h2>No invented numbers</h2>
-<p>Benchmarks, throughput and latency figures are in the documentation only when
-they have actually been measured. If it is not measured, it is not claimed.</p>
+<h2>Evidence, not a production badge.</h2>
+<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">published Guard report</a>
+links live acceptance runs on real Firecracker guests, workspace snapshot
+restore through real S3 storage, and measured gateway costs. Results are scoped
+to those runs: multi-host security and aarch64 runtime remain unvalidated, and
+the dated parallel soak still contains three capacity refusals in 80 runs.
+<a href="/status">The status page</a> lists the evidence and remaining limits;
+it is not a live monitor of your cluster.</p>
 
   </main>
 </div>

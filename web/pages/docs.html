@@ -1,9 +1,9 @@
-<!-- meta:title=AIec — documentation -->
+<!-- meta:title=Documentation -->
 <!-- meta:description=Run AIec yourself: prerequisites, install, first sandbox, the SDK, self-hosting and operations. AIec is open source with no hosted API. -->
 
 <h1>Docs</h1>
-<p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL and
-S3-compatible storage, and about an hour.</p>
+<p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL,
+S3-compatible storage, and a configured control plane and worker.</p>
 
 <h2 id="prerequisites">What you need</h2>
 <div class="grid-2">
@@ -26,17 +26,24 @@ S3-compatible storage, and about an hour.</p>
   <li><strong>Get the code.</strong>
       <pre><code>git clone https://github.com/fedoragobrowse-design/AIec.git
 cd AIec</code></pre></li>
-  <li><strong>Build the guest image.</strong> This produces the root filesystem
-      and the signed artifact manifest the workers verify.
-      <pre><code>./scripts/build-firecracker-guest.sh</code></pre></li>
+  <li><strong>Build the binaries and guest image.</strong> The image builder
+      needs Docker, an uncompressed compatible guest kernel and a private guest
+      secret. It writes image digests; configure signed-image admission separately
+      using the deployment guide.
+      <pre><code>cargo build --release -p aiec-api -p aiec-cli -p aiec-mcp
+export PATH="$PWD/target/release:$PATH"
+export AIEC_KERNEL=/path/to/vmlinux
+export AIEC_GUEST_SECRET="$(openssl rand -hex 32)"
+./scripts/build-firecracker-guest.sh</code></pre></li>
   <li><strong>Check the host.</strong> <code>aiec doctor</code> validates KVM,
       the Firecracker binary, the guest artifact and its digest, the database,
       object storage, networking and TLS, and tells you exactly what is
       missing.
       <pre><code>aiec doctor</code></pre></li>
   <li><strong>Start the control plane and a worker.</strong> The systemd units
-      in <code>deploy/</code> are templates; see
-      <a href="/docs">self-hosting</a> for the environment they expect.</li>
+      in <code>deploy/</code> are templates; follow the
+      <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>
+      for database, object storage, TLS, image trust and worker configuration.</li>
 </ol>
 
 <h2 id="first-sandbox">Your first sandbox</h2>
@@ -45,13 +52,14 @@ account to sign up for and no key to request from anyone.</p>
 <pre><code>pip install agentforge-sdk</code></pre>
 <pre><code>from agentforge import AIec
 
-af = AIec(base_url="https://127.0.0.1:8080", api_key="af_live_...")
+af = AIec(base_url="https://your-control-plane.example", api_key="af_live_...")
 
 box = af.sandboxes.create(image="aiec-coding:latest")
 print(box.exec(["uname", "-a"])["stdout"])
 box.destroy()</code></pre>
-<p><code>base_url</code> is required — there is no default, because there is no
-hosted endpoint to default to.</p>
+<p>Set <code>base_url</code> to your deployed endpoint, or set <code>AIEC_URL</code>.
+The SDK falls back to <code>http://127.0.0.1:8080</code> for a local control plane;
+there is no hosted endpoint.</p>
 
 <h2 id="concepts">Core concepts</h2>
 <div class="grid-2">
@@ -88,12 +96,14 @@ it. No policy selected means no network.</p>
 run = af.runs.create(command=["pytest", "-q"], guard="model-only")</code></pre>
 <p>A Guard selection replaces <code>network</code> rather than sitting beside it:
 two descriptions of one egress would be two paths to the internet, and the
-wider one would be the one that applied. Encrypted tunnels are not inspected in
-the default mode, so a rule that needs method or path visibility is refused
-rather than quietly unenforced — unless you turn interception on and accept
-that Guard will then hold a key able to read what it forwards.
-<code>GUARD_POLICY.md</code> in the repository has the templates, the operator
-boundary, and how to verify a policy without deploying it.</p>
+wider one would be the one that applied. Encrypted tunnels do not give Guard
+method or path visibility. A CONNECT tunnel to a host requiring those checks is
+refused, not silently forwarded without governance; TLS interception is not
+claimed as a validated deployment mode. The four built-in templates are
+<code>no_network</code>, <code>model_only</code>,
+<code>model_plus_allowlist</code> and <code>read_only_api</code>.
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/GUARD_POLICY.md">GUARD_POLICY.md</a>
+has the selection syntax, operator boundary and verifier instructions.</p>
 
 <h3>What runs alongside it</h3>
 <ul class="tight">
@@ -123,10 +133,12 @@ aiec guard release &lt;sandbox&gt;      # reopen a held machine
 aiec guard proposals &lt;sandbox&gt;    # pending and decided
 aiec guard verify policy.yaml       # compile and verify, apply nothing
 aiec guard import-openshell policy.yaml --out guard.yaml</code></pre>
-<p>The watchdog and the gateway need <code>CAP_NET_ADMIN</code>: without it a
-worker reports <code>network_policy: false</code> and refuses every governed
-placement rather than pretending to enforce. Check it with
-<code>aiec doctor</code>.</p>
+<p>The worker needs <code>CAP_NET_ADMIN</code> and <code>CAP_NET_RAW</code>.
+The packaged <code>deploy/aiec-worker.service</code> grants both; an alternate
+launcher must grant them explicitly. If the nftables startup probe fails, the
+worker reports <code>network_policy: false</code> and refuses governed placement.
+Check the host with <code>aiec doctor</code>, and configure the watchdog and
+credential bindings before starting governed workloads.</p>
 
 <h2 id="mcp">Driving it from an agent</h2>
 <p>The <a href="/mcp">local MCP server</a> exposes the same lifecycle as tools:
@@ -135,10 +147,14 @@ destroy it. It talks only to a control plane you run, so the workload stays on
 hardware you control.</p>
 
 <h2 id="operations">Operating it</h2>
-<p>Self-hosting, TLS, workers, object storage, backup and restore are in
-<code>docs/DEPLOYMENT.md</code> in the repository, alongside
-<code>docs/DESIGN.md</code> for the architecture and <code>docs/API.md</code>
-for every endpoint.</p>
+<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>
+covers TLS, workers, object storage, backup and restore. The
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DESIGN.md">architecture guide</a>
+explains placement and fencing; the
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/API.md">API reference</a>
+lists request and response shapes. Use the
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
+for acceptance evidence, exact reproduction commands and measured limits.</p>
 
 <p>There is no cloud, no hosted API and no sign-up. Everything runs where you put
 it.</p>
