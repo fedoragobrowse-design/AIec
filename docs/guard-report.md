@@ -770,18 +770,30 @@ diagnostic outlives the scratch without the database, socket or rootfs copies
 outliving it too, and the report lists what was kept.
 
 Keeping a journal is keeping a record whose free-form fields a guest can shape
-a little, so the retained set is scanned against the run's own minted secrets
-and any file containing one is deleted, named in
-`evidence_withheld_for_secrets` rather than redacted. That check is what makes
-the claim hold as the journal's schema changes; by construction today the
-record is a closed set of ids, hashes, counters and a category, every `reason`
-is a static string with no request data interpolated into it, and the one
-guest-controlled field, the `host:port` destination, is recorded only after an
-authority containing `@` or an `authorization` header has already been
-refused. A teardown that fails is a `cleanup_errors` entry naming the path,
-flips a passing run to failing, and is reported as `residue` rather than left to
-be found later. A directory the run did not create is not re-permissioned:
-`P3_ROOT` may be a parent the operator shares with another suite.
+a little, so the retained set is scanned against the run's own secrets *before*
+it is written: a file that would contain one is not copied at all, and is named
+in `evidence_withheld_for_secrets` rather than redacted. Checking before the
+copy rather than deleting afterwards is the difference between a secret that
+was never on disk and one that existed there until a later read removed it.
+The scanned set is everything the run minted — the API and worker tokens, the
+guard credential, the guest and image secrets, the S3 key, both TLS private
+keys (as individual base64 lines, which is how a key is ever printed) and the
+database password — and the failure report itself is covered by the same rule,
+because it is the one file written into the tree after the copies.
+
+That check is what makes the claim hold as the journal's schema changes. By
+construction today the record is a closed set of ids, hashes, counters and a
+category, every `reason` is a static string with no request data interpolated
+into it, and the one guest-controlled field, the `host:port` destination, is
+recorded only after an authority containing `@` or an `authorization` header
+has already been refused. The 138 records left by a passing Phase 5 run carry
+exactly those fourteen fields and nothing else.
+
+A teardown that fails is a `cleanup_errors` entry naming the path, flips a
+passing run to failing, and is reported as `residue` rather than left to be
+found later.
+A directory the run did not create is not re-permissioned: `P3_ROOT` may be a
+parent the operator shares with another suite.
 
 Three more state defects were found by rerunning the suites against that
 arrangement, all of them cases where a retained file was trusted for existing

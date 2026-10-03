@@ -81,6 +81,34 @@ def private(path, data):
     path.chmod(0o600)
 
 
+def retain_evidence(scratch, evidence):
+    """Copies a failed run's bounded evidence, skipping anything holding a secret.
+
+    Returns the relative paths kept and withheld. A withheld file is never
+    written rather than written and removed: the check is the same substring
+    test used on service logs, applied to the bytes about to be copied, so the
+    secret never exists in the evidence directory even briefly.
+    """
+    candidates = []
+    for log in sorted(scratch.glob("*.log")):
+        # spawn() gives a service the log for the whole run, and a run that
+        # fails late can leave a large one; the tail is what explains the
+        # failure, and an unbounded copy is the problem being fixed.
+        candidates.append((log.name, log.read_bytes()[-LOG_TAIL_BYTES:]))
+    for journal in sorted(scratch.glob("vms/guard/*/events.jsonl")):
+        candidates.append((str(Path(journal.parent.name) / journal.name), journal.read_bytes()))
+    retained, withheld = [], []
+    for name, data in candidates:
+        if any(secret.encode() in data for secret in SECRETS):
+            withheld.append(name)
+            continue
+        kept = evidence / name
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        private(kept, data.decode("utf-8", "replace"))
+        retained.append(name)
+    return sorted(retained), sorted(withheld)
+
+
 def command(argv, **kwargs):
     return subprocess.run(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           **kwargs)
@@ -530,14 +558,13 @@ def inside():
     # Key material and the database password are part of what a log must never
     # carry, so the scan below is given them as well: a service that printed its
     # own TLS key would otherwise pass a check that only knows about tokens.
-    # The PEM body is taken rather than the whole file, because a service that
-    # leaked a key prints the body. An empty password is not added at all: the
-    # empty string is a substring of every file, and adding it would report
-    # every retained log as leaking.
+    # The PEM body is taken one line at a time rather than joined, because
+    # anything that prints a key prints it wrapped at 64 columns and the joined
+    # form would never match such a copy. An empty password is not added at
+    # all: the empty string is a substring of every file, and adding it would
+    # report every retained file as leaking.
     for key in ("api.key", "ca.key"):
-        body = (tls / key).read_text().strip().splitlines()[1:-1]
-        if body:
-            SECRETS.append("".join(body))
+        SECRETS.extend((tls / key).read_text().strip().splitlines()[1:-1])
     credentials = os.environ["P3_DATABASE_URL"].split("://", 1)[1].split("@", 1)[0]
     password = urllib.parse.unquote(credentials.partition(":")[2])
     if password:
@@ -809,39 +836,16 @@ def outer():
         evidence = parent / "failed" / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8])
         evidence.mkdir(parents=True, exist_ok=True)
         evidence.chmod(0o700)
-        for log in sorted(scratch.glob("*.log")):
-            # spawn() gives a service the log for the whole run, and a run that
-            # fails late can leave a large one; the tail is what explains the
-            # failure, and an unbounded copy is the problem being fixed.
-            tail = log.read_bytes()[-LOG_TAIL_BYTES:]
-            (evidence / log.name).write_bytes(tail)
-            (evidence / log.name).chmod(0o600)
-        for journal_path in sorted(scratch.glob("vms/guard/*/events.jsonl")):
-            kept = evidence / journal_path.parent.name / journal_path.name
-            kept.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(journal_path, kept)
-        # Retained evidence is checked against this run's own secrets before it
-        # is called evidence. The scan over service logs alone is not enough
-        # once journals are kept too, and "the schema has no secret field" is an
-        # argument about today's code rather than a property of what was
-        # copied. A file that does contain a secret is deleted rather than
-        # kept with a redaction: the report says which file it was, so the
-        # absence is visible, and nothing derived from it is left on disk.
-        withheld = []
-        retained = []
-        for kept in sorted(path for path in evidence.rglob("*") if path.is_file()):
-            if any(secret.encode() in kept.read_bytes() for secret in SECRETS):
-                withheld.append(str(kept.relative_to(evidence)))
-                kept.unlink()
-            else:
-                retained.append(str(kept.relative_to(evidence)))
-        # A journal's directory is the only subdirectory this copies into, and
-        # one left empty by a withheld file is a directory with nothing in it.
-        for stale in sorted(path for path in evidence.rglob("*") if path.is_dir()):
-            if not any(stale.iterdir()):
-                stale.rmdir()
+        retained, withheld = retain_evidence(scratch, evidence)
         result["evidence_retained"] = retained
         result["evidence_withheld_for_secrets"] = withheld
+        # Retained evidence is checked against this run's own secrets before it
+        # is ever written, which is stronger than checking it afterwards: a
+        # file that had to be deleted to be safe was on disk, in full, in the
+        # meantime, and "the schema has no secret field" is an argument about
+        # today's code rather than a property of what is being copied. Nothing
+        # is redacted — a match is simply not copied, and the report names the
+        # file that was withheld so the absence is visible.
     try:
         shutil.rmtree(scratch)
     except OSError as error:
@@ -857,13 +861,25 @@ def outer():
             evidence = scratch
     destination = report if result["status"] == "PASS" else evidence / "failure.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(result, indent=2)
+    # The report is the last thing written into the evidence tree, so it would
+    # otherwise be the one file the copy-time scan does not cover, and a run
+    # that failed is exactly the run whose observations are least controlled.
+    # The same rule as the copied evidence applies: withhold the file and say
+    # which one it was. The scanned logs and journals are still there.
+    summary = {"status": result["status"], "passed": result.get("passed", 0),
+               "cases": result.get("cases", 0), "cleanup_errors": result["cleanup_errors"],
+               "report": str(destination), "evidence": str(evidence) if evidence else None,
+               "residue": str(residue) if residue else None}
+    if any(secret in payload for secret in SECRETS):
+        summary["report_withheld_for_secrets"] = str(destination)
+        print(json.dumps(summary), file=sys.stderr)
+        print(json.dumps(summary))
+        return 1
     temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
-    private(temporary, json.dumps(result, indent=2))
+    private(temporary, payload)
     os.replace(temporary, destination)
-    print(json.dumps({"status": result["status"], "passed": result.get("passed", 0),
-                      "cases": result.get("cases", 0), "cleanup_errors": result["cleanup_errors"],
-                      "report": str(destination), "evidence": str(evidence) if evidence else None,
-                      "residue": str(residue) if residue else None}))
+    print(json.dumps(summary))
     return 0 if result["status"] == "PASS" else 1
 
 
