@@ -49,13 +49,16 @@ SECRETS: list[str] = [os.environ["RP_API_KEY"], os.environ["RP_WORKER_TOKEN"],
 
 
 def publish(report, payload):
-    """Publishes a passing report so the evidence outlives the scratch tree.
+    """Publishes a passing report so the evidence is committed, not just left.
 
-    A failed run stays inside its own scratch directory: a diagnostic must not
-    be able to replace the authoritative artifact, and this report is the only
-    record of whether the durable reaper acted without a watchdog. The payload
-    is checked against the run's own credentials first, on the same principle
-    as the retained service logs.
+    The run root survives the run - the launcher traps the database and nothing
+    removes the tree - so the report was readable afterwards at a path under
+    ~/aiec that no artifact referenced and no commit quoted. A failed run is
+    left there instead: a diagnostic must not be able to replace the
+    authoritative artifact, and this report is the only record of whether the
+    durable reaper acted without a watchdog. The payload is checked against
+    the run's own credentials first, on the same principle as the retained
+    service logs.
     """
     if report["status"] != "PASS":
         return None

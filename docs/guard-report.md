@@ -795,10 +795,11 @@ found later.
 A directory the run did not create is not re-permissioned: `P3_ROOT` may be a
 parent the operator shares with another suite.
 
-**The durable reaper's evidence now outlives its scratch tree.** The reaper
-suite wrote its report into the run root, which is removed on every run, so a
-passing run left nothing behind that could be read later — the sixteen cases
-existed only in a console line. The driver now publishes a passing report to
+**The durable reaper's evidence is now published.** The suite wrote its report
+into `$RP_ROOT`, a scratch directory that nothing publishes, no artifact
+references and no commit quotes — the launcher traps the database and leaves
+the tree, so a passing run's sixteen cases existed only in a console line and
+in a path under `~/aiec`. The driver now publishes a passing report to
 `benchmarks/guard-reaper-acceptance.json` after checking the payload against
 the run's own credentials, and a failed run publishes nothing: a diagnostic
 must not be able to replace an authoritative artifact. `RP_REPORT` moves the
