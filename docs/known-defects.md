@@ -168,6 +168,14 @@ with it, which is why the call came back 200.
 The predicate now also keys on `allowed_tools` and `denied_tools`, since both
 are rules about the body independent of the method list.
 
+**Operator-visible:** a deny-only policy now inspects request bodies, so it
+inherits the pre-existing refusal of a body whose `content-length` is not
+declared. A chunked `tools/call` that used to be forwarded unchecked under such
+a policy now gets `400 l7: request body length is not declared and cannot be
+inspected`. That is the fail-closed direction - an unbounded body cannot be
+read for the denied tool - but a client that streams its MCP requests without a
+declared length will see the new 400.
+
 ## Open
 
 ### A worker restarts machines for sandboxes whose runs finished
