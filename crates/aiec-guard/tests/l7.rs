@@ -369,6 +369,51 @@ async fn an_unlisted_tool_is_refused_even_when_the_policy_allows_no_method() {
     f.finish().await;
 }
 
+/// A deny-only policy now inspects bodies, so it inherits the refusal of a body
+/// whose length is not declared.
+///
+/// This is a deliberate consequence of the fix rather than an accident: a body
+/// that cannot be bounded cannot be read for the denied tool, so forwarding it
+/// unchecked would reintroduce the same gap from the other direction. Before
+/// the fix this request was forwarded unchecked because no body was inspected
+/// at all.
+#[tokio::test]
+async fn a_deny_only_policy_refuses_a_body_whose_length_is_not_declared() {
+    let policy = L7Policy {
+        mcp: McpRules {
+            allowed_methods: Vec::new(),
+            allowed_tools: Vec::new(),
+            denied_tools: vec!["delete_repository".into()],
+        },
+        ..l7_policy()
+    };
+    let f = Fixture::start(Some(policy)).await;
+
+    let chunked = f
+        .client()
+        .post(format!("http://mcp.guard.test:{}/mcp", f.port))
+        .header("content-type", "application/json")
+        .body(reqwest::Body::wrap_stream(stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_repository"}}"#
+                    .to_vec(),
+            ))
+        })))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chunked.status(), 400);
+    assert_eq!(
+        chunked.text().await.unwrap(),
+        "l7: request body length is not declared and cannot be inspected"
+    );
+    assert!(
+        f.upstream.seen.lock().is_empty(),
+        "an unbounded body must not be forwarded unchecked"
+    );
+    f.finish().await;
+}
+
 #[tokio::test]
 async fn a_graphql_query_is_forwarded_and_a_mutation_is_refused() {
     let f = Fixture::start(Some(l7_policy())).await;

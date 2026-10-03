@@ -161,8 +161,9 @@ in the policy was skipped at once.
 Measured before the fix, through the real gateway: a `tools/call` for the
 explicitly denied `delete_repository` returned **200** and reached the upstream.
 Not refused and not warned - forwarded. The same held for a tool outside an
-allow list. The method gate does not rescue it: with the body skipped there is
-no method to read a method from, so the deny was inert.
+allow list. The method gate does not rescue it either: that allow-list is
+evaluated inside the body-inspection path, so skipping the body skips the gate
+with it, which is why the call came back 200.
 
 The predicate now also keys on `allowed_tools` and `denied_tools`, since both
 are rules about the body independent of the method list.
