@@ -104,7 +104,8 @@ def retain_evidence(scratch, evidence):
             continue
         kept = evidence / name
         kept.parent.mkdir(parents=True, exist_ok=True)
-        private(kept, data.decode("utf-8", "replace"))
+        kept.write_bytes(data)
+        kept.chmod(0o600)
         retained.append(name)
     return sorted(retained), sorted(withheld)
 
