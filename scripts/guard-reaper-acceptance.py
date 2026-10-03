@@ -44,8 +44,15 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # that interval, not against an assumption that it has already fired.
 REAP_INTERVAL_SECONDS = 15
 
-SECRETS: list[str] = [os.environ["RP_API_KEY"], os.environ["RP_WORKER_TOKEN"],
-                      os.environ.get("AIEC_GUEST_SECRET", "").strip()]
+# Everything this run mints. There is no guard credential here on purpose: the
+# suite runs with no watchdog process at all, so it never mints one. The
+# database password is included for the same reason Phase 3 includes it - the
+# report describes a run that connected to that database, and a connection
+# string is exactly the kind of thing a case's evidence would quote.
+SECRETS: list[str] = [API_KEY, WORKER_TOKEN, os.environ.get("AIEC_GUEST_SECRET", "").strip()]
+_password = urllib.parse.unquote(DATABASE_URL.split("://", 1)[1].split("@", 1)[0].partition(":")[2])
+if _password:
+    SECRETS.append(_password)
 
 
 def publish(report, payload):
