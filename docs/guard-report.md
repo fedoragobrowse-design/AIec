@@ -808,6 +808,12 @@ external server it does not own, reached across the namespace boundary through
 the Unix-socket relay (`guard-reaper-external-db-acceptance.json`). Both were
 run on the final tree: sixteen of sixteen each, no cleanup errors.
 
+**Phase 5's report is published the same way.** It was written only into the run
+root, so the 37/37 artifact in `benchmarks/` existed because someone had copied
+it by hand after a passing run; the driver now publishes it itself, on a pass
+alone, after checking the payload against the run's guest secret, image-signing
+key and guard credentials. `P5_REPORT` moves the destination.
+
 Three more state defects were found by rerunning the suites against that
 arrangement, all of them cases where a retained file was trusted for existing
 rather than for describing what the run was about to use.

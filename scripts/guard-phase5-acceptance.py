@@ -886,6 +886,36 @@ def signed_image_boot_phase() -> None:
         retire(sandbox)
 
 
+def publish(report, payload):
+    """Copies a passing report into benchmarks/ so the evidence outlives the run.
+
+    The run root is scratch that the next run reuses, so a report left only
+    there is evidence nobody can find afterwards and that no later commit can
+    quote. Publication happens on a pass alone: a failed or partial run must
+    never be able to replace the authoritative artifact, which is the same
+    rule the partial-evidence path above follows. The payload is checked
+    against the run's own credentials first, on the same principle as the
+    Phase 3 retained evidence.
+    """
+    if report["status"] != "PASS":
+        return None
+    secrets = [os.environ.get("AIEC_GUEST_SECRET", "").strip(),
+               (ROOT / "image-signing.key").read_text().strip() if (ROOT / "image-signing.key").exists() else ""]
+    credentials = ROOT / "guard-credentials.json"
+    if credentials.exists():
+        secrets.extend(str(value).strip() for value in json.loads(credentials.read_text()).values())
+    if any(secret and secret in payload for secret in secrets):
+        return "withheld: the report contains a credential from this run"
+    destination = Path(os.environ.get(
+        "P5_REPORT", Path(__file__).resolve().parent.parent / "benchmarks" / "guard-phase5-acceptance.json"))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(destination.name + ".tmp")
+    staging.write_text(payload)
+    os.chmod(staging, 0o600)
+    os.replace(staging, destination)
+    return str(destination)
+
+
 def main() -> int:
     started_at = time.time()
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -1059,12 +1089,14 @@ def main() -> int:
         },
     }
     path = ROOT / "phase5-report.json"
+    payload = json.dumps(report, indent=2)
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(report, indent=2))
+    temporary.write_text(payload)
     os.chmod(temporary, 0o600)
     temporary.replace(path)
     print(json.dumps({key: report[key] for key in
-                      ("status", "acceptance_scope", "passed", "failing", "cleanup_errors")}))
+                      ("status", "acceptance_scope", "passed", "failing", "cleanup_errors")}
+                     | {"published": publish(report, payload)}))
     return 0 if report["status"] == "PASS" else 1
 
 
