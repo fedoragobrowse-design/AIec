@@ -81,36 +81,93 @@ reports the state it actually observed and fails if the machine is still there.
 | A quota refusal cost five placement attempts and read as an outage | `acquire_sandbox` mapped every placement failure to `Unavailable`, the one kind the run loop retries | "Stop calling a quota refusal an outage" |
 | Sandboxes could not resolve names, or could not resolve at all | the container spec set no resolvers and let the daemon pick a public one the network blocks | `e975003` |
 
-## Open
+## Fixed in the 2026-10-02 audit
+
+The findings below were confirmed against the current source, fixed, and pinned
+by a regression that was watched failing first. They are recorded here rather
+than deleted because their shapes recur: two of them are the same "one fact
+wrote in two places" mistake.
 
 ### `set_run_failure` had no compare-and-set
 
-**Status:** fixed. `set_run_failure` wrote `state` and `failure_reason`
-unconditionally, so a cancelled run whose synchronous `execute` then failed was
-rewritten from `cancelled` to `failed` and a caller that had already been told
-`200 OK / cancelled` later read a run that said `failed`. It now keeps a
-terminal state and still records the reason on the losing write, and `advance`
-returns `Conflict` on a terminal transition instead of adopting it.
+`set_run_failure` wrote `state` and `failure_reason` unconditionally, so a
+cancelled run whose synchronous `execute` then failed was rewritten from
+`cancelled` to `failed` and a caller that had already been told `200 OK /
+cancelled` later read a run that said `failed`. It now keeps a terminal state and
+still records the reason on the losing write, and `advance` returns `Conflict`
+on a terminal transition instead of adopting it.
 
 ### `record_run_results` lost results on the final failure
 
-**Status:** fixed. The last `fail()` passed the pre-execution snapshot, whose
-state was `Queued`, so writing results in that state was rejected and
-`phase_ms` and `cleanup_failed` were silently dropped for every run that failed
-after placement. Failure settlement no longer routes through a lifecycle-checked
-results write.
+The last `fail()` passed the pre-execution snapshot, whose state was `Queued`, so
+writing results in that state was rejected and `phase_ms` and `cleanup_failed`
+were silently dropped for every run that failed after placement. Failure
+settlement no longer routes through a lifecycle-checked results write.
 
 ### Results were lost when settling failed
 
-**Status:** fixed. `fail()` returned `Ok(())` whether or not either of its two
-writes succeeded, and both were warn-only, so a database blip during settlement
-left a run permanently non-terminal with a `run.failed` event already in the
-log - a terminal event for a run that never became terminal.
+`fail()` returned `Ok(())` whether or not either of its two writes succeeded, and
+both were warn-only, so a database blip during settlement left a run permanently
+non-terminal with a `run.failed` event already in the log - a terminal event for
+a run that never became terminal.
 
 Settlement is now one atomic write (`MetadataStore::record_run_failure`) that
 records results, reason, terminal state and `completed_at` together. The
 `run.failed` event is emitted only after that write succeeds, and a refused
 settlement is reported to the caller instead of swallowed.
+
+### `register_worker` could wedge a worker permanently
+
+The upsert updated `total_*` but omitted `available_*`, so a worker
+re-registering after being reprovisioned smaller tripped the
+`nodes_capacity_within_total` check, which surfaced as a conflict; a worker that
+cannot register cannot heartbeat, and one that cannot heartbeat is never
+recovered.
+
+The upsert now derives each `available_*` from the capacity actually committed
+(`total - available` before the change) subtracted from the new total and floored
+at zero, so a resize preserves in-use capacity, never exceeds the new total, and
+cannot violate the check constraint.
+
+### A worker's `available_*` did not follow a capacity change
+
+Raising a worker's `--capacity` updated `total_*` through the registration
+upsert, but `available_vcpus` / `available_memory_bytes` /
+`available_disk_bytes` were left alone, so they kept the old value. A worker
+taken from 3 to 8 vCPU still advertised 3 available, and concurrent work was
+refused with `LOCAL_CAPACITY_UNAVAILABLE` even though the cluster was idle.
+
+The upsert was right not to clobber those columns outright - they are a running
+reservation, and overwriting them would hand the same vCPU to two sandboxes.
+What was missing was reconciliation of "reserved" against "in use", which is
+what `register_worker` now does. No manual reconciliation is needed after a
+capacity change.
+
+The mechanism is the registration upsert, not the heartbeat as originally
+recorded: `heartbeat_worker` deliberately leaves `total_*` and `available_*`
+untouched, which `heartbeat_preserves_scheduler_capacity_and_refreshes_same_version`
+pins.
+
+### An operator's tool lists were silently unenforced
+
+**Severity:** authorization, fail-open. `governs_bodies` decided whether to
+inspect a request body by keying on `mcp.allowed_methods` alone, but `McpRules`
+defaults every list to empty and validation checks only bounds, name format and
+allow/deny overlap - it never requires `allowed_methods` to be non-empty. A
+policy of `allowed_methods: []` with a `denied_tools` list therefore validated
+cleanly, was judged to have nothing to say about any body, and every body rule
+in the policy was skipped at once.
+
+Measured before the fix, through the real gateway: a `tools/call` for the
+explicitly denied `delete_repository` returned **200** and reached the upstream.
+Not refused and not warned - forwarded. The same held for a tool outside an
+allow list. The method gate does not rescue it: with the body skipped there is
+no method to read a method from, so the deny was inert.
+
+The predicate now also keys on `allowed_tools` and `denied_tools`, since both
+are rules about the body independent of the method list.
+
+## Open
 
 ### A worker restarts machines for sandboxes whose runs finished
 
@@ -119,20 +176,6 @@ sandboxes whose runs had finished long before, ids unchanged. The control plane
 believes those sandboxes are stranded while the worker re-materialises them, so
 reclaiming capacity by expiring their leases does not stick. Not yet traced to
 the worker code that does it.
-
-### `register_worker` could wedge a worker permanently
-
-**Status:** fixed. The upsert updated `total_*` but omitted `available_*`, so a
-worker re-registering after being reprovisioned smaller tripped the
-`nodes_capacity_within_total` check, which surfaced as a conflict; a worker that
-cannot register cannot heartbeat, and one that cannot heartbeat is never
-recovered.
-
-The upsert now derives each `available_*` from the capacity actually committed
-(`total - available` before the change) subtracted from the new total and
-floored at zero, so a resize preserves in-use capacity, never exceeds the new
-total, and cannot violate the check constraint.
-
 
 ### `aiec_compare_omp` drops the per-run output
 
@@ -183,29 +226,6 @@ one run.
 A comparison is only checkable if you can see what each side actually did. Two
 sides reporting identical numbers mean nothing without the evidence, so this is
 the first thing to fix before trusting a comparison result.
-
-### A worker's `available_*` did not follow a capacity change
-
-**Status:** fixed. **Severity:** operational.
-
-Raising a worker's `--capacity` updated `total_*` through the registration
-upsert, but `available_vcpus` / `available_memory_bytes` /
-`available_disk_bytes` were left alone, so they kept the old value. A worker
-taken from 3 to 8 vCPU still advertised 3 available, and concurrent work was
-refused with `LOCAL_CAPACITY_UNAVAILABLE` even though the cluster was idle.
-
-The upsert was right not to clobber those columns outright - they are a running
-reservation, and overwriting them would hand the same vCPU to two sandboxes.
-What was missing was reconciliation of "reserved" against "in use", which is
-what `register_worker` now does: `available_x` becomes
-`new_total_x - (old_total_x - old_available_x)`, floored at zero. A resize
-therefore preserves the capacity actually committed, never exceeds the new
-total, and needs no manual reconciliation afterwards.
-
-The mechanism is the registration upsert, not the heartbeat as originally
-recorded: `heartbeat_worker` deliberately leaves `total_*` and `available_*`
-untouched, which `heartbeat_preserves_scheduler_capacity_and_refreshes_same_version`
-pins.
 
 ### The `initialize` handshake never answers `2026-07-28`
 

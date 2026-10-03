@@ -1325,8 +1325,18 @@ async fn deny_l7(
     response(status, reason)
 }
 /// Whether the policy has anything to say about a request body.
+///
+/// A `denied_tools` or `allowed_tools` list is a rule about the body even when
+/// no method is allowed, and both are independent of the method list: an
+/// operator who writes `allowed_methods: []` with a deny list has still named
+/// a tool that must not be called. Keying only on `allowed_methods` meant such
+/// a policy never buffered the body, so the check that consumes a deny list was
+/// unreachable and the explicit deny was silently unenforced - the fail-open
+/// direction, from a policy that validated cleanly.
 fn governs_bodies(policy: &L7Policy) -> bool {
     !policy.mcp.allowed_methods.is_empty()
+        || !policy.mcp.allowed_tools.is_empty()
+        || !policy.mcp.denied_tools.is_empty()
         || policy.graphql.allow_mutations
         || !policy.graphql.operations.is_empty()
         || !policy.graphql.root_fields.is_empty()

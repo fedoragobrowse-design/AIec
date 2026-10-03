@@ -295,6 +295,80 @@ async fn an_allowed_mcp_tool_call_reaches_the_upstream_and_a_write_tool_does_not
     assert!(!journal.contains("rotate_key"));
 }
 
+/// A deny list must be enforced even when the policy allows no method at all.
+///
+/// `McpRules` defaults every list to empty and validation only checks bounds,
+/// name format and allow/deny overlap, so `allowed_methods: []` with a deny
+/// list is a policy that compiles and validates. The body is only inspected
+/// when the policy "has something to say about" it, and that predicate used to
+/// key on `allowed_methods` alone - so this request was forwarded to the
+/// upstream with a denied tool, and every body rule in the policy was silently
+/// unenforced at once.
+#[tokio::test]
+async fn a_denied_tool_is_refused_even_when_the_policy_allows_no_method() {
+    let policy = L7Policy {
+        mcp: McpRules {
+            allowed_methods: Vec::new(),
+            allowed_tools: Vec::new(),
+            denied_tools: vec!["delete_repository".into()],
+        },
+        ..l7_policy()
+    };
+    let f = Fixture::start(Some(policy)).await;
+
+    let deleted = f
+        .post(
+            "mcp.guard.test",
+            "/mcp",
+            &rpc("tools/call", Some("delete_repository")),
+        )
+        .await;
+    assert_eq!(
+        deleted.status(),
+        403,
+        "a policy that denies a tool must refuse it, not forward it"
+    );
+    assert!(
+        f.upstream.seen.lock().is_empty(),
+        "the refused call must not reach the upstream"
+    );
+
+    let events = f.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.reason.starts_with("l7 mcp:")),
+        "the refusal must be journalled with the reason it was refused"
+    );
+}
+
+/// The allow-list half of the same shape: a policy that names the tools it
+/// permits must refuse a call to a tool it did not name, rather than skipping
+/// the body entirely because no method list was populated.
+#[tokio::test]
+async fn an_unlisted_tool_is_refused_even_when_the_policy_allows_no_method() {
+    let policy = L7Policy {
+        mcp: McpRules {
+            allowed_methods: Vec::new(),
+            allowed_tools: vec!["read_file".into()],
+            denied_tools: Vec::new(),
+        },
+        ..l7_policy()
+    };
+    let f = Fixture::start(Some(policy)).await;
+
+    let called = f
+        .post(
+            "mcp.guard.test",
+            "/mcp",
+            &rpc("tools/call", Some("rotate_key")),
+        )
+        .await;
+    assert_eq!(called.status(), 403);
+    assert!(f.upstream.seen.lock().is_empty());
+    f.finish().await;
+}
+
 #[tokio::test]
 async fn a_graphql_query_is_forwarded_and_a_mutation_is_refused() {
     let f = Fixture::start(Some(l7_policy())).await;
