@@ -556,8 +556,8 @@ pub async fn bootstrap_api_key(
     }
 }
 pub fn router(state: AppState) -> Router {
-    // Rate limiting runs outside `auth` so that unauthenticated floods are
-    // bounded too, and inside it so a tenant is limited per tenant.
+    // Authentication selects the tenant bucket; refused credentials still
+    // consume their peer bucket. Each protected request is admitted once.
     // Signup is deliberately outside the auth layer: it is how a stranger
     // obtains a credential in the first place. It is invite-gated, and rate
     // limited like everything else.
@@ -576,8 +576,7 @@ pub fn router(state: AppState) -> Router {
             "/v1",
             protected
                 .merge(key_routes())
-                .layer(middleware::from_fn_with_state(state.clone(), auth))
-                .layer(middleware::from_fn_with_state(state.clone(), rate_limit)),
+                .layer(middleware::from_fn_with_state(state.clone(), auth)),
         )
         .nest("/v1/workers", workers)
         .layer(middleware::from_fn_with_state(state.clone(), count_request))
@@ -595,8 +594,13 @@ fn default_rate_limit() -> ratelimit::RateLimit {
 /// address. Returns 429 with a machine-readable code and a `Retry-After`
 /// header so clients can back off correctly.
 async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    // `auth` inserts a `Principal`, not a bare tenant id; reading the wrong type
-    // meant every caller shared the anonymous bucket.
+    match rate_limit_response(&state, &request) {
+        Some(response) => response,
+        None => next.run(request).await,
+    }
+}
+
+fn rate_limit_response(state: &AppState, request: &Request) -> Option<Response> {
     let peer = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -604,10 +608,7 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
     let tenant = request.extensions().get::<Principal>().map(|p| p.tenant_id);
     let key = ratelimit::limit_key(tenant, peer);
     let decision = state.limiter().check(&key);
-    if !decision.allowed {
-        return limited_response(decision.retry_after_seconds);
-    }
-    next.run(request).await
+    (!decision.allowed).then(|| limited_response(decision.retry_after_seconds))
 }
 
 fn limited_response(retry_after_seconds: u64) -> Response {
@@ -1455,8 +1456,21 @@ async fn auth(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiFailure> {
-    let raw = request
-        .headers()
+    let authentication = authenticate_request(&state, request.headers())
+        .await
+        .map(|principal| request.extensions_mut().insert(principal));
+    if let Some(response) = rate_limit_response(&state, &request) {
+        return Ok(response);
+    }
+    authentication?;
+    Ok(next.run(request).await)
+}
+
+async fn authenticate_request(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<Principal, ApiFailure> {
+    let raw = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
@@ -1485,12 +1499,11 @@ async fn auth(
             "expired or revoked API key",
         ));
     }
-    request.extensions_mut().insert(Principal {
+    Ok(Principal {
         tenant_id: key.tenant_id,
         key_id: key.id,
         scopes: key.scopes,
-    });
-    Ok(next.run(request).await)
+    })
 }
 /// Liveness: the process is up and serving. Deliberately dependency-free so a
 /// database blip does not get the process killed.
@@ -1696,9 +1709,25 @@ pub(crate) async fn provision_sandbox(
     // A guarded sandbox's lifetime and model ceilings are durable before the
     // machine is built, not when its gateway first needs one: a budget created
     // at first use is a budget a worker restart can reset.
-    guard::initialize_guard_budget(s.repository().as_ref(), &x)
-        .await
-        .map_err(ApiFailure::from)?;
+    if let Err(error) = guard::initialize_guard_budget(s.repository().as_ref(), &x).await {
+        // Admission already owns metadata and, in production, a reservation.
+        // No runtime allocation was attempted: release only those resources.
+        let cleanup = async {
+            if s.is_production() && x.runtime != RuntimeKind::Hosted {
+                s.scheduler().release(tenant, x.id).await?;
+            }
+            s.repository().delete_sandbox(tenant, x.id).await
+        }
+        .await;
+        if let Err(cleanup_error) = cleanup {
+            return Err(ApiFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_unavailable",
+                format!("{error}; admission rollback failed: {cleanup_error}"),
+            ));
+        }
+        return Err(ApiFailure::from(error));
+    }
 
     // From here the sandbox holds capacity and a lease, so every exit has to
     // give both back. Before this, only the environment-preparation failure did:
@@ -3319,6 +3348,13 @@ async fn restore_snapshot(
             }
         },
     };
+    if !s.allows_runtime(runtime) {
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "runtime_not_permitted",
+            "this deployment offers microVM-class isolation only; process and container runtimes are self-hosted only",
+        ));
+    }
     let now = Utc::now();
     let mut x = Sandbox {
         id: new_id(),
@@ -3389,29 +3425,44 @@ async fn restore_snapshot(
             .await
             .map_err(ApiFailure::from)?;
     }
-    s.runtime_for(&x)?
-        .create(&x)
-        .await
-        .map_err(ApiFailure::from)?;
-    s.platform
-        .snapshots()
-        .ok_or_else(|| {
-            ApiFailure::from(CoreError::Conflict("snapshots are not configured".into()))
-        })?
-        .restore(
-            &x,
-            &SnapshotMetadata {
-                id: stored.id,
-                kind,
-                object_key: stored.object_key.clone(),
-                checksum_sha256: stored.checksum_sha256.clone(),
-            },
-        )
-        .await
-        .map_err(ApiFailure::from)?;
-    s.commit_state(&x, SandboxState::Restoring, SandboxState::Running)
-        .await
-        .map_err(ApiFailure::from)?;
+    let restored = async {
+        s.runtime_for(&x)?
+            .create(&x)
+            .await
+            .map_err(ApiFailure::from)?;
+        s.platform
+            .snapshots()
+            .ok_or_else(|| {
+                ApiFailure::from(CoreError::Conflict("snapshots are not configured".into()))
+            })?
+            .restore(
+                &x,
+                &SnapshotMetadata {
+                    id: stored.id,
+                    kind,
+                    object_key: stored.object_key.clone(),
+                    checksum_sha256: stored.checksum_sha256.clone(),
+                },
+            )
+            .await
+            .map_err(ApiFailure::from)?;
+        s.commit_state(&x, SandboxState::Restoring, SandboxState::Running)
+            .await
+            .map_err(ApiFailure::from)
+    }
+    .await;
+    if let Err(error) = restored {
+        // Like ordinary provisioning, a restore owns compute until teardown
+        // succeeds. Never leave its new machine and reservation on an error.
+        if let Err(cleanup_error) = runs::destroy_with_retry(&s, p.tenant_id, x.id).await {
+            return Err(ApiFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_unavailable",
+                format!("{}; cleanup failed: {cleanup_error}", error.message),
+            ));
+        }
+        return Err(error);
+    }
     x.state = SandboxState::Running;
     Ok(Json(x))
 }
@@ -4250,6 +4301,10 @@ mod tests {
         /// Sandboxes created for a run, keyed by the request id that asked for
         /// them, so a retried request joins the machine it already has.
         sandbox_requests: TestMutex<TestMap<(Uuid, Uuid), SandboxId>>,
+        /// When set, `record_run_failure` fails like a database that has gone
+        /// away mid-settlement, so the run-execution failure path can be
+        /// observed under a store that refuses the write.
+        refuse_failure_writes: TestMutex<bool>,
     }
 
     impl LeasedRepository {
@@ -4263,6 +4318,7 @@ mod tests {
                 run_artifacts: TestMutex::new(TestMap::new()),
                 sandbox_requests: TestMutex::new(TestMap::new()),
                 run_attempts: TestMutex::new(TestMap::new()),
+                refuse_failure_writes: TestMutex::new(false),
             })
         }
 
@@ -5021,6 +5077,43 @@ mod tests {
             Ok(run.clone())
         }
 
+        async fn record_run_failure(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            results: RunResults,
+            reason: Option<String>,
+        ) -> Result<Run, CoreError> {
+            if *self.refuse_failure_writes.lock().await {
+                return Err(CoreError::Backend("the store refused the write".into()));
+            }
+            let mut runs = self.runs.lock().await;
+            let run = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            // The same guard the real store applies: a run that already reached
+            // a terminal verdict keeps it and still records why, so a cancelled
+            // run whose execution then fails is not reported as failed. A run
+            // already failed keeps the results and reason the first write took,
+            // so a repeated settlement cannot erase the evidence.
+            let already_failed = run.state == RunState::Failed;
+            if !already_failed {
+                if run.state != RunState::Succeeded && run.state != RunState::Cancelled {
+                    run.results = results;
+                    run.failure_reason = reason;
+                    run.state = RunState::Failed;
+                    if run.completed_at.is_none() {
+                        run.completed_at = Some(Utc::now());
+                    }
+                } else {
+                    run.results = results;
+                    run.failure_reason = reason;
+                }
+            }
+            Ok(run.clone())
+        }
+
         async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
             self.stored_run_for_child(event.run_id).await?;
             let mut events = self.run_events.lock().await;
@@ -5277,6 +5370,32 @@ mod tests {
             if stored.retained_sandbox_id == Some(sandbox_id) {
                 stored.retained_sandbox_id = None;
                 stored.retained_until = None;
+                if stored
+                    .results
+                    .cleanup_failed
+                    .as_ref()
+                    .is_some_and(|report| report.sandbox_id == sandbox_id)
+                {
+                    stored.results.cleanup_failed = None;
+                }
+            }
+            Ok(stored.clone())
+        }
+
+        async fn record_retention_cleanup_failure(
+            &self,
+            tenant: TenantId,
+            id: Uuid,
+            sandbox_id: SandboxId,
+            error: String,
+        ) -> Result<Run, CoreError> {
+            let mut runs = self.runs.lock().await;
+            let stored = runs
+                .get_mut(&id)
+                .filter(|run| run.tenant_id == tenant)
+                .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            if stored.retained_sandbox_id == Some(sandbox_id) {
+                stored.results.cleanup_failed = Some(CleanupReport { sandbox_id, error });
             }
             Ok(stored.clone())
         }
@@ -5321,6 +5440,7 @@ mod tests {
     /// for the worker that has just taken ownership of a reassigned sandbox.
     struct AdoptingRuntime {
         imported: TestMutex<Vec<Vec<u8>>>,
+        destroyed: TestMutex<Vec<Uuid>>,
     }
 
     #[async_trait::async_trait]
@@ -5377,7 +5497,8 @@ mod tests {
             self.imported.lock().await.push(archive.to_vec());
             Ok(())
         }
-        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+        async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+            self.destroyed.lock().await.push(sandbox.id);
             Ok(())
         }
         async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
@@ -5420,8 +5541,11 @@ mod tests {
         async fn restore(
             &self,
             _: &Sandbox,
-            _: &aiec_core::snapshots::SnapshotMetadata,
+            snapshot: &aiec_core::snapshots::SnapshotMetadata,
         ) -> Result<(), CoreError> {
+            if snapshot.kind != SnapshotKind::Workspace {
+                return Err(CoreError::Unsupported("unsupported snapshot kind".into()));
+            }
             Ok(())
         }
     }
@@ -5443,6 +5567,7 @@ mod tests {
             let metadata: Arc<dyn MetadataStore> = repository.clone();
             let runtime = Arc::new(AdoptingRuntime {
                 imported: TestMutex::new(Vec::new()),
+                destroyed: TestMutex::new(Vec::new()),
             });
             let platform = Platform::builder()
                 .runtime(runtime.clone())
@@ -5583,6 +5708,104 @@ mod tests {
                 .unwrap()
                 .state,
             SandboxState::Running,
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_non_workspace_restore_reclaims_the_new_computer() {
+        let fixture = RecoveryFixture::new(b"archive".to_vec());
+        let tenant = new_id();
+        let source = fixture.sandbox(tenant).await;
+        let mut stored = fixture
+            .store_snapshot(&source, "snapshot", b"archive")
+            .await;
+        stored.id = new_id();
+        stored.kind = "memory".into();
+        stored.workspace_object_key = None;
+        fixture
+            .repository
+            .put_stored_snapshot(stored.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            restore_snapshot(
+                State(fixture.state.clone()),
+                Extension(principal(tenant)),
+                Path(stored.id),
+                Json(RestoreSnapshotRequest {
+                    image: None,
+                    cpu: None,
+                    memory_mb: None,
+                    disk_mb: None,
+                    runtime: Some(RuntimeKind::Docker),
+                }),
+            )
+            .await
+            .is_err()
+        );
+        let sandboxes = fixture.repository.list_sandboxes(tenant).await.unwrap();
+        let restored = sandboxes
+            .iter()
+            .find(|sandbox| sandbox.id != source.id)
+            .unwrap();
+        assert_eq!(restored.state, SandboxState::Destroyed);
+        assert_eq!(
+            fixture.runtime.destroyed.lock().await.as_slice(),
+            &[restored.id]
+        );
+        assert_eq!(
+            sandboxes
+                .iter()
+                .find(|sandbox| sandbox.id == source.id)
+                .unwrap()
+                .state,
+            SandboxState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn non_workspace_restore_respects_the_deployment_isolation_boundary() {
+        let mut fixture = RecoveryFixture::new(b"archive".to_vec());
+        fixture.state = fixture.state.clone().with_hosted_only(true);
+        let tenant = new_id();
+        let source = fixture.sandbox(tenant).await;
+        let mut stored = fixture
+            .store_snapshot(&source, "snapshot", b"archive")
+            .await;
+        stored.id = new_id();
+        stored.kind = "memory".into();
+        fixture
+            .repository
+            .put_stored_snapshot(stored.clone())
+            .await
+            .unwrap();
+        let error = restore_snapshot(
+            State(fixture.state.clone()),
+            Extension(principal(tenant)),
+            Path(stored.id),
+            Json(RestoreSnapshotRequest {
+                image: None,
+                cpu: None,
+                memory_mb: None,
+                disk_mb: None,
+                runtime: Some(RuntimeKind::Docker),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "runtime_not_permitted");
+        assert_eq!(
+            fixture
+                .repository
+                .list_sandboxes(tenant)
+                .await
+                .unwrap()
+                .iter()
+                .map(|sandbox| sandbox.id)
+                .collect::<Vec<_>>(),
+            vec![source.id]
         );
     }
     /// A workspace captured on a worker is worthless if the bytes die with that
@@ -5735,6 +5958,7 @@ mod tests {
         /// Raw file bytes served by the chunk transfer and public JSON reader.
         files: Option<std::sync::Arc<TestMap<String, bytes::Bytes>>>,
         failing_command: Option<Vec<String>>,
+        forbid_destroy: bool,
     }
 
     impl RunRuntime {
@@ -5840,6 +6064,7 @@ mod tests {
             Ok(())
         }
         async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
+            assert!(!self.forbid_destroy, "runtime teardown before allocation");
             if let Some(recorder) = &self.recorder
                 && let Ok(mut log) = recorder.destroyed.lock()
             {
@@ -6044,6 +6269,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retention_expiry_clears_a_failure_recorded_after_its_read() {
+        let fixture = RunFixture::new();
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        fixture.store.create_sandbox(sandbox.clone()).await.unwrap();
+        let mut run = settled_run(fixture.tenant, RunState::Failed);
+        run.retained_sandbox_id = Some(sandbox.id);
+        run.retained_until = Some(now - chrono::Duration::seconds(1));
+        fixture.store.seed(run.clone()).await;
+        // A second sweeper records a failure after this sweeper reads the run.
+        let mut results = run.results.clone();
+        results.cleanup_failed = Some(CleanupReport {
+            sandbox_id: sandbox.id,
+            error: "a concurrent expiry failed".into(),
+        });
+        fixture
+            .store
+            .record_run_results(fixture.tenant, run.id, results, run.state)
+            .await
+            .unwrap();
+        runs::expire_retention(&fixture.state, &run).await.unwrap();
+        let stored = fixture.store.get_run(fixture.tenant, run.id).await.unwrap();
+        assert_eq!(stored.retained_sandbox_id, None);
+        assert_eq!(stored.retained_until, None);
+        assert!(stored.results.cleanup_failed.is_none());
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Destroyed
+        );
+    }
+
     /// A finished run must stop its machine, not merely forget it.
     ///
     /// The bug this pins shipped twice. Cleanup called
@@ -6203,6 +6481,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_limits_authenticated_tenants_independently_of_peer_address() {
+        let mut fixture = RunFixture::new();
+        fixture.state = fixture
+            .state
+            .clone()
+            .with_rate_limit(ratelimit::RateLimit::new(0.0001, 1));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let other_key = format!("af_live_{}", "cd".repeat(24));
+        fixture.issue_key(new_id(), &other_key).await;
+        let app = router(fixture.state.clone());
+        let request = |key: &str, peer: &str| {
+            let mut request = Request::builder()
+                .uri("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            request
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(&fixture.key, "127.0.0.1:1000"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // Moving addresses must not reset a tenant's budget.
+        assert_eq!(
+            app.clone()
+                .oneshot(request(&fixture.key, "127.0.0.2:1000"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // A different tenant behind the same address owns a separate budget.
+        assert_eq!(
+            app.clone()
+                .oneshot(request(&other_key, "127.0.0.1:1000"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("invalid", "127.0.0.3:1000"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.oneshot(request("invalid", "127.0.0.3:1000"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
     struct RunFixture {
         state: AppState,
         store: Arc<LeasedRepository>,
@@ -6210,6 +6553,110 @@ mod tests {
         tenant: Uuid,
         key: String,
         root: std::path::PathBuf,
+    }
+
+    #[tokio::test]
+    async fn refused_guard_budget_initialization_reclaims_admitted_sandbox() {
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            forbid_destroy: true,
+            ..Default::default()
+        }));
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Creating,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: aiec_core::EnvironmentSpec {
+                guard: Some(aiec_guard::policy::GuardConfig::default()),
+                ..Default::default()
+            },
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        // This store deliberately lacks Guard budget persistence. Admission
+        // has completed, but no runtime allocation has been attempted.
+        assert!(
+            provision_sandbox(
+                &fixture.state,
+                fixture.tenant,
+                new_id(),
+                sandbox.clone(),
+                Default::default(),
+                None,
+                false
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Destroyed
+        );
+    }
+
+    /// A run whose settlement the store refuses must not look finished.
+    ///
+    /// `fail()` used to write the results and then the failure verdict as two
+    /// statements, both `tracing::warn!`-and-carry-on, and returned `Ok(())`
+    /// whatever the store said. A database that went away mid-settlement
+    /// therefore produced a durable `run.failed` event on a run still in
+    /// `running`, with no verdict and no reason: the caller got `200` with a
+    /// live run, and the event log said it had failed. The caller has to be
+    /// told instead - the run is unsettled and still running, which is the
+    /// truth, rather than reported as successfully failed.
+    #[tokio::test]
+    async fn a_run_whose_settlement_is_refused_is_reported_unsettled() {
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime::default()));
+        *fixture.store.refuse_failure_writes.lock().await = true;
+        let mut run = settled_run(fixture.tenant, RunState::Running);
+        fixture.store.seed(run.clone()).await;
+        let mut results = RunResults::default();
+        let mut phases = BTreeMap::new();
+        let error = crate::runs::settle_failure(
+            &fixture.state,
+            fixture.tenant,
+            &mut run,
+            Some("the workload failed".into()),
+            &mut results,
+            &mut phases,
+        )
+        .await
+        .expect_err("a refused settlement must be reported");
+        assert!(matches!(error, CoreError::Backend(_)), "{error:?}");
+        let stored = fixture
+            .store
+            .get_run(fixture.tenant, run.id)
+            .await
+            .expect("run row");
+        assert_eq!(
+            stored.state,
+            RunState::Running,
+            "a run the store refused to settle must not be recorded as settled"
+        );
+        assert!(
+            !fixture
+                .store
+                .run_events
+                .lock()
+                .await
+                .get(&run.id)
+                .is_some_and(|events| events.iter().any(|e| e.event_type == "run.failed")),
+            "no failure event for a failure that was never durably recorded"
+        );
     }
 
     impl RunFixture {

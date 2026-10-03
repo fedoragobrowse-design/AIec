@@ -384,6 +384,26 @@ async fn only_exactly_the_four_verdicts_are_accepted() {
 }
 
 #[tokio::test]
+async fn a_duplicated_verdict_key_is_refused_rather_than_collapsed() {
+    // `serde_json::Value` keeps the last of two identical keys, so a reply
+    // carrying a restriction and a permission for the same key is read as the
+    // permission. The schema is one key; a second copy is not that schema.
+    for reply in [
+        r#"{"verdict":"quarantine","verdict":"ok"}"#,
+        r#"{"verdict":"ok","verdict":"quarantine"}"#,
+    ] {
+        let rejected = parse_verdict(reply)
+            .expect_err("a duplicated verdict key must not resolve to one verdict");
+        assert_eq!(
+            rejected.reason,
+            aiec_guard::watcher::RejectReason::DuplicateKey,
+            "reply {reply}"
+        );
+        assert_eq!(rejected.reply_bytes, reply.len());
+    }
+}
+
+#[tokio::test]
 async fn anything_outside_the_enum_is_rejected_and_recorded_without_its_text() {
     let cases = [
         // An authority the watcher may not have.

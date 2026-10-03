@@ -65,7 +65,10 @@ fn into_core(error: RuntimeError) -> CoreError {
         // An unavailable backend stays unavailable. Collapsing it into `Io`
         // turned a Guard or Firecracker refusal into "io error: <text>", which
         // loses the class a caller branches on and buries the reason under a
-        // category that says nothing about who refused.
+        // category that says nothing about who refused. Everything else still
+        // becomes `Io`: `aiec-api` relies on that for destroy, where a
+        // vanished backend process has to read as a transport fault rather than
+        // a permanent one (see `is_transient_destroy_error`).
         RuntimeError::Unavailable(message) => CoreError::Unavailable(message),
         other => CoreError::Io(std::io::Error::other(other.to_string())),
     }
@@ -653,9 +656,17 @@ impl BubblewrapRuntime {
         if let Some(p) = out.parent() {
             tokio::fs::create_dir_all(p).await?;
         }
+        // tar opens its output with truncate semantics, so pointing it straight
+        // at `out` means a capture that fails part way through - an unreadable
+        // file, a file deleted while it is being walked, a full disk - replaces
+        // the archive already published under this key with a partial one and
+        // then reports an error, leaving a snapshot the next restore cannot
+        // use. Capture into a sibling temp file and publish it with rename so
+        // the previous snapshot survives a failed capture intact.
+        let temporary = out.with_extension("tar.partial");
         let output = Command::new("tar")
             .arg("-cf")
-            .arg(&out)
+            .arg(&temporary)
             .arg("-C")
             .arg(&root)
             .arg(".")
@@ -665,9 +676,14 @@ impl BubblewrapRuntime {
             .output()
             .await?;
         if !output.status.success() {
+            let _ = tokio::fs::remove_file(&temporary).await;
             return Err(RuntimeError::Archive(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
+        }
+        if let Err(error) = tokio::fs::rename(&temporary, &out).await {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
         }
         Ok(tokio::fs::metadata(out).await?.len())
     }
@@ -676,22 +692,120 @@ impl BubblewrapRuntime {
             .root
             .join("snapshots")
             .join(format!("{}.tar", local_archive_name(key)?));
-        let root = self.base(s).join("workspace");
+        let bytes = tokio::fs::read(&archive).await?;
+        self.restore_bytes(s, bytes).await
+    }
+    /// Unpacks an archive the caller has already read and, where it matters,
+    /// already verified.
+    ///
+    /// Taking the bytes rather than a key is what makes a digest check mean
+    /// something: if the provider verified a digest and then re-read the file
+    /// by key, a concurrent import publishing under that key in between would
+    /// have the extracted archive differ from the verified one.
+    pub async fn restore_bytes(&self, s: &Sandbox, bytes: Vec<u8>) -> Result<(), RuntimeError> {
+        let base = self.base(s);
+        let root = base.join("workspace");
+        tokio::fs::create_dir_all(&root).await?;
+        // The bytes have to land on disk before tar can read them, and they must
+        // land somewhere only this call uses for the duration.
+        let unpacked = base.join(format!(".unpacked-{}.tar", Uuid::now_v7()));
+        tokio::fs::write(&unpacked, &bytes).await?;
+        // Extracting straight into the live workspace means a corrupt or
+        // truncated archive leaves it half replaced: tar unpacks every member
+        // it can reach and then fails, and the workspace it returns has lost
+        // the files that archive did overwrite while never gaining the ones it
+        // did not reach. Unpack into a staging directory and swap it in only
+        // once tar has confirmed the whole archive landed.
+        let staging = base.join(format!(".restore-{}", Uuid::now_v7()));
+        let backup = base.join(format!(".previous-{}", Uuid::now_v7()));
+        tokio::fs::create_dir_all(&staging).await?;
         let output = Command::new("tar")
             .arg("-xf")
-            .arg(archive)
+            .arg(&unpacked)
             .arg("-C")
-            .arg(&root)
+            .arg(&staging)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
-            .await?;
+            .await;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                let _ = tokio::fs::remove_file(&unpacked).await;
+                return Err(error.into());
+            }
+        };
         if !output.status.success() {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            let _ = tokio::fs::remove_file(&unpacked).await;
             return Err(RuntimeError::Archive(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
+        // `workspace` is bind-mounted into the sandbox at create time, so its
+        // directory inode has to stay put: swapping the directory itself would
+        // leave a running guest reading and writing the backup copy. Move the
+        // entries in and out instead, rolling back on any failure so the
+        // workspace is either wholly the archive or wholly what it was.
+        fn remove(path: &std::path::Path) -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            }
+        }
+        tokio::fs::create_dir_all(&backup).await?;
+        let mut displaced = Vec::new();
+        let mut entries = tokio::fs::read_dir(&root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            if let Err(error) = tokio::fs::rename(entry.path(), backup.join(&name)).await {
+                // Eviction is not all-or-nothing, so the entries already moved
+                // have to come back before returning: otherwise a rename that
+                // failed on the third entry leaves the workspace silently
+                // missing the first two, which is the half-replaced state the
+                // staging above exists to prevent.
+                for moved in displaced.iter().rev() {
+                    let _ = tokio::fs::rename(backup.join(moved), root.join(moved)).await;
+                }
+                let _ = tokio::fs::remove_dir_all(&backup).await;
+                let _ = tokio::fs::remove_dir_all(&staging).await;
+                let _ = tokio::fs::remove_file(&unpacked).await;
+                return Err(error.into());
+            }
+            displaced.push(name);
+        }
+        let mut moved = Vec::new();
+        let mut staged = tokio::fs::read_dir(&staging).await?;
+        let mut failure = None;
+        while let Some(entry) = staged.next_entry().await? {
+            let name = entry.file_name();
+            match tokio::fs::rename(entry.path(), root.join(&name)).await {
+                Ok(()) => moved.push(name),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            for name in moved.iter().rev() {
+                let _ = remove(&root.join(name));
+            }
+            for name in displaced.iter().rev() {
+                let _ = tokio::fs::rename(backup.join(name), root.join(name)).await;
+            }
+            let _ = tokio::fs::remove_dir_all(&backup).await;
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+            let _ = tokio::fs::remove_file(&unpacked).await;
+            return Err(error.into());
+        }
+        let _ = tokio::fs::remove_dir_all(&backup).await;
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        let _ = tokio::fs::remove_file(&unpacked).await;
         Ok(())
     }
     pub async fn export_workspace_snapshot(
@@ -702,6 +816,16 @@ impl BubblewrapRuntime {
         validate_archive_key(key)?;
         let size = self.snapshot(sandbox, key).await?;
         if size > MAX_WORKSPACE_ARCHIVE_BYTES as u64 {
+            // The capture itself succeeded, so the oversized archive is sitting
+            // at the key's path on the worker's disk. `destroy` removes the
+            // sandbox base directory but not `root/snapshots`, so leaving it
+            // there means every rejected capture keeps up to 64 MiB of a file
+            // no code path will ever read, for as long as the worker lives.
+            let rejected = self
+                .root
+                .join("snapshots")
+                .join(format!("{}.tar", local_archive_name(key)?));
+            let _ = tokio::fs::remove_file(&rejected).await;
             return Err(RuntimeError::Archive(
                 "workspace archive exceeds 64 MiB".into(),
             ));
@@ -738,9 +862,21 @@ impl BubblewrapRuntime {
         let directory = self.root.join("snapshots");
         tokio::fs::create_dir_all(&directory).await?;
         let name = local_archive_name(&archive.key)?;
-        let temporary = directory.join(format!(".{name}.import"));
+        // The temporary name is per import, not per key. Two imports of the
+        // same key - a restore racing a snapshot restore, say - would otherwise
+        // write through one shared `.{name}.import` file and interleave their
+        // bytes, so the rename that publishes it can land a spliced archive
+        // under the key. Only the final rename is shared, and rename replaces
+        // the destination atomically, so the published file is always one
+        // whole archive.
+        let temporary = directory.join(format!(".{name}.{}.import", Uuid::now_v7()));
         tokio::fs::write(&temporary, &archive.bytes).await?;
-        tokio::fs::rename(temporary, directory.join(format!("{name}.tar"))).await?;
+        if let Err(error) =
+            tokio::fs::rename(&temporary, directory.join(format!("{name}.tar"))).await
+        {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
         self.restore(sandbox, &archive.key).await
     }
     async fn destroy(&self, s: &Sandbox) -> Result<(), RuntimeError> {
@@ -893,7 +1029,47 @@ impl SnapshotProvider for BubblewrapRuntime {
         sandbox: &Sandbox,
         metadata: &SnapshotMetadata,
     ) -> Result<(), CoreError> {
-        Self::restore(self, sandbox, &metadata.object_key)
+        // A key that cannot be used safely is a caller error, so it is reported
+        // as one rather than being stringified into `Io` by `into_core`, where
+        // it would be indistinguishable from a genuine disk fault.
+        validate_archive_key(&metadata.object_key)
+            .map_err(|error| CoreError::InvalidRequest(error.to_string()))?;
+        // The archive is re-read from this worker's disk by key, so the key on
+        // its own only proves *some* archive exists. The digest recorded next to
+        // it is what binds those bytes to the snapshot being restored; without
+        // this check a stale local archive left under a reused key is extracted
+        // and reported as a successful restore of the wrong snapshot.
+        let archive = self.root.join("snapshots").join(format!(
+            "{}.tar",
+            local_archive_name(&metadata.object_key)
+                .map_err(|error| CoreError::InvalidRequest(error.to_string()))?
+        ));
+        let bytes = match tokio::fs::read(&archive).await {
+            Ok(bytes) => bytes,
+            // A missing local archive is not an I/O fault: this runtime only
+            // holds the copy the capturing worker wrote, so a restore it cannot
+            // serve from its own disk has to be handed those bytes. Naming the
+            // reason keeps it attributable rather than an unattributed 500.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::Conflict(format!(
+                    "this runtime holds no workspace archive for {}; restore must supply the \
+                     archive bytes captured by the owning worker",
+                    metadata.object_key
+                )));
+            }
+            Err(error) => return Err(CoreError::Io(error)),
+        };
+        if bytes.len() > MAX_WORKSPACE_ARCHIVE_BYTES {
+            return Err(CoreError::LimitExceeded(
+                "workspace snapshot exceeds 64 MiB".into(),
+            ));
+        }
+        aiec_core::snapshots::verify_archive_checksum(&bytes, &metadata.checksum_sha256)?;
+        // Unpack the bytes that were just verified. Handing `restore` the key
+        // instead would make it read the file again, and a concurrent import
+        // publishing under that key in between would have the archive actually
+        // extracted differ from the one the digest was checked against.
+        BubblewrapRuntime::restore_bytes(self, sandbox, bytes)
             .await
             .map_err(into_core)
     }
@@ -3553,6 +3729,13 @@ impl FirecrackerRuntime {
                     });
                     pending.push(child.path);
                 } else {
+                    // A portable snapshot must not become a way around a
+                    // configured file canary: observe each file before its
+                    // bytes are read for the archive, exactly as
+                    // `export_workspace` does for the same walk.
+                    self.network
+                        .guard_observe_file_read(sandbox, &child.path)
+                        .await?;
                     let response = self
                         .guest_call(
                             sandbox.id,
@@ -3983,6 +4166,13 @@ impl SandboxRuntime for FirecrackerRuntime {
         request: FileChunkRequest,
     ) -> Result<FileChunk, CoreError> {
         request.validate()?;
+        // `get_file` observes the read against any configured file canary
+        // before the bytes are fetched. The chunked read carries the same bytes
+        // in the same workspace and has to be held to the same rule, or a
+        // canary is trivially bypassed by reading a large file in chunks.
+        self.network
+            .guard_observe_file_read(sandbox, &request.path)
+            .await?;
         match self
             .guest_call(
                 sandbox.id,
@@ -4732,6 +4922,308 @@ mod tests {
                 .await
                 .is_err()
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A failed recapture must not destroy the last good archive for the key.
+    ///
+    /// The published path is `snapshots/<name>.tar`, which is also where the
+    /// recovery-from-snapshot path reads from. Writing the tar straight to it
+    /// means a capture that fails partway has already truncated or replaced the
+    /// only copy, so the key is left with no archive at all rather than with the
+    /// previous good one. The failure here is forced by a file tar cannot read;
+    /// the assertions are on what survives at the published path.
+    #[tokio::test]
+    async fn failed_recapture_keeps_the_previously_published_archive() {
+        let root = std::env::temp_dir().join(format!("af-recapture-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+        runtime
+            .put_file(
+                &target,
+                PutFileRequest {
+                    path: "/workspace/keep.txt".into(),
+                    content_base64: "Z29vZA==".into(),
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+        let first = runtime
+            .export_workspace_snapshot(&target, "recapture")
+            .await
+            .unwrap();
+        let published = root
+            .join("snapshots")
+            .join(format!("{}.tar", local_archive_name("recapture").unwrap()));
+        let before = tokio::fs::read(&published).await.unwrap();
+
+        // Force the capture to fail in a way that does not depend on the test
+        // running unprivileged: `tar -cf -C <path>` cannot change into a path
+        // that is not a directory. Replacing the workspace with a regular file
+        // makes the second capture fail for every user, including root, while
+        // leaving the published archive from the first capture in place.
+        let workspace = root.join(target.id.to_string()).join("workspace");
+        tokio::fs::remove_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&workspace, b"not a directory")
+            .await
+            .unwrap();
+
+        let outcome = runtime
+            .export_workspace_snapshot(&target, "recapture")
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "a capture whose workspace is not a directory must fail"
+        );
+        let after = tokio::fs::read(&published).await.unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&after)),
+            first.checksum_sha256,
+            "the published archive for the key must still be the last good capture"
+        );
+        assert_eq!(before, after);
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// Restore replaces the workspace rather than merging into it.
+    ///
+    /// `tar -xf` into the live directory keeps every file the archive does not
+    /// mention, so a file deleted in the source workspace reappears after a
+    /// restore that is reported as successful. The archive here is a real one
+    /// produced by a capture; only the state between capture and restore
+    /// differs, which is exactly the sequence a snapshot restore performs.
+    #[tokio::test]
+    async fn restore_replaces_stale_files_instead_of_merging_them_back() {
+        let root = std::env::temp_dir().join(format!("af-replace-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+        for name in ["kept.txt", "deleted.txt"] {
+            runtime
+                .put_file(
+                    &target,
+                    PutFileRequest {
+                        path: format!("/workspace/{name}"),
+                        content_base64: "cHJvdmVu".into(),
+                        mode: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .export_workspace_snapshot(&target, "replace")
+            .await
+            .unwrap();
+        let workspace = root.join(target.id.to_string()).join("workspace");
+        tokio::fs::remove_file(workspace.join("deleted.txt"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("added-after-capture.txt"), b"stale")
+            .await
+            .unwrap();
+
+        runtime.restore(&target, "replace").await.unwrap();
+
+        assert!(
+            workspace.join("deleted.txt").exists(),
+            "the captured file is restored"
+        );
+        assert!(
+            !workspace.join("added-after-capture.txt").exists(),
+            "a file created after the capture must not survive a restore that replaces the workspace"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A truncated archive must not replace the live workspace.
+    ///
+    /// GNU tar does *not* help here: `tar -xf` on an archive cut in half exits 0
+    /// with empty stderr and quietly unpacks only the members that were whole,
+    /// leaving the workspace holding a partial tree. There is no tar-level gate
+    /// that catches this, so the defense has to be the digest - which is
+    /// verified before these bytes ever reach the unpack. Without that check a
+    /// truncated archive is extracted and reported as a successful restore.
+    #[tokio::test]
+    async fn a_truncated_archive_is_refused_before_the_workspace_is_touched() {
+        let root = std::env::temp_dir().join(format!("af-partial-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+        runtime
+            .put_file(
+                &target,
+                PutFileRequest {
+                    path: "/workspace/live.txt".into(),
+                    content_base64: "bGl2ZQ==".into(),
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+        let workspace = root.join(target.id.to_string()).join("workspace");
+        let good = runtime
+            .export_workspace_snapshot(&target, "partial")
+            .await
+            .unwrap();
+        let mut truncated = good.bytes.clone();
+        truncated.truncate(truncated.len() / 2);
+        assert!(
+            truncated.len() < good.bytes.len(),
+            "the fixture must actually be shorter than the archive it came from"
+        );
+        // Published under the key, exactly as a stale or half-uploaded local
+        // copy would be.
+        let published = root
+            .join("snapshots")
+            .join(format!("{}.tar", local_archive_name("partial").unwrap()));
+        tokio::fs::write(&published, &truncated).await.unwrap();
+        let metadata = SnapshotMetadata {
+            id: Uuid::now_v7(),
+            kind: SnapshotKind::Workspace,
+            object_key: "partial".into(),
+            checksum_sha256: good.checksum_sha256,
+        };
+
+        let outcome = SnapshotProvider::restore(&runtime, &target, &metadata).await;
+
+        assert!(
+            outcome.is_err(),
+            "a truncated archive must not be reported as a successful restore"
+        );
+        assert!(
+            workspace.join("live.txt").exists(),
+            "a refused restore must leave the live workspace intact"
+        );
+        assert_eq!(
+            tokio::fs::read(workspace.join("live.txt")).await.unwrap(),
+            b"live"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// `SnapshotProvider::restore` binds the archive it reads off local disk to
+    /// the snapshot it claims to restore.
+    ///
+    /// The archive is found by object key, so the key alone only proves some
+    /// archive exists at that path. Without the digest check a stale archive
+    /// left under a reused key is extracted and reported as a successful
+    /// restore of the wrong snapshot.
+    #[tokio::test]
+    async fn snapshot_provider_restore_refuses_an_archive_that_does_not_match_its_digest() {
+        let root = std::env::temp_dir().join(format!("af-restore-digest-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+        runtime
+            .put_file(
+                &target,
+                PutFileRequest {
+                    path: "/workspace/proof.txt".into(),
+                    content_base64: "cHJvdmVu".into(),
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+        let archive = runtime
+            .export_workspace_snapshot(&target, "digest")
+            .await
+            .unwrap();
+        // A different archive under the same key: exactly what a stale local
+        // copy left by an earlier capture of a reused key looks like.
+        let other = WorkspaceArchive {
+            key: archive.key.clone(),
+            bytes: archive.bytes.clone(),
+            checksum_sha256: "0".repeat(64),
+        };
+        let metadata = SnapshotMetadata {
+            id: Uuid::now_v7(),
+            kind: SnapshotKind::Workspace,
+            object_key: other.key,
+            checksum_sha256: other.checksum_sha256,
+        };
+
+        let outcome = SnapshotProvider::restore(&runtime, &target, &metadata).await;
+
+        assert!(
+            outcome.is_err(),
+            "a local archive whose digest disagrees with the snapshot must be refused"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// Two imports of the same key must not write through one shared temporary
+    /// file.
+    ///
+    /// The temporary name was derived only from the key hash, so concurrent
+    /// imports interleaved their bytes through one path and the rename that
+    /// publishes the archive could land a spliced tar under the key.
+    #[tokio::test]
+    async fn concurrent_imports_of_one_key_publish_a_whole_archive() {
+        let root = std::env::temp_dir().join(format!("af-import-race-{}", Uuid::now_v7()));
+        let runtime = std::sync::Arc::new(BubblewrapRuntime::new(&root));
+        let first_sandbox = sandbox(Uuid::now_v7(), 60);
+        let second_sandbox = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&first_sandbox).await.unwrap();
+        runtime.create(&second_sandbox).await.unwrap();
+        runtime
+            .put_file(
+                &first_sandbox,
+                PutFileRequest {
+                    path: "/workspace/proof.txt".into(),
+                    content_base64: "cHJvdmVu".into(),
+                    mode: None,
+                },
+            )
+            .await
+            .unwrap();
+        let archive = runtime
+            .export_workspace_snapshot(&first_sandbox, "race")
+            .await
+            .unwrap();
+        let payload = archive.bytes.clone();
+        let expected = archive.checksum_sha256.clone();
+
+        // Byte-identical valid archives: the digest gate in
+        // `import_workspace_snapshot` passes, so every import really does write
+        // its temporary file, and an interleaved write shows up as a published
+        // file whose digest is not the one all eight agreed on.
+        let imports = (0..8).map(|index| {
+            let runtime = std::sync::Arc::clone(&runtime);
+            let target = if index % 2 == 0 {
+                first_sandbox.clone()
+            } else {
+                second_sandbox.clone()
+            };
+            let archive = WorkspaceArchive {
+                key: "race".into(),
+                bytes: payload.clone(),
+                checksum_sha256: expected.clone(),
+            };
+            tokio::spawn(async move { runtime.import_workspace_snapshot(&target, &archive).await })
+        });
+        for import in imports {
+            import
+                .await
+                .unwrap()
+                .expect("an import of a valid archive must succeed");
+        }
+        let published = tokio::fs::read(
+            root.join("snapshots")
+                .join(format!("{}.tar", local_archive_name("race").unwrap())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&published)),
+            expected,
+            "concurrent imports of one key must publish one whole archive, not a splice"
+        );
+        assert_eq!(published, payload);
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

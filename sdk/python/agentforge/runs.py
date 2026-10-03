@@ -39,6 +39,16 @@ MAX_RUN_QUEUE_WAIT_SECONDS = 86_400
 #: exceed the server's grace (`PLACEMENT_GRACE_SECONDS`).
 RUN_RESPONSE_SLACK_SECONDS = 300
 
+#: How long a cancel may take. It is not the general request budget: the
+#: control plane transitions the run and then destroys every machine it was
+#: holding *before it answers*, so the reply is as slow as the teardown it had
+#: to do. Timing out first does not stop the cancellation - it hides it. The
+#: caller is told the transport failed while the run it asked to stop is on its
+#: way to Cancelled and the machine it wanted reclaimed is still being
+#: reclaimed. Same budget as the Rust client, for the same reason
+#: (`CANCEL_TIMEOUT` in crates/aiec-client/src/lib.rs).
+CANCEL_TIMEOUT_SECONDS = 300
+
 
 def _run_response_timeout(request: dict) -> float:
     """How long to wait for a run to come back settled.
@@ -375,7 +385,9 @@ class Runs:
         caller's intent is already true, and a second cancel must not look like a
         mistake.
         """
-        return self.client._request("POST", f"/v1/runs/{run_id}/cancel")
+        return self.client._request(
+            "POST", f"/v1/runs/{run_id}/cancel", timeout=CANCEL_TIMEOUT_SECONDS
+        )
 
     # -- workflows ------------------------------------------------------
 

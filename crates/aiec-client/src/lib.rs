@@ -759,16 +759,34 @@ impl AIecClient {
         })
     }
 }
+/// Percent-encodes everything outside the unreserved set, for a single path
+/// segment.
+///
+/// The old version mapped each byte to its own `String`, so a path cost one
+/// allocation per character plus a `format!` per reserved one - and artifact
+/// names are absolute sandbox paths like `/workspace/report.tar.gz`, so nearly
+/// every byte paid twice. One pass counts the bytes that need escaping, which
+/// sizes the result exactly (they are known to be three bytes each) and means
+/// the `String` is built once.
 fn urlencode(value: &str) -> String {
-    value
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    let escaped = value
         .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
+        .filter(
+            |b| !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~'),
+        )
+        .count();
+    let mut out = String::with_capacity(value.len() + 2 * escaped);
+    for byte in value.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

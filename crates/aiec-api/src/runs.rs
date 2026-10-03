@@ -319,7 +319,7 @@ pub(crate) async fn execute_created(
                 settle(state, tenant, &mut current, &mut results, &mut phases).await?;
             } else {
                 let reason = current.failure_reason.take();
-                fail(
+                settle_failure(
                     state,
                     tenant,
                     &mut current,
@@ -345,7 +345,7 @@ pub(crate) async fn execute_created(
     }
     let mut results = std::mem::take(&mut run.results);
     let mut phases = results.phase_ms.clone();
-    fail(
+    settle_failure(
         state,
         tenant,
         &mut run,
@@ -824,7 +824,18 @@ async fn post_placement(
 }
 
 /// Marks a run failed and records why.
-async fn fail(
+///
+/// Results, reason and the terminal verdict are written in one statement, the
+/// same way `settle` writes a success. Writing them separately - and treating
+/// a refusal of either as a warning - left a durable `run.failed` event on a
+/// run the store had not moved, with the caller told the failure had been
+/// recorded. That outcome is not recoverable: nothing reconciles a run whose
+/// event log says it failed while its row says it is running, so an unsettled
+/// settlement is reported to the caller instead of swallowed.
+///
+/// The event follows the write rather than preceding it, so the log never
+/// claims a verdict the store refused.
+pub(crate) async fn settle_failure(
     state: &AppState,
     tenant: TenantId,
     run: &mut Run,
@@ -832,36 +843,19 @@ async fn fail(
     results: &mut RunResults,
     phases: &mut BTreeMap<String, u64>,
 ) -> Result<(), CoreError> {
+    results.phase_ms = phases.clone();
+    run.failure_reason = reason;
+    *run = state
+        .repository()
+        .record_run_failure(tenant, run.id, results.clone(), run.failure_reason.clone())
+        .await?;
     event(
         state,
         run,
         "run.failed",
-        serde_json::json!({ "reason": reason.clone().unwrap_or_default() }),
+        serde_json::json!({ "reason": run.failure_reason.clone().unwrap_or_default() }),
     )
     .await;
-    run.failure_reason = reason;
-    results.phase_ms = phases.clone();
-    // Persisted rather than held in memory. Two separate omissions showed up as
-    // a failed run with a blank reason: the outcome was only ever recorded on a
-    // local copy that was then re-read from the store, and the reason column
-    // had no writer at all.
-    if let Err(error) = state
-        .repository()
-        .record_run_results(tenant, run.id, results.clone(), run.state)
-        .await
-    {
-        tracing::warn!(run_id = %run.id, error = %error, "could not record a run's results");
-    }
-    if let Err(error) = state
-        .repository()
-        .set_run_failure(tenant, run.id, run.failure_reason.clone(), RunState::Failed)
-        .await
-    {
-        tracing::warn!(run_id = %run.id, error = %error, "could not record why a run failed");
-    }
-    if let Ok(updated) = state.repository().get_run(tenant, run.id).await {
-        *run = updated;
-    }
     Ok(())
 }
 
@@ -1834,32 +1828,18 @@ pub(crate) async fn expire_retention(state: &AppState, run: &Run) -> Result<(), 
         return Ok(());
     }
     if let Err(error) = destroy_with_retry(state, run.tenant_id, sandbox_id).await {
-        let mut results = run.results.clone();
-        results.cleanup_failed = Some(CleanupReport {
-            sandbox_id,
-            error: error.clone(),
-        });
         state
             .repository()
-            .record_run_results(run.tenant_id, run.id, results, run.state)
+            .record_retention_cleanup_failure(run.tenant_id, run.id, sandbox_id, error.clone())
             .await?;
         return Err(CoreError::Unavailable(error));
     }
+    // Clear only this machine's report, atomically with retention. A late
+    // failing sweeper cannot restore it after the successful teardown.
     state
         .repository()
         .clear_run_retention(run.tenant_id, run.id, sandbox_id)
         .await?;
-    // A destroy that has now succeeded clears the earlier report of one that
-    // did not. Leaving it would tell the caller their machine outlived the run
-    // after the evidence says the opposite.
-    if run.results.cleanup_failed.is_some() {
-        let mut results = run.results.clone();
-        results.cleanup_failed = None;
-        state
-            .repository()
-            .record_run_results(run.tenant_id, run.id, results, run.state)
-            .await?;
-    }
     event(
         state,
         run,

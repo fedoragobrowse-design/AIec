@@ -1051,7 +1051,34 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
+    /// Records that the teardown of a retained machine failed.
+    ///
+    /// Conditional on `sandbox_id` still being the retained machine, for the
+    /// same reason `clear_run_retention` is: two sweeper passes can overlap on
+    /// the same run, and the loser must not leave a report about a machine the
+    /// winner already released. Reading the run, mutating a copy of its results
+    /// and writing the whole document back is what makes that impossible to
+    /// guarantee - the read-modify-write window drops or resurrects whatever
+    /// else changed `results` meanwhile - so the report has to be written by the
+    /// database under the same predicate that selects the row.
+    async fn record_retention_cleanup_failure(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _sandbox_id: Uuid,
+        _error: String,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
     /// Clears a reclaimed retention marker without clearing a different machine.
+    ///
+    /// Clears the matching cleanup report in the same statement. A caller that
+    /// released the machine has just disproved any report about it, and doing
+    /// that in a separate read-modify-write is exactly the race
+    /// `record_retention_cleanup_failure` exists to close: a late failing
+    /// sweeper's write would otherwise land after the clear and the run would
+    /// answer "cleanup failed" forever. A report about a *different* machine is
+    /// left alone; it is still true.
     async fn clear_run_retention(
         &self,
         _tenant: TenantId,
@@ -1248,6 +1275,32 @@ pub trait MetadataStore: Send + Sync {
         _id: Uuid,
         _failure_reason: Option<String>,
         _state: RunState,
+    ) -> Result<Run, CoreError> {
+        Err(CoreError::Unsupported("run storage".into()))
+    }
+
+    /// Records what a run produced, why it failed, and its terminal state, in
+    /// one statement.
+    ///
+    /// This exists because doing it as `record_run_results` followed by
+    /// `set_run_failure` is two round trips that can disagree. The first carries
+    /// the caller's pre-settlement state, so between them the run holds results
+    /// for an outcome it has not reached yet; if either write fails, the run is
+    /// left non-terminal with a terminal `run.failed` event already appended and
+    /// its evidence only ever in the failed write. One `UPDATE` leaves no such
+    /// window: results, `failure_reason`, `state` and `completed_at` either all
+    /// land or none do.
+    ///
+    /// A run that already reached a terminal state is not rewritten - the same
+    /// protection `set_run_failure` gives - because a cancelled run whose
+    /// execution then fails against the machine it no longer owns would
+    /// otherwise be reported to the caller as failed.
+    async fn record_run_failure(
+        &self,
+        _tenant: TenantId,
+        _id: Uuid,
+        _results: crate::run::RunResults,
+        _reason: Option<String>,
     ) -> Result<Run, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }

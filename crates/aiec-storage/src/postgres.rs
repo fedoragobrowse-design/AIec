@@ -1222,9 +1222,17 @@ impl PostgresScheduler {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
-            let existing_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox_id).await?;
+            let mut existing_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox_id).await?;
             let existing_lease = fetch_lease_for_sandbox(&mut tx, tenant, sandbox_id).await?;
-            if existing_lease.status == "active" || existing_sandbox.node_id.is_some() {
+            // Reuse only a lease that is still an owner. `expires_at` is part of
+            // the predicate for the same reason `dispatch_target` includes it:
+            // an expired-but-still-`active` row is not an owner, and handing
+            // back its endpoint dispatches the sandbox to a machine recovery is
+            // already reclaiming. The second term alone would let any assigned
+            // sandbox through, which is every expired lease.
+            let lease_is_live =
+                existing_lease.status == "active" && existing_lease.expires_at > Utc::now();
+            if lease_is_live {
                 let worker_endpoint: String =
                     sqlx::query_scalar("SELECT control_endpoint FROM nodes WHERE id = $1")
                         .bind(existing_lease.node_id)
@@ -1239,6 +1247,33 @@ impl PostgresScheduler {
                     lease_id: existing_lease.id,
                     lease_generation: existing_lease.generation,
                 });
+            }
+            if existing_lease.status == "active" {
+                // An expired lease that recovery has not collected yet still
+                // holds its worker's capacity debited. Settle it the way
+                // `reassign_expired_lease` settles one it finds still `active`,
+                // so the retry below places the sandbox on capacity that is
+                // actually free instead of tripping "already assigned". The
+                // debit rides on the lease, not on the sandbox's assignment, so
+                // it is released even if the assignment is already gone.
+                release_capacity(
+                    &mut tx,
+                    &existing_lease,
+                    "expired",
+                    "lease_expired_reschedule",
+                )
+                .await?;
+                sqlx::query(
+                    "UPDATE sandboxes SET node_id=NULL, updated_at=now() \
+                     WHERE tenant_id=$1 AND id=$2 AND node_id=$3",
+                )
+                .bind(tenant)
+                .bind(existing_sandbox.id)
+                .bind(existing_lease.node_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(database_error)?;
+                existing_sandbox.node_id = None;
             }
             if existing_sandbox.state == SandboxState::Destroyed {
                 return Err(StoreError::Conflict(
@@ -1557,6 +1592,58 @@ impl PostgresRepository {
         .map_err(database_error)?
         .ok_or(StoreError::NotFound)?;
         run_from_row(&updated)
+    }
+
+    /// Writes results, failure reason and terminal state in one statement.
+    ///
+    /// The terminal guard is the same one `set_run_failure` applies, and for
+    /// the same reason: cancelling a run destroys its machine, the in-flight
+    /// execution then fails against a machine that is gone, and this statement
+    /// decides whether the caller keeps `cancelled` or is overwritten with
+    /// `failed`. Results and the reason are still recorded on that losing
+    /// write, so what happened is preserved even when the verdict is not
+    /// changed - only the terminal outcome is protected.
+    ///
+    /// `completed_at` is written only when the resulting state is terminal, so
+    /// this cannot stamp a run as finished on the one path where the guard
+    /// above deliberately declines to settle it.
+    async fn record_run_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        results: RunResults,
+        reason: Option<String>,
+    ) -> Result<Run, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        // Locks the row and answers `NotFound` for a run that does not exist;
+        // the update below reads its own `state` under that same lock, so the
+        // terminal guard cannot be decided twice concurrently.
+        let _row = sqlx::query("SELECT * FROM runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::NotFound)?;
+        let updated = sqlx::query(
+            "UPDATE runs SET \
+               results = CASE WHEN state = 'failed' THEN results ELSE $1 END, \
+               failure_reason = CASE WHEN state = 'failed' THEN failure_reason ELSE $2 END, \
+               state = CASE WHEN state IN ('succeeded','cancelled') THEN state ELSE 'failed' END, \
+               completed_at = CASE WHEN state IN ('succeeded','cancelled') \
+                 THEN completed_at ELSE COALESCE(completed_at, now()) END \
+             WHERE tenant_id = $3 AND id = $4 RETURNING *",
+        )
+        .bind(serde_json::to_value(&results)?)
+        .bind(reason.as_deref())
+        .bind(tenant)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let value = run_from_row(&updated)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(value)
     }
 
     async fn set_run_placement(
@@ -2308,6 +2395,12 @@ impl PostgresRepository {
              capabilities=EXCLUDED.capabilities, control_endpoint=EXCLUDED.control_endpoint, \
              total_vcpus=EXCLUDED.total_vcpus, total_memory_bytes=EXCLUDED.total_memory_bytes, \
              total_disk_bytes=EXCLUDED.total_disk_bytes, sandbox_count=nodes.sandbox_count, \
+             available_vcpus=GREATEST(0, LEAST(EXCLUDED.total_vcpus, \
+               EXCLUDED.total_vcpus - (nodes.total_vcpus - nodes.available_vcpus))), \
+             available_memory_bytes=GREATEST(0, LEAST(EXCLUDED.total_memory_bytes, \
+               EXCLUDED.total_memory_bytes - (nodes.total_memory_bytes - nodes.available_memory_bytes))), \
+             available_disk_bytes=GREATEST(0, LEAST(EXCLUDED.total_disk_bytes, \
+               EXCLUDED.total_disk_bytes - (nodes.total_disk_bytes - nodes.available_disk_bytes))), \
              healthy=EXCLUDED.healthy, version=EXCLUDED.version, metadata=EXCLUDED.metadata, \
              started_at=EXCLUDED.started_at, last_heartbeat=EXCLUDED.last_heartbeat \
              WHERE nodes.version < EXCLUDED.version",
@@ -3528,14 +3621,49 @@ impl PostgresRepository {
         run_from_row(&row)
     }
 
+    async fn record_retention_cleanup_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+        error: String,
+    ) -> Result<Run, StoreError> {
+        // A targeted write into `results`, not a replacement of it: a concurrent
+        // clear, or any other results write, must not be undone here. Fenced on
+        // `retained_sandbox_id` so a sweeper holding a stale read whose machine
+        // was already released matches nothing and writes nothing.
+        let row = sqlx::query(
+            "UPDATE runs SET results = jsonb_set( \
+               COALESCE(results,'{}'::jsonb), '{cleanup_failed}', \
+               jsonb_build_object('sandbox_id', $3::text, 'error', $4), true) \
+             WHERE tenant_id=$1 AND id=$2 AND retained_sandbox_id=$3 RETURNING *",
+        )
+        .bind(tenant)
+        .bind(id)
+        .bind(sandbox_id)
+        .bind(error)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::NotFound)?;
+        run_from_row(&row)
+    }
+
     async fn clear_run_retention(
         &self,
         tenant: Uuid,
         id: Uuid,
         sandbox_id: Uuid,
     ) -> Result<Run, StoreError> {
+        // Retention and the report about that same machine clear together, under
+        // one predicate. Splitting them let a sweeper already in flight
+        // repopulate the report after the clear committed, leaving a permanently
+        // failed teardown that the dispatcher re-leases forever. Narrowing by
+        // sandbox id leaves a report about another machine alone; it is still true.
         let row = sqlx::query(
-            "UPDATE runs SET retained_sandbox_id=NULL, retained_until=NULL \
+            "UPDATE runs SET retained_sandbox_id=NULL, retained_until=NULL, \
+               results = CASE WHEN results->'cleanup_failed'->>'sandbox_id' = $3::text \
+                 THEN results - 'cleanup_failed' ELSE results END \
              WHERE tenant_id=$1 AND id=$2 AND retained_sandbox_id=$3 RETURNING *",
         )
         .bind(tenant)
@@ -4363,6 +4491,17 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn record_run_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        results: RunResults,
+        reason: Option<String>,
+    ) -> Result<Run, CoreError> {
+        Self::record_run_failure(self, tenant, id, results, reason)
+            .await
+            .map_err(core_error)
+    }
 
     async fn set_run_placement(
         &self,
@@ -4437,6 +4576,17 @@ impl MetadataStore for PostgresRepository {
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Run, CoreError> {
         Self::retain_run_sandbox(self, tenant, id, sandbox_id, until)
+            .await
+            .map_err(core_error)
+    }
+    async fn record_retention_cleanup_failure(
+        &self,
+        tenant: Uuid,
+        id: Uuid,
+        sandbox_id: Uuid,
+        error: String,
+    ) -> Result<Run, CoreError> {
+        Self::record_retention_cleanup_failure(self, tenant, id, sandbox_id, error)
             .await
             .map_err(core_error)
     }
@@ -6901,6 +7051,263 @@ pub(crate) mod tests {
         );
     }
 
+    /// Scheduling is idempotent on its request id, so a retry after a timeout
+    /// hands back the placement it already made. That is only correct while the
+    /// lease is still an owner: handing back an expired one sends the caller to
+    /// a machine recovery is already reclaiming, and the sandbox ends up with
+    /// two writers who both believe they hold the node.
+    #[tokio::test]
+    async fn a_rescheduled_sandbox_never_reuses_an_expired_lease() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        repository.migrate().await.unwrap();
+        let node_id = register_test_worker(&repository, tenant).await;
+        let request_id = new_id();
+
+        // Pinned to one worker throughout: the preferred node is part of the
+        // idempotency fingerprint, so a retry may not change it, and the
+        // capacity assertions below are about this sandbox rather than about
+        // which free worker the retry happened to choose.
+        let first = schedule_test_sandbox(
+            &repository,
+            tenant,
+            request_id,
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+
+        // A retry while the lease is live is the idempotent case: same node,
+        // same lease, no second debit.
+        let retried = schedule_test_sandbox(
+            &repository,
+            tenant,
+            request_id,
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retried.lease_id, first.lease_id);
+        assert_eq!(retried.worker_id, first.worker_id);
+        assert_eq!(retried.lease_generation, first.lease_generation);
+
+        // Now the lease expires without recovery collecting it. The row is still
+        // `active` and the sandbox is still assigned, which is exactly the state
+        // that used to be mistaken for ownership.
+        sqlx::query(
+            "UPDATE sandbox_leases SET expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(first.lease_id)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+
+        // Pinned to the same worker so the capacity assertions below are about
+        // this sandbox rather than about which free worker the retry chose.
+        let after_expiry = schedule_test_sandbox(
+            &repository,
+            tenant,
+            request_id,
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_expiry.worker_id, node_id);
+        assert_ne!(
+            after_expiry.lease_id, first.lease_id,
+            "an expired lease is not an owner; the retry must not hand it back"
+        );
+        assert!(
+            after_expiry.lease_generation > first.lease_generation,
+            "the replacement fences the generation the expired lease held"
+        );
+        let dispatched = PostgresScheduler::new((*repository).clone())
+            .dispatch_target(tenant, after_expiry.sandbox.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatched.lease_id, after_expiry.lease_id,
+            "the placement the caller was handed is the one it can dispatch to"
+        );
+
+        // And the worker is not charged twice for the same sandbox: the expired
+        // lease's debit was released before the replacement took it.
+        let worker = repository.get_worker(node_id).await.unwrap();
+        assert_eq!(
+            worker.registration.available_vcpus, 1,
+            "one sandbox on one worker costs one debit, not two"
+        );
+        assert_eq!(
+            worker.registration.available_memory_bytes,
+            (128 - 64) * 1_048_576,
+            "the expired lease's debit is released before the replacement takes it"
+        );
+        assert_eq!(
+            worker.registration.available_disk_bytes,
+            (1024 - 512) * 1_048_576,
+            "the expired lease's debit is released before the replacement takes it"
+        );
+        assert_eq!(worker.sandbox_count, 1);
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A worker that comes back on a different machine reports different
+    /// capacity. Its record is updated in place, so the number of units already
+    /// promised to sandboxes has to survive that resize - it is the one thing
+    /// the new registration knows nothing about.
+    #[tokio::test]
+    async fn a_worker_resizing_carries_the_units_already_committed() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        repository.migrate().await.unwrap();
+        let now = Utc::now();
+        let node_id = new_id();
+        let name = format!("resizing-node-{tenant}");
+
+        let registration =
+            |total_vcpus: u32, available_vcpus: u32, version: u64| WorkerRegistration {
+                node_id,
+                name: name.clone(),
+                runtime: RuntimeKind::Firecracker,
+                capabilities: Default::default(),
+                control_endpoint: "https://127.0.0.1:19443".to_string(),
+                total_vcpus,
+                total_memory_bytes: u64::from(total_vcpus) * 1_048_576,
+                total_disk_bytes: u64::from(total_vcpus) * 1_048_576,
+                available_vcpus,
+                available_memory_bytes: u64::from(available_vcpus) * 1_048_576,
+                available_disk_bytes: u64::from(available_vcpus) * 1_048_576,
+                healthy: true,
+                version,
+                metadata: Value::Object(Default::default()),
+                started_at: now,
+                last_heartbeat: now,
+            };
+        async fn worker(
+            repository: &PostgresRepository,
+            node_id: Uuid,
+        ) -> aiec_core::storage::WorkerStatus {
+            repository
+                .list_workers(true)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|worker| worker.registration.node_id == node_id)
+                .expect("the worker keeps its record across a resize")
+        }
+
+        // Eight vCPUs with five already committed to sandboxes.
+        repository
+            .register_worker(registration(8, 3, 1))
+            .await
+            .unwrap();
+        repository
+            .set_worker_draining(node_id, true, Some("maintenance"))
+            .await
+            .unwrap();
+
+        // Growing: the committed five stay committed, the three that were free
+        // stay free, and the five new vCPUs are all advertised.
+        repository
+            .register_worker(registration(16, 3, 2))
+            .await
+            .unwrap();
+        let grown = worker(&repository, node_id).await;
+        assert_eq!(grown.registration.total_vcpus, 16);
+        assert_eq!(
+            grown.registration.available_vcpus, 11,
+            "growing a worker must advertise the capacity it gained"
+        );
+
+        // Shrinking below what is committed: the five committed units cannot
+        // fit, but they are real sandboxes that are still running. The worker
+        // reports no headroom rather than refusing to register - refusing would
+        // wedge a worker that is healthy and holding work.
+        repository
+            .register_worker(registration(4, 3, 3))
+            .await
+            .unwrap();
+        let shrunk = worker(&repository, node_id).await;
+        assert_eq!(shrunk.registration.total_vcpus, 4);
+        assert_eq!(
+            shrunk.registration.available_vcpus, 0,
+            "a worker smaller than its committed units reports no headroom, \
+             not negative headroom"
+        );
+        assert!(
+            shrunk.registration.available_vcpus <= shrunk.registration.total_vcpus,
+            "a resize must never advertise more than the worker has"
+        );
+        // The resize is about capacity only. What the worker is running, and
+        // whether it is taking new work, are not the registration's to change.
+        assert_eq!(shrunk.sandbox_count, grown.sandbox_count);
+        assert!(!shrunk.accepting_sandboxes);
+        assert_eq!(shrunk.drain_reason.as_deref(), Some("maintenance"));
+
+        // An idle worker that shrinks simply gives up the difference.
+        let idle = new_id();
+        let idle_name = format!("idle-resizing-node-{tenant}");
+        repository
+            .register_worker(WorkerRegistration {
+                node_id: idle,
+                name: idle_name,
+                runtime: RuntimeKind::Firecracker,
+                capabilities: Default::default(),
+                control_endpoint: "https://127.0.0.1:19443".to_string(),
+                total_vcpus: 8,
+                total_memory_bytes: 8 * 1_048_576,
+                total_disk_bytes: 8 * 1_048_576,
+                available_vcpus: 8,
+                available_memory_bytes: 8 * 1_048_576,
+                available_disk_bytes: 8 * 1_048_576,
+                healthy: true,
+                version: 1,
+                metadata: Value::Object(Default::default()),
+                started_at: now,
+                last_heartbeat: now,
+            })
+            .await
+            .unwrap();
+        repository
+            .register_worker(WorkerRegistration {
+                node_id: idle,
+                name: format!("idle-resizing-node-{tenant}"),
+                runtime: RuntimeKind::Firecracker,
+                capabilities: Default::default(),
+                control_endpoint: "https://127.0.0.1:19443".to_string(),
+                total_vcpus: 4,
+                total_memory_bytes: 4 * 1_048_576,
+                total_disk_bytes: 4 * 1_048_576,
+                available_vcpus: 4,
+                available_memory_bytes: 4 * 1_048_576,
+                available_disk_bytes: 4 * 1_048_576,
+                healthy: true,
+                version: 2,
+                metadata: Value::Object(Default::default()),
+                started_at: now,
+                last_heartbeat: now,
+            })
+            .await
+            .unwrap();
+        let idle_worker = repository
+            .list_workers(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|worker| worker.registration.node_id == idle)
+            .unwrap();
+        assert_eq!(
+            idle_worker.registration.available_vcpus, 4,
+            "a worker that gave up capacity it was not using keeps what it has left"
+        );
+    }
+
     /// A queued run, with everything else left at its defaults so a test can say
     /// exactly which field it is exercising.
     fn run(tenant: Uuid) -> Run {
@@ -7596,6 +8003,237 @@ pub(crate) mod tests {
         assert!(expired.retention_expired(now));
         assert!(!held.retention_expired(now));
         assert!(!released.retention_expired(now));
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// Two sweeper passes can overlap on one run's retained machine. The pass
+    /// that destroys it and the pass that reports the teardown failed are both
+    /// correct in isolation; the order they happen in decides whether the run
+    /// is left claiming a machine nobody owns. Both orders are exercised here
+    /// because both were wrong.
+    #[tokio::test]
+    async fn a_released_machine_leaves_no_cleanup_report_and_cannot_be_reported_afterwards() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let now = whole_microsecond_ago(0);
+
+        // Failure first, then a successful release: the release disproves the
+        // report, so the report must go with it in the same statement.
+        let mut reported = run(tenant);
+        reported.state = RunState::Failed;
+        repository.create_run(reported.clone()).await.unwrap();
+        let machine = new_id();
+        let held = repository
+            .retain_run_sandbox(
+                tenant,
+                reported.id,
+                machine,
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held.retained_sandbox_id, Some(machine));
+        let failed = repository
+            .record_retention_cleanup_failure(
+                tenant,
+                reported.id,
+                machine,
+                "runtime unavailable".into(),
+            )
+            .await
+            .unwrap();
+        let report = failed
+            .results
+            .cleanup_failed
+            .expect("the failed teardown is reported");
+        assert_eq!(report.sandbox_id, machine);
+        assert_eq!(report.error, "runtime unavailable");
+
+        let cleared = repository
+            .clear_run_retention(tenant, reported.id, machine)
+            .await
+            .unwrap();
+        assert_eq!(cleared.retained_sandbox_id, None);
+        assert_eq!(cleared.retained_until, None);
+        assert!(
+            cleared.results.cleanup_failed.is_none(),
+            "a machine that was released has no teardown left to have failed"
+        );
+
+        // The sweeper that is still in flight with a stale read now tries to
+        // report its failure. It must write nothing, or the run is back to
+        // claiming a machine the winner already destroyed.
+        assert!(matches!(
+            repository
+                .record_retention_cleanup_failure(
+                    tenant,
+                    reported.id,
+                    machine,
+                    "runtime unavailable".into()
+                )
+                .await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            repository
+                .get_run(tenant, reported.id)
+                .await
+                .unwrap()
+                .results
+                .cleanup_failed
+                .is_none()
+        );
+        // And a second release of the same machine is not a silent success
+        // either: there is no longer anything of its retention to clear.
+        assert!(matches!(
+            repository
+                .clear_run_retention(tenant, reported.id, machine)
+                .await,
+            Err(StoreError::NotFound)
+        ));
+
+        // A report about an earlier machine outlives the release of the one
+        // that follows it. It is recorded while that machine is the retained
+        // one, and clearing a later machine must not take it with it.
+        let mut other = run(tenant);
+        other.state = RunState::Failed;
+        repository.create_run(other.clone()).await.unwrap();
+        let kept = new_id();
+        let released = new_id();
+        repository
+            .retain_run_sandbox(tenant, other.id, kept, now + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        repository
+            .record_retention_cleanup_failure(tenant, other.id, kept, "still broken".into())
+            .await
+            .unwrap();
+        repository
+            .retain_run_sandbox(tenant, other.id, released, now + chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        let swept = repository
+            .clear_run_retention(tenant, other.id, released)
+            .await
+            .unwrap();
+        let survivor = swept
+            .results
+            .cleanup_failed
+            .expect("another machine's failed teardown is still true");
+        assert_eq!(survivor.sandbox_id, kept);
+        assert_eq!(survivor.error, "still broken");
+        assert_eq!(swept.retained_sandbox_id, None);
+
+        // A report for a machine this run is not retaining is refused outright
+        // rather than filed against whoever currently holds the machine.
+        let mut stranger = run(tenant);
+        stranger.state = RunState::Failed;
+        repository.create_run(stranger.clone()).await.unwrap();
+        assert!(matches!(
+            repository
+                .record_retention_cleanup_failure(tenant, stranger.id, kept, "not mine".into())
+                .await,
+            Err(StoreError::NotFound)
+        ));
+
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A failure is one fact about a run: what it produced, why it stopped, and
+    /// that it stopped. Written as two statements it can be half-applied, and
+    /// the half that lands is the misleading one - results describing an outcome
+    /// the run has not reached, or a `run.failed` event with a run that never
+    /// became terminal.
+    #[tokio::test]
+    async fn a_failure_settles_results_reason_and_completion_in_one_write() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+
+        let mut failing = run(tenant);
+        failing.state = RunState::Running;
+        repository.create_run(failing.clone()).await.unwrap();
+        let settled = repository
+            .record_run_failure(
+                tenant,
+                failing.id,
+                RunResults {
+                    phase_ms: BTreeMap::from([("collect".to_owned(), 90)]),
+                    git_status: " M README".into(),
+                    ..Default::default()
+                },
+                Some("the task exited 1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.state, RunState::Failed);
+        assert_eq!(settled.failure_reason.as_deref(), Some("the task exited 1"));
+        assert_eq!(settled.results.phase_ms.get("collect"), Some(&90));
+        assert_eq!(settled.results.git_status, " M README");
+        assert!(
+            settled.completed_at.is_some(),
+            "a failed run is terminal and carries the moment it became so"
+        );
+        let reread = repository.get_run(tenant, failing.id).await.unwrap();
+        assert_eq!(reread.state, RunState::Failed);
+        assert_eq!(reread.failure_reason.as_deref(), Some("the task exited 1"));
+        assert_eq!(reread.results.phase_ms.get("collect"), Some(&90));
+
+        // Writing the same failure again must not move the run or its evidence:
+        // a retried settlement is the same fact, not a second event, and the
+        // retry that carries a default results document must not erase the
+        // measurements the first one took.
+        let again = repository
+            .record_run_failure(tenant, failing.id, RunResults::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(again.state, RunState::Failed);
+        assert_eq!(again.completed_at, settled.completed_at);
+        assert_eq!(again.failure_reason.as_deref(), Some("the task exited 1"));
+        assert_eq!(again.results.phase_ms.get("collect"), Some(&90));
+        assert_eq!(again.results.git_status, " M README");
+
+        // A cancelled run whose in-flight execution then fails keeps the verdict
+        // its caller was already told, while still recording what the execution
+        // produced and why it stopped. Not an error: cancelling is not undone by
+        // a machine that is already gone failing once more.
+        let mut cancelled = run(tenant);
+        cancelled.state = RunState::Cancelled;
+        cancelled.completed_at = Some(whole_microsecond_ago(30));
+        repository.create_run(cancelled.clone()).await.unwrap();
+        let kept = repository
+            .record_run_failure(
+                tenant,
+                cancelled.id,
+                RunResults {
+                    git_status: "clean".into(),
+                    ..Default::default()
+                },
+                Some("runtime vanished".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept.state, RunState::Cancelled);
+        assert_eq!(kept.failure_reason.as_deref(), Some("runtime vanished"));
+        assert_eq!(kept.results.git_status, "clean");
+        assert_eq!(kept.completed_at, cancelled.completed_at);
+
+        // A run that is not this tenant's is not found rather than failed.
+        assert!(matches!(
+            repository
+                .record_run_failure(
+                    new_id(),
+                    failing.id,
+                    RunResults::default(),
+                    Some("not mine".into())
+                )
+                .await,
+            Err(StoreError::NotFound)
+        ));
+
         drop_test_schema(&repository, admin, schema).await;
     }
 }

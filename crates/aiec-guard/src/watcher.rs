@@ -728,6 +728,9 @@ pub enum RejectReason {
     UnknownField,
     /// No `verdict` key.
     MissingVerdict,
+    /// The same key twice: the parser would collapse it to one value, so the
+    /// reply is not the one-key object the schema defines.
+    DuplicateKey,
     /// A verdict outside the closed vocabulary.
     UnknownVerdict,
     /// Past the reply bound, refused unread.
@@ -1391,9 +1394,21 @@ pub fn parse_verdict(content: &str) -> std::result::Result<WatcherVerdict, Rejec
     if content.len() > MAX_REPLY_BYTES {
         return Err(refused(RejectReason::Oversized));
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content.trim()) else {
-        return Err(refused(RejectReason::NotAnObject));
+    // `serde_json::Value` keeps the last of two identical keys, so a reply
+    // carrying a restriction and a permission under one key would be read as
+    // the permission. Parse through the duplicate-rejecting reader instead:
+    // the schema is one key, so a second copy is not that schema.
+    let Ok(strict) = serde_json::from_str::<crate::l7::StrictJson>(content.trim()) else {
+        // A reply the strict reader refuses but a collapsing one accepts is
+        // exactly the duplicated key; anything else is not the rigid object.
+        let reason = if serde_json::from_str::<serde_json::Value>(content.trim()).is_ok() {
+            RejectReason::DuplicateKey
+        } else {
+            RejectReason::NotAnObject
+        };
+        return Err(refused(reason));
     };
+    let value = strict.0;
     let Some(object) = value.as_object() else {
         return Err(refused(RejectReason::NotAnObject));
     };

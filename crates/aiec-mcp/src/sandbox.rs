@@ -539,7 +539,7 @@ impl LocalAiec {
         let status = self
             .exec_shell(
                 sandbox_id,
-                &format!("cd {repo_path} && git --no-pager status --porcelain=v1"),
+                &format!("cd {repo_path} && git --no-pager status --porcelain=v1 -z"),
                 60,
             )
             .await?;
@@ -558,22 +558,15 @@ impl LocalAiec {
             )
             .await?;
 
-        let changed: Vec<String> = status
-            .stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                // porcelain v1: "XY path"
-                line.split_once(' ')
-                    .map_or(line, |(_, rest)| rest)
-                    .trim()
-                    .to_owned()
-            })
-            .collect();
+        let changed = porcelain_paths(&status.stdout);
+        // NUL written as a newline, because that is what separates the records
+        // anyway; `changed_files` above holds the exact paths. This is the same
+        // stream rendered for a human reading it.
+        let git_status = status.stdout.replace('\0', "\n");
 
         Ok(GitEvidence {
             head: head.stdout.trim().to_owned(),
-            git_status: status.stdout,
+            git_status,
             git_diff: diff.stdout.clone(),
             changed_files: changed,
             diff_bytes: diff.stdout.len(),
@@ -650,6 +643,34 @@ pub struct GitEvidence {
     pub git_diff: String,
     pub changed_files: Vec<String>,
     pub diff_bytes: usize,
+}
+
+/// The paths `git status --porcelain=v1 -z` reported, exactly as it printed them.
+///
+/// Each record is two status characters, a space, then the path - and for a
+/// rename or a copy the *original* path follows as its own NUL-terminated
+/// field. Splitting the ordinary way and trimming the remainder turned both
+/// cases into something that is not a path: a file edited without staging is
+/// ` M src/main.rs`, which trimmed gives `M src/main.rs`, and a rename gave
+/// `new name.txt -> old name.txt`. The whole point of the field is that a
+/// reader can open what the run claims it touched.
+fn porcelain_paths(porcelain: &str) -> Vec<String> {
+    let mut fields = porcelain.split('\0');
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        let bytes = record.as_bytes();
+        // The shortest possible record is `XY ` plus one byte of path.
+        if bytes.len() < 4 || bytes[2] != b' ' {
+            continue;
+        }
+        // `bytes[2]` is ASCII, so index 3 is a character boundary and this slice
+        // can never split one.
+        paths.push(record[3..].to_owned());
+        if matches!(bytes[0], b'R' | b'C') {
+            let _ = fields.next();
+        }
+    }
+    paths
 }
 
 fn view_of(sandbox: &Sandbox) -> SandboxView {
@@ -751,6 +772,29 @@ mod tests {
         let (whole, truncated) = clamp("short", 100);
         assert!(!truncated);
         assert_eq!(whole, "short");
+    }
+
+    /// The changed-file list is the run's own account of what it touched, and a
+    /// reader opens those names. Trimming a porcelain line handed back
+    /// `M src/main.rs` for the most ordinary thing an agent does - edit a file
+    /// without staging it - and `new name.txt -> old name.txt` for a rename.
+    #[test]
+    fn changed_files_are_the_paths_git_printed() {
+        let stream = " M src/main.rs\0?? new file.rs\0A  added.rs\0";
+        assert_eq!(
+            porcelain_paths(stream),
+            vec!["src/main.rs", "new file.rs", "added.rs"]
+        );
+
+        // A rename is two NUL-terminated fields; only the destination is a path
+        // the run left behind.
+        assert_eq!(
+            porcelain_paths("R  new name.txt\0old name.txt\0"),
+            vec!["new name.txt"]
+        );
+
+        // With -z git does not C-quote, so a non-ASCII name arrives as itself.
+        assert_eq!(porcelain_paths("?? caf\u{e9}.txt\0"), vec!["caf\u{e9}.txt"]);
     }
 
     #[test]

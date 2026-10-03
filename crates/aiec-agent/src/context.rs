@@ -152,9 +152,29 @@ impl Context {
         if before <= KEEP_RECENT {
             return (before as u32, before as u32);
         }
+        // The kept window must not start on a tool result. A `tool` message
+        // answers the assistant message before it, so cutting there leaves one
+        // whose `tool_calls` are in the dropped half - and every OpenAI-shaped
+        // provider rejects that with a 400 on the *next* request. One turn that
+        // asked for six tools is enough: the assistant goes, six orphans stay,
+        // and the run cannot continue at all.
+        let mut cut = before - KEEP_RECENT;
+        while cut < before && matches!(self.messages[cut], Message::Tool { .. }) {
+            cut += 1;
+        }
+        // Agents do batch more tools than the window holds, and then the whole
+        // window is results. Widening it back to the assistant that asked for
+        // them keeps the newest turn whole rather than discarding the turn the
+        // model just paid for.
+        if cut >= before {
+            while cut > 0 && matches!(self.messages[cut - 1], Message::Tool { .. }) {
+                cut -= 1;
+            }
+            cut = cut.saturating_sub(1);
+        }
         let head: Vec<String> = self
             .messages
-            .drain(..before - KEEP_RECENT)
+            .drain(..cut)
             .filter_map(|message| describe(&message))
             .collect();
         let digest = if head.is_empty() {
@@ -410,6 +430,71 @@ mod tests {
                 .count();
             assert_eq!(matched, 1, "{} is answered {matched} times", call.id);
         }
+    }
+
+    /// Compaction must not leave a tool result whose call it dropped.
+    ///
+    /// A `tool` message is only meaningful next to the assistant turn that
+    /// asked for it; a provider rejects the whole request when one arrives with
+    /// no matching `tool_calls`. The kept window used to be a fixed six
+    /// messages counted back from the end, so a turn that asked for more than a
+    /// couple of tools put the cut inside the results and stranded the rest of
+    /// them - after which the run cannot continue at all.
+    #[test]
+    fn compaction_leaves_no_tool_result_without_its_call() {
+        let mut context = Context::new(&task());
+        // An agent that batches its reads is ordinary, so the newest turn here
+        // asks for six tools at once: more than the kept window holds.
+        for turn in 0..8 {
+            context.push_assistant(Some(format!("turn {turn}")));
+            let calls: Vec<ToolCall> = (0..6)
+                .map(|index| ToolCall {
+                    id: format!("call_{turn}_{index}"),
+                    name: "read".to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .collect();
+            context.push_tool_calls(calls.clone());
+            for call in &calls {
+                context.push_tool_result(call, "output");
+            }
+        }
+        context.compact();
+        let wire = context.as_wire();
+        let mut asked: Vec<String> = Vec::new();
+        let mut answers = 0usize;
+        for message in &wire {
+            match message["role"].as_str() {
+                Some("assistant") => {
+                    if let Some(list) = message["tool_calls"].as_array() {
+                        asked.extend(
+                            list.iter()
+                                .filter_map(|call| call["id"].as_str().map(str::to_owned)),
+                        );
+                    }
+                }
+                Some("tool") => {
+                    let id = message["tool_call_id"].as_str().unwrap_or_default();
+                    answers += 1;
+                    assert!(
+                        asked.iter().any(|seen| seen == id),
+                        "compaction stranded the answer to {id}: {wire:?}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // Every turn the agent paid for is gone either way, but the newest one
+        // has to survive: keeping nothing but a digest throws away the results
+        // the model just asked for.
+        assert!(
+            answers > 0,
+            "compaction dropped the whole conversation: {wire:?}"
+        );
+        assert!(
+            wire.iter().any(|m| m["tool_call_id"] == "call_7_5"),
+            "the newest turn did not survive: {wire:?}"
+        );
     }
     #[test]
     fn the_system_message_is_first_and_stable() {

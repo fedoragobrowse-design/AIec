@@ -1015,25 +1015,12 @@ finally:
         let staging = format!("/tmp/aiec-stage-{}", Uuid::now_v7());
         let staged_archive = format!("{staging}/workspace.tar");
         let extracted = format!("{staging}/workspace");
-        let result = self
-            .restore_archive(&binding, &staging, &staged_archive, &extracted, archive)
-            .await;
-        // The staging directory is disposable either way; a cleanup failure must
-        // not mask the outcome of the restore itself.
-        if let Err(error) = self
-            .run_command(
-                &binding,
-                &["rm".to_owned(), "-rf".to_owned(), staging],
-                None,
-                BTreeMap::new(),
-                None,
-                120,
-            )
+        // `restore_archive` owns the staging directory: only it knows whether a
+        // failure left the staged copy as the sole surviving workspace, so a
+        // blanket cleanup here would delete the recovery copy its own error
+        // message tells the caller where to find.
+        self.restore_archive(&binding, &staging, &staged_archive, &extracted, archive)
             .await
-        {
-            tracing::warn!(%error, "E2B workspace staging cleanup failed");
-        }
-        result
     }
 
     async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
@@ -1109,11 +1096,36 @@ finally:
 }
 
 impl E2bRuntime {
+    /// Discards a staging directory that no longer holds the only copy of a
+    /// workspace.
+    ///
+    /// A cleanup failure is never allowed to mask the outcome of the restore it
+    /// is cleaning up after.
+    async fn discard_staging(&self, binding: &ProviderSandbox, staging: &str) {
+        if let Err(error) = self
+            .run_command(
+                binding,
+                &["rm".to_owned(), "-rf".to_owned(), staging.to_owned()],
+                None,
+                BTreeMap::new(),
+                None,
+                120,
+            )
+            .await
+        {
+            tracing::warn!(%error, "E2B workspace staging cleanup failed");
+        }
+    }
+
     /// Replaces the live workspace with a portable archive captured elsewhere.
     ///
     /// The bytes are staged outside the workspace and only swapped in once the
     /// extraction is known to be complete, so a failure leaves either the old
-    /// workspace or an explicit report that it is gone.
+    /// workspace or an explicit report that it is gone. Every failure but the
+    /// final install cleans the staging directory up, because up to that point
+    /// the live workspace is still the copy worth keeping; the install failure
+    /// deliberately leaves it, since that is where the error tells the caller
+    /// the only surviving copy of their workspace is.
     async fn restore_archive(
         &self,
         binding: &ProviderSandbox,
@@ -1141,6 +1153,7 @@ impl E2bRuntime {
             )
             .await?;
         if unpack.exit_code != 0 {
+            self.discard_staging(binding, staging).await;
             return Err(CoreError::Backend(format!(
                 "workspace archive could not be extracted: {}",
                 unpack.stderr.trim()
@@ -1157,6 +1170,7 @@ impl E2bRuntime {
             )
             .await?;
         if probe.exit_code != 0 {
+            self.discard_staging(binding, staging).await;
             return Err(CoreError::Backend(
                 "workspace archive did not contain a workspace directory".into(),
             ));
@@ -1172,6 +1186,7 @@ impl E2bRuntime {
             )
             .await?;
         if clear.exit_code != 0 {
+            self.discard_staging(binding, staging).await;
             return Err(CoreError::Backend(format!(
                 "existing workspace could not be replaced: {}",
                 clear.stderr.trim()
@@ -1192,8 +1207,12 @@ impl E2bRuntime {
             )
             .await?;
         if install.exit_code == 0 {
+            self.discard_staging(binding, staging).await;
             return Ok(());
         }
+        // The live workspace is gone and this staged copy is the only one
+        // left, so it is deliberately kept: cleaning up here would discard the
+        // workspace the message below points the caller at.
         Err(CoreError::Backend(format!(
             "workspace restore failed: {}; the previous workspace was removed and the staged copy is at {extracted}",
             install.stderr.trim()

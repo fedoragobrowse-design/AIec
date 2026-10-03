@@ -1981,20 +1981,35 @@ struct Download {
 async fn run_watchdog(state: Arc<Runtime>) -> Result<()> {
     let mut stop = state.stop.subscribe();
     let mut delivered = None;
-    let mut audited = None;
+    // Keyed by the generation the cut happened under *and* by why it happened.
+    // A dead-man latch that follows an ordinary cut leaves the generation
+    // untouched - `latch_cut` only bumps it when the cut is new - but it is a
+    // separate decision, and a journal that recorded only the ordinary one
+    // cannot show that the watchdog was the thing that went wrong.
+    let mut audited: Option<(u64, &'static str)> = None;
+    // The deadline this loop has already cut for, and why it cut for it.
+    // `pending` stays set after an ordinary cut is reclaimed by a heartbeat, and
+    // that reclaim must not retire the deadline: the next silence still has to
+    // cut. Recording the deadline stops the same deadline being cut twice, and
+    // recording the reason keeps a watchdog cut from being filed as a host
+    // fault, or the other way round.
+    let mut cut_reason: Option<(tokio::time::Instant, &'static str)> = None;
     loop {
         if *stop.borrow() == u64::MAX {
             break;
         }
-        let (deadline, pending) = {
-            let watchdog = state.watchdog.lock();
-            (watchdog.deadline, watchdog.pending)
-        };
-        if state.terminal_failure.load(Ordering::Acquire)
-            || (!pending && tokio::time::Instant::now() >= deadline)
-        {
+        let deadline = state.watchdog.lock().deadline;
+        let armed = cut_reason.is_none_or(|(cut, _)| cut != deadline);
+        if state.terminal_failure.load(Ordering::Acquire) {
+            // A host fault cuts whatever the watchdog is doing.
+            if armed {
+                let _ = state.latch_cut(true);
+                cut_reason = Some((deadline, "gateway terminal fault latched network cut"));
+            }
+        } else if armed && tokio::time::Instant::now() >= deadline {
             // Cancellation happens synchronously, before any attachment I/O or audit.
             let _ = state.latch_cut(true);
+            cut_reason = Some((deadline, "watchdog deadline latched network cut"));
         }
         let pending = state.watchdog.lock().pending;
         let generation = *state.stop.borrow();
@@ -2008,15 +2023,22 @@ async fn run_watchdog(state: Arc<Runtime>) -> Result<()> {
                 delivered = Some(generation);
             }
         }
-        if pending && audited != Some(generation) {
-            audited = Some(generation);
+        // Whatever cut for *this* deadline is what the journal says. A cut the
+        // loop did not make - an operator cut, a host fault elsewhere - keeps
+        // the original wording.
+        let reason = cut_reason.filter(|(cut, _)| *cut == deadline).map_or(
+            "watchdog or host fault latched network cut",
+            |(_, reason)| reason,
+        );
+        if pending && audited != Some((generation, reason)) {
+            audited = Some((generation, reason));
             // A failed/full journal cannot gate the network cut.
             if state
                 .audit_tx
                 .try_send(AuditCommand::Record(state.measured_event(
                     Category::Lifecycle,
                     Decision::Cut,
-                    "watchdog or host fault latched network cut",
+                    reason,
                     None,
                     0,
                     0,
@@ -2030,7 +2052,7 @@ async fn run_watchdog(state: Arc<Runtime>) -> Result<()> {
         tokio::select! {
             _ = stop.changed() => {},
             _ = state.watchdog_changed.notified() => {},
-            _ = tokio::time::sleep_until(deadline), if !pending => {},
+            _ = tokio::time::sleep_until(deadline), if armed => {},
         }
     }
     Ok(())

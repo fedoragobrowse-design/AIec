@@ -1029,6 +1029,59 @@ async fn a_heartbeat_still_reopens_an_ordinary_cut() {
     let _ = f.finish().await;
 }
 
+/// Reclaiming an ordinary cut is not a waiver of the dead-man. The watchdog
+/// coming back reopens the attachment, but the deadline that governs the next
+/// silence is still the deadline; an ordinary reclaim must not retire it.
+#[tokio::test]
+async fn an_ordinary_cut_reclaimed_by_a_heartbeat_still_leaves_the_deadman_armed() {
+    let f = Fixture::configured(|_| {}, |sink| sink, None, 1_000).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    f.gateway().control().cut().expect("cut");
+    f.gateway().heartbeat(&f.identity).expect("still reporting");
+    assert!(!f.control.network_cut(), "the watchdog reclaimed its cut");
+
+    // The watchdog now goes silent past the deadline it must be cut by.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    assert!(
+        f.control.network_cut(),
+        "an ordinary reclaim must not disarm the dead-man switch"
+    );
+    let _ = f.finish().await;
+}
+
+/// The dead-man latch that follows an ordinary cut leaves the generation
+/// untouched, so the journal must still record it as a separate event. A
+/// journal with one cut record and no reason to tell them apart cannot show
+/// that the watchdog was the thing that went wrong.
+#[tokio::test]
+async fn a_dead_man_cut_after_an_ordinary_cut_is_journaled_separately() {
+    let f = Fixture::configured(|_| {}, |sink| sink, None, 1_000).await;
+    assert!(f.gateway().heartbeat(&f.identity).expect("first heartbeat"));
+    f.gateway().control().cut().expect("cut");
+    f.gateway().heartbeat(&f.identity).expect("still reporting");
+    assert!(!f.control.network_cut(), "the watchdog reclaimed its cut");
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    assert!(f.control.network_cut());
+
+    let events = f.finish().await;
+    let cuts: Vec<&str> = events
+        .iter()
+        .filter(|event| event.reason.contains("latched network cut"))
+        .map(|event| event.reason.as_str())
+        .collect();
+    assert_eq!(
+        cuts.len(),
+        2,
+        "both the ordinary cut and the dead-man must be on record: {cuts:?}"
+    );
+    assert!(
+        cuts.iter()
+            .any(|reason| reason.contains("watchdog deadline")),
+        "the dead-man must be named as the watchdog, not folded into the operator's cut: \
+         {cuts:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_model_request_reserves_durably_before_any_byte_reaches_upstream() {
     let authority = Arc::new(RecordingAuthority {

@@ -380,7 +380,7 @@ impl RunView {
                 .map(|artifact| RunArtifactView {
                     name: artifact.name.clone(),
                     size_bytes: artifact.size_bytes,
-                    download_url: format!("/v1/runs/{}/artifacts/{}", run.id, artifact.name),
+                    download_url: artifact_download_url(&run.id, &artifact.name),
                 })
                 .collect(),
             placement: serde_json::to_value(&run.placement).unwrap_or_else(|_| json!({})),
@@ -393,6 +393,44 @@ impl RunView {
         }
     }
 }
+
+/// Where one run artifact's bytes are, as a path under the API base URL.
+///
+/// An artifact's name is the path it had inside the sandbox -
+/// `/workspace/report.txt` - so concatenating it produced
+/// `/v1/runs/{id}/artifacts//workspace/report.txt`, whose empty component the
+/// route cannot match: a listing whose own links 404. Every byte outside the
+/// unreserved set is escaped, so a name holding a space or a non-ASCII
+/// character comes back the same way round too. Same encoding as
+/// `run_artifact_download_url` on the control plane.
+fn artifact_download_url(run_id: &Uuid, name: &str) -> String {
+    use std::fmt::Write as _;
+
+    // Sized for the worst case - every byte escaped - because artifact names
+    // are absolute sandbox paths, so the usual name escapes nearly all of them
+    // and a `String` that grows to fit reallocates on the way.
+    let mut url =
+        String::with_capacity(name.len() * 3 + RUN_URL_PREFIX.len() + ARTIFACT_SUFFIX.len() + 36);
+    url.push_str(RUN_URL_PREFIX);
+    let _ = write!(url, "{run_id}");
+    url.push_str(ARTIFACT_SUFFIX);
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            url.push(char::from(byte));
+        } else {
+            url.push('%');
+            url.push(char::from(HEX[usize::from(byte >> 4)]));
+            url.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    url
+}
+
+/// Hex digits for percent-encoding, so escaping a byte is two table lookups
+/// rather than a `format!` and the heap it borrows.
+const HEX: [u8; 16] = *b"0123456789ABCDEF";
+const RUN_URL_PREFIX: &str = "/v1/runs/";
+const ARTIFACT_SUFFIX: &str = "/artifacts/";
 
 /// One cell of a batch or a matrix, and what became of it.
 #[derive(Debug, Clone, Serialize)]
@@ -885,6 +923,31 @@ mod tests {
             .expect("the derived policy still compiles");
         assert_eq!(effective.network.dns.allowed_zones.len(), 1);
         assert_eq!(effective.network.egress.len(), 1);
+    }
+
+    /// The listing has to link each artifact to bytes that exist.
+    ///
+    /// An artifact's name is the path it had inside the sandbox, and the
+    /// download route only matches a single encoded segment, so a name pasted
+    /// in raw produced `/v1/runs/{id}/artifacts//workspace/report.txt` - an
+    /// empty component the route cannot match. A caller following the listing's
+    /// own link got a 404 for an artifact the run had stored.
+    #[test]
+    fn an_artifact_link_addresses_the_artifact_it_names() {
+        let id = Uuid::parse_str("0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b31").expect("a uuid");
+        assert_eq!(
+            artifact_download_url(&id, "/workspace/report.txt"),
+            format!("/v1/runs/{id}/artifacts/%2Fworkspace%2Freport.txt")
+        );
+        assert_eq!(
+            artifact_download_url(&id, "report.txt"),
+            format!("/v1/runs/{id}/artifacts/report.txt")
+        );
+        // A space is a URL the HTTP client would truncate the path at.
+        assert_eq!(
+            artifact_download_url(&id, "report 2026.tar.gz"),
+            format!("/v1/runs/{id}/artifacts/report%202026.tar.gz")
+        );
     }
 
     #[test]

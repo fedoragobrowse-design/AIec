@@ -72,12 +72,18 @@ impl Repository {
         } else {
             String::new()
         };
-        // Once. The changed-file list is parsed out of the status, so reading
-        // it twice means the evidence can disagree with itself: a file written
-        // between the two calls appears in one field and not the other, and
-        // nothing downstream can tell which list is the real one.
-        let status = self.status();
+        // Once, and unquoted. The changed-file list is parsed out of the same
+        // bytes the status is rendered from, so reading it twice means the
+        // evidence can disagree with itself: a file written between the two
+        // calls appears in one field and not the other, and nothing downstream
+        // can tell which list is the real one.
+        let status = if self.available {
+            raw_status(&self.root).unwrap_or_default()
+        } else {
+            String::new()
+        };
         let changed_files = changed_files(&self.root, &status);
+        let status = render_status(&status);
         GitEvidence {
             head_before: None,
             head_after,
@@ -92,8 +98,28 @@ impl Repository {
 
 /// Working tree status, as the `git_status` tool returns it.
 pub fn status(root: &Path) -> Result<String, HarnessError> {
-    git(root, &["status", "--porcelain=v1"])
+    raw_status(root).map(|raw| render_status(&raw))
+}
+
+/// The raw porcelain stream: NUL-separated records, every path exactly as it
+/// exists.
+///
+/// `-z` is not a display choice. Without it git C-quotes any path holding a
+/// backslash, a control character or a non-ASCII byte, and the two status
+/// columns sit in front of the path with a variable number of spaces between
+/// them - so a parser that trims the remainder hands back `M src/main.rs`, or
+/// `new name.txt -> old name.txt`, neither of which is a path that exists.
+fn raw_status(root: &Path) -> Result<String, HarnessError> {
+    git(root, &["status", "--porcelain=v1", "-z"])
         .map_err(|_| HarnessError::Tool("git status failed; is this a repository?".to_owned()))
+}
+
+/// The `-z` stream rendered for a human reading it.
+///
+/// NUL written as a newline, because that is what separates the records anyway;
+/// `changed_files` holds the exact paths this was rendered from.
+fn render_status(raw: &str) -> String {
+    raw.replace('\0', "\n")
 }
 
 /// The uncommitted diff, as the `git_diff` tool returns it.
@@ -105,14 +131,15 @@ pub fn diff(root: &Path) -> Result<String, HarnessError> {
     Ok(crate::tools::compress(&text, MAX_DIFF))
 }
 
-/// Distinct paths touched by the working tree, parsed from porcelain status.
+/// Distinct paths touched by the working tree, parsed from the raw `-z` stream.
+///
+/// Each record is two status characters, a space, then the path - and for a
+/// rename or a copy the *original* path follows as its own NUL-terminated
+/// field. Only the destination is kept: that is the path the run left behind,
+/// and the original is what the caller already has from the commit.
 fn changed_files(root: &Path, status: &str) -> Vec<String> {
     if !status.is_empty() {
-        return status
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim().to_owned()))
-            .collect();
+        return porcelain_paths(status);
     }
     // No porcelain output: fall back to the diff's own file headers.
     git(root, &["--no-pager", "diff", "--name-only", "HEAD"])
@@ -122,6 +149,26 @@ fn changed_files(root: &Path, status: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// The paths `git status --porcelain=v1 -z` reported, exactly as it printed them.
+fn porcelain_paths(porcelain: &str) -> Vec<String> {
+    let mut fields = porcelain.split('\0');
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        let bytes = record.as_bytes();
+        // The shortest possible record is `XY ` plus one byte of path.
+        if bytes.len() < 4 || bytes[2] != b' ' {
+            continue;
+        }
+        // `bytes[2]` is ASCII, so index 3 is a character boundary and this
+        // slice can never split one.
+        paths.push(record[3..].to_owned());
+        if matches!(bytes[0], b'R' | b'C') {
+            let _ = fields.next();
+        }
+    }
+    paths
 }
 
 fn git_root(path: &Path) -> Option<std::path::PathBuf> {
@@ -206,6 +253,70 @@ mod tests {
             evidence.diff.contains("two"),
             "the diff should show the change"
         );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// The changed-file list has to hold paths, and the paths have to exist.
+    ///
+    /// A file an agent edited without staging is porcelain ` M src/main.rs`:
+    /// two status columns, then the path. Splitting the line at its first space
+    /// and trimming the rest - the obvious way - yields `M src/main.rs`, which
+    /// is not a file. Renames came back as `new name.txt -> old name.txt`, and
+    /// a path holding a non-ASCII byte came back in git's C-quoted form. All
+    /// three were reported as files the run touched.
+    #[test]
+    fn changed_files_are_paths_that_exist() {
+        let path = repo("changed");
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap()
+        };
+        run(&["add", "src/main.rs"]);
+        run(&["commit", "-q", "-m", "second"]);
+
+        // A plain edit: the single most common thing a coding agent does.
+        std::fs::write(path.join("src/main.rs"), "fn main() { println!(); }\n").unwrap();
+        // A rename of something committed above.
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "third"]);
+        run(&["mv", "a.txt", "renamed a.txt"]);
+        run(&["add", "-A"]);
+        // A name git C-quotes unless -z is asked for.
+        std::fs::write(path.join("caf\u{e9}.txt"), "x\n").unwrap();
+
+        let repository = Repository::open(&path).expect("opened");
+        let evidence = repository.collect_after();
+        assert!(
+            evidence.changed_files.contains(&"src/main.rs".to_owned()),
+            "an edited file reported as {:?}",
+            evidence.changed_files
+        );
+        assert!(
+            evidence.changed_files.contains(&"renamed a.txt".to_owned()),
+            "a rename reported as {:?}",
+            evidence.changed_files
+        );
+        assert!(
+            evidence.changed_files.contains(&"caf\u{e9}.txt".to_owned()),
+            "a quoted path reported as {:?}",
+            evidence.changed_files
+        );
+        for reported in &evidence.changed_files {
+            assert!(
+                path.join(reported).exists(),
+                "{reported:?} is not a file in the repository"
+            );
+        }
         let _ = std::fs::remove_dir_all(path);
     }
 

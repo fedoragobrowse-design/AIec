@@ -1124,7 +1124,7 @@ const INTERCEPTION_REFUSAL: &str =
 /// the other end of the connection may keep the first. That gap is a policy
 /// bypass: a body carrying two `method` fields can pass an allow check as one
 /// method and execute as another.
-struct StrictJson(Value);
+pub(crate) struct StrictJson(pub(crate) Value);
 
 impl<'de> serde::Deserialize<'de> for StrictJson {
     fn deserialize<D: serde::Deserializer<'de>>(

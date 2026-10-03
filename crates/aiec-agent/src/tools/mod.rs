@@ -207,27 +207,94 @@ fn arg_usize(args: &Value, name: &str, fallback: usize) -> usize {
 ///
 /// The harness runs inside a sandbox, so this is not about hostile tenants. It
 /// is about the model accidentally writing to `/etc` because it guessed a path,
-/// which is a very common failure and a very annoying one.
+/// which is a very common failure and a very annoying one - and every tool
+/// schema here already says the path is "relative to the repository root", so
+/// an absolute path is the model guessing rather than the caller asking.
+///
+/// Refusing `..` and absolute paths is not enough on its own: those are lexical
+/// rules, and a repository can hold a symlink pointing anywhere -
+/// `ln -s /etc link` makes `link/hosts` a path inside the repository whose
+/// contents are not. So the answer is resolved through the real tree. Every
+/// component that exists is canonicalized and must stay under the root, and a
+/// component that does not exist yet is simply appended, which is what lets
+/// `write` create `src/deep/new.rs` without having to special-case creation.
+/// A path that exists but cannot be resolved - a dangling symlink, above all -
+/// is refused rather than guessed at: opening one for write follows the link
+/// and creates whatever it points at.
+///
+/// The check is on the tree as it is now. A link swapped between this call and
+/// the write is still a way out; that is the price of not being the kernel, and
+/// it is out of scope here because the caller is the model, not an attacker.
 fn resolve(root: &Path, raw: &str) -> Result<PathBuf, HarnessError> {
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
-        return Ok(candidate.to_path_buf());
+        return Err(HarnessError::Tool(format!(
+            "`{raw}` is absolute; paths are relative to the repository root"
+        )));
     }
-    // The prefix check below is lexical, so `a/../b` would slip through it:
-    // the path has to be walked first, rejecting any `..` outright.
+    // The prefix checks below are lexical, so `a/../b` would slip through
+    // them: the path has to be walked first, rejecting any `..` outright.
     if candidate
         .components()
         .any(|part| part == std::path::Component::ParentDir)
     {
         return Err(HarnessError::Tool(format!("`{raw}` leaves the repository")));
     }
-    let joined = root.join(candidate);
-    if !joined.starts_with(root) {
-        return Err(HarnessError::Tool(format!(
-            "`{raw}` is outside the repository"
-        )));
+    let base = std::fs::canonicalize(root).map_err(|error| {
+        HarnessError::Tool(format!(
+            "the repository root {} is unusable: {error}",
+            root.display()
+        ))
+    })?;
+    let parts: Vec<&std::ffi::OsStr> = candidate
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name),
+            // `.` is noise the join would keep; root and prefix cannot appear
+            // in a relative path, and `..` was refused above.
+            _ => None,
+        })
+        .collect();
+    let mut current = base.clone();
+    for (index, name) in parts.iter().enumerate() {
+        let probe = current.join(name);
+        match std::fs::symlink_metadata(&probe) {
+            Ok(_) => match std::fs::canonicalize(&probe) {
+                Ok(real) => {
+                    if !real.starts_with(&base) {
+                        return Err(HarnessError::Tool(format!(
+                            "`{raw}` is outside the repository"
+                        )));
+                    }
+                    current = real;
+                }
+                // It exists, so something is there to be opened, and it cannot
+                // be resolved. Creating the file would follow the link.
+                Err(_) => {
+                    return Err(HarnessError::Tool(format!(
+                        "`{raw}` does not resolve; it may be a broken link"
+                    )));
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Nothing here yet, and nothing below it can exist either. The
+                // rest of the path is the caller's to create, but it hangs off
+                // what was walked, not off the root: `current` may be several
+                // resolved components down, and joining to the root would drop
+                // the directories that do exist.
+                for name in &parts[index..] {
+                    current.push(*name);
+                }
+                break;
+            }
+            Err(error) => {
+                return Err(HarnessError::Tool(format!(
+                    "cannot resolve `{raw}`: {error}"
+                )));
+            }
+        }
     }
-    Ok(joined)
+    Ok(current)
 }
 
 fn read(root: &Path, args: &Value) -> Result<String, HarnessError> {
@@ -674,6 +741,171 @@ mod tests {
         assert!(resolve(&root, "inside/file.rs").is_ok());
         let escape = resolve(&root, "../outside").unwrap_err();
         assert!(escape.to_string().contains("outside"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_absolute_path_is_refused_rather_than_taken_as_given() {
+        // Every path schema says "relative to the repository root", and the
+        // whole point of `resolve` is that the model does not get to write
+        // wherever it guessed. An absolute path used to be returned untouched,
+        // so `/etc/cron.d/x` or `/root/.ssh/authorized_keys` reached straight
+        // through every file tool.
+        let root = scratch("absolute");
+        for outside in ["/etc/hostname", "/root/.ssh/authorized_keys", "/tmp"] {
+            let failure = resolve(&root, outside);
+            assert!(
+                matches!(&failure, Err(error) if error
+                    .to_string()
+                    .contains("relative to the repository root")),
+                "{outside} resolved to {:?}, which is outside {root:?}",
+                failure.map(|path| path.display().to_string())
+            );
+        }
+        assert!(
+            resolve(&root, "inside/file.rs").is_ok(),
+            "relative paths still work"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Refusing `..` and absolute paths is a rule about the *string*, and a
+    /// repository can hold a symlink. `ln -s /etc link` makes `link/hostname` a
+    /// perfectly relative path with no `..` anywhere in it whose bytes are
+    /// `/etc/hostname`, so both the read tools and `write` walked straight out.
+    #[test]
+    fn a_link_out_of_the_repository_is_refused_rather_than_followed() {
+        let root = scratch("symlink-out");
+        // A directory outside the repository, standing in for /etc: the same
+        // shape, without a failing test reaching into a real system directory.
+        let outside_root = scratch("symlink-outside");
+        std::fs::write(root.join("inside.txt"), "inside\n").unwrap();
+        // The target has to hold a file, or `out/hostname` is simply a path
+        // that does not exist and the walk would treat it as a new one.
+        std::fs::write(outside_root.join("hostname"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside_root, root.join("out")).expect("symlink out");
+
+        for outside in ["out/hostname", "out"] {
+            let failure = resolve(&root, outside);
+            assert!(
+                matches!(&failure, Err(error) if error
+                    .to_string()
+                    .contains("outside the repository")),
+                "{outside} resolved to {:?}",
+                failure.map(|path| path.display().to_string())
+            );
+        }
+        // And it is the tools, not just the helper, that have to refuse.
+        let read_error = read(&root, &serde_json::json!({"path": "out/hostname"}))
+            .expect_err("a read through a link out of the repository must fail");
+        assert!(read_error.to_string().contains("outside"), "{read_error}");
+        let write_error = write(
+            &root,
+            &serde_json::json!({"path": "out/pwned", "content": "x"}),
+        )
+        .expect_err("a write through a link out of the repository must fail");
+        assert!(write_error.to_string().contains("outside"), "{write_error}");
+        assert!(
+            !outside_root.join("pwned").exists(),
+            "the write landed outside the repository anyway"
+        );
+        let _ = std::fs::remove_dir_all(&outside_root);
+
+        // A link back inside is ordinary, and must keep working: refusing every
+        // symlink would break every repository that has one.
+        std::os::unix::fs::symlink(root.join("inside.txt"), root.join("link")).expect("symlink");
+        let through = resolve(&root, "link").expect("a link inside the repository resolves");
+        assert_eq!(
+            std::fs::read_to_string(&through).unwrap(),
+            "inside\n",
+            "a link that stays inside is followed, not refused"
+        );
+
+        // Creating a file several directories deep still works: a component
+        // that does not exist yet is not an escape.
+        assert!(resolve(&root, "new/deeper/file.txt").is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Creating a file is the one case where the path legitimately does not
+    /// exist yet, so the walk stops early and hands back a path. It has to hand
+    /// back the right one: joining the missing tail to the repository root
+    /// instead of to what was walked silently dropped the directories that do
+    /// exist, so `src/deep/new.txt` landed in `src/`, or in neither.
+    #[test]
+    fn a_new_file_is_created_where_it_was_asked_for() {
+        let root = scratch("new-file");
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+
+        // The first component is missing entirely.
+        assert!(
+            write(
+                &root,
+                &serde_json::json!({"path": "brand/new.txt", "content": "a"})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("brand/new.txt")).unwrap(),
+            "a"
+        );
+        // Several levels are missing at once.
+        assert!(
+            write(
+                &root,
+                &serde_json::json!({"path": "one/two/three.txt", "content": "b"})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("one/two/three.txt")).unwrap(),
+            "b"
+        );
+        // The tail is missing but the head exists, which is the case a
+        // root-relative join gets wrong: `new.txt` belongs in `src/deep`.
+        assert!(
+            write(
+                &root,
+                &serde_json::json!({"path": "src/deep/new.txt", "content": "c"})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/deep/new.txt")).unwrap(),
+            "c"
+        );
+        assert!(
+            !root.join("src/new.txt").exists() && !root.join("new.txt").exists(),
+            "the new file was written somewhere it was not asked for"
+        );
+        // Overwriting an existing file still finds it.
+        assert!(
+            write(
+                &root,
+                &serde_json::json!({"path": "src/deep/new.txt", "content": "d"})
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/deep/new.txt")).unwrap(),
+            "d"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Opening a broken link for writing creates whatever it points at, so a
+    /// link to nothing has to be refused rather than resolved to a guess.
+    #[test]
+    fn a_broken_link_is_refused_rather_than_created_through() {
+        let root = scratch("symlink-dangling");
+        std::os::unix::fs::symlink("/tmp/aiec-never-created", root.join("dangling"))
+            .expect("symlink");
+        let failure = resolve(&root, "dangling");
+        assert!(
+            matches!(&failure, Err(error) if error.to_string().contains("does not resolve")),
+            "a dangling link resolved to {:?}",
+            failure.map(|path| path.display().to_string())
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

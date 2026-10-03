@@ -83,28 +83,34 @@ reports the state it actually observed and fails if the machine is still there.
 
 ## Open
 
-### `set_run_failure` has no compare-and-set
+### `set_run_failure` had no compare-and-set
 
-`set_run_failure` writes `state` and `failure_reason` unconditionally. A
-cancelled run whose synchronous `execute` then fails is rewritten from
-`cancelled` to `failed`, so a caller that was told `200 OK / cancelled` reads a
-run that says `failed`. `advance` also adopts a terminal state and returns `Ok`,
-which lets `execute` keep running commands on a machine `cancel_run` already
-destroyed.
+**Status:** fixed. `set_run_failure` wrote `state` and `failure_reason`
+unconditionally, so a cancelled run whose synchronous `execute` then failed was
+rewritten from `cancelled` to `failed` and a caller that had already been told
+`200 OK / cancelled` later read a run that said `failed`. It now keeps a
+terminal state and still records the reason on the losing write, and `advance`
+returns `Conflict` on a terminal transition instead of adopting it.
 
-### `record_run_results` loses results on the final failure
+### `record_run_results` lost results on the final failure
 
-The last `fail()` passes the pre-execution snapshot, whose state is `Queued`.
-Writing results in that state is rejected by the lifecycle, so `phase_ms` and
-`cleanup_failed` are silently dropped for every run that failed after placement
-- which is precisely the population that may be holding compute.
+**Status:** fixed. The last `fail()` passed the pre-execution snapshot, whose
+state was `Queued`, so writing results in that state was rejected and
+`phase_ms` and `cleanup_failed` were silently dropped for every run that failed
+after placement. Failure settlement no longer routes through a lifecycle-checked
+results write.
 
-### Results are lost when settling fails
+### Results were lost when settling failed
 
-`fail()` returns `Ok(())` whether or not either of its two writes succeeded, and
-both are warn-only. A database blip during settlement leaves a run permanently
-non-terminal while a `run.failed` event already exists - a terminal event for a
-run that never became terminal.
+**Status:** fixed. `fail()` returned `Ok(())` whether or not either of its two
+writes succeeded, and both were warn-only, so a database blip during settlement
+left a run permanently non-terminal with a `run.failed` event already in the
+log - a terminal event for a run that never became terminal.
+
+Settlement is now one atomic write (`MetadataStore::record_run_failure`) that
+records results, reason, terminal state and `completed_at` together. The
+`run.failed` event is emitted only after that write succeeds, and a refused
+settlement is reported to the caller instead of swallowed.
 
 ### A worker restarts machines for sandboxes whose runs finished
 
@@ -114,13 +120,18 @@ believes those sandboxes are stranded while the worker re-materialises them, so
 reclaiming capacity by expiring their leases does not stick. Not yet traced to
 the worker code that does it.
 
-### `register_worker` can wedge a worker permanently
+### `register_worker` could wedge a worker permanently
 
-The upsert updates `total_vcpus` but deliberately omits `available_vcpus`. A
-worker that re-registers after being reprovisioned smaller trips the
-`nodes_capacity_within_total` check, which surfaces as a conflict; a worker that
+**Status:** fixed. The upsert updated `total_*` but omitted `available_*`, so a
+worker re-registering after being reprovisioned smaller tripped the
+`nodes_capacity_within_total` check, which surfaced as a conflict; a worker that
 cannot register cannot heartbeat, and one that cannot heartbeat is never
 recovered.
+
+The upsert now derives each `available_*` from the capacity actually committed
+(`total - available` before the change) subtracted from the new total and
+floored at zero, so a resize preserves in-use capacity, never exceeds the new
+total, and cannot violate the check constraint.
 
 
 ### `aiec_compare_omp` drops the per-run output
@@ -173,32 +184,28 @@ A comparison is only checkable if you can see what each side actually did. Two
 sides reporting identical numbers mean nothing without the evidence, so this is
 the first thing to fix before trusting a comparison result.
 
-### A worker's `available_*` does not follow a capacity change
+### A worker's `available_*` did not follow a capacity change
 
-**Status:** open. **Severity:** operational.
+**Status:** fixed. **Severity:** operational.
 
-Raising a worker's `--capacity` updates its `total_*` on the next heartbeat, but
-`available_vcpus` / `available_memory_bytes` / `available_disk_bytes` are
-deliberately left alone by the registration upsert, so they keep the old value.
-A worker taken from 3 to 8 vCPU still advertises 3 available, and concurrent
-work is refused with `LOCAL_CAPACITY_UNAVAILABLE` even though the cluster is
-idle.
+Raising a worker's `--capacity` updated `total_*` through the registration
+upsert, but `available_vcpus` / `available_memory_bytes` /
+`available_disk_bytes` were left alone, so they kept the old value. A worker
+taken from 3 to 8 vCPU still advertised 3 available, and concurrent work was
+refused with `LOCAL_CAPACITY_UNAVAILABLE` even though the cluster was idle.
 
-The upsert is right not to clobber these — they are a running reservation, and
-overwriting them would hand the same vCPU to two sandboxes. What is missing is
-any reconciliation of "reserved" against "in use". Until then, changing a
-worker's capacity needs its node row reconciled by hand:
+The upsert was right not to clobber those columns outright - they are a running
+reservation, and overwriting them would hand the same vCPU to two sandboxes.
+What was missing was reconciliation of "reserved" against "in use", which is
+what `register_worker` now does: `available_x` becomes
+`new_total_x - (old_total_x - old_available_x)`, floored at zero. A resize
+therefore preserves the capacity actually committed, never exceeds the new
+total, and needs no manual reconciliation afterwards.
 
-```sql
-update nodes
-   set available_vcpus = total_vcpus,
-       available_memory_bytes = total_memory_bytes,
-       available_disk_bytes = total_disk_bytes
- where name = '<worker>' and sandbox_count = 0;
-```
-
-The `sandbox_count = 0` guard matters: without it the update would hand
-capacity that a live sandbox is holding to the next placement.
+The mechanism is the registration upsert, not the heartbeat as originally
+recorded: `heartbeat_worker` deliberately leaves `total_*` and `available_*`
+untouched, which `heartbeat_preserves_scheduler_capacity_and_refreshes_same_version`
+pins.
 
 ### The `initialize` handshake never answers `2026-07-28`
 
