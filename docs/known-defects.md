@@ -461,11 +461,20 @@ requires the run to have used the machine before it may keep it.
 Reproduced against `13f7d3e`, in a worktree at that commit with its own target
 directory, by two PostgreSQL tests:
 
+
 The reproductions named below were run in a throwaway worktree that was
 removed afterwards, so they are not in the tree and cannot be re-run as
-written. They are recorded for what they observed, not as gates; the fixed
-behaviour each one describes is covered by a permanent regression at the same
-commit.
+written. They are recorded for what they observed, not as gates. The behaviour
+each one describes is instead covered by these permanent PostgreSQL
+regressions:
+
+- `a_run_only_links_keeps_and_records_machines_from_its_own_tenant` — refuses a
+  link to another tenant's machine, and refuses retention of a machine the run
+  never used.
+- `a_run_that_still_holds_a_machine_cannot_be_deleted_out_from_under_it` —
+  refuses the delete while the run retains or names a machine.
+- `a_released_machine_leaves_no_cleanup_report_and_cannot_be_reported_afterwards`
+  — covers the displacement case, where a second retention replaced the first.
 
 - `f4_baseline_a_run_links_a_machine_from_another_tenant` — the link was
   accepted and the run's link list then held the foreign id.
@@ -628,9 +637,14 @@ first with the write returning `Ok(())`.
   the Debug formatting of `Scope`, not the `scope_wire_name` the API parses.
 - A repetition count was expanded before it was validated, in three places
   rather than one: `run_repetitions`, `omp::compare` (two runs per repetition),
-  and the MCP comparison tool (which reserves capacity for both sides before
-  expanding). `u32::MAX` requested a multi-terabyte allocation and aborted the
-  process. All three now share `MAX_EVAL_REPETITIONS`.
+  and the MCP comparison tool, which reserves capacity for both sides before
+  expanding anything. `u32::MAX` requested a multi-terabyte allocation and
+  aborted the process. All three now share `MAX_EVAL_REPETITIONS`. Of the
+  three, the MCP tool (`aiec_compare_omp`) and the `/v1/eval/repetitions` route
+  are reachable from a caller today; `omp::compare` is currently unrouted, so
+  its share of the fix is defence in depth on a public function rather than a
+  closed hole. Worth keeping anyway — the function is `pub` and a suite file is
+  caller-authored — but it should not be read as the route an attacker took.
 
 - The CLI created Firecracker and Docker sandboxes through a bare
   `reqwest::Client::new()`, bypassing `AIEC_TLS_CA_CERT` and the 60 s timeout.
@@ -651,10 +665,17 @@ the normal case when a batch is admitted at once — could both see a slot free
 and both take it. The kernel does not reject the second: a second interface may
 carry an address already in use, so the duplicate becomes two live sandboxes on
 one subnet with no error raised anywhere. The probe and the assignment are now
-serialized within a worker. **Partially fixed:** this is a process-local lock,
-so a deployment running two workers against one host still depends on the
-inventory probe rather than on an atomic reservation. Closing that needs a
-lockfile or a kernel-side claim, which is not built.
+serialized within a worker. **Partially fixed, and the scope is worth being
+precise about:** the existing placement advisory lock does **not** already cover
+this. Network attachment happens in the runtime at microVM creation, long after
+placement returns, and in the legacy guard fallback; the placement lock is a
+PostgreSQL advisory lock held inside `select_schedulable_node` and it does not
+span any of it. So this needed its own lock, taken as a `static` so it holds
+across every call site without giving `LinuxNetworkManager` interior
+mutability. What that lock does **not** cover is a second worker process on the
+same host: cross-process, the reservation is still the inventory probe rather
+than an atomic claim. Closing that needs a lockfile or a kernel-side
+reservation, which is not built.
 
 ## Open
 
