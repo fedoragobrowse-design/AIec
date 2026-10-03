@@ -44,6 +44,34 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 # that interval, not against an assumption that it has already fired.
 REAP_INTERVAL_SECONDS = 15
 
+SECRETS: list[str] = [os.environ["RP_API_KEY"], os.environ["RP_WORKER_TOKEN"],
+                      os.environ.get("AIEC_GUEST_SECRET", "").strip()]
+
+
+def publish(report, payload):
+    """Publishes a passing report so the evidence outlives the scratch tree.
+
+    A failed run stays inside its own scratch directory: a diagnostic must not
+    be able to replace the authoritative artifact, and this report is the only
+    record of whether the durable reaper acted without a watchdog. The payload
+    is checked against the run's own credentials first, on the same principle
+    as the retained service logs.
+    """
+    if report["status"] != "PASS":
+        return None
+    if any(secret and secret in payload for secret in SECRETS):
+        print(json.dumps({"status": "PASS", "report_withheld_for_secrets": True}))
+        return None
+    destination = Path(os.environ.get(
+        "RP_REPORT", Path(__file__).resolve().parent.parent / "benchmarks" / "guard-reaper-acceptance.json"))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + "." + os.urandom(4).hex() + ".tmp")
+    temporary.write_text(payload)
+    temporary.chmod(0o600)
+    os.replace(temporary, destination)
+    return destination
+
+
 CASES: list[dict] = []
 FAILURES: list[str] = []
 CLEANUP_ERRORS: list[str] = []
@@ -409,9 +437,12 @@ def main() -> int:
         "elapsed_seconds": round(time.time() - started_at, 3),
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
-    (ROOT / "report.json").write_text(json.dumps(report, indent=2))
+    payload = json.dumps(report, indent=2)
+    (ROOT / "report.json").write_text(payload)
+    published = publish(report, payload)
     print(json.dumps({k: report[k] for k in
-                      ("status", "passed", "cases", "failing", "cleanup_errors")}))
+                      ("status", "passed", "cases", "failing", "cleanup_errors")}
+                     | {"published": str(published) if published else None}))
     return 0 if report["status"] == "PASS" else 1
 
 

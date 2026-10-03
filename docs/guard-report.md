@@ -795,6 +795,19 @@ found later.
 A directory the run did not create is not re-permissioned: `P3_ROOT` may be a
 parent the operator shares with another suite.
 
+**The durable reaper's evidence now outlives its scratch tree.** The reaper
+suite wrote its report into the run root, which is removed on every run, so a
+passing run left nothing behind that could be read later — the sixteen cases
+existed only in a console line. The driver now publishes a passing report to
+`benchmarks/guard-reaper-acceptance.json` after checking the payload against
+the run's own credentials, and a failed run publishes nothing: a diagnostic
+must not be able to replace an authoritative artifact. `RP_REPORT` moves the
+destination, which is how the same sixteen cases are recorded twice — once
+against a private cluster the run builds and destroys, and once against an
+external server it does not own, reached across the namespace boundary through
+the Unix-socket relay (`guard-reaper-external-db-acceptance.json`). Both were
+run on the final tree: sixteen of sixteen each, no cleanup errors.
+
 Three more state defects were found by rerunning the suites against that
 arrangement, all of them cases where a retained file was trusted for existing
 rather than for describing what the run was about to use.

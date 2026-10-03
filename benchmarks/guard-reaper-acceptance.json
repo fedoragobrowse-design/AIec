@@ -1,0 +1,232 @@
+{
+  "schema": "aiec.guard.reaper-acceptance.v1",
+  "status": "PASS",
+  "passed": 16,
+  "cases": 16,
+  "cases_detail": [
+    {
+      "case": "worker-registers-and-stays-healthy",
+      "status": "PASS",
+      "evidence": {
+        "registered": true,
+        "health": {
+          "node_id": "01a0ff34-d46d-767c-a0de-fded9003161d",
+          "healthy": true,
+          "runtime": "firecracker",
+          "capabilities": {
+            "isolation": "micro_vm",
+            "exec": true,
+            "files": true,
+            "streaming": false,
+            "pty": false,
+            "docker_image": false,
+            "guest_agent": true,
+            "full_kernel_isolation": true,
+            "portable_workspace": false,
+            "vm_snapshot": true,
+            "memory_resume": true,
+            "network_policy": true,
+            "gpu": false,
+            "pause": true,
+            "pause_reclaims_resources": false,
+            "workspace_snapshot": false,
+            "vsock": true,
+            "coding_guest": true
+          },
+          "in_flight": 0,
+          "capacity": 4,
+          "sandbox_count": 0,
+          "guest_profile": {
+            "artifact_version": "1.0.0",
+            "base": "debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "profile": "coding",
+            "capabilities": [
+              "sh",
+              "coreutils",
+              "git",
+              "ca-certificates",
+              "dns",
+              "https",
+              "tar",
+              "gzip",
+              "curl",
+              "python3"
+            ],
+            "git_version": "git version 2.39.5",
+            "guest_agent_version": "0.1.0",
+            "guest_protocol_version": 2
+          }
+        }
+      }
+    },
+    {
+      "case": "no-watchdog-process-runs-in-this-suite",
+      "status": "PASS",
+      "evidence": {
+        "started_processes": [
+          "control-plane",
+          "worker"
+        ]
+      }
+    },
+    {
+      "case": "guard-read-key-is-minted",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "scopes": [
+          "guard:read"
+        ]
+      }
+    },
+    {
+      "case": "guarded-sandbox-starts-for-budget-exhaustion",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "state": "running",
+        "error": null
+      }
+    },
+    {
+      "case": "durable-budget-is-spent-through-the-controlled-ledger",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "budget": {
+          "identity": {
+            "sandbox_id": "01a0ff34-e41f-716d-bfcf-256c0e0f9f05",
+            "tenant_id": "e68ed924-1fd0-4efa-9941-169c73119ccd",
+            "policy_hash": "f58f3e715fe8b5aa5607306fc73c5a8b61c99e6520898d5bbcf703248d80cb18"
+          },
+          "expires_at": "2026-10-03T00:55:51.487564Z",
+          "max_model_requests": 1,
+          "max_bytes_in": 268435456,
+          "max_bytes_out": 67108864,
+          "model_requests": 0,
+          "bytes_in": 0,
+          "bytes_out": 0,
+          "quarantined": false
+        }
+      }
+    },
+    {
+      "case": "sandbox-is-running-and-unquarantined-before-the-reaper",
+      "status": "PASS",
+      "evidence": {
+        "quarantined": false,
+        "network_cut": true
+      }
+    },
+    {
+      "case": "durable-budget-is-exhausted-through-the-ledger-route",
+      "status": "PASS",
+      "evidence": {
+        "status": 204,
+        "response": null,
+        "route": "POST /v1/workers/{node}/guard/reserve with the worker credential"
+      }
+    },
+    {
+      "case": "reaper-quarantines-an-exhausted-budget-with-no-watchdog",
+      "status": "PASS",
+      "evidence": {
+        "rules": [
+          "durable_budget_exhausted"
+        ],
+        "observed_after_seconds": 13.027,
+        "network_cut_at": "2026-10-03T00:41:02.099305295Z",
+        "final_state": "quarantined",
+        "author": "control-plane durable reaper; no watchdog and no quarantine caller in this run"
+      }
+    },
+    {
+      "case": "reaper-quarantine-cuts-egress",
+      "status": "PASS",
+      "evidence": {
+        "network_cut_at": "2026-10-03T00:41:02.099305295Z"
+      }
+    },
+    {
+      "case": "reaper-quarantine-is-durable",
+      "status": "PASS",
+      "evidence": {
+        "state": "quarantined"
+      }
+    },
+    {
+      "case": "reaper-quarantine-refuses-resume",
+      "status": "PASS",
+      "evidence": {
+        "status": 409,
+        "error": "conflict"
+      }
+    },
+    {
+      "case": "a-later-reaper-tick-changes-nothing",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "same_incident": true,
+        "completed_at": "2026-10-03T00:41:06.399710568Z",
+        "previous_completed_at": "2026-10-03T00:41:06.399710568Z"
+      }
+    },
+    {
+      "case": "guarded-sandbox-starts-for-lifetime-expiry",
+      "status": "PASS",
+      "evidence": {
+        "status": 200,
+        "state": "running",
+        "error": null
+      }
+    },
+    {
+      "case": "durable-budget-expiry-equals-the-sandbox-lifetime",
+      "status": "PASS",
+      "evidence": {
+        "expires_at": "2026-10-03T00:42:22.429118Z",
+        "timeout_seconds": 45,
+        "created_at": "2026-10-03T00:41:37.429118Z"
+      }
+    },
+    {
+      "case": "reaper-quarantines-an-expired-lifetime",
+      "status": "PASS",
+      "evidence": {
+        "rules": [
+          "sandbox_lifetime_expired"
+        ],
+        "observed_after_seconds": 56.802,
+        "states_observed": [
+          "quarantined",
+          "running"
+        ],
+        "final_state": "quarantined",
+        "race": "ordinary lease expiry may end the sandbox first; the state sequence above records which, rather than assuming the reaper won"
+      }
+    },
+    {
+      "case": "reaped-sandboxes-are-held-not-orphaned",
+      "status": "PASS",
+      "evidence": {
+        "remaining": [
+          {
+            "id": "01a0ff35-9795-71e7-b59e-e44214360260",
+            "state": "quarantined"
+          },
+          {
+            "id": "01a0ff34-e41f-716d-bfcf-256c0e0f9f05",
+            "state": "quarantined"
+          }
+        ]
+      }
+    }
+  ],
+  "failing": [],
+  "cleanup_errors": [],
+  "reap_interval_seconds": 15,
+  "observation_provenance": "control-plane durable reaper; no watchdog process and no caller of POST /guard/quarantine exists in this run",
+  "elapsed_seconds": 110.399,
+  "finished_at": "2026-10-03T00:42:37.317899+00:00"
+}
