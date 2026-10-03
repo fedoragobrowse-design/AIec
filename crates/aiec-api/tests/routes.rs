@@ -14,6 +14,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use parking_lot::Mutex;
+use serde_json::Value;
 use sha2::Digest;
 use std::sync::{Arc, LazyLock};
 use tower::ServiceExt;
@@ -2961,5 +2962,405 @@ async fn a_release_note_may_contain_spaces() {
         status,
         StatusCode::BAD_REQUEST,
         "an embedded newline is still refused: {body}"
+    );
+}
+
+/// An image resolver that admits a named allow-list and records what it saw.
+///
+/// The recording is the point: a path that boots a machine from a stored
+/// snapshot has to go through the resolver that signs what this deployment
+/// serves, so the question a test can ask is whether the resolver was asked.
+struct SelectiveResolver {
+    admitted: Vec<String>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl ImageResolver for SelectiveResolver {
+    async fn resolve(&self, reference: &ImageReference) -> Result<ResolvedImage, CoreError> {
+        self.seen.lock().push(reference.as_str().to_owned());
+        if !self.admitted.iter().any(|name| name == reference.as_str()) {
+            return Err(CoreError::NotFound(format!(
+                "image {} is not served by this deployment",
+                reference.as_str()
+            )));
+        }
+        Ok(ResolvedImage {
+            reference: reference.clone(),
+            image_id: format!("signed:{}", reference.as_str()),
+            rootfs: "/internal/rootfs".into(),
+            digest: ImageDigest::new("a".repeat(64)).unwrap(),
+            size_bytes: 1,
+            architecture: None,
+        })
+    }
+}
+
+/// A snapshot provider that reports every kind it can take and hands back a
+/// portable workspace archive, recording the kind each capture was asked for.
+struct RecordingSnapshots {
+    kinds: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl SnapshotProvider for RecordingSnapshots {
+    fn capabilities(&self) -> aiec_core::snapshots::SnapshotCapabilities {
+        aiec_core::snapshots::SnapshotCapabilities {
+            virtual_machine: true,
+            memory: true,
+            workspace: true,
+            cross_instance_restore: true,
+        }
+    }
+    async fn capture(
+        &self,
+        _sandbox: &Sandbox,
+        request: &aiec_core::snapshots::SnapshotRequest,
+    ) -> Result<aiec_core::snapshots::CapturedSnapshot, CoreError> {
+        self.kinds.lock().push(format!("{:?}", request.kind));
+        Ok(aiec_core::snapshots::CapturedSnapshot::from_archive(
+            aiec_core::SnapshotId::new_v4(),
+            request.kind,
+            request.object_key.clone(),
+            b"{\"version\":1,\"entries\":[]}".to_vec(),
+        ))
+    }
+    async fn restore(
+        &self,
+        _sandbox: &Sandbox,
+        _snapshot: &aiec_core::snapshots::SnapshotMetadata,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// A restore may not boot an image this deployment does not serve.
+///
+/// The restore path used to take the caller's replacement image verbatim, so
+/// the signed-manifest admission that `create_sandbox` depends on was absent
+/// from the one path that starts a machine from a stored snapshot: an
+/// unadmitted reference became a booted machine. Asking the resolver is the
+/// whole fix, and the test asks whether the resolver refused.
+#[tokio::test]
+async fn a_restore_may_not_boot_an_image_the_deployment_does_not_serve() {
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![
+            Scope::SandboxesRead,
+            Scope::SandboxesWrite,
+            Scope::SnapshotsRead,
+            Scope::SnapshotsWrite,
+        ],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let artifacts = std::env::temp_dir().join(format!("aiec-restore-{}", Uuid::now_v7()));
+    let platform = Platform::builder()
+        .runtime(Arc::new(MockRuntime))
+        .metadata_store(repo)
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .artifact_store(Arc::new(aiec_storage::FilesystemObjectStore::new(
+            &artifacts,
+        )))
+        .policy(Arc::new(DefaultPolicy))
+        .images(Arc::new(SelectiveResolver {
+            admitted: vec!["python:3.13".into()],
+            seen: seen.clone(),
+        }))
+        .snapshots(Arc::new(RecordingSnapshots {
+            kinds: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .build()
+        .expect("valid platform");
+    let router = app(AppState::development(platform));
+    let post = |path: String, body: serde_json::Value| {
+        let (router, key) = (router.clone(), key.clone());
+        async move {
+            router
+                .oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {key}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let created = post(
+        "/v1/sandboxes".into(),
+        serde_json::json!({
+            "image": "python:3.13", "cpu": 1, "memory_mb": 512, "disk_mb": 2048,
+            "timeout_seconds": 300
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let sandbox = created["id"].as_str().unwrap().to_owned();
+
+    let snap = post(
+        format!("/v1/sandboxes/{sandbox}/snapshots"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        snap.status(),
+        StatusCode::OK,
+        "a workspace snapshot completes"
+    );
+    let snap: Value = serde_json::from_slice(
+        &axum::body::to_bytes(snap.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let snapshot = snap["id"].as_str().unwrap().to_owned();
+
+    let refused = post(
+        format!("/v1/snapshots/{snapshot}/restore"),
+        serde_json::json!({"image": "ghcr.io/someone-else/unadmitted:latest"}),
+    )
+    .await;
+    assert_ne!(
+        refused.status(),
+        StatusCode::OK,
+        "a restore booted an image no resolver ever admitted"
+    );
+    assert!(
+        seen.lock()
+            .iter()
+            .any(|seen| seen == "ghcr.io/someone-else/unadmitted:latest"),
+        "the replacement image never reached the resolver that signs images: {:?}",
+        seen.lock().clone()
+    );
+    let _ = std::fs::remove_dir_all(&artifacts);
+}
+
+/// A snapshot whose bytes this control plane cannot store is refused before the
+/// capture runs.
+///
+/// The kind was chosen from the runtime's own capabilities, so on the
+/// microVM-class runtime - the production one - an unqualified request took the
+/// `VirtualMachine` branch, ran a whole machine capture, left the provider's
+/// snapshot on the worker's disk, and then failed the metadata row because a
+/// VM snapshot needs a memory object, a disk object and a workspace object and
+/// `CapturedSnapshot` carries none of them. The assertions are that the capture
+/// is asked for the workspace kind, that the row completes, and that an
+/// explicitly named VM kind is refused without touching the provider.
+#[tokio::test]
+async fn a_snapshot_is_captured_in_the_kind_the_control_plane_can_finish() {
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    let kinds = Arc::new(Mutex::new(Vec::new()));
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![
+            Scope::SandboxesRead,
+            Scope::SandboxesWrite,
+            Scope::SnapshotsRead,
+            Scope::SnapshotsWrite,
+        ],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let (platform, artifacts) = development_platform(
+        Arc::new(MockRuntime),
+        repo,
+        Some(Arc::new(RecordingSnapshots {
+            kinds: kinds.clone(),
+        })),
+    );
+    let router = app(AppState::development(platform));
+    let created = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let sandbox = created["id"].as_str().unwrap().to_owned();
+
+    let snap = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{sandbox}/snapshots"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snap.status(),
+        StatusCode::OK,
+        "an unqualified snapshot must be the kind that can be stored"
+    );
+    assert_eq!(
+        kinds.lock().clone(),
+        vec![format!(
+            "{:?}",
+            aiec_core::snapshots::SnapshotKind::Workspace
+        )],
+        "the capture was not asked for a workspace"
+    );
+
+    let refused = router
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{sandbox}/snapshots"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"virtual_machine"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let refused: Value = serde_json::from_slice(
+        &axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refused["error"]["code"], "unsupported_snapshot_kind");
+    assert_eq!(
+        kinds.lock().len(),
+        1,
+        "the provider was asked to capture a kind the control plane cannot store"
+    );
+    let _ = std::fs::remove_dir_all(&artifacts);
+}
+
+/// `git_diff` executes in the sandbox's own runtime, not the primary one.
+///
+/// Every other sandbox verb dispatches through `runtime_for`. The deployment's
+/// primary runtime here is a mock that echoes the command it was handed back as
+/// its stdout, while the runtime registered for Docker tags its answer with its
+/// own name, so the response says which machine was asked. No microVM entry is
+/// registered: `firecracker` requests are refused outside a production server,
+/// and the dispatch under test is the same either way.
+#[tokio::test]
+async fn a_git_diff_executes_in_the_runtime_the_sandbox_lives_on() {
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let docker = Arc::new(TaggedRuntime {
+        label: "docker",
+        calls: calls.clone(),
+        isolation: aiec_core::runtime::RuntimeIsolation::Container,
+    });
+    let mut registry = aiec_core::runtime::RuntimeRegistry::new();
+    registry.register(RuntimeKind::Docker, docker);
+    let platform = Platform::builder()
+        .runtime(Arc::new(MockRuntime))
+        .runtime_registry(Arc::new(registry))
+        .metadata_store(repo)
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy))
+        .build()
+        .unwrap();
+    let router = app(AppState::development(platform));
+    let created = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300,"runtime":"docker"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let create_status = created.status();
+    let create_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        create_status,
+        StatusCode::OK,
+        "a Docker sandbox must be creatable on this deployment: {create_body}"
+    );
+    let sandbox = create_body["id"].as_str().unwrap().to_owned();
+
+    let diff = router
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{sandbox}/git/diff"))
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.status(), StatusCode::OK);
+    let diff: Value = serde_json::from_slice(
+        &axum::body::to_bytes(diff.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        diff["stdout"].as_str().unwrap().starts_with("docker:"),
+        "the diff did not come from the sandbox's own runtime: {diff}"
+    );
+    assert!(
+        calls.lock().iter().any(|call| call.starts_with("exec:git")),
+        "the sandbox's runtime never ran a git command: {:?}",
+        calls.lock().clone()
     );
 }

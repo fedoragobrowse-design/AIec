@@ -1,19 +1,140 @@
+"""The sandbox surface of the AIec API, and the transport under it.
+
+The budgets below are not tuning: each one is derived from a bound the control
+plane itself enforces, and each is deliberately *longer* than that bound, so
+the server is always the one that gives up first. A client that gives up first
+does not cancel anything -- the command keeps running inside a sandbox the
+caller has been told is fine, which is the expensive failure.
+"""
+
 import base64
 import json
 import os
+import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from .runs import Runs
 from .evals import Evals
+
+#: What the control plane gives a command that states no timeout of its own
+#: (``default_exec_timeout`` in crates/aiec-core/src/lib.rs). An exec that
+#: states none has to be waited out for this long.
+DEFAULT_EXEC_SECONDS = 60
+
+#: The ceiling on a command's own timeout, as the control plane validates it:
+#: ``validate_exec`` refuses ``timeout_seconds`` of zero or above
+#: ``MAX_EXEC_SECONDS`` (crates/aiec-core/src/lib.rs). This is the ceiling, not
+#: the 60 s default, because a client cannot read the caller's intended budget
+#: out of the request and would otherwise time out against a caller who asked
+#: for an hour and got a validated one.
+MAX_EXEC_SECONDS = 3_600
+
+#: What the wait adds on top of the command's own timeout. The control plane
+#: kills the command at its deadline and *then* has to answer, so the wait has
+#: to exceed the timeout or the client abandons an exec the server is about to
+#: report. Same reasoning as ``RUN_RESPONSE_SLACK_SECONDS`` in runs.py.
+EXEC_RESPONSE_SLACK_SECONDS = 120
+
+#: How long an artifact upload may take server-side, from
+#: ``artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS`` (crates/aiec-api), which the
+#: API's artifact routes apply as their own deadline.
+MAX_ARTIFACT_UPLOAD_SECONDS = 300
+
+#: ...plus the round trip and the storage write the handler does after the
+#: upload itself, so the upload is never the thing that gives up first.
+ARTIFACT_UPLOAD_SLACK_SECONDS = 60
+
+#: ``POST /v1/sandboxes`` blocks through the whole of provisioning: placement,
+#: boot, and the clone of the task's git repository when one is asked for.
+#: There is no small deadline on it server-side, and a repository is exactly
+#: the thing that takes minutes, so the budget is the longest single operation
+#: the API allows plus the upload that may follow it.
+SANDBOX_PROVISION_TIMEOUT_SECONDS = MAX_EXEC_SECONDS + MAX_ARTIFACT_UPLOAD_SECONDS
+
+#: Capturing a snapshot freezes the sandbox and uploads what it froze, so it is
+#: at least as long as the longest operation the API allows, with the same
+#: slack above it.
+SNAPSHOT_TIMEOUT_SECONDS = SANDBOX_PROVISION_TIMEOUT_SECONDS + EXEC_RESPONSE_SLACK_SECONDS
+
+#: Teardown is a machine being reclaimed, not a command being run: the same
+#: wait ``Runs.cancel`` takes for the same reason
+#: (``CANCEL_TIMEOUT_SECONDS`` in runs.py).
+DESTROY_TIMEOUT_SECONDS = 300
+
+#: Listing a tenant's sandboxes joins each one's machine state, so it is a
+#: query over the whole inventory rather than a single record. Bounded, but not
+#: the budget for a call that reads one thing.
+LIST_TIMEOUT_SECONDS = 300
+
+#: The budget for the control-plane calls that are genuinely short: read one
+#: run, write one file, read one file's content. Anything the server may hold
+#: for minutes states its own budget above.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
+
+
+def _exec_timeout(stated: Any) -> float:
+    """How long to wait for a command the caller may have given an hour to.
+
+    The server kills a command at ``timeout_seconds`` and answers after that,
+    so the wait is the command's own budget plus slack -- never the general
+    default, which would cut a long command short and report a sandbox that is
+    still running it. A stated value of zero (or none) falls back to the
+    server's own default rather than to zero, because ``validate_exec`` refuses
+    a zero timeout outright and a client waiting zero seconds is wrong either
+    way.
+    """
+    try:
+        execution = int(stated)
+    except (TypeError, ValueError):
+        execution = 0
+    if execution <= 0:
+        execution = DEFAULT_EXEC_SECONDS
+    return min(MAX_EXEC_SECONDS, execution) + EXEC_RESPONSE_SLACK_SECONDS
+
+
+def _retry_after_seconds(header: str | None) -> float | None:
+    """The seconds a ``Retry-After`` header asks for, or ``None``.
+
+    RFC 9110 permits two forms and a gateway uses both: delta-seconds and an
+    HTTP-date. Parsing only the first drops the back-off exactly when the
+    server gave the longest one -- a date is how a gateway says "not before
+    this time" -- and a rate-limited client then retries as fast as it can,
+    which is the opposite of what the header asked for. The date form is
+    resolved with the stdlib's ``parsedate_to_datetime`` rather than by
+    re-implementing the three accepted date spellings.
+    """
+    text = (header or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    # A date with no zone is GMT by definition (RFC 9110), and comparing a
+    # naive datetime against an aware one raises rather than falling back.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 class AIecError(RuntimeError):
     """An error returned by the AIec API.
 
     ``code`` is stable and machine-readable; ``request_id`` is echoed in the
     server logs, so quoting it makes a support report actionable.
+    A failure that never reached the control plane is raised as one of these
+    as well -- a refused connection, an unresolvable host, a TLS failure, a
+    reset or a socket timeout -- because a caller catching ``AIecError`` is
+    catching this API's failures. Those carry ``status`` 0, since there was no
+    response to carry a status, and keep the original error as their cause.
     """
 
     def __init__(self, status: int, payload: Any):
@@ -25,7 +146,10 @@ class AIecError(RuntimeError):
         message = error.get("message", str(payload))
         super().__init__(message)
         # 429 carries a Retry-After so a client can back off without guessing.
-        self.retry_after: float | None = getattr(self, "_retry_after", None)
+        # Initialised here rather than read off an attribute nobody has set
+        # yet: the header only arrives with the transport failure, so
+        # `_request` writes it after construction.
+        self.retry_after: float | None = None
 
     def __str__(self) -> str:
         base = super().__str__()
@@ -65,7 +189,7 @@ class AIec:
 
     def _request(
         self, method: str, path: str, payload: dict | None = None, *,
-        timeout: float = 120,
+        timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     ) -> Any:
         data = None if payload is None else json.dumps(payload).encode()
         request = Request(
@@ -87,14 +211,31 @@ class AIec:
             except Exception:
                 error_payload = {"error": {"message": str(error)}}
             failure = AIecError(error.code, error_payload)
-            # A rate-limited client must be able to back off without guessing.
-            retry_after = error.headers.get("Retry-After") if error.headers else None
-            if retry_after:
-                try:
-                    failure.retry_after = float(retry_after)
-                except ValueError:
-                    failure.retry_after = None
+            # A rate-limited client must be able to back off without guessing,
+            # in either of the two forms RFC 9110 lets a gateway answer with.
+            headers = error.headers
+            failure.retry_after = _retry_after_seconds(
+                headers.get("Retry-After") if headers else None
+            )
             raise failure from error
+        except (URLError, OSError) as error:
+            # Connection refused, DNS failure, TLS failure, a reset and the
+            # socket timeout `urlopen` raises are all `OSError`s and never an
+            # `HTTPError`, so without this they escape the documented
+            # `except AIecError` as an unrelated type while a caller believes
+            # it is handling this API's failures. Status 0 says "never reached
+            # the control plane": there was no response to carry one. The
+            # original is kept as the cause, which is the diagnostic that
+            # matters for a transport failure.
+            raise AIecError(
+                0,
+                {
+                    "error": {
+                        "code": "transport_error",
+                        "message": f"{method} {path}: {error}",
+                    }
+                },
+            ) from error
 
     def usage(self) -> Any:
         return self._request("GET", "/v1/usage")
@@ -109,10 +250,20 @@ class _Sandboxes:
         self.client = client
 
     def create(self, **kwargs: Any) -> "Sandbox":
-        return Sandbox(self.client, self.client._request("POST", "/v1/sandboxes", kwargs))
+        # Provisioning, not a control-plane read: the server places a machine,
+        # boots it and clones the repository before it answers.
+        return Sandbox(
+            self.client,
+            self.client._request(
+                "POST", "/v1/sandboxes", kwargs,
+                timeout=SANDBOX_PROVISION_TIMEOUT_SECONDS,
+            ),
+        )
 
     def list(self) -> Any:
-        return self.client._request("GET", "/v1/sandboxes")
+        return self.client._request(
+            "GET", "/v1/sandboxes", timeout=LIST_TIMEOUT_SECONDS
+        )
 
 
 @dataclass
@@ -126,13 +277,37 @@ class Sandbox:
     def __enter__(self) -> "Sandbox":
         return self
 
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        self.destroy()
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        """Destroy the sandbox, without replacing the body's own failure.
+
+        A body that raised has already failed, and a teardown failure on top of
+        it replaces the exception the caller's `except` catches: the reason the
+        block failed survives only as `__context__` and the caller logs the
+        teardown instead -- a sandbox that had already timed out reporting 5xx
+        on the way out. So when the body failed, teardown errors are recorded
+        on ``teardown_error`` and warned about rather than raised, and the
+        body's exception is the one that propagates. When the body succeeded
+        there is nothing to displace, so a teardown failure surfaces.
+        """
+        try:
+            self.destroy()
+        except Exception as error:
+            if exc_type is None:
+                raise
+            self.teardown_error = error
+            warnings.warn(
+                f"the body of the with block failed and destroying sandbox "
+                f"{self.data.get('id')!r} failed too: {error!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return False
 
     def exec(self, command: list[str] | str, **kwargs: Any) -> Any:
         argv = ["/bin/sh", "-lc", command] if isinstance(command, str) else command
         return self.client._request(
-            "POST", f"/v1/sandboxes/{self.data['id']}/exec", {"command": argv, **kwargs}
+            "POST", f"/v1/sandboxes/{self.data['id']}/exec", {"command": argv, **kwargs},
+            timeout=_exec_timeout(kwargs.get("timeout_seconds")),
         )
 
     def write_file(self, path: str, content: str | bytes, mode: int | None = None) -> Any:
@@ -159,6 +334,10 @@ class Sandbox:
             "POST",
             f"/v1/sandboxes/{self.data['id']}/artifacts/{quote(name, safe='')}",
             {"content_base64": base64.b64encode(raw).decode()},
+            # The server gives an upload `MAX_ARTIFACT_UPLOAD_SECONDS` of its
+            # own, so the client waits longer than that and the upload is never
+            # reported as failed while the server is still storing it.
+            timeout=MAX_ARTIFACT_UPLOAD_SECONDS + ARTIFACT_UPLOAD_SLACK_SECONDS,
         )
 
     def pause(self) -> Any:
@@ -178,7 +357,12 @@ class Sandbox:
     def git_diff(self) -> Any:
         return self.client._request("POST", f"/v1/sandboxes/{self.data['id']}/git/diff", {})
     def snapshot(self) -> Any:
-        return self.client._request("POST", f"/v1/sandboxes/{self.data['id']}/snapshots", {})
+        # Capturing a snapshot means freezing a machine and uploading it, so it
+        # takes longer than anything else here and has to be waited out as such.
+        return self.client._request(
+            "POST", f"/v1/sandboxes/{self.data['id']}/snapshots", {},
+            timeout=SNAPSHOT_TIMEOUT_SECONDS,
+        )
 
     def stop(self) -> Any:
         return self.client._request("POST", f"/v1/sandboxes/{self.data['id']}/stop", {})
@@ -187,7 +371,12 @@ class Sandbox:
         return self.client._request("POST", f"/v1/sandboxes/{self.data['id']}/resume", {})
 
     def destroy(self) -> Any:
-        return self.client._request("DELETE", f"/v1/sandboxes/{self.data['id']}")
+        # Reclaiming a machine is a teardown, not a read: the reply is as slow
+        # as the destruction the server had to do before it answered.
+        return self.client._request(
+            "DELETE", f"/v1/sandboxes/{self.data['id']}",
+            timeout=DESTROY_TIMEOUT_SECONDS,
+        )
 
     def delete_file(self, path: str) -> Any:
         return self.client._request(

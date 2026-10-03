@@ -2482,6 +2482,40 @@ impl PostgresRepository {
         &self,
         heartbeat: WorkerHeartbeat,
     ) -> Result<WorkerStatus, StoreError> {
+        // One transaction, and the ownership question is answered before
+        // anything is written. The two used to be separate autocommit
+        // statements with the UPDATE first, so the row was already marked
+        // healthy with a fresh `last_heartbeat` by the time the refusal was
+        // produced: the worker whose leases had been revoked - and whose
+        // capacity had already been returned - stayed in the placement pool,
+        // and the CLI keeps beating every five seconds after a 409. The
+        // comment below promised "refuse it rather than record it" and the
+        // statement order did the opposite.
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        // A node whose leases have all been expired or released owns nothing, so
+        // a heartbeat claiming to still be serving sandboxes reports ownership
+        // the control plane has already taken back. Refuse it rather than record
+        // it: a returning worker must re-register to become schedulable again.
+        let owned: i64 = sqlx::query_scalar(
+            // The expiry predicate matters: a lease that has lapsed on the clock
+            // but has not been swept yet still reads as 'active', and that is
+            // exactly the window in which a late heartbeat arrives.
+            "SELECT count(*) FROM sandbox_leases \
+             WHERE node_id = $1 AND status = 'active' AND expires_at > now()",
+        )
+        .bind(heartbeat.node_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if owned == 0 && heartbeat.healthy && heartbeat.sandbox_count > 0 {
+            // Rolling back by dropping the transaction keeps the node row
+            // exactly as it was: unhealthy is not what this worker is, and a
+            // stale heartbeat is not what this worker sent.
+            return Err(StoreError::Conflict(format!(
+                "worker reports {} running sandboxes but holds no active lease",
+                heartbeat.sandbox_count
+            )));
+        }
         let result = sqlx::query(
             "UPDATE nodes SET healthy=$1, version=$2, metadata=$3, last_error=$4, \
              observed_sandbox_count=$5, last_heartbeat=now() \
@@ -2499,7 +2533,7 @@ impl PostgresRepository {
                 .map_err(|error| StoreError::Conflict(error.to_string()))?,
         )
         .bind(heartbeat.node_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(database_error)?;
         if result.rows_affected() == 0 {
@@ -2521,27 +2555,7 @@ impl PostgresRepository {
                 "worker heartbeat lost a concurrent update race".into(),
             ));
         }
-        // A node whose leases have all been expired or released owns nothing, so
-        // a heartbeat claiming to still be serving sandboxes reports ownership
-        // the control plane has already taken back. Refuse it rather than record
-        // it: a returning worker must re-register to become schedulable again.
-        let owned: i64 = sqlx::query_scalar(
-            // The expiry predicate matters: a lease that has lapsed on the clock
-            // but has not been swept yet still reads as 'active', and that is
-            // exactly the window in which a late heartbeat arrives.
-            "SELECT count(*) FROM sandbox_leases \
-             WHERE node_id = $1 AND status = 'active' AND expires_at > now()",
-        )
-        .bind(heartbeat.node_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        if owned == 0 && heartbeat.healthy && heartbeat.sandbox_count > 0 {
-            return Err(StoreError::Conflict(format!(
-                "worker reports {} running sandboxes but holds no active lease",
-                heartbeat.sandbox_count
-            )));
-        }
+        tx.commit().await.map_err(database_error)?;
         self.get_worker(heartbeat.node_id).await
     }
 
@@ -2693,16 +2707,41 @@ impl PostgresRepository {
             return Ok(Vec::new());
         }
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        // The lease row is locked first, and the assignment second, because
+        // every path that gives capacity back (`release_capacity`, and through
+        // it `delete_sandbox`, `release_worker_lease`, `reconcile_expired_leases`
+        // and `release_orphaned_leases`) takes them in that order. Locking the
+        // assignment first is the exact inverse, so a worker claiming a
+        // reservation while the reconciler sweeps the same sandbox is a cycle:
+        // PostgreSQL aborts one side with 40P01, and on the reconciler side that
+        // is the whole `FOR UPDATE` page it was sweeping.
+        let lease_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT l.id FROM sandbox_leases l \
+             JOIN sandbox_assignments a ON a.lease_id = l.id \
+             JOIN sandboxes s ON s.id=a.sandbox_id AND s.tenant_id=a.tenant_id \
+             WHERE a.node_id=$1 AND a.status='reserved' AND l.status='active' \
+               AND l.expires_at > now() AND s.state <> 'quarantined' \
+             ORDER BY a.created_at LIMIT $2 FOR UPDATE OF l SKIP LOCKED",
+        )
+        .bind(node_id)
+        .bind(i64::from(limit.clamp(1, 100)))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if lease_ids.is_empty() {
+            tx.commit().await.map_err(database_error)?;
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
             "SELECT a.* FROM sandbox_assignments a \
              JOIN sandbox_leases l ON l.id = a.lease_id \
              JOIN sandboxes s ON s.id=a.sandbox_id AND s.tenant_id=a.tenant_id \
-             WHERE a.node_id=$1 AND a.status='reserved' AND l.status='active' \
-               AND l.expires_at > now() AND s.state <> 'quarantined' \
-             ORDER BY a.created_at LIMIT $2 FOR UPDATE OF a SKIP LOCKED",
+             WHERE a.node_id=$1 AND a.status='reserved' AND l.id = ANY($2) \
+               AND l.status='active' AND l.expires_at > now() AND s.state <> 'quarantined' \
+             ORDER BY a.created_at FOR UPDATE OF a SKIP LOCKED",
         )
         .bind(node_id)
-        .bind(i64::from(limit.clamp(1, 100)))
+        .bind(&lease_ids)
         .fetch_all(&mut *tx)
         .await
         .map_err(database_error)?;
@@ -2712,24 +2751,37 @@ impl PostgresRepository {
             let request_id: Uuid = row.try_get("request_id")?;
             let sandbox_id: Uuid = row.try_get("sandbox_id")?;
             let lease_id: Uuid = row.try_get("lease_id")?;
-            sqlx::query(
-                "UPDATE sandbox_assignments SET status='assigned', updated_at=now() \
-                 WHERE tenant_id=$1 AND request_id=$2",
-            )
-            .bind(tenant_id)
-            .bind(request_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            sqlx::query(
+            // Fenced exactly like `renew_worker_lease`: the lease this claim is
+            // about to hand the worker has to still be the one the control plane
+            // owns, at the generation the claim read. Without the predicate the
+            // update matched zero rows for a lease a reconciler had already
+            // expired, the result was discarded, and the worker was handed a
+            // reservation the control plane had taken back - a real machine
+            // built against a lease whose fencing calls are then all refused.
+            let renewed = sqlx::query(
                 "UPDATE sandbox_leases SET expires_at=now()+($1 * interval '1 second'), \
-                 generation=generation+1, updated_at=now() WHERE id=$2 AND status='active'",
+                 generation=generation+1, updated_at=now() \
+                 WHERE id=$2 AND status='active' AND expires_at > now()",
             )
             .bind(
                 i64::try_from(lease_ttl_seconds)
                     .map_err(|error| StoreError::Conflict(error.to_string()))?,
             )
             .bind(lease_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+            if renewed.rows_affected() == 0 {
+                // Left `reserved` for the scheduler to hand out again: this
+                // request never owned it, so this request must not mark it.
+                continue;
+            }
+            sqlx::query(
+                "UPDATE sandbox_assignments SET status='assigned', updated_at=now() \
+                 WHERE tenant_id=$1 AND request_id=$2 AND status='reserved'",
+            )
+            .bind(tenant_id)
+            .bind(request_id)
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
@@ -3163,7 +3215,17 @@ impl PostgresRepository {
         if owned.is_some() {
             return Ok(None);
         }
-        let sandbox = fetch_sandbox(&mut *tx, lease.tenant_id, lease.sandbox_id).await?;
+        // The sandbox row is locked for the rest of this transaction, not just
+        // read. This path held the expired lease's lock and nothing else, while
+        // the ordinary stop path (`update_state` -> `lock_sandbox`) holds only
+        // the sandbox row: a sandbox read as `running` here could be stopped by
+        // a concurrent request a moment later, and this transaction would then
+        // move it back to `creating` with a fresh live lease and debited
+        // capacity, under a caller who had just been told it was going away.
+        // Locking it makes the state check below and the write at the end
+        // describe the same row.
+        let sandbox_row = lock_sandbox(&mut tx, lease.tenant_id, lease.sandbox_id).await?;
+        let sandbox: Sandbox = sandbox_from_row(&sandbox_row)?;
         // Only a live sandbox is worth recovering: a sandbox that is being stopped,
         // snapshotted or torn down is left to those flows.
         if !matches!(
@@ -3245,18 +3307,28 @@ impl PostgresRepository {
             now,
         )
         .await?;
-        sqlx::query(
+        let reassigned = sqlx::query(
             "UPDATE sandboxes SET node_id=$1, state=$2, runtime_path=NULL, updated_at=$3 \
-             WHERE tenant_id=$4 AND id=$5",
+             WHERE tenant_id=$4 AND id=$5 AND state=$6",
         )
         .bind(node_id)
         .bind(SandboxState::Creating.as_str())
         .bind(now)
         .bind(lease.tenant_id)
         .bind(lease.sandbox_id)
+        .bind(sandbox.state.as_str())
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
+        if reassigned.rows_affected() == 0 {
+            // The state this recovery validated against is gone. The new lease,
+            // the debited node and the retargeted assignment all roll back with
+            // it rather than stranding a machine against a sandbox somebody
+            // else is tearing down.
+            return Err(StoreError::Conflict(
+                "sandbox left the recoverable states while its lease was being reassigned".into(),
+            ));
+        }
         insert_sandbox_event(
             &mut tx,
             lease.tenant_id,
@@ -5511,6 +5583,75 @@ pub(crate) mod tests {
             .unwrap();
         let refreshed = repository.heartbeat_worker(heartbeat).await.unwrap();
         assert!(refreshed.registration.last_heartbeat > Utc::now() - chrono::Duration::seconds(5));
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A worker that holds no active lease is refused *and* left unrefreshed.
+    ///
+    /// The refusal is the easy half. The row is the point: the heartbeat used
+    /// to update `nodes` first and check ownership afterwards, so a worker
+    /// whose leases had all expired or been released - whose capacity had
+    /// already been taken back - still had its `last_heartbeat` refreshed and
+    /// stayed healthy in the placement pool, and the CLI keeps beating every
+    /// five seconds after a 409. The node here is aged by an hour first, so
+    /// the assertion distinguishes "the row was left alone" from "the row was
+    /// written and the error was still produced".
+    #[tokio::test]
+    async fn a_heartbeat_claiming_sandboxes_without_a_lease_leaves_the_row_alone() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let claimed = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        expire_lease(&repository, claimed[0].lease.id).await;
+        sqlx::query("UPDATE nodes SET last_heartbeat=now()-interval '1 hour' WHERE id=$1")
+            .bind(node_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        let aged = repository.get_worker(node_id).await.unwrap();
+
+        let error = repository
+            .heartbeat_worker(WorkerHeartbeat {
+                node_id,
+                sandbox_count: 1,
+                healthy: true,
+                version: 1,
+                metadata: json!({}),
+                last_error: None,
+            })
+            .await
+            .expect_err("a worker with no active lease must not be recorded as serving");
+        match error {
+            StoreError::Conflict(message) => assert!(
+                message.contains("no active lease"),
+                "the refusal must say what the control plane found: {message}"
+            ),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+
+        let after = repository.get_worker(node_id).await.unwrap();
+        assert_eq!(
+            after.registration.last_heartbeat, aged.registration.last_heartbeat,
+            "the refused heartbeat refreshed the row anyway, leaving a worker \
+             that owns nothing in the placement pool"
+        );
+        assert_eq!(
+            after.observed_sandbox_count, aged.observed_sandbox_count,
+            "the refused heartbeat recorded a sandbox count it does not have"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 

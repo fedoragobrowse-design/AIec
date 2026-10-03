@@ -155,6 +155,14 @@ impl Client {
     }
 
     /// One completion. Retries transient failures with a bounded backoff.
+    ///
+    /// Only [`HarnessError::Model`] is retried. A provider that has answered
+    /// and said no - a bad key, a model it has never heard of - answers the
+    /// same way to the same request, so retrying it spends three attempts and,
+    /// because a turn that timed out after being accepted is billed, three
+    /// charges to learn what one already said. Those come back as
+    /// [`HarnessError::ModelRefused`] and leave on the first attempt, carrying
+    /// the provider's own words.
     pub async fn complete(
         &self,
         context: &Context,
@@ -238,13 +246,27 @@ impl Client {
             // The provider's own error text is included: it is the only thing
             // that says whether this is a bad key, a bad model name, or a quota
             // problem, and a harness that swallows it cannot be diagnosed.
-            return Err(HarnessError::Model(format!(
-                "provider returned {status}: {}",
-                crate::clip(&text, 300)
-            )));
+            let detail = format!("provider returned {status}: {}", crate::clip(&text, 300));
+            return Err(if worth_retrying(status) {
+                HarnessError::Model(detail)
+            } else {
+                HarnessError::ModelRefused(detail)
+            });
         }
         parse_reply(&text)
     }
+}
+
+/// Whether a status is worth sending the same request again for.
+///
+/// 5xx and 429 are the endpoint or its capacity failing, not the request, and
+/// a bounded retry is the right answer to both. Every other 4xx is a statement
+/// about this request - an unauthorised key, a model that does not exist, a
+/// body the endpoint will not parse - and will be repeated exactly. 3xx stays
+/// retryable too: it should have been followed by the client, so seeing one
+/// means the path back to the endpoint is still unsettled.
+fn worth_retrying(status: reqwest::StatusCode) -> bool {
+    !(status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS)
 }
 
 #[derive(Deserialize)]
@@ -344,6 +366,7 @@ fn first_env(names: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_tool_reply_is_parsed() {
@@ -393,5 +416,138 @@ mod tests {
             arguments: "{\"path\":\"b\"}".to_owned(),
         };
         assert_ne!(first.signature(), second.signature());
+    }
+
+    /// An endpoint that answers every request with `status`, and counts them.
+    ///
+    /// The count is the whole point: what is under test is how many times the
+    /// harness was willing to ask, not what it did with the answer.
+    async fn refusing(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<usize>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let address = listener.local_addr().expect("local address");
+        let served = Arc::new(Mutex::new(0usize));
+        let counted = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = Vec::new();
+                let mut chunk = [0; 8192];
+                // Read until the declared body has arrived, so the client is
+                // never answered mid-write.
+                loop {
+                    let Ok(count) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..count]);
+                    let text = String::from_utf8_lossy(&buffer).into_owned();
+                    let Some(header_end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let declared: usize = text[..header_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().ok())?
+                        })
+                        .unwrap_or(0);
+                    if text.len() - header_end - 4 >= declared {
+                        break;
+                    }
+                }
+                *counted.lock().expect("request count") += 1;
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{address}/v1"), served)
+    }
+
+    fn task_for(base_url: &str) -> crate::task::Task {
+        crate::task::Task {
+            instruction: "do the thing".to_owned(),
+            repo_path: None,
+            validations: Vec::new(),
+            max_turns: 4,
+            max_requests: 4,
+            max_tool_output_bytes: 4096,
+            model: Some(crate::task::ModelChoice {
+                provider: Some(base_url.to_owned()),
+                model: "stub".to_owned(),
+                reasoning: None,
+            }),
+            context_notes: Vec::new(),
+        }
+    }
+
+    /// A bad key is not a transient failure.
+    ///
+    /// It was retried three times with a growing backoff, which delays a run
+    /// that was never going to succeed by two seconds and, on a billed
+    /// endpoint, charges for the privilege of being told the same thing again.
+    #[tokio::test]
+    async fn a_refused_request_is_not_sent_again() {
+        let (base_url, served) =
+            refusing("401 Unauthorized", r#"{"error":"invalid api key"}"#).await;
+        let client = Client::from_task(&task_for(&base_url)).expect("client");
+        let context = Context::new(&task_for(&base_url));
+        let error = client
+            .complete(&context, &[], 64)
+            .await
+            .expect_err("a 401 is not a reply");
+        assert_eq!(
+            *served.lock().expect("request count"),
+            1,
+            "a refused request was retried"
+        );
+        // The status, and the provider's own words about it, are what an
+        // operator has to work with.
+        let text = error.to_string();
+        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("invalid api key"), "{text}");
+        assert!(
+            matches!(error, HarnessError::ModelRefused(_)),
+            "a refusal must not be classifiable as retryable: {text}"
+        );
+    }
+
+    /// A 5xx is the endpoint's problem, and a bounded retry is the answer.
+    ///
+    /// The backoff is what makes this worth keeping: a sandbox is disposable
+    /// and a retry costs a second rather than the whole run.
+    #[tokio::test]
+    async fn a_server_error_is_retried() {
+        let (base_url, served) =
+            refusing("503 Service Unavailable", r#"{"error":"overloaded"}"#).await;
+        let client = Client::from_task(&task_for(&base_url)).expect("client");
+        let context = Context::new(&task_for(&base_url));
+        let error = client
+            .complete(&context, &[], 64)
+            .await
+            .expect_err("503 on every attempt");
+        assert_eq!(
+            *served.lock().expect("request count"),
+            3,
+            "a server error was not retried the bounded number of times"
+        );
+        assert!(matches!(error, HarnessError::Model(_)), "{error}");
+        assert!(error.to_string().contains("503"), "{error}");
     }
 }

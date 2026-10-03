@@ -4,7 +4,7 @@
 //! reach the context engine and the budgets directly instead of through
 //! accessors that exist only to satisfy a boundary it does not have.
 
-use crate::task::{HarnessError, Result_, StopReason, Task};
+use crate::task::{GitEvidence, HarnessError, Result_, StopReason, Task};
 use crate::{HARNESS_VERSION, budget, context, events, loop_guard, model, tools};
 use std::sync::Arc;
 
@@ -18,9 +18,18 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
     // walking the tree: a checkout of a large repository must not cost a
     // filesystem scan before the first model request.
     let git = tools::git::Repository::open(&repo)?;
-    outcome.git.head_before = git.head();
-    outcome.git.branch = git.branch();
-    outcome.git.status = git.status();
+    // What the repository looked like before the run, kept because the
+    // after-collection cannot know it: `collect_after` runs once, at the end,
+    // and reports `head_before: null` for every run it is given. Held here
+    // instead of being written into `outcome` directly because the merge at
+    // the bottom is the thing that has to be right, and it is the thing that
+    // can be tested on its own.
+    let before = GitEvidence {
+        head_before: git.head(),
+        branch: git.branch(),
+        status: git.status(),
+        ..Default::default()
+    };
 
     let registry = tools::Registry::new(&repo);
     let model = model::Client::from_task(&task)?;
@@ -119,11 +128,123 @@ pub async fn execute(task: Task, outcome: &mut Result_) -> Result<(), HarnessErr
 
     // The evidence, collected from inside the machine where the work
     // happened rather than guessed from the agent's own account of it.
-    outcome.git = git.collect_after();
+    outcome.git = merge_git_evidence(&before, git.collect_after());
 
     outcome.summary = context.summary();
     outcome.ok = all_passed && stop == StopReason::TaskComplete
         || (all_passed && stop == StopReason::ModelFinished);
     outcome.events = events.drain();
     Ok(())
+}
+
+/// Combines the observation made before the run with the one made after it.
+///
+/// `collect_after` can only describe the state it finds at the end, so on its
+/// own it reports `head_before: null` and the diff has no commit to be read
+/// against - a result document that cannot say what the agent changed it from.
+/// Only `head_before` is taken from the earlier observation: everything else
+/// (`status`, `diff`, `changed_files`, `head_after`) is an overwrite by the
+/// after-collection, deliberately, because it describes the tree the run left
+/// behind and that is what the document is evidence *of*. `branch` is the one
+/// field both sides observed; the run's own branch is the truthful one when it
+/// moved, and the before-branch fills in only when the after-collection could
+/// not read one at all.
+fn merge_git_evidence(before: &GitEvidence, mut after: GitEvidence) -> GitEvidence {
+    after.head_before = before.head_before.clone();
+    if after.branch.is_none() {
+        after.branch = before.branch.clone();
+    }
+    after
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A repository with one commit, which is the state the harness opens.
+    fn repository(label: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("aiec-agent-{label}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&path).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+        path
+    }
+
+    /// The result document says what the run started from, not only where it
+    /// ended up.
+    ///
+    /// `collect_after` alone reported `head_before: null` for every run, so a
+    /// reader had the final head and a diff and no way to tie the two
+    /// together - which is the one question the evidence exists to answer.
+    /// Here the run commits, so the two heads are genuinely different and
+    /// swapping one for the other would be visible.
+    #[test]
+    fn the_pre_run_head_survives_the_evidence_collection() {
+        let path = repository("evidence");
+        let git = tools::git::Repository::open(&path).expect("opened");
+        let before = GitEvidence {
+            head_before: git.head(),
+            branch: git.branch(),
+            status: git.status(),
+            ..Default::default()
+        };
+
+        std::fs::write(path.join("b.txt"), "two\n").unwrap();
+        Command::new("git")
+            .args(["add", "b.txt"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-q", "-m", "second"])
+            .current_dir(&path)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()
+            .unwrap();
+
+        let merged = merge_git_evidence(&before, git.collect_after());
+        assert!(
+            merged.head_before.is_some(),
+            "the pre-run head was dropped: {merged:?}"
+        );
+        assert_eq!(merged.head_before, before.head_before);
+        assert_ne!(
+            merged.head_before, merged.head_after,
+            "the head moved and both observations must survive"
+        );
+        // The branch did not move, so the before-observation and the
+        // after-collection agree; the merge must not have invented a third
+        // answer for it.
+        assert_eq!(merged.branch, before.branch, "{merged:?}");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// With no repository at all, the merge adds nothing rather than
+    /// inventing an observation.
+    #[test]
+    fn no_repository_means_no_evidence_to_merge() {
+        let merged = merge_git_evidence(&GitEvidence::default(), GitEvidence::default());
+        assert!(merged.head_before.is_none());
+        assert!(merged.head_after.is_none());
+        assert!(merged.status.is_empty());
+        assert!(merged.errors.is_empty());
+    }
 }

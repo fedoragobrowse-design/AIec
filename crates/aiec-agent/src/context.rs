@@ -44,6 +44,13 @@ pub struct Context {
     /// turns the ceiling into a number that only ever grows.
     live: u32,
     max_tokens: u32,
+    /// Bound on one tool result, in bytes: the task's own
+    /// `max_tool_output_bytes` and the harness cap, whichever is smaller.
+    ///
+    /// Computed once, here, because this is the only place a tool result is
+    /// bounded. A ceiling the task declares but nothing reads is not a
+    /// ceiling - a task asking for a kilobyte was being sent four.
+    tool_output_limit: usize,
     turns: u32,
 }
 
@@ -72,6 +79,9 @@ impl Context {
             // room for a large tool result to arrive without overflowing.
             max_tokens: 96_000,
             turns: 0,
+            tool_output_limit: crate::DEFAULT_TOOL_OUTPUT_BYTES
+                .min(4096)
+                .min(task.max_tool_output_bytes),
         }
     }
 
@@ -88,7 +98,34 @@ impl Context {
     }
 
     /// Attaches tool calls to the assistant turn just recorded.
+    ///
+    /// The calls are charged here rather than in [`Context::push_assistant`]
+    /// because they are attached after the text was recorded, and they are the
+    /// larger half: a `write` call carries a whole file in its arguments. A
+    /// ledger that does not count them reports the conversation as well inside
+    /// the window while the provider is rejecting it for being over, which is
+    /// the one failure the ceiling exists to prevent.
     pub fn push_tool_calls(&mut self, calls: Vec<crate::model::ToolCall>) {
+        if !calls.is_empty() {
+            // Serialized the way `as_wire` serializes them, so what is charged
+            // here is what the rebase inside `compact` measures later and the
+            // two cannot drift apart.
+            let rendered: Vec<Value> = calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        }
+                    })
+                })
+                .collect();
+            let rendered = serde_json::to_string(&rendered).unwrap_or_default();
+            self.add("tool_calls", estimate_tokens(&rendered));
+        }
         if let Some(Message::Assistant { tool_calls, .. }) = self.messages.last_mut() {
             *tool_calls = calls;
         }
@@ -101,8 +138,7 @@ impl Context {
     /// which question this is the answer to. A result with an empty id is not a
     /// shorter message, it is a message about nothing.
     pub fn push_tool_result(&mut self, call: &ToolCall, content: &str) {
-        let compressed = crate::DEFAULT_TOOL_OUTPUT_BYTES.min(4096);
-        let rendered = crate::tools::compress(content, compressed);
+        let rendered = crate::tools::compress(content, self.tool_output_limit);
         self.add("tool", estimate_tokens(&rendered));
         self.messages.push(Message::Tool {
             tool_call_id: call.id.clone(),
@@ -178,7 +214,14 @@ impl Context {
             .filter_map(|message| describe(&message))
             .collect();
         let digest = if head.is_empty() {
-            String::new()
+            // `describe` has nothing to say about a contentless assistant turn
+            // or about a system message, so a run whose drained turns were all
+            // of those leaves `head` empty even though exchanges were dropped.
+            // An empty string is not an option: it goes on the wire as a
+            // `user` message with empty content, and every provider that
+            // validates it rejects the whole request over it. The count of
+            // what was dropped says the same thing and is never empty.
+            format!("Earlier in this run ({cut} exchanges, compacted)")
         } else {
             format!(
                 "Earlier in this run ({} exchanges, compacted):\n{}",
@@ -187,7 +230,20 @@ impl Context {
             )
         };
         let digest_tokens = estimate_tokens(&digest);
-        self.messages.insert(0, Message::User { content: digest });
+        // The digest is the run's one leading user turn. If the kept window
+        // already begins with a user message - a note the harness pushed, or a
+        // digest an earlier compaction left at the front - inserting a fresh
+        // one in front of it puts two consecutive `user` messages on the wire,
+        // and a provider that requires alternating roles rejects the whole
+        // request rather than the odd message. Folding the kept turn into the
+        // digest keeps both texts and the invariant.
+        match self.messages.first() {
+            Some(Message::User { content }) => {
+                let merged = format!("{digest}\n{content}");
+                self.messages[0] = Message::User { content: merged };
+            }
+            _ => self.messages.insert(0, Message::User { content: digest }),
+        }
         self.ledger.insert("compacted", digest_tokens);
         // Rebase what the conversation costs. Without this the ceiling keeps
         // measuring every message the run ever produced, so the first
@@ -336,13 +392,23 @@ mod tests {
     }
 
     fn task() -> Task {
+        task_with_tool_output(4096)
+    }
+
+    /// The same task with the tool-result ceiling the tests here vary.
+    ///
+    /// The ceiling is live, so it is a fixture knob rather than a constant: a
+    /// test that measures what one tool result costs has to say what it asked
+    /// for. 4096 is the harness's own cap, so everything that does not care
+    /// about the ceiling sees exactly what it always saw.
+    fn task_with_tool_output(max_tool_output_bytes: usize) -> Task {
         Task {
             instruction: "fix the parser".to_owned(),
             repo_path: None,
             validations: Vec::new(),
             max_turns: 8,
             max_requests: 16,
-            max_tool_output_bytes: 1024,
+            max_tool_output_bytes,
             model: None,
             context_notes: vec!["the parser is hand written".to_owned()],
         }
@@ -577,5 +643,176 @@ mod tests {
         context.push_tool_result(&call("read"), "x".repeat(4000).as_str());
         assert!(context.ledger().contains_key("tool"));
         assert!(context.tokens() > 1000);
+    }
+
+    /// Compaction has to leave a conversation a provider will accept.
+    ///
+    /// Two things about the digest are load-bearing. It is never empty: a turn
+    /// that only carried tool calls has no content to describe, so a run whose
+    /// drained turns were all of those produced `Message::User { content: "" }`,
+    /// and a provider that validates user content rejects the whole request
+    /// over a turn that says nothing. And it is never a second one: a note the
+    /// harness pushed can be the first message of the kept window, and a fresh
+    /// digest inserted in front of it puts two `user` messages back to back,
+    /// which a provider requiring alternating roles also refuses.
+    #[test]
+    fn compaction_never_emits_an_empty_user_turn_or_two_in_a_row() {
+        let mut context = Context::new(&task());
+        // Every drained turn describes as nothing: a contentless assistant turn
+        // has no content, and a tool result would have described - so this is a
+        // conversation with no text in it at all.
+        for _ in 0..12 {
+            context.push_assistant(None);
+        }
+        context.compact();
+        let digest = context.as_wire()[1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !digest.trim().is_empty(),
+            "compaction wrote an empty user turn: {digest:?}"
+        );
+        assert!(
+            digest.contains("compacted"),
+            "the digest must say what it is: {digest:?}"
+        );
+
+        // Now the shape that produces a second user turn. Compaction cuts a
+        // fixed number of messages back from the end, and a note the harness
+        // pushed is not tied to a pair the way an assistant turn is - so a note
+        // sitting six back from the end *is* the first message of the kept
+        // window. Four exchanges, then the note at exactly that position.
+        const NOTE: &str = "a note the harness pushed and wants kept";
+        let mut context = Context::new(&task());
+        for index in 0..2 {
+            context.push_assistant(Some(format!("turn {index}")));
+            context.push_tool_result(&call("read"), "output");
+        }
+        context.push_note(NOTE.to_owned());
+        for index in 2..4 {
+            context.push_assistant(Some(format!("turn {index}")));
+            context.push_tool_result(&call("read"), "output");
+        }
+        context.push_assistant(Some("turn 4".to_owned()));
+        assert_eq!(context.as_wire()[5]["content"].as_str(), Some(NOTE));
+
+        context.compact();
+        assert_single_leading_user(&context);
+        let digest = context.as_wire()[1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            digest.contains(NOTE),
+            "the note folded into the digest was dropped: {digest:?}"
+        );
+
+        // And again, driven twice in a row: the digest compaction leaves at
+        // the front is itself the leading user turn, so a naive second digest
+        // lands on top of it.
+        for index in 5..7 {
+            context.push_assistant(Some(format!("turn {index}")));
+            context.push_tool_result(&call("read"), "output");
+        }
+        context.compact();
+        assert_single_leading_user(&context);
+    }
+
+    /// The wire holds one leading user turn - the digest - and it says
+    /// something, and it is not followed by a second user turn.
+    fn assert_single_leading_user(context: &Context) {
+        let wire = context.as_wire();
+        assert_eq!(wire[1]["role"], "user", "no digest at the front: {wire:?}");
+        let digest = wire[1]["content"].as_str().unwrap_or_default();
+        assert!(
+            !digest.trim().is_empty(),
+            "compaction wrote an empty user turn: {wire:?}"
+        );
+        assert!(
+            digest.contains("Earlier in this run"),
+            "the front of the conversation is not a digest: {digest:?}"
+        );
+        for pair in wire.windows(2) {
+            assert!(
+                !(pair[0]["role"] == "user" && pair[1]["role"] == "user"),
+                "two user turns in a row after compaction: {wire:?}"
+            );
+        }
+    }
+
+    /// A tool call's arguments are prompt bytes and have to be paid for.
+    ///
+    /// A `write` call carries a whole file. Charging only the assistant's text
+    /// left the ceiling reading a conversation that was, in the provider's
+    /// arithmetic, far over its window - so compaction never ran and the run
+    /// died on a context-length error with nothing in the ledger to explain it.
+    #[test]
+    fn tool_calls_are_charged_to_the_context() {
+        let mut context = Context::new(&task());
+        // Forty kilobytes of file in one call: a large but ordinary edit.
+        let write = |index: usize| ToolCall {
+            id: format!("call_{index}"),
+            name: "write".to_owned(),
+            arguments: serde_json::json!({
+                "path": "src/lib.rs",
+                "content": "x".repeat(40_000),
+            })
+            .to_string(),
+        };
+        context.push_assistant(Some("rewriting the module".to_owned()));
+        let before = context.tokens();
+        context.push_tool_calls(vec![write(0)]);
+        let charged = context.tokens() - before;
+        assert!(
+            charged > 8_000,
+            "forty kilobytes of arguments were charged {charged} tokens"
+        );
+        assert!(
+            context.ledger().contains_key("tool_calls"),
+            "the charge is unattributed: {:?}",
+            context.ledger()
+        );
+        // And it has to be enough to reach the ceiling, or charging it changes
+        // nothing that matters.
+        for index in 1..10 {
+            context.push_assistant(Some(format!("turn {index}")));
+            context.push_tool_calls(vec![write(index)]);
+        }
+        assert!(
+            context.should_compact(),
+            "ten forty-kilobyte writes cost {} tokens and the ceiling is 96_000",
+            context.tokens()
+        );
+    }
+
+    /// The ceiling the task asks for is the one that applies.
+    ///
+    /// `max_tool_output_bytes` was read by nothing at all: the bound came from
+    /// the harness's own constant, so a task asking for a kilobyte was handed
+    /// four, and a caller who tuned it for cost had no effect on anything.
+    #[test]
+    fn a_task_can_cap_one_tool_result() {
+        let mut context = Context::new(&task_with_tool_output(1024));
+        context.push_tool_result(&call("read"), &"x".repeat(200_000));
+        let wire = context.as_wire();
+        let rendered = wire
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("a tool result")["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            rendered.len() <= 1024,
+            "the task asked for 1024 bytes and got {}",
+            rendered.len()
+        );
+        // A ceiling that clips without saying so is worse than no ceiling.
+        assert!(
+            rendered.contains("elided"),
+            "the clip is invisible: {} bytes",
+            rendered.len()
+        );
     }
 }

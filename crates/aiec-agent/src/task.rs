@@ -211,6 +211,15 @@ pub struct GitEvidence {
     pub changed_files: Vec<String>,
     #[serde(default)]
     pub diff_truncated: bool,
+    /// What could not be collected, and why.
+    ///
+    /// A git call that exits non-zero is not a clean tree. Rendering it as an
+    /// empty status, an empty diff and no changed files makes a failed
+    /// collection indistinguishable from a repository the agent left tidy, and
+    /// everything downstream - a file count, a diff size - reads the failure
+    /// as "nothing happened". A caller that wants the old shape ignores this.
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -258,6 +267,15 @@ pub enum HarnessError {
     Model(String),
     #[error("tool: {0}")]
     Tool(String),
+    /// A provider refusal that will refuse again: a bad key, a model that does
+    /// not exist, a request the endpoint will not accept in this shape.
+    ///
+    /// Separate from [`HarnessError::Model`] because the two are answered
+    /// differently. One is worth sending again; this one is worth reading, and
+    /// sending it again spends an attempt - and on a billed turn, another
+    /// charge - to be told exactly the same thing.
+    #[error("model refused the request: {0}")]
+    ModelRefused(String),
     #[error("configuration: {0}")]
     Config(String),
     #[error("budget: {0}")]

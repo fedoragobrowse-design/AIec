@@ -108,7 +108,11 @@ fn tail(text: &str) -> String {
     while at < text.len() && !text.is_char_boundary(at) {
         at += 1;
     }
-    format!("…{}\n{}", &text[at..], text[..start].is_empty())
+    // The ellipsis is the whole marker: the text before the cut was dropped,
+    // and saying so costs nothing. It used to append `text[..start].is_empty()`
+    // here, which formatted a bool - so every truncated validation ended its
+    // evidence with the literal word `true`.
+    format!("…{}", &text[at..])
 }
 
 #[cfg(test)]
@@ -157,5 +161,39 @@ mod tests {
         let root = std::env::temp_dir();
         let results = run_one(&root, &[]).await;
         assert!(!results.ok);
+    }
+
+    /// A truncated validation's evidence is text, and only text.
+    ///
+    /// The cut used to be followed by `text[..start].is_empty()` formatted into
+    /// the string, so every truncated validation reported its own evidence
+    /// ending in the literal word `true` - in the result document, in the
+    /// summary, and in anything that read them as prose.
+    #[tokio::test]
+    async fn a_truncated_validation_reports_text_and_not_a_bool() {
+        // Four kilobytes of output: enough to be cut, with a marker at the end
+        // so a correct tail has something recognisable in it.
+        let result = run_one(
+            Path::new("."),
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "i=0; while [ $i -lt 4000 ]; do printf 'a'; i=$((i+1)); done; printf '\\nTAILMARKER'"
+                    .to_owned(),
+            ],
+        )
+        .await;
+        assert!(result.ok, "{result:?}");
+        let rendered = result.output_tail.as_str();
+        assert!(
+            rendered.contains("TAILMARKER"),
+            "the tail of the output is missing: {rendered:?}"
+        );
+        assert!(
+            !rendered.ends_with("true") && !rendered.ends_with("false"),
+            "a bool was formatted into the evidence: {rendered:?}"
+        );
+        // And the cut is still marked as a cut.
+        assert!(rendered.starts_with('…'), "{rendered:?}");
     }
 }

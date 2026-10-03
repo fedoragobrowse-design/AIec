@@ -285,6 +285,58 @@ async fn token_usage_accumulates_across_turns() {
     let _ = std::fs::remove_dir_all(repo);
 }
 
+/// The result document carries the commit the run started from.
+///
+/// `collect_after` can only describe the tree it finds at the end, so on its
+/// own it reported `head_before: null` for every run - the head before and the
+/// head after were the same field's two halves, and one of the halves was
+/// structurally absent. A reader had a diff and nothing to read it against.
+#[tokio::test]
+async fn the_result_document_says_where_the_run_started() {
+    let repo = repository("evidence");
+    let head_before = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .expect("git runs");
+    let head_before = String::from_utf8_lossy(&head_before.stdout)
+        .trim()
+        .to_owned();
+
+    let model = StubModel::start(vec![asking_for_a_tool("call_evidence"), finished()]).await;
+    let mut outcome = Result_::default();
+    agent::execute(task(&repo, &model), &mut outcome)
+        .await
+        .expect("the run completes");
+
+    assert!(
+        outcome.git.head_before.is_some(),
+        "the pre-run head was dropped: {:?}",
+        outcome.git
+    );
+    assert_eq!(
+        outcome.git.head_before.as_deref(),
+        Some(head_before.as_str()),
+        "head_before is not the head the run started from"
+    );
+    assert_eq!(
+        outcome.git.head_after.as_deref(),
+        Some(head_before.as_str()),
+        "nothing in this run commits, so the head should not have moved"
+    );
+    // This run only read the file, so the tree it left is clean: no changed
+    // files, no diff. And a clean tree has nothing to report in `errors` - the
+    // field exists so that a failed collection is not indistinguishable from
+    // one, not so that a good run has something to apologise for.
+    assert!(
+        outcome.git.changed_files.is_empty() && outcome.git.diff.is_empty(),
+        "a read leaves the tree clean: {:?}",
+        outcome.git
+    );
+    assert!(outcome.git.errors.is_empty(), "{:?}", outcome.git.errors);
+    let _ = std::fs::remove_dir_all(repo);
+}
+
 /// The context ceiling is enforced, not merely declared.
 ///
 /// A model that keeps asking for a tool and a repository that keeps answering

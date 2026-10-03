@@ -542,18 +542,52 @@ fn push_stream(out: &mut String, kept: &[u8], total: u64, cap: usize) {
 /// A truncation marker says what was dropped: a model that knows its output was
 /// clipped can ask for the rest, whereas one handed a silent truncation assumes
 /// that was all of it.
+///
+/// The marker is counted *against* `limit` rather than added on top of it. Every
+/// caller here treats the limit as a ceiling - `Task::max_tool_output_bytes` is
+/// documented as one - and a bound the marker can push past is not the bound
+/// that was asked for.
 pub fn compress(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
     }
-    let head = crate::head_bytes(text, limit * 3 / 4).len();
-    let tail = crate::tail_bytes(text, limit - limit * 3 / 4).len();
-    let mut kept = String::with_capacity(limit);
+    let marker = |head: usize, tail: usize| {
+        format!(
+            "\n… [{} bytes elided; re-read the file or narrow the query] …\n",
+            text.len().saturating_sub(head).saturating_sub(tail)
+        )
+    };
+    // The head keeps three quarters of the budget and the tail a quarter: the
+    // last lines of a failing build are the useful ones, and they are worth as
+    // much as everything that came before them. The split is then solved for
+    // rather than guessed at, because the marker names how much was elided and
+    // so grows by a digit or two as the head shrinks to make room for it - each
+    // pass takes the overflow off the head budget, and the correction is smaller
+    // than the marker it is paying for, so a couple of passes clear it.
+    let mut head_budget = limit.saturating_mul(3) / 4;
+    let tail_budget = limit / 4;
+    let tail = crate::tail_bytes(text, tail_budget).len();
+    let mut head = crate::head_bytes(text, head_budget).len();
+    let mut text_marker = marker(head, tail);
+    while head > 0 && head + text_marker.len() + tail > limit {
+        let overflow = head + text_marker.len() + tail - limit;
+        head_budget = head_budget.saturating_sub(overflow);
+        head = crate::head_bytes(text, head_budget).len();
+        text_marker = marker(head, tail);
+    }
+    if head + text_marker.len() + tail > limit {
+        // A limit too small to hold the marker and any of the text at all: the
+        // marker is then the whole honest answer, and it is smaller than any
+        // string carrying text would be. The one case where this still exceeds
+        // `limit` is a task asking for a ceiling below the marker's own size -
+        // a few dozen bytes - and the alternatives there are worse than
+        // overshooting it: an empty string says nothing at all, and dropping
+        // the notice would report that the tool had nothing to say.
+        return text_marker;
+    }
+    let mut kept = String::with_capacity(head + text_marker.len() + tail);
     kept.push_str(&text[..head]);
-    kept.push_str(&format!(
-        "\n… [{} bytes elided; re-read the file or narrow the query] …\n",
-        text.len() - head - tail
-    ));
+    kept.push_str(&text_marker);
     kept.push_str(&text[text.len() - tail..]);
     kept
 }

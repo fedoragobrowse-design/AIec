@@ -176,7 +176,250 @@ inspected`. That is the fail-closed direction - an unbounded body cannot be
 read for the denied tool - but a client that streams its MCP requests without a
 declared length will see the new 400.
 
+## Fixed in the 2026-10-03 audit
+
+### A restore booted an image no resolver had admitted
+
+`restore_snapshot` took the caller's replacement image verbatim. `create_sandbox`
+resolves every image through the signed-manifest resolver first, so the
+admission that decides what this deployment serves was missing from the one
+path that starts a machine out of a stored snapshot. Both now go through one
+`admit_image`, and the fallback to the snapshot's own `image_id` applies only
+when the caller supplies no replacement. Regression:
+`a_restore_may_not_boot_an_image_the_deployment_does_not_serve` asks the
+resolver whether it was consulted, which is what distinguishes admission from
+taking the string.
+
+### `git_diff` ran on the wrong machine
+
+Every other sandbox verb dispatches through `runtime_for(&sandbox)`; `git_diff`
+used the deployment's primary runtime. On a deployment whose primary is Docker,
+a Firecracker sandbox had its diff executed by the Docker path — a different
+machine from the one holding the repository. Regression:
+`a_git_diff_executes_in_the_runtime_the_sandbox_lives_on`.
+
+### A snapshot of a kind the control plane cannot store
+
+`POST /v1/sandboxes/{id}/snapshots` chose its kind from the runtime's own
+capabilities, so on the microVM runtime an unqualified request took the
+`VirtualMachine` branch: it ran a whole-machine capture, left the provider's
+snapshot on the worker's disk, and then failed the metadata row, because
+completing a VM snapshot needs a memory object, a disk object and a workspace
+object and `CapturedSnapshot` carries none of them. The only capture path that
+stores bytes is the workspace one, so the API now defaults to that kind and
+refuses the others with `409 unsupported_snapshot_kind` *before* the provider is
+asked to do anything. Regression:
+`a_snapshot_is_captured_in_the_kind_the_control_plane_can_finish`.
+
+**Operator-visible:** `kind: "virtual_machine"` and `kind: "memory"` are
+refused on every deployment, including one whose runtime advertises those
+capabilities. There is no code path that can finish such a snapshot, so
+accepting one produced a failure after the work rather than an answer.
+
+### A refused worker heartbeat still refreshed its row
+
+`heartbeat_worker` updated `nodes` first and checked active-lease ownership
+afterwards. A worker whose leases had all expired or been released — whose
+capacity the control plane had already taken back — got a fresh
+`last_heartbeat` and stayed healthy in the placement pool, and the CLI keeps
+beating every five seconds after a `409`. Ownership is now answered first, in
+the same transaction as the update, and a refusal leaves the row exactly as it
+was. Regression:
+`a_heartbeat_claiming_sandboxes_without_a_lease_leaves_the_row_alone`, which
+ages the node by an hour first so it can tell "left alone" from "written anyway".
+
+### A worker claim could hand back a lease the control plane had taken back
+
+`claim_worker_assignments` renewed `sandbox_leases` with `WHERE id=$2 AND
+status='active'` and discarded the result. A reconciler that had expired the
+lease between the claim's `SELECT` and that `UPDATE` left the update matching
+zero rows, nothing raised, and the worker was handed a reservation the control
+plane no longer owned: it built a machine against it, every fencing call was
+then refused, and the node was advertising capacity already handed out. The
+renewal is fenced like `renew_worker_lease` (`status='active' AND expires_at >
+now()`) and a claim that renews nothing leaves its assignment `reserved`.
+
+The same function also locked `sandbox_assignments` before `sandbox_leases`,
+the exact inverse of `release_capacity`, which every capacity-releasing path
+funnels through. A claim racing a sweep is an ABBA cycle, and PostgreSQL aborts
+one side with `40P01` — on the reconciler that is the whole `FOR UPDATE` page it
+was sweeping, so one concurrent claim defers every other expiry in the batch.
+The lease row is now locked first, matching the order the releasing paths use.
+
+**Not regression-tested.** Both defects need a claim and a reconciler to
+interleave between two adjacent statements inside one transaction. The fixes are
+verified by the storage suite, review and the ordered `SELECT`s above, not by a
+test that fails on the old code: a fault-injection seam at that point does not
+exist, and a timing-dependent test would be a test that lies.
+
+### Lease recovery could resurrect a sandbox that was being stopped
+
+`reassign_expired_lease` read the sandbox with a plain `SELECT` and wrote it back
+with no expected-state predicate, holding only the expired lease's lock. The
+ordinary stop path holds only the sandbox row, so a sandbox read as `running`
+could be stopped by a concurrent request a moment later and then moved back to
+`creating` by recovery, with a fresh live lease and debited capacity, for a
+caller who had just been told the sandbox was going away. The sandbox row is now
+locked for the whole transaction and the write is predicated on the state that
+was validated, so the check and the write describe the same row. A state that
+moved under the recovery rolls the new lease, the debited node and the
+retargeted assignment back with it.
+
+**Not regression-tested:** as above, the interleaving is not reproducible
+without a fault-injection seam.
+
+## Fixed in the 2026-10-03 audit: the agent harness
+
+### Compaction could write a request no provider accepts
+
+`compact` built its digest from `describe`, which returns nothing for a
+contentless assistant turn, and then wrote it as a `user` message. A run whose
+drained turns were all tool-call-only turns produced
+`Message::User { content: "" }` — an empty user turn on the wire, which a
+provider that validates content rejects by refusing the *whole* request. The
+digest now falls back to naming what was dropped (`Earlier in this run (N
+exchanges, compacted)`), which is never empty.
+
+The second half of the same defect: the digest was unconditionally inserted at
+the front, so a kept window that already began with a `User` message (a pushed
+context note, or a digest left by an earlier compaction) produced two
+consecutive `user` messages, which a provider requiring alternating roles also
+refuses. A leading kept `User` is now folded into the digest, keeping both texts.
+
+### Tool-call arguments were not charged to the ledger
+
+`push_assistant` charged the assistant *text*; the tool calls attached
+afterwards were never charged at all. A `write` call carries a whole file in its
+arguments, so the ledger reported a conversation as comfortably inside its
+window while the provider rejected it for being over — the one failure the
+ceiling exists to prevent. They are now serialised exactly as `as_wire`
+serialises them and charged under bucket `tool_calls`.
+
+### `max_tool_output_bytes` was never read
+
+`push_tool_result` compressed to `DEFAULT_TOOL_OUTPUT_BYTES.min(4096)` and
+ignored the task's own ceiling entirely: a task asking for a kilobyte was sent
+four. The effective limit is now
+`min(DEFAULT_TOOL_OUTPUT_BYTES, 4096, task.max_tool_output_bytes)`.
+
+The compressor itself undercounted: the truncation marker was appended *after*
+the limit was met, so a 1024-byte ceiling produced up to 1024 + marker bytes.
+The head/tail split now counts the marker against `limit` and solves the
+remaining split in a bounded monotone loop, which matters because a single pass
+does not converge when the head byte count snaps back off a UTF-8 boundary. A
+limit smaller than the marker itself (~66 bytes) returns the marker and exceeds
+the limit: returning an empty string or dropping the notice are both worse.
+
+### Every result document reported `head_before: null`
+
+`collect_after` runs once, at the end, and cannot know what the repository
+looked like before the run — and `execute` assigned it over `outcome.git`
+entirely, so the field the evidence exists to answer was always null. `execute`
+now captures head/branch/status before the run and merges, with
+`merge_git_evidence`: only `head_before` comes from the earlier observation,
+`branch` falls back to it only when the after-collection could not read one,
+and everything describing the tree the run left behind is the
+after-collection's.
+
+### Git evidence adopted an enclosing checkout
+
+`Repository::open` took `rev-parse --show-toplevel`, which names the *nearest
+enclosing* checkout. A task directory that happens to sit inside an unrelated
+repository therefore reported that repository's head, branch, status and diff as
+the run's evidence — a tree the agent's tools, confined to `task.repo()`, were
+never allowed to touch. `open` now canonicalises the task path and refuses a
+toplevel that is not the task's own directory, failing closed: such a task
+reports no repository at all rather than another tree's state. The meaning of
+`task.repo_path` is narrowed accordingly — it must be the checkout root.
+
+### A failed git collection was reported as a clean tree
+
+`diff` and `status` were `unwrap_or_default()`, so a git that would not run (an
+unborn repository, an unreadable index) produced byte-for-byte what a clean
+working tree produces: "the agent changed nothing", asserted as evidence.
+Failures now propagate, and `collect_after` records each one in the new
+`GitEvidence.errors` field instead of defaulting. The `changed_files` fallback
+also split `--name-only` output on newlines rather than the NUL separator, so a
+renamed file produced a single entry naming both paths.
+
+### A provider that had already refused was asked three more times
+
+Every non-success response became `HarnessError::Model`, which `Client::complete`
+retries with a bounded backoff. A bad key, a model the provider has never heard
+of, or a body it will not parse is a statement about *this* request and is
+repeated exactly, so a run that was never going to succeed paid three attempts
+— and, on a billed endpoint, three charges — to learn what one had already said.
+Responses are now classified: 429, 5xx and 3xx stay `Model` (the endpoint or
+its capacity, not the request); every other 4xx becomes the new
+`HarnessError::ModelRefused`, which leaves on the first attempt carrying the
+provider's own text.
+
+### Truncated validation evidence ended in the literal word `true`
+
+`tail` appended `text[..start].is_empty()` into the formatted string, so every
+truncated validation's evidence — in the result document, in the summary, and
+in anything reading them as prose — ended with a formatted boolean. The ellipsis
+is the whole marker; the bool is gone.
+
+### A result document that could not be saved still returned the earned code
+
+`run` did `let _ = outcome.save(...)` and then returned the exit code the run
+earned, so a write failure — an unwritable result directory — was invisible:
+the harness exited 0 with no result document anywhere. `publish` now writes the
+document and returns 2 when the save fails, and the task's own error is printed
+to stderr *before* the save is attempted, so an unwritable directory cannot
+replace the only complaint the operator gets to read.
+
+Every item in this section ships with a regression that fails on the old
+behaviour. The retry classification is counted rather than inferred: a loopback
+endpoint that answers every request with one status is asked exactly once for a
+401 and exactly three times for a 503.
+
 ## Open
+
+### A provisioning rollback can destroy another request's machine
+
+**Status: open.** A narrowed blast radius is in place; the defect is not fixed.
+
+A retried `POST /v1/sandboxes` is handed the *same* sandbox id and walks into
+provisioning against a row the original request owns. When the retry fails, its
+rollback destroys that machine.
+
+The rollback now re-reads the row and refuses to tear down anything no longer in
+`Creating`/`Starting`, reporting `409 sandbox_not_owned` instead. That closes the
+case where the original had already committed `Running` and was about to return
+it to its caller. It does not close the defect:
+
+- **A state is not an owner.** `Creating` is exactly the state a retry finds the
+  row in, so a retry that fails before the winner commits `Running` still
+  destroys the winner's machine and reports the failure as its own.
+- **The read and the destroy are separate statements.** A row that becomes live
+  in that window is still torn down.
+- **The idempotency key cannot be the owner.** Both requests carry the same
+  `request_id`, so a token taken from it is the same value twice.
+
+A fix needs ownership that distinguishes the two *attempts*: a
+`provisioning_attempt` column written by whichever attempt created the row,
+claimed once, and checked by the rollback in the same statement that begins the
+teardown — or provisioning serialised per sandbox id, so the second attempt never
+walks into a row the first owns. The regression has to interleave two requests
+across the runtime's `start` with a gated test runtime; `MemoryRepository`
+serialises them, so it cannot be written against the in-memory repository.
+
+### Accepted, not fixed: placement holds a worker row lock while it waits
+
+`select_schedulable_node` selects its candidate `FOR UPDATE SKIP LOCKED` and then
+waits, inside that lock, for the host's advisory lock — up to 40 attempts of
+5 ms. For that window every `debit_capacity`, `release_capacity`,
+`heartbeat_worker` and `revoke_worker` on that node waits behind the placement.
+The wait is deliberate: it is what stops a colliding placement being refused as
+`no schedulable worker has capacity` when the host has room in it, which was a
+measured failure mode. Reordering it means taking the host lock before the node
+lock, which is not possible without knowing which host the candidate is on, so
+the candidate would have to be re-selected and re-validated after the host lock —
+the reservation path this audit has already measured end to end. The bound is
+200 ms and it only occurs when two placements contend for one host, so this is
+recorded as a deliberate trade-off rather than fixed.
 
 ### A worker restarts machines for sandboxes whose runs finished
 

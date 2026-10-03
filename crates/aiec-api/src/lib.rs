@@ -1767,6 +1767,46 @@ pub(crate) async fn provision_sandbox(
     .await;
 
     if let Err(error) = provision {
+        // A narrowed blast radius, not an ownership check.
+        //
+        // A retry that arrives while the original request is mid-flight is
+        // handed the *same* sandbox id and walks into provisioning against a row
+        // in `Creating` that another request owns. Its failure then destroyed
+        // that machine, including the case where the original had already
+        // committed `Running` and was about to return it to its caller. Anything
+        // no longer in `Creating`/`Starting` has been handed to somebody, so
+        // this request leaves it alone and reports the refusal; it stays visible
+        // in its own state for the reaper or its owner to deal with.
+        //
+        // What this does *not* do is establish ownership. `Creating` is exactly
+        // the state a retry finds the row in, so a retry that fails before the
+        // winner commits still tears the winner's machine down, and the re-read
+        // and the destroy are separate statements, so a row that becomes live in
+        // between them is torn down too. The idempotency key cannot be the owner
+        // token - both requests carry the same `request_id`. Closing this needs a
+        // per-attempt provisioning token claimed on the row and checked by the
+        // teardown, or provisioning serialised per sandbox id; see
+        // docs/known-defects.md.
+        let ours = match s.repository().get_sandbox(tenant, x.id).await {
+            Ok(current) => {
+                matches!(
+                    current.state,
+                    SandboxState::Creating | SandboxState::Starting
+                )
+            }
+            Err(CoreError::NotFound(_)) => true,
+            Err(_) => false,
+        };
+        if !ours {
+            return Err(ApiFailure::new(
+                StatusCode::CONFLICT,
+                "sandbox_not_owned",
+                format!(
+                    "{}; the sandbox is in a state this request does not own, so it was left alone",
+                    error.message
+                ),
+            ));
+        }
         // Capacity is returned only after the runtime confirms it stopped.
         // A failed stop remains owned and visible for retry; it is not a free slot.
         if let Err(cleanup_error) = runs::destroy_with_retry(s, tenant, x.id).await {
@@ -1983,27 +2023,7 @@ async fn create_sandbox(
             ));
         }
     }
-    let reference = aiec_core::images::ImageReference::new(&r.image).map_err(ApiFailure::from)?;
-    let resolved_image_id = if runtime_kind == RuntimeKind::Firecracker {
-        if let Some(images) = s.platform.images() {
-            images
-                .resolve(&reference)
-                .await
-                .map_err(ApiFailure::from)?
-                .image_id
-        } else if s.is_production() {
-            return Err(ApiFailure::from(CoreError::Conflict(
-                "Firecracker image admission is not configured".into(),
-            )));
-        } else {
-            image_id(&r.image)
-        }
-    } else if let Some(images) = s.platform.images() {
-        images.resolve(&reference).await.map_err(ApiFailure::from)?;
-        reference.as_str().to_owned()
-    } else {
-        reference.as_str().to_owned()
-    };
+    let resolved_image_id = admit_image(&s, runtime_kind, &r.image).await?;
     let request_id = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
@@ -2033,6 +2053,43 @@ async fn create_sandbox(
     };
     let x = provision_sandbox(&s, p.tenant_id, request_id, x, required, None, false).await?;
     Ok(create_response(x.sandbox, &_selection_reason))
+}
+
+/// The image a machine is allowed to boot, for whichever path is starting one.
+///
+/// The signed manifest resolver is the only thing that decides whether an
+/// image is one this deployment serves, so every path that boots a machine
+/// goes through it: a caller-supplied string is a request for an image, never
+/// an admission to boot one. `create_sandbox` and `restore_snapshot` used to
+/// disagree here, and the restore path took the caller's string verbatim, so
+/// the manifest admission the create path depends on was missing from the one
+/// path that boots a machine from a stored snapshot.
+async fn admit_image(
+    s: &AppState,
+    runtime: RuntimeKind,
+    image: &str,
+) -> Result<String, ApiFailure> {
+    let reference = aiec_core::images::ImageReference::new(image).map_err(ApiFailure::from)?;
+    if runtime == RuntimeKind::Firecracker {
+        if let Some(images) = s.platform.images() {
+            return Ok(images
+                .resolve(&reference)
+                .await
+                .map_err(ApiFailure::from)?
+                .image_id);
+        }
+        if s.is_production() {
+            return Err(ApiFailure::from(CoreError::Conflict(
+                "Firecracker image admission is not configured".into(),
+            )));
+        }
+        Ok(image_id(image))
+    } else if let Some(images) = s.platform.images() {
+        images.resolve(&reference).await.map_err(ApiFailure::from)?;
+        Ok(reference.as_str().to_owned())
+    } else {
+        Ok(reference.as_str().to_owned())
+    }
 }
 async fn prepare_environment(
     state: &AppState,
@@ -2895,7 +2952,12 @@ async fn git_diff(
         )));
     }
     let result = s
-        .runtime()
+        // The sandbox's own runtime, not the deployment's primary one. Every
+        // other sandbox verb dispatches through `runtime_for`, so on a
+        // deployment whose primary runtime is Docker a Firecracker sandbox had
+        // its `git_diff` executed by the Docker path - which is either not the
+        // machine holding the repository, or a machine that does not exist.
+        .runtime_for(&sandbox)?
         .exec(
             &sandbox,
             ExecRequest {
@@ -3140,17 +3202,26 @@ async fn create_snapshot(
         )
     })?;
     let capabilities = provider.capabilities();
-    let kind = request.kind.unwrap_or({
-        if capabilities.virtual_machine {
-            SnapshotKind::VirtualMachine
-        } else {
-            SnapshotKind::Workspace
-        }
-    });
+    // A caller that names no kind gets the kind this control plane can actually
+    // finish, which is the workspace one. It used to default to `VirtualMachine`
+    // whenever the runtime advertised microVM capture, and that default was the
+    // common case on the production runtime.
+    let kind = request.kind.unwrap_or(SnapshotKind::Workspace);
     let supported = match kind {
-        SnapshotKind::VirtualMachine => capabilities.virtual_machine,
-        SnapshotKind::Memory => capabilities.memory,
         SnapshotKind::Workspace => capabilities.workspace,
+        // A VM or memory capture is not something this control plane can
+        // finish, whatever the runtime says it can take. Completing one needs a
+        // memory object, a disk object and a workspace object recorded on the
+        // snapshot row, and `CapturedSnapshot` carries none of them: the only
+        // path that stores a capture's bytes is the workspace one. Asking the
+        // capability flag alone ran the whole capture, left the provider's
+        // snapshot on the worker's disk, and then failed the row on the
+        // completeness check with a Conflict nobody could act on.
+        //
+        // Refusing before `capture` runs is the difference between an honest
+        // "this kind is not supported" and a failed capture that also leaks
+        // worker-local state.
+        SnapshotKind::VirtualMachine | SnapshotKind::Memory => false,
     };
     if !supported {
         return Err(ApiFailure::new(
@@ -3355,12 +3426,23 @@ async fn restore_snapshot(
             "this deployment offers microVM-class isolation only; process and container runtimes are self-hosted only",
         ));
     }
+    // A restore boots a machine, so the image it boots is admitted the same way
+    // a create admits one. Taking `r.image` verbatim meant the only boot path
+    // that skipped the signed manifest resolver was the one booting an image
+    // the deployment never vouched for: a tenant with any complete snapshot
+    // could name any image string and get it into a microVM. An image the
+    // caller does not name is the snapshot's own, which was admitted when the
+    // snapshot was taken.
+    let image_id = match r.image.as_deref() {
+        Some(image) => admit_image(&s, runtime, image).await?,
+        None => stored.image_id.clone(),
+    };
     let now = Utc::now();
     let mut x = Sandbox {
         id: new_id(),
         tenant_id: p.tenant_id,
         node_id: None,
-        image_id: r.image.unwrap_or(stored.image_id.clone()),
+        image_id,
         state: SandboxState::Restoring,
         runtime,
         cpu: r.cpu.unwrap_or(1),

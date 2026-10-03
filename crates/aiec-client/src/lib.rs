@@ -227,6 +227,54 @@ fn run_response_timeout(workload: &WorkloadSpec) -> Duration {
 /// machine it was holding to be destroyed.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Slack above a server-side bound, so the control plane always gives up first
+/// and the client is the last thing to decide a call has failed.
+const SERVER_OPERATION_SLACK_SECONDS: u64 = 120;
+
+/// The longest exec the API accepts (`aiec_core::MAX_EXEC_SECONDS`).
+const MAX_EXEC_SECONDS: u64 = 3_600;
+
+/// The exec the API runs for `git_diff`, which it fixes at 60 seconds.
+const GIT_DIFF_EXEC_SECONDS: u64 = 60;
+
+/// The upload allowance the API gives an artifact write
+/// (`artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS`).
+const ARTIFACT_UPLOAD_SECONDS: u64 = 300;
+
+/// Provisioning has no small server-side deadline: it clones the workload's
+/// repository, pulls layers and runs setup commands inside the machine, all
+/// before the control plane answers. A clone of a large repository alone is
+/// minutes, so this is an allowance rather than a bound the API enforces.
+const PROVISION_SECONDS: u64 = 900;
+
+/// The wait an exec is given: the command's own stated timeout, which the API
+/// accepts up to `MAX_EXEC_SECONDS`, plus slack.
+///
+/// The client's default is 60 seconds, which is the right size for the
+/// control-plane verbs and wrong for anything that runs inside a machine. An
+/// `exec` the API happily ran for an hour used to be abandoned at 60 seconds
+/// by the caller, with the command still running in a sandbox the caller had
+/// been told was broken.
+fn exec_timeout(request: &ExecRequest) -> Duration {
+    Duration::from_secs(
+        request.timeout_seconds.clamp(1, MAX_EXEC_SECONDS) + SERVER_OPERATION_SLACK_SECONDS,
+    )
+}
+
+/// The wait provisioning is given. `POST /v1/sandboxes` answers only after the
+/// machine exists, its repository is cloned and its setup commands have run, so
+/// it is bounded by the deployment's own work rather than by the 60 seconds the
+/// client defaults to for control-plane verbs.
+fn provision_timeout() -> Duration {
+    Duration::from_secs(PROVISION_SECONDS + SERVER_OPERATION_SLACK_SECONDS)
+}
+
+/// The wait a snapshot capture is given: a capture is the work the runtime does
+/// to freeze the machine plus the artifact upload allowance on top of it.
+fn snapshot_timeout() -> Duration {
+    Duration::from_secs(ARTIFACT_UPLOAD_SECONDS * 2 + SERVER_OPERATION_SLACK_SECONDS)
+}
+
 /// Checks a caller-stated batch limit against the bound the control plane puts
 /// on one, so a client cannot be the thing that makes a batch unbounded.
 fn check_batch_parallelism(max_parallel: usize) -> Result<usize, ClientError> {
@@ -345,7 +393,8 @@ impl AIecClient {
     ) -> Result<Sandbox, ClientError> {
         self.send(
             self.request(reqwest::Method::POST, "/v1/sandboxes")
-                .json(request),
+                .json(request)
+                .timeout(provision_timeout()),
         )
         .await
     }
@@ -370,7 +419,8 @@ impl AIecClient {
         }
         self.send(
             self.request(reqwest::Method::POST, "/v1/sandboxes")
-                .json(&body),
+                .json(&body)
+                .timeout(provision_timeout()),
         )
         .await
     }
@@ -405,7 +455,8 @@ impl AIecClient {
     pub async fn exec(&self, id: Uuid, request: &ExecRequest) -> Result<ExecResult, ClientError> {
         self.send(
             self.request(reqwest::Method::POST, &format!("/v1/sandboxes/{id}/exec"))
-                .json(request),
+                .json(request)
+                .timeout(exec_timeout(request)),
         )
         .await
     }
@@ -415,7 +466,10 @@ impl AIecClient {
                 reqwest::Method::POST,
                 &format!("/v1/sandboxes/{id}/git/diff"),
             )
-            .json(&serde_json::json!({})),
+            .json(&serde_json::json!({}))
+            .timeout(Duration::from_secs(
+                GIT_DIFF_EXEC_SECONDS + SERVER_OPERATION_SLACK_SECONDS,
+            )),
         )
         .await
     }
@@ -440,7 +494,10 @@ impl AIecClient {
     pub async fn put_file(&self, id: Uuid, request: &PutFileRequest) -> Result<(), ClientError> {
         self.send_empty(
             self.request(reqwest::Method::PUT, &format!("/v1/sandboxes/{id}/files"))
-                .json(request),
+                .json(request)
+                .timeout(Duration::from_secs(
+                    ARTIFACT_UPLOAD_SECONDS + SERVER_OPERATION_SLACK_SECONDS,
+                )),
         )
         .await
     }
@@ -475,7 +532,8 @@ impl AIecClient {
                 reqwest::Method::POST,
                 &format!("/v1/sandboxes/{id}/snapshots"),
             )
-            .json(&serde_json::json!({})),
+            .json(&serde_json::json!({}))
+            .timeout(snapshot_timeout()),
         )
         .await
     }
@@ -496,7 +554,8 @@ impl AIecClient {
                 reqwest::Method::POST,
                 &format!("/v1/snapshots/{id}/restore"),
             )
-            .json(request),
+            .json(request)
+            .timeout(provision_timeout()),
         )
         .await
     }
@@ -835,6 +894,85 @@ mod tests {
             "a run queued for {SERVER_MAX_QUEUE_WAIT_SECONDS}s then executed for \
             600s would still be running when the client gives up"
         );
+    }
+
+    /// The same failure on the sandbox verbs.
+    ///
+    /// The client default of 60 seconds is sized for the control-plane verbs
+    /// and is shorter than work the API explicitly accepts: an exec may state
+    /// 3600 seconds, `git_diff` runs a 60-second exec server-side, and
+    /// provisioning answers only after the machine is built. Every one of those
+    /// used to inherit the 60-second default, so the client gave up while the
+    /// command kept running inside a sandbox the caller had been told was
+    /// broken.
+    #[test]
+    fn a_machine_bound_verb_outlasts_the_clients_default() {
+        // Mirrors `aiec_core::MAX_EXEC_SECONDS`, the API's own `validate_exec`
+        // ceiling. Duplicated on purpose, as in the run timeout above.
+        const SERVER_MAX_EXEC_SECONDS: u64 = 3_600;
+        const CLIENT_DEFAULT_SECONDS: u64 = 60;
+
+        let longest = ExecRequest {
+            command: vec!["pytest".into()],
+            working_directory: Some("/workspace".into()),
+            environment: BTreeMap::new(),
+            timeout_seconds: SERVER_MAX_EXEC_SECONDS,
+            stdin: None,
+        };
+        assert!(
+            exec_timeout(&longest).as_secs() > SERVER_MAX_EXEC_SECONDS,
+            "the client abandons an exec the API is still running"
+        );
+
+        // A caller that states its own budget gets that budget, not the
+        // client's default and not the API's ceiling.
+        let short = ExecRequest {
+            timeout_seconds: CLIENT_DEFAULT_SECONDS,
+            ..longest.clone()
+        };
+        assert_eq!(
+            exec_timeout(&short).as_secs(),
+            CLIENT_DEFAULT_SECONDS + SERVER_OPERATION_SLACK_SECONDS
+        );
+        assert!(
+            exec_timeout(&short) < exec_timeout(&longest),
+            "the exec budget no longer follows the timeout the caller stated"
+        );
+
+        // A zero timeout is not a budget at all: `aiec-core` refuses the
+        // request outright rather than substituting a default, so the wait is
+        // the clamped minimum plus slack. Anything derived from zero itself
+        // would be a zero-length budget for a request that is answered in
+        // microseconds by the refusal.
+        let zero = ExecRequest {
+            timeout_seconds: 0,
+            ..longest.clone()
+        };
+        assert_eq!(
+            exec_timeout(&zero).as_secs(),
+            1 + SERVER_OPERATION_SLACK_SECONDS,
+            "a refused request must still leave room for the refusal to arrive"
+        );
+
+        for (what, wait) in [
+            (
+                "git_diff",
+                Duration::from_secs(GIT_DIFF_EXEC_SECONDS + SERVER_OPERATION_SLACK_SECONDS),
+            ),
+            (
+                "put_file",
+                Duration::from_secs(ARTIFACT_UPLOAD_SECONDS + SERVER_OPERATION_SLACK_SECONDS),
+            ),
+            ("create_snapshot", snapshot_timeout()),
+            ("create_sandbox", provision_timeout()),
+            ("restore_snapshot", provision_timeout()),
+        ] {
+            assert!(
+                wait.as_secs() > CLIENT_DEFAULT_SECONDS,
+                "{what} inherits the 60s client default, which is shorter than \
+                 the work the API accepts for it"
+            );
+        }
     }
 
     use super::*;
