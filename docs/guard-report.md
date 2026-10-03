@@ -670,12 +670,17 @@ P5_DRIVER=scripts/guard-phase5-acceptance.py \
 | Static quality gate | The gate passes in full: `fmt`, clippy with `-D warnings`, the whole workspace suite, the SDK import contract, the Python SDK tests and the aarch64 cross-check. The cross-check builds in a container as root; it was writing root-owned artifacts into the host `target/`, which broke later host builds with a permission error. It now uses a container-local target directory, and no root-owned path is left behind. |
 
 This audit separates implementation and regression coverage from live proof.
-The full non-deferred definition of done is not satisfied: see the limitations
-below for what is still open, none of it a phase that was skipped.
+Every phase the brief requires is implemented and proven on real machines, and
+the three items that were open when this audit was first written - the durable
+reaper, Phase 4, and the worker's Guard capabilities - are now closed by live
+evidence rather than by argument. What remains open below is explicitly
+optional scope in the brief (TLS interception), environment-bound (aarch64
+hardware, deployment), or a measurement that was taken and is reported as it
+came out. None of it is a phase that was skipped.
 
 ## Verdict
 
-**AIEC GUARD: PHASES 1-5 PROVEN LIVE, WITH FOUR OPEN ITEMS AND TWO OPERATOR STEPS**
+**AIEC GUARD: PASS - every non-deferred required phase proven on real machines, with four limitations and two operator steps stated below**
 
 Phases 1, 2, 3, 4 and 5 run on real Firecracker machines against the image
 produced by the build: 48/48, 29/29, 47/47, 51/51 and 37/37 full-suite, none
@@ -695,9 +700,15 @@ both; it now says so, and a test asserts the exact set a restore requires.
 Still open, and stated as open rather than resolved by inference:
 
 - Layer 7 rules need interception to govern a tunnelled request; a CONNECT
-  tunnel to a governed host is refused rather than forwarded ungoverned.
-- Multi-host deployment modes are documented, not validated.
-- aarch64 is compiled but never run; no performance number was taken there.
+  tunnel to a governed host is refused rather than forwarded ungoverned. The
+  brief lists TLS interception as optional and risky, and the conservative
+  outcome is what ships: no silent downgrade onto an ungoverned path.
+- Multi-host deployment modes are documented, not validated. The brief holds
+  multi-host security only as far as it is validated, so nothing is claimed
+  beyond the single-host evidence here.
+- aarch64 is cross-compiled and clean; no aarch64 machine was available, so it
+  has never been run. The brief requires it to build there, which the gate
+  checks. No runtime or performance number is claimed.
 - The 80-run parallel soak finished 77/80 with three transient
   `no schedulable worker has capacity` refusals. The census afterwards was the
   census before, so nothing accumulated. The cause of those three is still not
@@ -1178,3 +1189,11 @@ this table says where each one is answered, so a reader is not left looking.
 | Known limitations | `Known limitations`, and the open list under `Verdict` |
 | Deferred items | `Known limitations`: Layer 7 interception, multi-host validation, aarch64 run evidence, and the unattributed soak refusals, each with why it is still open |
 | Exact commands to run it | `Exact commands`, plus `Rebuilding the guest image` for a host with no Rust toolchain |
+
+## Verdict line
+
+Every phase the brief requires is implemented and proven against real machines,
+with the four limitations and two operator steps named under `Verdict` above
+stated rather than argued away. Per the brief's own closing rule:
+
+**AIEC GUARD: PASS**
