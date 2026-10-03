@@ -557,34 +557,25 @@ pub fn compress(text: &str, limit: usize) -> String {
             text.len().saturating_sub(head).saturating_sub(tail)
         )
     };
-    // The head keeps three quarters of the budget and the tail a quarter: the
-    // last lines of a failing build are the useful ones, and they are worth as
-    // much as everything that came before them. The split is then solved for
-    // rather than guessed at, because the marker names how much was elided and
-    // so grows by a digit or two as the head shrinks to make room for it - each
-    // pass takes the overflow off the head budget, and the correction is smaller
-    // than the marker it is paying for, so a couple of passes clear it.
-    let mut head_budget = limit.saturating_mul(3) / 4;
-    let tail_budget = limit / 4;
-    let tail = crate::tail_bytes(text, tail_budget).len();
-    let mut head = crate::head_bytes(text, head_budget).len();
-    let mut text_marker = marker(head, tail);
-    while head > 0 && head + text_marker.len() + tail > limit {
-        let overflow = head + text_marker.len() + tail - limit;
-        head_budget = head_budget.saturating_sub(overflow);
-        head = crate::head_bytes(text, head_budget).len();
-        text_marker = marker(head, tail);
+    // Reserve the longest possible marker before splitting the remaining
+    // bytes. Keeping text can only reduce the elided count's digit width.
+    let marker_bytes = marker(0, 0).len();
+    if marker_bytes > limit {
+        // A compact ASCII truncation notice fits any nonzero ceiling. Zero
+        // explicitly requests no output, including no notice.
+        if limit == 0 {
+            return String::new();
+        }
+        let head = crate::head_bytes(text, limit - 1);
+        let mut kept = String::with_capacity(head.len() + 1);
+        kept.push_str(head);
+        kept.push('~');
+        return kept;
     }
-    if head + text_marker.len() + tail > limit {
-        // A limit too small to hold the marker and any of the text at all: the
-        // marker is then the whole honest answer, and it is smaller than any
-        // string carrying text would be. The one case where this still exceeds
-        // `limit` is a task asking for a ceiling below the marker's own size -
-        // a few dozen bytes - and the alternatives there are worse than
-        // overshooting it: an empty string says nothing at all, and dropping
-        // the notice would report that the tool had nothing to say.
-        return text_marker;
-    }
+    let budget = limit - marker_bytes;
+    let head = crate::head_bytes(text, budget.saturating_mul(3) / 4).len();
+    let tail = crate::tail_bytes(text, budget / 4).len();
+    let text_marker = marker(head, tail);
     let mut kept = String::with_capacity(head + text_marker.len() + tail);
     kept.push_str(&text[..head]);
     kept.push_str(&text_marker);
@@ -766,6 +757,26 @@ mod tests {
     #[test]
     fn a_short_result_is_untouched() {
         assert_eq!(compress("short", 100), "short");
+    }
+
+    #[test]
+    fn compression_honors_even_a_sub_marker_byte_ceiling() {
+        for text in ["a".repeat(1000), "🦀".repeat(1000)] {
+            for limit in 0..=128 {
+                let rendered = compress(&text, limit);
+                assert!(
+                    rendered.len() <= limit,
+                    "limit {limit} produced {} bytes: {rendered:?}",
+                    rendered.len()
+                );
+                if limit > 0 {
+                    assert!(
+                        rendered.contains("elided") || rendered.ends_with('~'),
+                        "truncation must remain visible at limit {limit}: {rendered:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

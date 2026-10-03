@@ -44,6 +44,14 @@ pub struct ScheduledSandbox {
     pub lease_generation: i64,
 }
 
+/// Atomic provisioning admission. A replay is never permission to build or roll back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProvisionAdmission {
+    pub scheduled: ScheduledSandbox,
+    /// True only for the call that acquired a new lease, not a live-lease replay.
+    pub acquired: bool,
+}
+
 /// Dispatch authority read from one active lease and its worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerDispatch {
@@ -60,6 +68,18 @@ pub trait Scheduler: Send + Sync {
         &self,
         request: ScheduleRequest,
     ) -> Result<ScheduledSandbox, crate::CoreError>;
+    /// Places a sandbox and distinguishes a newly acquired lease from a replay.
+    ///
+    /// Implementations must determine `acquired` in the admission transaction.
+    /// A scheduler without that distinction cannot safely provision.
+    async fn schedule_for_provision(
+        &self,
+        _request: ScheduleRequest,
+    ) -> Result<ProvisionAdmission, crate::CoreError> {
+        Err(crate::CoreError::Unsupported(
+            "scheduler does not support owned provisioning admission".into(),
+        ))
+    }
     /// Resolves endpoint and fencing identity atomically from an unexpired lease.
     async fn dispatch_target(
         &self,

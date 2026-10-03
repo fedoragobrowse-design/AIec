@@ -245,7 +245,7 @@ pub(crate) async fn execute_created(
             results: RunResults::default(),
         };
         // Scheduling links this existing attempt before slow provisioning starts.
-        store.record_run_attempt(evidence.clone()).await?;
+        store.record_run_attempt(tenant, evidence.clone()).await?;
         let result = tokio::time::timeout(
             remaining,
             execute(
@@ -477,7 +477,10 @@ pub async fn event(state: &AppState, run: &Run, event_type: &str, detail: serde_
         detail,
     };
     // A history write must never fail the work it describes.
-    let _ = state.repository().append_run_event(record).await;
+    let _ = state
+        .repository()
+        .append_run_event(run.tenant_id, record)
+        .await;
 }
 
 /// Moves the run to the next state, tolerating a lost race.

@@ -751,8 +751,6 @@ pub trait MetadataStore: Send + Sync {
     /// take over the existing record rather than be rejected. Returning the
     /// authoritative id lets the caller adopt the identity it was given.
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError>;
-    /// Updates a legacy node heartbeat.
-    async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError>;
     /// Lists registered legacy nodes.
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError>;
     /// Stores a tenant.
@@ -1042,6 +1040,16 @@ pub trait MetadataStore: Send + Sync {
     /// run and never written, so the sweeper - which selects on
     /// `retained_until` - never saw the run, the machine was never reclaimed,
     /// and the caller was handed a `null` sandbox id and told nothing.
+    ///
+    /// Three things have to hold at once, and one write has to decide all of
+    /// them, because the alternative is a check followed by a write and a run
+    /// whose machine is already being kept arrives in between: the machine
+    /// belongs to this run's tenant, this run is one that used it, and a
+    /// machine already kept is never displaced. That last one is why a retry of
+    /// the same machine succeeds - it is the same retention, restated - while
+    /// a second machine is refused: overwriting leaves the first machine with
+    /// no `retained_until` anywhere, so the sweeper never reclaims it and it
+    /// holds capacity for the life of the database.
     async fn retain_run_sandbox(
         &self,
         _tenant: TenantId,
@@ -1091,6 +1099,11 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// A run whose history has been recorded is retained: the record of what
     /// happened is not deletable, and deleting the run would take it with it.
+    ///
+    /// A run that still holds a machine is refused for the same reason the
+    /// sweeper needs `retained_until` to be true: the run row and its links are
+    /// the only indexes that lead to those machines, so deleting it strands
+    /// capacity and containers with nothing left to reclaim them.
     async fn delete_run(&self, _tenant: TenantId, _id: Uuid) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
@@ -1098,7 +1111,14 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// Events are append-only in storage: there is no update or delete path, so
     /// a mistake is answered by appending a correcting event.
-    async fn append_run_event(&self, _event: RunEvent) -> Result<(), CoreError> {
+    ///
+    /// `run_events` carries no tenant of its own, so the tenant is a parameter
+    /// rather than something read back off the event: a write is refused unless
+    /// it names this tenant's run, and a machine it names belongs to that same
+    /// tenant. Naming another tenant's machine here makes it readable through
+    /// this tenant's history and sends cleanup after a machine the run never
+    /// held.
+    async fn append_run_event(&self, _tenant: TenantId, _event: RunEvent) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Lists a run's history in the order it happened.
@@ -1110,7 +1130,16 @@ pub trait MetadataStore: Send + Sync {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Records that a run used a machine, and what for.
-    async fn link_run_sandbox(&self, _link: RunSandbox) -> Result<(), CoreError> {
+    ///
+    /// The machine has to belong to the run's tenant. `run_sandboxes` has no
+    /// tenant column and its sandbox reference is a bare id, so without this
+    /// the row accepts any pair - and the run's cleanup reads exactly these
+    /// ids to tear machines down.
+    async fn link_run_sandbox(
+        &self,
+        _tenant: TenantId,
+        _link: RunSandbox,
+    ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Lists the machines a run used.
@@ -1122,7 +1151,15 @@ pub trait MetadataStore: Send + Sync {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Records one attempt of a run.
-    async fn record_run_attempt(&self, _attempt: RunAttempt) -> Result<(), CoreError> {
+    ///
+    /// Tenant-scoped for the same reason [`MetadataStore::append_run_event`]
+    /// is: `run_attempts` carries none of its own, and the machine an attempt
+    /// names has to be the tenant's.
+    async fn record_run_attempt(
+        &self,
+        _tenant: TenantId,
+        _attempt: RunAttempt,
+    ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Completes an in-progress attempt once, retaining its own outcomes.

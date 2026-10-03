@@ -621,6 +621,23 @@ pub struct WorkerRegistration {
 /// them is what a reader of `WorkerHeartbeat` finds first.
 pub use aiec_core::storage::WorkerHeartbeat;
 
+// Carries one admission's immutable worker authority through awaited provisioning
+// operations. This is not a lock: the store and worker still validate the lease.
+tokio::task_local! {
+    static PROVISION_DISPATCH: (TenantId, Uuid, Option<aiec_core::scheduler::WorkerDispatch>);
+}
+
+pub(crate) async fn provision_scope<F: Future>(
+    tenant: TenantId,
+    sandbox: Uuid,
+    dispatch: Option<aiec_core::scheduler::WorkerDispatch>,
+    future: F,
+) -> F::Output {
+    PROVISION_DISPATCH
+        .scope((tenant, sandbox, dispatch), future)
+        .await
+}
+
 #[derive(Clone)]
 pub struct WorkerRuntime {
     client: Arc<dyn WorkerClient>,
@@ -648,15 +665,28 @@ impl WorkerRuntime {
         }
     }
 
+    async fn dispatch_for(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<aiec_core::scheduler::WorkerDispatch, CoreError> {
+        if let Ok(Some(dispatch)) = PROVISION_DISPATCH.try_with(|(tenant, id, dispatch)| {
+            (*tenant == sandbox.tenant_id && *id == sandbox.id)
+                .then(|| dispatch.clone())
+                .flatten()
+        }) {
+            return Ok(dispatch);
+        }
+        self.scheduler
+            .dispatch_target(sandbox.tenant_id, sandbox.id)
+            .await
+    }
+
     async fn call(
         &self,
         sandbox: &Sandbox,
         operation: WorkerOperation,
     ) -> Result<WorkerValue, CoreError> {
-        let dispatch = self
-            .scheduler
-            .dispatch_target(sandbox.tenant_id, sandbox.id)
-            .await?;
+        let dispatch = self.dispatch_for(sandbox).await?;
         let response = self
             .client
             .invoke(
@@ -807,10 +837,7 @@ impl SandboxRuntime for WorkerRuntime {
         request: FileChunkRequest,
     ) -> Result<FileChunk, CoreError> {
         request.validate()?;
-        let dispatch = self
-            .scheduler
-            .dispatch_target(sandbox.tenant_id, sandbox.id)
-            .await?;
+        let dispatch = self.dispatch_for(sandbox).await?;
         let authorization = WorkerRequest {
             request_id: new_id(),
             lease_id: dispatch.lease_id,
@@ -838,10 +865,7 @@ impl SandboxRuntime for WorkerRuntime {
     ) -> Result<Vec<FileChunk>, CoreError> {
         request.validate()?;
         let count = count.clamp(1, aiec_core::runtime::FILE_CHUNK_BURST);
-        let dispatch = self
-            .scheduler
-            .dispatch_target(sandbox.tenant_id, sandbox.id)
-            .await?;
+        let dispatch = self.dispatch_for(sandbox).await?;
         let authorization = WorkerRequest {
             request_id: new_id(),
             lease_id: dispatch.lease_id,

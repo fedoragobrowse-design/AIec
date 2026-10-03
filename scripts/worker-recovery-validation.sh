@@ -55,6 +55,8 @@ API_PID=''
 WORKER_A_PID=''
 WORKER_B_PID=''
 FAILURES=0
+TENANT_ID=''
+INITIAL_TAPS=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l)
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '[%s] %s\n' "$(now)" "$*"; }
@@ -148,6 +150,14 @@ check() {
     return 1
   fi
 }
+# Runtime labels identify the disposable tenant, not every managed sandbox on
+# the user's Docker daemon. Include stopped containers in the leak census.
+managed_containers() {
+  [ -n "${TENANT_ID:-}" ] || return 0
+  "${DOCKER[@]}" ps -a -q --filter label=com.aiec.managed=true \
+    --filter "label=com.aiec.tenant=$TENANT_ID"
+}
+
 
 cleanup() {
   set +e
@@ -163,8 +173,7 @@ cleanup() {
   # Remove containers this harness created. A run that is interrupted before the
   # control plane destroys its sandboxes would otherwise leave them running.
   if [ "$HAVE_DOCKER" = 1 ]; then
-    "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null \
-      | xargs -r "${DOCKER[@]}" rm -f 2>/dev/null || true
+    managed_containers 2>/dev/null | xargs -r "${DOCKER[@]}" rm -f 2>/dev/null || true
   fi
   if [ "$KEEP" = 1 ]; then
     printf 'preserved=%s\n' "$OUT"
@@ -366,10 +375,10 @@ run_iteration() {
   [ -n "$WORKER_B_PID" ] || { dump_diagnostics; echo "worker B did not start" >&2; return 1; }
 
   log "iteration $iteration: SIGKILL worker A (no graceful deregistration)"
-  kill -9 "$WORKER_A_PID" 2>/dev/null
-  wait "$WORKER_A_PID" 2>/dev/null
+  kill -9 "$WORKER_A_PID" 2>/dev/null || true
+  wait "$WORKER_A_PID" 2>/dev/null || true
   WORKER_A_PID=''
-  pkill -9 -f "state-dir $state_a" 2>/dev/null
+  pkill -9 -f "state-dir $state_a" 2>/dev/null || true
 
   log "iteration $iteration: waiting for lease expiry and control-plane recovery"
   local recovered=0 deadline=$((SECONDS + LEASE_TTL + 90))
@@ -516,7 +525,7 @@ run_iteration() {
   sleep 2
   local containers
   if [ "$HAVE_DOCKER" = 1 ]; then
-    containers=$({ "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null || true; } | wc -l)
+    containers=$(managed_containers | wc -l)
     check "iteration $iteration: no managed containers remain" test "$containers" -eq 0 || return 1
   fi
 
@@ -524,8 +533,8 @@ run_iteration() {
   # wait on the API server, which is meant to outlive every iteration.
   for pid in "$WORKER_A_PID" "$WORKER_B_PID"; do
     if [ -n "$pid" ]; then
-      kill "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
     fi
   done
   WORKER_A_PID=''
@@ -567,16 +576,23 @@ count_matches() {
     | wc -l
 }
 
-leftover_procs=$(count_matches "$CARGO_TARGET_DIR/release/aiec")
+leftover_procs=$(count_matches "state-dir $OUT/state")
 leftover_containers=skipped
 if [ "$HAVE_DOCKER" = 1 ]; then
-  leftover_containers=$({ "${DOCKER[@]}" ps -q --filter label=com.aiec.managed=true 2>/dev/null || true; } | wc -l)
+  leftover_containers=$(managed_containers | wc -l)
 fi
-leftover_fc=$(count_matches "api-sock")
+leftover_fc=$(count_matches "api-sock $OUT")
 leftover_taps=$(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^af/ {print $2}' | wc -l || echo 0)
-active_leases=$(sql "select count(*) from sandbox_leases where status='active'" 2>/dev/null | head -1)
+active_leases=$(sql "select count(*) from sandbox_leases where status='active' and tenant_id='$TENANT_ID'" | head -1)
 active_leases=${active_leases:-0}
 printf '%s\n' "processes=$leftover_procs containers=$leftover_containers firecracker=$leftover_fc taps=$leftover_taps active_leases=$active_leases"
+check "no harness worker processes remain" test "$leftover_procs" -eq 0 || true
+if [ "$HAVE_DOCKER" = 1 ]; then
+  check "no harness containers remain" test "$leftover_containers" -eq 0 || true
+fi
+check "no harness Firecracker processes remain" test "$leftover_fc" -eq 0 || true
+check "TAP census returned to baseline" test "$leftover_taps" -eq "$INITIAL_TAPS" || true
+check "no harness active leases remain" test "$active_leases" -eq 0 || true
 
 if [ "$FAILURES" -eq 0 ] && [ "$ITERATIONS" -ge 3 ]; then
   printf '\nSAME_HOST_MULTI_WORKER_VALIDATION: PASS (%s iterations)\n' "$ITERATIONS"

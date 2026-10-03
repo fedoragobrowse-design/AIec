@@ -110,8 +110,7 @@ fn tail(text: &str) -> String {
     }
     // The ellipsis is the whole marker: the text before the cut was dropped,
     // and saying so costs nothing. It used to append `text[..start].is_empty()`
-    // here, which formatted a bool - so every truncated validation ended its
-    // evidence with the literal word `true`.
+    // here, which appended the literal word `false` to truncated evidence.
     format!("…{}", &text[at..])
 }
 
@@ -165,10 +164,8 @@ mod tests {
 
     /// A truncated validation's evidence is text, and only text.
     ///
-    /// The cut used to be followed by `text[..start].is_empty()` formatted into
-    /// the string, so every truncated validation reported its own evidence
-    /// ending in the literal word `true` - in the result document, in the
-    /// summary, and in anything that read them as prose.
+    /// The cut used to append `text[..start].is_empty()` as a boolean. The
+    /// retained output must end at the actual tail marker, not `false`.
     #[tokio::test]
     async fn a_truncated_validation_reports_text_and_not_a_bool() {
         // Four kilobytes of output: enough to be cut, with a marker at the end

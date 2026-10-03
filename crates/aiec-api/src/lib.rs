@@ -16,6 +16,8 @@ pub mod guard;
 mod guard_proposals;
 mod guard_release;
 pub mod omp;
+#[cfg(test)]
+mod provision_ownership_tests;
 pub mod ratelimit;
 pub(crate) mod repo_cache;
 mod run_queue;
@@ -1198,6 +1200,8 @@ async fn reconcile_workers(State(state): State<AppState>) -> ApiResult<Value> {
         .reconcile_expired_leases(RECONCILE_LIMIT)
         .await
         .map_err(ApiFailure::from)?;
+    // Eligibility, not who asked: a machine a run still owns, or one whose
+    // teardown has started, is never rebuilt from here.
     let recoveries = recover_expired_leases(&state, &actions).await;
     let workers = state
         .repository()
@@ -1660,10 +1664,11 @@ pub(crate) async fn provision_sandbox(
     // through a leased worker node, so there is nothing for the worker
     // scheduler to place. Worker-backed runtimes are scheduled as before.
     let scheduled_at = std::time::Instant::now();
+    let mut dispatch = None;
     if s.is_production() && x.runtime != RuntimeKind::Hosted {
-        x = s
+        let admission = s
             .scheduler()
-            .schedule(aiec_core::scheduler::ScheduleRequest {
+            .schedule_for_provision(aiec_core::scheduler::ScheduleRequest {
                 tenant_id: tenant,
                 request_id,
                 sandbox: x,
@@ -1682,8 +1687,27 @@ pub(crate) async fn provision_sandbox(
                     "scheduler_unavailable",
                     other.to_string(),
                 ),
-            })?
-            .sandbox;
+            })?;
+        x = admission.scheduled.sandbox;
+        if !admission.acquired {
+            timings.scheduler_ms = scheduled_at.elapsed().as_millis() as u64;
+            if matches!(x.state, SandboxState::Creating | SandboxState::Starting) {
+                return Err(ApiFailure::new(
+                    StatusCode::CONFLICT,
+                    "sandbox_provisioning",
+                    "the idempotent sandbox request is already provisioning",
+                ));
+            }
+            return Ok(ProvisionedSandbox {
+                sandbox: x,
+                timings,
+            });
+        }
+        dispatch = Some(aiec_core::scheduler::WorkerDispatch {
+            endpoint: admission.scheduled.worker_endpoint,
+            lease_id: admission.scheduled.lease_id,
+            generation: admission.scheduled.lease_generation,
+        });
     } else {
         if let Some(run_id) = run_id {
             x = s
@@ -1699,55 +1723,78 @@ pub(crate) async fn provision_sandbox(
         }
     }
     timings.scheduler_ms = scheduled_at.elapsed().as_millis() as u64;
+    worker::provision_scope(
+        tenant,
+        x.id,
+        dispatch.clone(),
+        provision_admitted_sandbox(s, tenant, x, timings, dispatch, authorization_present),
+    )
+    .await
+}
+
+/// State writes and rollback use the lease acquired by this call, never a fresh
+/// ownership lookup that can silently adopt a replacement's authority.
+async fn commit_provision_state(
+    s: &AppState,
+    sandbox: &Sandbox,
+    expected: SandboxState,
+    next: SandboxState,
+    dispatch: Option<&aiec_core::scheduler::WorkerDispatch>,
+) -> Result<(), CoreError> {
+    match dispatch {
+        Some(dispatch) => {
+            s.repository()
+                .update_state_with_lease(
+                    sandbox.tenant_id,
+                    sandbox.id,
+                    expected,
+                    next,
+                    dispatch.lease_id,
+                    dispatch.generation,
+                )
+                .await
+        }
+        None => s
+            .repository()
+            .update_state(sandbox.tenant_id, sandbox.id, expected, next, None)
+            .await
+            .map(|_| ()),
+    }
+}
+
+async fn provision_admitted_sandbox(
+    s: &AppState,
+    tenant: TenantId,
+    mut x: Sandbox,
+    mut timings: ProvisionTimings,
+    dispatch: Option<aiec_core::scheduler::WorkerDispatch>,
+    authorization_present: bool,
+) -> Result<ProvisionedSandbox, ApiFailure> {
     if x.state != SandboxState::Creating {
         return Ok(ProvisionedSandbox {
             sandbox: x,
             timings,
         });
     }
-
-    // A guarded sandbox's lifetime and model ceilings are durable before the
-    // machine is built, not when its gateway first needs one: a budget created
-    // at first use is a budget a worker restart can reset.
-    if let Err(error) = guard::initialize_guard_budget(s.repository().as_ref(), &x).await {
-        // Admission already owns metadata and, in production, a reservation.
-        // No runtime allocation was attempted: release only those resources.
-        let cleanup = async {
-            if s.is_production() && x.runtime != RuntimeKind::Hosted {
-                s.scheduler().release(tenant, x.id).await?;
-            }
-            s.repository().delete_sandbox(tenant, x.id).await
-        }
-        .await;
-        if let Err(cleanup_error) = cleanup {
-            return Err(ApiFailure::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "runtime_unavailable",
-                format!("{error}; admission rollback failed: {cleanup_error}"),
-            ));
-        }
-        return Err(ApiFailure::from(error));
-    }
-
-    // From here the sandbox holds capacity and a lease, so every exit has to
-    // give both back. Before this, only the environment-preparation failure did:
-    // a `create` that failed left a `Failed` row still holding its lease, and a
-    // `start` that failed left the row in `Starting` holding the lease and the
-    // node's capacity. Neither is reclaimable by anything - the sweeper leaves
-    // rows with a live lease alone - so each one permanently consumed a slot.
-    // A hundred-run soak made it visible: successes stalled after twenty runs
-    // and the tenant was refused on quota with seven sandboxes stuck in
-    // `creating` and `starting`.
+    let guard = guard::initialize_guard_budget(s.repository().as_ref(), &x).await;
+    let allocated = guard.is_ok();
     let provision = async {
+        guard.map_err(ApiFailure::from)?;
         let allocated_at = std::time::Instant::now();
         s.runtime_for(&x)?
             .create(&x)
             .await
             .map_err(ApiFailure::from)?;
         timings.allocation_ms = allocated_at.elapsed().as_millis() as u64;
-        s.commit_state(&x, SandboxState::Creating, SandboxState::Starting)
-            .await
-            .map_err(ApiFailure::from)?;
+        commit_provision_state(
+            s,
+            &x,
+            SandboxState::Creating,
+            SandboxState::Starting,
+            dispatch.as_ref(),
+        )
+        .await
+        .map_err(ApiFailure::from)?;
         x.state = SandboxState::Starting;
         let booted_at = std::time::Instant::now();
         s.runtime_for(&x)?
@@ -1758,58 +1805,48 @@ pub(crate) async fn provision_sandbox(
         let workspace_at = std::time::Instant::now();
         prepare_environment(s, &x, &x.environment, authorization_present).await?;
         timings.workspace_ms = workspace_at.elapsed().as_millis() as u64;
-        s.commit_state(&x, SandboxState::Starting, SandboxState::Running)
-            .await
-            .map_err(ApiFailure::from)?;
+        commit_provision_state(
+            s,
+            &x,
+            SandboxState::Starting,
+            SandboxState::Running,
+            dispatch.as_ref(),
+        )
+        .await
+        .map_err(ApiFailure::from)?;
         x.state = SandboxState::Running;
         Ok::<(), ApiFailure>(())
     }
     .await;
 
     if let Err(error) = provision {
-        // A narrowed blast radius, not an ownership check.
-        //
-        // A retry that arrives while the original request is mid-flight is
-        // handed the *same* sandbox id and walks into provisioning against a row
-        // in `Creating` that another request owns. Its failure then destroyed
-        // that machine, including the case where the original had already
-        // committed `Running` and was about to return it to its caller. Anything
-        // no longer in `Creating`/`Starting` has been handed to somebody, so
-        // this request leaves it alone and reports the refusal; it stays visible
-        // in its own state for the reaper or its owner to deal with.
-        //
-        // What this does *not* do is establish ownership. `Creating` is exactly
-        // the state a retry finds the row in, so a retry that fails before the
-        // winner commits still tears the winner's machine down, and the re-read
-        // and the destroy are separate statements, so a row that becomes live in
-        // between them is torn down too. The idempotency key cannot be the owner
-        // token - both requests carry the same `request_id`. Closing this needs a
-        // per-attempt provisioning token claimed on the row and checked by the
-        // teardown, or provisioning serialised per sandbox id; see
-        // docs/known-defects.md.
-        let ours = match s.repository().get_sandbox(tenant, x.id).await {
-            Ok(current) => {
-                matches!(
-                    current.state,
-                    SandboxState::Creating | SandboxState::Starting
-                )
-            }
-            Err(CoreError::NotFound(_)) => true,
-            Err(_) => false,
-        };
-        if !ours {
+        // This atomic state/lease CAS is teardown initiation. Recovery and
+        // admission cannot replace a Destroying sandbox after it succeeds.
+        if let Err(fence_error) =
+            commit_provision_state(s, &x, x.state, SandboxState::Destroying, dispatch.as_ref())
+                .await
+        {
             return Err(ApiFailure::new(
                 StatusCode::CONFLICT,
                 "sandbox_not_owned",
                 format!(
-                    "{}; the sandbox is in a state this request does not own, so it was left alone",
+                    "{}; rollback ownership refused: {fence_error}",
                     error.message
                 ),
             ));
         }
-        // Capacity is returned only after the runtime confirms it stopped.
-        // A failed stop remains owned and visible for retry; it is not a free slot.
-        if let Err(cleanup_error) = runs::destroy_with_retry(s, tenant, x.id).await {
+        let cleanup = if allocated {
+            // The scoped worker dispatch still carries the original lease.
+            // Capacity is released only after runtime teardown confirms stop.
+            runs::destroy_with_retry(s, tenant, x.id).await
+        } else {
+            // Guard initialization failed before runtime allocation.
+            s.repository()
+                .delete_sandbox(tenant, x.id)
+                .await
+                .map_err(|e| e.to_string())
+        };
+        if let Err(cleanup_error) = cleanup {
             return Err(ApiFailure::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "runtime_unavailable",
@@ -4425,16 +4462,27 @@ mod tests {
                 .ok_or_else(|| CoreError::NotFound("run not found".into()))
         }
 
-        /// The run a child row hangs off. Child rows carry no tenant of their
-        /// own, so this settles existence only; every read of them still goes
-        /// through the tenant-scoped run first.
-        async fn stored_run_for_child(&self, id: Uuid) -> Result<Run, CoreError> {
-            self.runs
-                .lock()
-                .await
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| CoreError::NotFound("run not found".into()))
+        /// The run a child row hangs off, under the tenant that owns it.
+        ///
+        /// Child rows carry no tenant of their own, so the tenant is settled
+        /// here rather than read back off the row: a run belonging to someone
+        /// else is not a run this caller may hang anything off, and a machine
+        /// belonging to someone else is not one of this tenant's.
+        async fn child_run(
+            &self,
+            tenant: Uuid,
+            id: Uuid,
+            machine: Option<Uuid>,
+        ) -> Result<Run, CoreError> {
+            let run = self.stored_run(tenant, id).await?;
+            if let Some(machine) = machine
+                && self.inner.get_sandbox(tenant, machine).await.is_err()
+            {
+                return Err(CoreError::Conflict(
+                    "a run may only name a machine belonging to its own tenant".into(),
+                ));
+            }
+            Ok(run)
         }
     }
 
@@ -4776,9 +4824,6 @@ mod tests {
         }
         async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
             self.inner.register_node(value).await
-        }
-        async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError> {
-            self.inner.heartbeat(id).await
         }
         async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
             self.inner.list_nodes().await
@@ -5196,8 +5241,13 @@ mod tests {
             Ok(run.clone())
         }
 
-        async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
-            self.stored_run_for_child(event.run_id).await?;
+        async fn append_run_event(
+            &self,
+            tenant: TenantId,
+            event: RunEvent,
+        ) -> Result<(), CoreError> {
+            self.child_run(tenant, event.run_id, event.sandbox_id)
+                .await?;
             let mut events = self.run_events.lock().await;
             let history = events.entry(event.run_id).or_default();
             history.push(event);
@@ -5220,8 +5270,13 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        async fn link_run_sandbox(&self, link: RunSandbox) -> Result<(), CoreError> {
-            self.stored_run_for_child(link.run_id).await?;
+        async fn link_run_sandbox(
+            &self,
+            tenant: TenantId,
+            link: RunSandbox,
+        ) -> Result<(), CoreError> {
+            self.child_run(tenant, link.run_id, Some(link.sandbox_id))
+                .await?;
             let mut links = self.run_sandboxes.lock().await;
             let held = links.entry(link.run_id).or_default();
             held.retain(|held| held.sandbox_id != link.sandbox_id);
@@ -5293,8 +5348,13 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
-            self.stored_run_for_child(attempt.run_id).await?;
+        async fn record_run_attempt(
+            &self,
+            tenant: TenantId,
+            attempt: RunAttempt,
+        ) -> Result<(), CoreError> {
+            self.child_run(tenant, attempt.run_id, attempt.sandbox_id)
+                .await?;
             let mut attempts = self.run_attempts.lock().await;
             let history = attempts.entry(attempt.run_id).or_default();
             // An attempt number is recorded once. Re-recording it would rewrite
@@ -5340,7 +5400,7 @@ mod tests {
             sandbox: Sandbox,
             _required: aiec_core::runtime::RuntimeCapabilities,
         ) -> Result<Sandbox, CoreError> {
-            self.stored_run_for_child(run_id).await?;
+            self.stored_run(sandbox.tenant_id, run_id).await?;
             // The machine exists as a row before it exists as a runtime, and the
             // rest of the run - usage, destruction, the sweeper - reads that row.
             self.inner.create_sandbox(sandbox.clone()).await?;
@@ -5351,11 +5411,14 @@ mod tests {
                 .ok_or_else(|| CoreError::NotFound("run attempt not found".into()))?;
             // Placement commits the link before the machine exists, so cleanup
             // can always find what a run held even if creation then failed.
-            self.link_run_sandbox(RunSandbox {
-                run_id,
-                sandbox_id: sandbox.id,
-                role: "primary".into(),
-            })
+            self.link_run_sandbox(
+                sandbox.tenant_id,
+                RunSandbox {
+                    run_id,
+                    sandbox_id: sandbox.id,
+                    role: "primary".into(),
+                },
+            )
             .await?;
             stored.sandbox_id = Some(sandbox.id);
             Ok(sandbox)
@@ -5426,11 +5489,36 @@ mod tests {
             sandbox_id: Uuid,
             until: chrono::DateTime<chrono::Utc>,
         ) -> Result<Run, CoreError> {
+            self.child_run(tenant, id, Some(sandbox_id)).await?;
             let mut runs = self.runs.lock().await;
             let stored = runs
                 .get_mut(&id)
                 .filter(|run| run.tenant_id == tenant)
                 .ok_or_else(|| CoreError::NotFound("run not found".into()))?;
+            // Restating the same retention is a retry and succeeds; a second
+            // machine is refused, because the one being displaced would keep a
+            // row the sweeper never selects and hold its capacity forever.
+            if let Some(kept) = stored.retained_sandbox_id
+                && kept != sandbox_id
+            {
+                return Err(CoreError::Conflict(
+                    "run already retains a different machine".into(),
+                ));
+            }
+            // A run may only keep a machine it actually used. Cleanup reads the
+            // links to decide what to tear down, so a retention naming anything
+            // else makes the two disagree.
+            if !self
+                .run_sandboxes
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|held| held.iter().any(|link| link.sandbox_id == sandbox_id))
+            {
+                return Err(CoreError::Conflict(
+                    "a run may only keep a machine it used".into(),
+                ));
+            }
             stored.retained_sandbox_id = Some(sandbox_id);
             stored.retained_until = Some(until);
             Ok(stored.clone())
@@ -5512,6 +5600,20 @@ mod tests {
                 .is_some_and(|events| !events.is_empty())
             {
                 return Err(CoreError::Conflict("run has recorded history".into()));
+            }
+            // Deleting the row also deletes the only index the sweeper and
+            // cleanup have on the machines this run holds.
+            if self
+                .run_sandboxes
+                .lock()
+                .await
+                .get(&id)
+                .is_some_and(|links| !links.is_empty())
+                || runs
+                    .get(&id)
+                    .is_some_and(|run| run.retained_sandbox_id.is_some())
+            {
+                return Err(CoreError::Conflict("run still owns a machine".into()));
             }
             runs.remove(&id);
             Ok(())
@@ -6203,6 +6305,213 @@ mod tests {
         }
     }
 
+    /// The tables hanging off a run carry no tenant of their own, so the tenant
+    /// has to arrive with the write. This store is what every run route is
+    /// exercised against, so the same association the database closes has to be
+    /// closed here: the link list is what cleanup reads to decide what to tear
+    /// down, and a machine belonging to another tenant in it can never be
+    /// destroyed by the destroy that is fenced on it.
+    #[tokio::test]
+    async fn a_run_only_links_keeps_and_records_machines_from_its_own_tenant() {
+        let fixture = RunFixture::new();
+        let outsider = new_id();
+        let now = Utc::now();
+        let until = now + chrono::Duration::hours(1);
+        let later = now + chrono::Duration::hours(2);
+
+        async fn machine(store: &LeasedRepository, tenant: Uuid) -> Sandbox {
+            let now = Utc::now();
+            let machine = Sandbox {
+                id: new_id(),
+                tenant_id: tenant,
+                node_id: None,
+                image_id: "alpine:3.21".into(),
+                state: SandboxState::Running,
+                runtime: RuntimeKind::Docker,
+                cpu: 1,
+                memory_mb: 128,
+                disk_mb: 512,
+                timeout_seconds: 60,
+                network: NetworkPolicy::Disabled,
+                environment: Default::default(),
+                created_at: now,
+                updated_at: now,
+                runtime_path: None,
+            };
+            store.create_sandbox(machine.clone()).await.unwrap();
+            machine
+        }
+
+        let run = settled_run(fixture.tenant, RunState::Succeeded);
+        fixture.store.seed(run.clone()).await;
+        let theirs = machine(&fixture.store, outsider).await;
+
+        assert!(matches!(
+            fixture
+                .store
+                .link_run_sandbox(
+                    fixture.tenant,
+                    RunSandbox {
+                        run_id: run.id,
+                        sandbox_id: theirs.id,
+                        role: "primary".into(),
+                    },
+                )
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(
+            fixture
+                .store
+                .list_run_sandboxes(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused link leaves nothing behind for cleanup to find"
+        );
+
+        assert!(matches!(
+            fixture
+                .store
+                .append_run_event(
+                    fixture.tenant,
+                    RunEvent {
+                        id: new_id(),
+                        run_id: run.id,
+                        sandbox_id: Some(theirs.id),
+                        event_type: "sandbox.assigned".into(),
+                        occurred_at: now,
+                        detail: json!({}),
+                    },
+                )
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(
+            fixture
+                .store
+                .list_run_events(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "history is append-only, so a refused event must leave no row either"
+        );
+        assert!(matches!(
+            fixture
+                .store
+                .record_run_attempt(
+                    fixture.tenant,
+                    RunAttempt {
+                        id: new_id(),
+                        run_id: run.id,
+                        attempt_number: 1,
+                        sandbox_id: Some(theirs.id),
+                        state: RunState::Running,
+                        failure_reason: None,
+                        started_at: now,
+                        completed_at: None,
+                        placement: Default::default(),
+                        results: Default::default(),
+                    },
+                )
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert!(
+            fixture
+                .store
+                .list_run_attempts(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(matches!(
+            fixture
+                .store
+                .retain_run_sandbox(fixture.tenant, run.id, theirs.id, until)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .get_run(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .retained_sandbox_id,
+            None
+        );
+
+        // A machine of this tenant's own that the run never used is refused for
+        // the neighbouring reason: retention and the link list have to agree,
+        // or cleanup tears down the machine the run asked to keep.
+        let unlinked = machine(&fixture.store, fixture.tenant).await;
+        assert!(matches!(
+            fixture
+                .store
+                .retain_run_sandbox(fixture.tenant, run.id, unlinked.id, until)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+
+        let kept = machine(&fixture.store, fixture.tenant).await;
+        let second = machine(&fixture.store, fixture.tenant).await;
+        for held in [&kept, &second] {
+            fixture
+                .store
+                .link_run_sandbox(
+                    fixture.tenant,
+                    RunSandbox {
+                        run_id: run.id,
+                        sandbox_id: held.id,
+                        role: "primary".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let retained = fixture
+            .store
+            .retain_run_sandbox(fixture.tenant, run.id, kept.id, until)
+            .await
+            .unwrap();
+        assert_eq!(retained.retained_sandbox_id, Some(kept.id));
+
+        // Restating the same retention is a retry of one decision, not a second
+        // one, so it succeeds and takes the later expiry.
+        let retried = fixture
+            .store
+            .retain_run_sandbox(fixture.tenant, run.id, kept.id, later)
+            .await
+            .unwrap();
+        assert_eq!(retried.retained_until, Some(later));
+
+        assert!(matches!(
+            fixture
+                .store
+                .retain_run_sandbox(fixture.tenant, run.id, second.id, until)
+                .await,
+            Err(CoreError::Conflict(_))
+        ));
+        let after = fixture.store.get_run(fixture.tenant, run.id).await.unwrap();
+        assert_eq!(
+            (after.retained_sandbox_id, after.retained_until),
+            (Some(kept.id), Some(later)),
+            "the refused second machine left the first one's retention untouched"
+        );
+
+        // Another tenant naming this run gets no answer at all: whether the run
+        // exists is not theirs to learn.
+        assert!(matches!(
+            fixture
+                .store
+                .retain_run_sandbox(outsider, run.id, kept.id, until)
+                .await,
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
     /// The run routes driven over real HTTP against the real router, with a
     /// store that keeps runs and a runtime that runs commands.
     /// Retention is judged on the run's outcome, so it has to be decided before
@@ -6287,11 +6596,14 @@ mod tests {
         fixture.store.seed(run.clone()).await;
         fixture
             .store
-            .link_run_sandbox(RunSandbox {
-                run_id: run.id,
-                sandbox_id,
-                role: "primary".into(),
-            })
+            .link_run_sandbox(
+                fixture.tenant,
+                RunSandbox {
+                    run_id: run.id,
+                    sandbox_id,
+                    role: "primary".into(),
+                },
+            )
             .await
             .expect("the run owns a machine");
 
@@ -7732,11 +8044,14 @@ mod tests {
         fixture.store.seed(run.clone()).await;
         fixture
             .store
-            .link_run_sandbox(RunSandbox {
-                run_id: run.id,
-                sandbox_id: sandbox.id,
-                role: "primary".into(),
-            })
+            .link_run_sandbox(
+                fixture.tenant,
+                RunSandbox {
+                    run_id: run.id,
+                    sandbox_id: sandbox.id,
+                    role: "primary".into(),
+                },
+            )
             .await
             .expect("link sandbox");
 

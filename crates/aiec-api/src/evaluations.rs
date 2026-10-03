@@ -577,9 +577,6 @@ mod tests {
         async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
             self.inner.register_node(value).await
         }
-        async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError> {
-            self.inner.heartbeat(id).await
-        }
         async fn put_tenant(&self, value: TenantRecord) -> Result<(), CoreError> {
             self.inner.put_tenant(value).await
         }

@@ -543,22 +543,73 @@ async fn link_attempt_sandbox(
     Ok(())
 }
 
-/// Confirms a run exists before an append that names no tenant of its own.
+/// How far a write to a run's child tables is allowed to reach.
+#[derive(Clone, Copy)]
+enum ChildAssociation {
+    /// The machine only has to belong to the tenant: this write is what
+    /// associates it with the run.
+    Owned,
+    /// Retention, which additionally requires the run to have used the machine
+    /// and may not displace the one the run is already keeping.
+    Retained,
+}
+
+/// Says which guard refused a run-child write, in terms the caller can act on.
 ///
-/// The child tables carry no tenant column, so the run is the only thing that
-/// scopes them. Checking first turns a naming mistake into [`StoreError::NotFound`]
-/// instead of handing the caller a foreign-key violation it cannot act on.
-async fn ensure_run(
+/// The write itself carries the predicates, so nothing inconsistent is ever
+/// stored - this only runs after a statement matched no rows, and turns that
+/// into [`StoreError::NotFound`] for a run that is not this tenant's and a
+/// [`StoreError::Conflict`] for a machine that is, rather than the
+/// foreign-key violation the caller has no way to interpret.
+async fn run_child_refusal(
     executor: impl sqlx::Executor<'_, Database = Postgres>,
+    tenant: Uuid,
     run: Uuid,
-) -> Result<(), StoreError> {
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM runs WHERE id = $1")
-        .bind(run)
-        .fetch_optional(executor)
-        .await
-        .map_err(database_error)?
-        .ok_or(StoreError::NotFound)?;
-    Ok(())
+    machine: Option<Uuid>,
+    require: ChildAssociation,
+) -> StoreError {
+    let row = match sqlx::query(
+        "SELECT r.retained_sandbox_id, \
+           EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = $1 AND s.tenant_id = $2) \
+             AS owns_machine, \
+           EXISTS (SELECT 1 FROM run_sandboxes rs \
+             WHERE rs.run_id = r.id AND rs.sandbox_id = $1) AS used_machine \
+         FROM runs r WHERE r.id = $3 AND r.tenant_id = $2",
+    )
+    .bind(machine)
+    .bind(tenant)
+    .bind(run)
+    .fetch_optional(executor)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => return database_error(error),
+    };
+    // Another tenant's run is not a run this caller may name, and saying which
+    // guard refused would confirm that it exists at all.
+    let Some(row) = row else {
+        return StoreError::NotFound;
+    };
+    if machine.is_some() && !row.try_get::<bool, _>("owns_machine").unwrap_or(false) {
+        return StoreError::Conflict(
+            "a run may only name a machine belonging to its own tenant".into(),
+        );
+    }
+    let used = row.try_get::<bool, _>("used_machine").unwrap_or(false);
+    let kept: Option<Uuid> = row.try_get("retained_sandbox_id").unwrap_or(None);
+    if matches!(require, ChildAssociation::Retained) {
+        if let Some(kept) = kept
+            && Some(kept) != machine
+        {
+            // Overwriting is the leak this refuses: the displaced machine has a
+            // row the sweeper will never select, so nothing ever reclaims it.
+            return StoreError::Conflict("run already retains a different machine".into());
+        }
+        if machine.is_some() && !used {
+            return StoreError::Conflict("a run may only keep a machine it used".into());
+        }
+    }
+    StoreError::Conflict("the run no longer accepts this write".into())
 }
 
 /// A hard delete of a run cascades into `run_events`, whose triggers reject any
@@ -819,6 +870,17 @@ async fn update_state_with_lease_transaction(
     generation: i64,
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await.map_err(database_error)?;
+    // Lease before sandbox, matching reassignment and capacity release. Hold
+    // the supplied identity stable through the state CAS.
+    sqlx::query(
+        "SELECT id FROM sandbox_leases WHERE tenant_id=$1 AND sandbox_id=$2 AND id=$3 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(id)
+    .bind(lease_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
     let row = lock_sandbox(&mut tx, tenant, id).await?;
     let current = active_lease(&mut tx, tenant, id).await?;
     match &current {
@@ -1145,7 +1207,7 @@ impl PostgresScheduler {
     async fn schedule_on_node(
         &self,
         request: ScheduleRequest,
-    ) -> Result<ScheduledSandbox, StoreError> {
+    ) -> Result<aiec_core::scheduler::ProvisionAdmission, StoreError> {
         let ScheduleRequest {
             tenant_id: tenant,
             request_id,
@@ -1222,8 +1284,17 @@ impl PostgresScheduler {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
-            let mut existing_sandbox = fetch_sandbox(&mut *tx, tenant, sandbox_id).await?;
             let existing_lease = fetch_lease_for_sandbox(&mut tx, tenant, sandbox_id).await?;
+            let sandbox_row = lock_sandbox(&mut tx, tenant, sandbox_id).await?;
+            let mut existing_sandbox = sandbox_from_row(&sandbox_row)?;
+            if matches!(
+                existing_sandbox.state,
+                SandboxState::Destroying | SandboxState::Destroyed | SandboxState::Quarantined
+            ) {
+                return Err(StoreError::Conflict(
+                    "sandbox is not available for provisioning admission".into(),
+                ));
+            }
             // Reuse only a lease that is still an owner. `expires_at` is part of
             // the predicate for the same reason `dispatch_target` includes it:
             // an expired-but-still-`active` row is not an owner, and handing
@@ -1240,12 +1311,15 @@ impl PostgresScheduler {
                         .await
                         .map_err(database_error)?;
                 tx.commit().await.map_err(database_error)?;
-                return Ok(ScheduledSandbox {
-                    sandbox: existing_sandbox,
-                    worker_id: existing_lease.node_id,
-                    worker_endpoint,
-                    lease_id: existing_lease.id,
-                    lease_generation: existing_lease.generation,
+                return Ok(aiec_core::scheduler::ProvisionAdmission {
+                    scheduled: ScheduledSandbox {
+                        sandbox: existing_sandbox,
+                        worker_id: existing_lease.node_id,
+                        worker_endpoint,
+                        lease_id: existing_lease.id,
+                        lease_generation: existing_lease.generation,
+                    },
+                    acquired: false,
                 });
             }
             if existing_lease.status == "active" {
@@ -1274,11 +1348,6 @@ impl PostgresScheduler {
                 .await
                 .map_err(database_error)?;
                 existing_sandbox.node_id = None;
-            }
-            if existing_sandbox.state == SandboxState::Destroyed {
-                return Err(StoreError::Conflict(
-                    "destroyed sandbox cannot be rescheduled".into(),
-                ));
             }
             sandbox = existing_sandbox;
             retry_assignment = true;
@@ -1364,12 +1433,15 @@ impl PostgresScheduler {
         let node_id: Uuid = node.try_get("id")?;
         debit_capacity(&mut tx, node_id, demand).await?;
         let assigned = sqlx::query(
-            "UPDATE sandboxes SET node_id = $1, updated_at = now() \
+            "UPDATE sandboxes SET node_id = $1, \
+             state=CASE WHEN $4 THEN 'creating' ELSE state END, \
+             runtime_path=CASE WHEN $4 THEN NULL ELSE runtime_path END, updated_at = now() \
              WHERE tenant_id = $2 AND id = $3 AND node_id IS NULL",
         )
         .bind(node_id)
         .bind(tenant)
         .bind(sandbox.id)
+        .bind(retry_assignment)
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
@@ -1447,12 +1519,15 @@ impl PostgresScheduler {
             .map_err(database_error)?;
         let lease = lease_from_row(&lease_row)?;
         tx.commit().await.map_err(database_error)?;
-        Ok(ScheduledSandbox {
-            sandbox: assigned_sandbox,
-            worker_id: node_id,
-            worker_endpoint,
-            lease_id,
-            lease_generation: lease.generation,
+        Ok(aiec_core::scheduler::ProvisionAdmission {
+            scheduled: ScheduledSandbox {
+                sandbox: assigned_sandbox,
+                worker_id: node_id,
+                worker_endpoint,
+                lease_id,
+                lease_generation: lease.generation,
+            },
+            acquired: true,
         })
     }
 }
@@ -1460,6 +1535,16 @@ impl PostgresScheduler {
 #[async_trait]
 impl Scheduler for PostgresScheduler {
     async fn schedule(&self, request: ScheduleRequest) -> Result<ScheduledSandbox, CoreError> {
+        self.schedule_on_node(request)
+            .await
+            .map(|admission| admission.scheduled)
+            .map_err(core_error)
+    }
+
+    async fn schedule_for_provision(
+        &self,
+        request: ScheduleRequest,
+    ) -> Result<aiec_core::scheduler::ProvisionAdmission, CoreError> {
         self.schedule_on_node(request).await.map_err(core_error)
     }
 
@@ -1543,7 +1628,7 @@ async fn fetch_lease_for_sandbox(
 ) -> Result<WorkerLease, StoreError> {
     let row = sqlx::query(
         "SELECT * FROM sandbox_leases WHERE tenant_id = $1 AND sandbox_id = $2 \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
     )
     .bind(tenant)
     .bind(sandbox)
@@ -2011,21 +2096,6 @@ impl PostgresRepository {
         .await
     }
 
-    async fn heartbeat(&self, id: Uuid) -> Result<(), StoreError> {
-        let result = sqlx::query(
-            "UPDATE nodes SET healthy = true, last_heartbeat = now(), version = version + 1 \
-             WHERE id = $1",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(database_error)?;
-        if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
-        }
-        Ok(())
-    }
-
     async fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
         let rows = sqlx::query(
             "SELECT * FROM nodes WHERE healthy = true \
@@ -2482,32 +2552,27 @@ impl PostgresRepository {
         &self,
         heartbeat: WorkerHeartbeat,
     ) -> Result<WorkerStatus, StoreError> {
-        // One transaction, and the ownership question is answered before
-        // anything is written. The two used to be separate autocommit
-        // statements with the UPDATE first, so the row was already marked
-        // healthy with a fresh `last_heartbeat` by the time the refusal was
-        // produced: the worker whose leases had been revoked - and whose
-        // capacity had already been returned - stayed in the placement pool,
-        // and the CLI keeps beating every five seconds after a 409. The
-        // comment below promised "refuse it rather than record it" and the
-        // statement order did the opposite.
+        // Lock lease rows before the node, matching capacity release. Merely
+        // counting under READ COMMITTED could observe an uncommitted revocation
+        // as still active, then refresh the node after that revocation committed.
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         // A node whose leases have all been expired or released owns nothing, so
         // a heartbeat claiming to still be serving sandboxes reports ownership
         // the control plane has already taken back. Refuse it rather than record
         // it: a returning worker must re-register to become schedulable again.
-        let owned: i64 = sqlx::query_scalar(
+        let owned: Vec<Uuid> = sqlx::query_scalar(
             // The expiry predicate matters: a lease that has lapsed on the clock
             // but has not been swept yet still reads as 'active', and that is
             // exactly the window in which a late heartbeat arrives.
-            "SELECT count(*) FROM sandbox_leases \
-             WHERE node_id = $1 AND status = 'active' AND expires_at > now()",
+            "SELECT id FROM sandbox_leases \
+             WHERE node_id = $1 AND status = 'active' AND expires_at > now() \
+             ORDER BY id FOR UPDATE",
         )
         .bind(heartbeat.node_id)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(database_error)?;
-        if owned == 0 && heartbeat.healthy && heartbeat.sandbox_count > 0 {
+        if owned.is_empty() && heartbeat.healthy && heartbeat.sandbox_count > 0 {
             // Rolling back by dropping the transaction keeps the node row
             // exactly as it was: unhealthy is not what this worker is, and a
             // stale heartbeat is not what this worker sent.
@@ -3084,6 +3149,15 @@ impl PostgresRepository {
         let mut actions = Vec::with_capacity(rows.len());
         for row in &rows {
             let lease = lease_from_row(row)?;
+            let sandbox_row = lock_sandbox(&mut tx, lease.tenant_id, lease.sandbox_id).await?;
+            let sandbox = sandbox_from_row(&sandbox_row)?;
+            if matches!(
+                sandbox.state,
+                SandboxState::Destroying | SandboxState::Quarantined
+            ) {
+                // Teardown owns this reservation until runtime stop is confirmed.
+                continue;
+            }
             release_capacity(&mut tx, &lease, "expired", "lease expired").await?;
             let source_key = format!("lease:{}:{}:expired", lease.id, lease.generation);
             let action_id = new_id();
@@ -3226,6 +3300,19 @@ impl PostgresRepository {
         // describe the same row.
         let sandbox_row = lock_sandbox(&mut tx, lease.tenant_id, lease.sandbox_id).await?;
         let sandbox: Sandbox = sandbox_from_row(&sandbox_row)?;
+        // A run's attempt/cleanup executor owns its machines. Generic lease
+        // recovery must not race that executor or resurrect a completed run.
+        // Link installation takes the same sandbox lock, so eligibility and
+        // association cannot change independently during this transaction.
+        let run_owned: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM run_sandboxes WHERE sandbox_id=$1)")
+                .bind(sandbox.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(database_error)?;
+        if run_owned {
+            return Ok(None);
+        }
         // Only a live sandbox is worth recovering: a sandbox that is being stopped,
         // snapshotted or torn down is left to those flows.
         if !matches!(
@@ -3678,9 +3765,23 @@ impl PostgresRepository {
         sandbox_id: Uuid,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Run, StoreError> {
+        // One statement decides all three guards. Written as a check followed by
+        // an update, two concurrent retentions of different machines both pass
+        // the check and the second overwrites the first: the displaced machine
+        // is left with no `retained_until` anywhere, so the sweeper never
+        // selects it and it holds its capacity until someone deletes the
+        // database. Fenced on the current value instead, so the loser writes
+        // nothing at all - and a retry of the *same* machine still succeeds,
+        // because that is the same retention restated, not a second one.
         let row = sqlx::query(
-            "UPDATE runs SET retained_sandbox_id=$1, retained_until=$2 \
-             WHERE tenant_id=$3 AND id=$4 RETURNING *",
+            "UPDATE runs r SET retained_sandbox_id=$1, retained_until=$2 \
+             WHERE r.tenant_id=$3 AND r.id=$4 \
+               AND (r.retained_sandbox_id IS NULL OR r.retained_sandbox_id=$1) \
+               AND EXISTS (SELECT 1 FROM sandboxes s \
+                 WHERE s.id=$1 AND s.tenant_id=$3) \
+               AND EXISTS (SELECT 1 FROM run_sandboxes rs \
+                 WHERE rs.run_id=r.id AND rs.sandbox_id=$1) \
+             RETURNING r.*",
         )
         .bind(sandbox_id)
         .bind(until)
@@ -3688,9 +3789,18 @@ impl PostgresRepository {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(database_error)?
-        .ok_or(StoreError::NotFound)?;
-        run_from_row(&row)
+        .map_err(database_error)?;
+        match row {
+            Some(row) => run_from_row(&row),
+            None => Err(run_child_refusal(
+                &self.pool,
+                tenant,
+                id,
+                Some(sandbox_id),
+                ChildAssociation::Retained,
+            )
+            .await),
+        }
     }
 
     async fn record_retention_cleanup_failure(
@@ -3749,14 +3859,41 @@ impl PostgresRepository {
     }
 
     async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
-        let result = sqlx::query("DELETE FROM runs WHERE tenant_id = $1 AND id = $2")
+        // A run that still holds a machine cannot be deleted, and the reason is
+        // the same one keeps `retained_until` from being optional bookkeeping:
+        // `runs_retained_until_idx` is how the sweeper finds the machine it owes
+        // a reclaim, and `run_sandboxes` is how cleanup finds the machines a run
+        // still owns. Deleting the row removes both indexes with nothing else
+        // pointing at the machines, so a deleted run keeps its vCPUs debited for
+        // the life of the database and its containers running with nothing left
+        // to tear them down. One statement has to decide this, because a check
+        // followed by the delete is the same window everything else here closed.
+        let result = sqlx::query(
+            "DELETE FROM runs r WHERE r.tenant_id = $1 AND r.id = $2 \
+               AND r.retained_sandbox_id IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM run_sandboxes rs WHERE rs.run_id = r.id)",
+        )
+        .bind(tenant)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(run_history_is_append_only)?;
+        if result.rows_affected() == 0 {
+            // Refused and absent are different answers: a caller that already
+            // deleted its run, and one whose run is still holding a machine.
+            let held = sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM runs WHERE tenant_id = $1 AND id = $2",
+            )
             .bind(tenant)
             .bind(id)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await
-            .map_err(run_history_is_append_only)?;
-        if result.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
+            .map_err(database_error)?;
+            return Err(if held.is_some() {
+                StoreError::Conflict("run still owns a machine".into())
+            } else {
+                StoreError::NotFound
+            });
         }
         Ok(())
     }
@@ -3764,7 +3901,7 @@ impl PostgresRepository {
     /// Appends one run event. There is deliberately no update or delete path:
     /// the table's triggers reject both, so a mistake has to be answered with a
     /// correcting event rather than an edit to the record of what happened.
-    async fn append_run_event(&self, value: RunEvent) -> Result<(), StoreError> {
+    async fn append_run_event(&self, tenant: Uuid, value: RunEvent) -> Result<(), StoreError> {
         if value.event_type.trim().is_empty() {
             return Err(StoreError::Conflict("a run event needs a type".into()));
         }
@@ -3773,10 +3910,16 @@ impl PostgresRepository {
                 "a run event detail must be a JSON object".into(),
             ));
         }
-        ensure_run(&self.pool, value.run_id).await?;
-        sqlx::query(
+        // Selected from the tenant's own run rather than inserted against a run
+        // id: `run_events` holds no tenant and no foreign key on the machine it
+        // may name, so a statement that does not carry both predicates stores a
+        // row another tenant's machine is readable through.
+        let written = sqlx::query(
             "INSERT INTO run_events (id, run_id, sandbox_id, type, occurred_at, detail) \
-             VALUES ($1,$2,$3,$4,$5,$6)",
+             SELECT $1::uuid, r.id, $3::uuid, $4::text, $5::timestamptz, $6::jsonb \
+             FROM runs r WHERE r.id = $2 AND r.tenant_id = $7 \
+               AND ($3::uuid IS NULL OR EXISTS (SELECT 1 FROM sandboxes s \
+                 WHERE s.id = $3 AND s.tenant_id = r.tenant_id))",
         )
         .bind(value.id)
         .bind(value.run_id)
@@ -3784,9 +3927,20 @@ impl PostgresRepository {
         .bind(value.event_type)
         .bind(value.occurred_at)
         .bind(value.detail)
+        .bind(tenant)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
+        if written.rows_affected() != 1 {
+            return Err(run_child_refusal(
+                &self.pool,
+                tenant,
+                value.run_id,
+                value.sandbox_id,
+                ChildAssociation::Owned,
+            )
+            .await);
+        }
         Ok(())
     }
 
@@ -3805,25 +3959,57 @@ impl PostgresRepository {
         rows.iter().map(run_event_from_row).collect()
     }
 
-    async fn link_run_sandbox(&self, value: RunSandbox) -> Result<(), StoreError> {
+    async fn link_run_sandbox(&self, tenant: Uuid, value: RunSandbox) -> Result<(), StoreError> {
         if value.role.trim().is_empty() {
             return Err(StoreError::Conflict("a run sandbox needs a role".into()));
         }
-        ensure_run(&self.pool, value.run_id).await?;
-        // Relinking the same machine is a change of purpose -- a retry takes
-        // over the role its first attempt had -- so the link is restated rather
-        // than duplicated, and a retried link of the same machine and role is a
-        // no-op instead of a unique violation.
-        sqlx::query(
-            "INSERT INTO run_sandboxes (run_id, sandbox_id, role) VALUES ($1,$2,$3) \
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        match lock_sandbox(&mut tx, tenant, value.sandbox_id).await {
+            Ok(_) => {}
+            Err(StoreError::NotFound) => {
+                return Err(run_child_refusal(
+                    &mut *tx,
+                    tenant,
+                    value.run_id,
+                    Some(value.sandbox_id),
+                    ChildAssociation::Owned,
+                )
+                .await);
+            }
+            Err(error) => return Err(error),
+        }
+        // The run and the machine have to be the same tenant's, and that is
+        // decided by the join rather than by a lookup a caller could race: the
+        // pair either lands whole or does not land at all. Relinking the same
+        // machine is a change of purpose -- a retry takes over the role its
+        // first attempt had -- so the link is restated rather than duplicated,
+        // and a retried link of the same machine and role is a no-op instead of
+        // a unique violation.
+        let written = sqlx::query(
+            "INSERT INTO run_sandboxes (run_id, sandbox_id, role) \
+             SELECT r.id, s.id, $3::text FROM runs r \
+             JOIN sandboxes s ON s.id = $2 AND s.tenant_id = r.tenant_id \
+             WHERE r.id = $1 AND r.tenant_id = $4 \
              ON CONFLICT (run_id, sandbox_id) DO UPDATE SET role = EXCLUDED.role",
         )
         .bind(value.run_id)
         .bind(value.sandbox_id)
         .bind(value.role)
-        .execute(&self.pool)
+        .bind(tenant)
+        .execute(&mut *tx)
         .await
         .map_err(database_error)?;
+        if written.rows_affected() != 1 {
+            return Err(run_child_refusal(
+                &mut *tx,
+                tenant,
+                value.run_id,
+                Some(value.sandbox_id),
+                ChildAssociation::Owned,
+            )
+            .await);
+        }
+        tx.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -3847,18 +4033,24 @@ impl PostgresRepository {
 
     /// Starts an attempt or imports already-completed historical evidence.
     /// Allocation assigns compute once; completion seals the attempt once.
-    async fn record_run_attempt(&self, value: RunAttempt) -> Result<(), StoreError> {
+    async fn record_run_attempt(&self, tenant: Uuid, value: RunAttempt) -> Result<(), StoreError> {
         if value.attempt_number <= 0 {
             return Err(StoreError::Conflict(
                 "a run attempt number must be positive".into(),
             ));
         }
         let state = attempt_state_as_str(value.state)?;
-        ensure_run(&self.pool, value.run_id).await?;
-        sqlx::query(
+        // Same shape as the other child writes: the run is selected under its
+        // tenant, and a machine the attempt names has to be that tenant's.
+        let written = sqlx::query(
             "INSERT INTO run_attempts \
              (id, run_id, attempt_number, sandbox_id, state, failure_reason, started_at, \
-              completed_at,placement,results) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+              completed_at, placement, results) \
+             SELECT $1::uuid, r.id, $3::integer, $4::uuid, $5::text, $6::text, \
+                    $7::timestamptz, $8::timestamptz, $9::jsonb, $10::jsonb \
+             FROM runs r WHERE r.id = $2 AND r.tenant_id = $11 \
+               AND ($4::uuid IS NULL OR EXISTS (SELECT 1 FROM sandboxes s \
+                 WHERE s.id = $4 AND s.tenant_id = r.tenant_id))",
         )
         .bind(value.id)
         .bind(value.run_id)
@@ -3870,9 +4062,20 @@ impl PostgresRepository {
         .bind(value.completed_at)
         .bind(serde_json::to_value(&value.placement)?)
         .bind(serde_json::to_value(&value.results)?)
+        .bind(tenant)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
+        if written.rows_affected() != 1 {
+            return Err(run_child_refusal(
+                &self.pool,
+                tenant,
+                value.run_id,
+                value.sandbox_id,
+                ChildAssociation::Owned,
+            )
+            .await);
+        }
         Ok(())
     }
 
@@ -4295,9 +4498,6 @@ impl MetadataStore for PostgresRepository {
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
         Self::register_node(self, value).await.map_err(core_error)
     }
-    async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError> {
-        Self::heartbeat(self, id).await.map_err(core_error)
-    }
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
         Self::list_nodes(self).await.map_err(core_error)
     }
@@ -4675,8 +4875,8 @@ impl MetadataStore for PostgresRepository {
     async fn delete_run(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
         Self::delete_run(self, tenant, id).await.map_err(core_error)
     }
-    async fn append_run_event(&self, event: RunEvent) -> Result<(), CoreError> {
-        Self::append_run_event(self, event)
+    async fn append_run_event(&self, tenant: Uuid, event: RunEvent) -> Result<(), CoreError> {
+        Self::append_run_event(self, tenant, event)
             .await
             .map_err(core_error)
     }
@@ -4685,8 +4885,10 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn link_run_sandbox(&self, link: RunSandbox) -> Result<(), CoreError> {
-        Self::link_run_sandbox(self, link).await.map_err(core_error)
+    async fn link_run_sandbox(&self, tenant: Uuid, link: RunSandbox) -> Result<(), CoreError> {
+        Self::link_run_sandbox(self, tenant, link)
+            .await
+            .map_err(core_error)
     }
     async fn list_run_sandboxes(
         &self,
@@ -4697,8 +4899,8 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn record_run_attempt(&self, attempt: RunAttempt) -> Result<(), CoreError> {
-        Self::record_run_attempt(self, attempt)
+    async fn record_run_attempt(&self, tenant: Uuid, attempt: RunAttempt) -> Result<(), CoreError> {
+        Self::record_run_attempt(self, tenant, attempt)
             .await
             .map_err(core_error)
     }
@@ -5653,6 +5855,75 @@ pub(crate) mod tests {
             "the refused heartbeat recorded a sandbox count it does not have"
         );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    #[tokio::test]
+    async fn lease_revocation_cannot_race_a_healthy_heartbeat() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let mut revoke = repository.pool.begin().await.unwrap();
+        sqlx::query("UPDATE sandbox_leases SET status='expired', expires_at=now()-interval '1 second' WHERE id=$1")
+            .bind(scheduled.lease_id).execute(&mut *revoke).await.unwrap();
+        sqlx::query(
+            "UPDATE nodes SET healthy=false, last_heartbeat=now()-interval '1 hour' WHERE id=$1",
+        )
+        .bind(node_id)
+        .execute(&mut *revoke)
+        .await
+        .unwrap();
+        // The isolated pool has two connections: revoke holds one, and the
+        // heartbeat uses this other backend. Wait for an actual database lock,
+        // not a timing assumption about which task has reached its UPDATE.
+        let mut connection = repository.pool.acquire().await.unwrap();
+        let heartbeat_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+        let heartbeats = repository.clone();
+        let beat = tokio::spawn(async move {
+            heartbeats
+                .heartbeat_worker(WorkerHeartbeat {
+                    node_id,
+                    sandbox_count: 1,
+                    healthy: true,
+                    version: 1,
+                    metadata: json!({}),
+                    last_error: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')",
+                ).bind(heartbeat_pid).fetch_one(&admin).await.unwrap();
+                if blocked { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("heartbeat did not reach the held database lock");
+        revoke.commit().await.unwrap();
+        let result = beat.await.unwrap();
+        let after = repository.get_worker(node_id).await.unwrap();
+        drop_test_schema(&repository, admin, schema).await;
+        assert!(
+            matches!(result, Err(StoreError::Conflict(_))),
+            "a revoked owner refreshed the node instead of refusing the heartbeat"
+        );
+        assert!(!after.registration.healthy);
+        assert_eq!(after.observed_sandbox_count, 0);
     }
 
     #[tokio::test]
@@ -7481,6 +7752,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// A machine that exists as a row and is linked to the run, which is what
+    /// a retention now requires of the machine it keeps: an id nobody ever
+    /// handed the run is not a machine the run held.
+    async fn linked_machine(repository: &PostgresRepository, tenant: Uuid, run: Uuid) -> Uuid {
+        let machine = sandbox(tenant);
+        let id = machine.id;
+        repository.create_sandbox(machine).await.unwrap();
+        repository
+            .link_run_sandbox(
+                tenant,
+                RunSandbox {
+                    run_id: run,
+                    sandbox_id: id,
+                    role: "primary".into(),
+                },
+            )
+            .await
+            .unwrap();
+        id
+    }
+
     fn run_event(run: Uuid, event_type: &str, offset_seconds: i64) -> RunEvent {
         RunEvent {
             id: new_id(),
@@ -7685,7 +7977,7 @@ pub(crate) mod tests {
         let outsider = other_tenant(&repository).await;
         let value = repository.create_run(run(tenant)).await.unwrap();
         repository
-            .append_run_event(run_event(value.id, "run.created", 0))
+            .append_run_event(tenant, run_event(value.id, "run.created", 0))
             .await
             .unwrap();
         repository
@@ -7866,7 +8158,7 @@ pub(crate) mod tests {
             .enumerate()
         {
             repository
-                .append_run_event(run_event(value.id, kind, offset as i64))
+                .append_run_event(tenant, run_event(value.id, kind, offset as i64))
                 .await
                 .unwrap();
         }
@@ -7886,7 +8178,7 @@ pub(crate) mod tests {
         // database failure the caller cannot act on.
         assert!(matches!(
             store(&repository)
-                .append_run_event(run_event(new_id(), "run.created", 0))
+                .append_run_event(tenant, run_event(new_id(), "run.created", 0))
                 .await,
             Err(CoreError::NotFound(_))
         ));
@@ -7948,11 +8240,14 @@ pub(crate) mod tests {
         repository.create_sandbox(machine).await.unwrap();
         let value = repository.create_run(run(tenant)).await.unwrap();
         repository
-            .link_run_sandbox(RunSandbox {
-                run_id: value.id,
-                sandbox_id,
-                role: "primary".into(),
-            })
+            .link_run_sandbox(
+                tenant,
+                RunSandbox {
+                    run_id: value.id,
+                    sandbox_id,
+                    role: "primary".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -7961,18 +8256,21 @@ pub(crate) mod tests {
             (2, RunState::Succeeded, None),
         ] {
             repository
-                .record_run_attempt(RunAttempt {
-                    id: new_id(),
-                    run_id: value.id,
-                    attempt_number: number,
-                    sandbox_id: Some(sandbox_id),
-                    state,
-                    failure_reason: reason.map(str::to_owned),
-                    started_at: Utc::now(),
-                    completed_at: Some(Utc::now()),
-                    placement: Default::default(),
-                    results: Default::default(),
-                })
+                .record_run_attempt(
+                    tenant,
+                    RunAttempt {
+                        id: new_id(),
+                        run_id: value.id,
+                        attempt_number: number,
+                        sandbox_id: Some(sandbox_id),
+                        state,
+                        failure_reason: reason.map(str::to_owned),
+                        started_at: Utc::now(),
+                        completed_at: Some(Utc::now()),
+                        placement: Default::default(),
+                        results: Default::default(),
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -8025,35 +8323,41 @@ pub(crate) mod tests {
         // that is not a try, and a second attempt cannot rewrite the first.
         assert!(matches!(
             store(&repository)
-                .record_run_attempt(RunAttempt {
-                    id: new_id(),
-                    run_id: value.id,
-                    attempt_number: 3,
-                    sandbox_id: None,
-                    state: RunState::Queued,
-                    failure_reason: None,
-                    started_at: Utc::now(),
-                    completed_at: None,
-                    placement: Default::default(),
-                    results: Default::default(),
-                })
+                .record_run_attempt(
+                    tenant,
+                    RunAttempt {
+                        id: new_id(),
+                        run_id: value.id,
+                        attempt_number: 3,
+                        sandbox_id: None,
+                        state: RunState::Queued,
+                        failure_reason: None,
+                        started_at: Utc::now(),
+                        completed_at: None,
+                        placement: Default::default(),
+                        results: Default::default(),
+                    },
+                )
                 .await,
             Err(CoreError::Conflict(_))
         ));
         assert!(matches!(
             store(&repository)
-                .record_run_attempt(RunAttempt {
-                    id: new_id(),
-                    run_id: value.id,
-                    attempt_number: 1,
-                    sandbox_id: None,
-                    state: RunState::Succeeded,
-                    failure_reason: None,
-                    started_at: Utc::now(),
-                    completed_at: None,
-                    placement: Default::default(),
-                    results: Default::default(),
-                })
+                .record_run_attempt(
+                    tenant,
+                    RunAttempt {
+                        id: new_id(),
+                        run_id: value.id,
+                        attempt_number: 1,
+                        sandbox_id: None,
+                        state: RunState::Succeeded,
+                        failure_reason: None,
+                        started_at: Utc::now(),
+                        completed_at: None,
+                        placement: Default::default(),
+                        results: Default::default(),
+                    },
+                )
                 .await,
             Err(CoreError::Conflict(_))
         ));
@@ -8068,13 +8372,83 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_that_still_holds_a_machine_cannot_be_deleted_out_from_under_it() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let machine = sandbox(tenant);
+        let sandbox_id = machine.id;
+        repository.create_sandbox(machine).await.unwrap();
+
+        // A linked machine is cleanup's only index onto it.
+        let linked = repository.create_run(run(tenant)).await.unwrap();
+        repository
+            .link_run_sandbox(
+                tenant,
+                RunSandbox {
+                    run_id: linked.id,
+                    sandbox_id,
+                    role: "primary".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store(&repository).delete_run(tenant, linked.id).await,
+                Err(CoreError::Conflict(_))
+            ),
+            "a run that still names a machine was deleted, stranding it"
+        );
+        assert!(repository.get_run(tenant, linked.id).await.is_ok());
+
+        // A retained machine is the sweeper's only index onto it, and retention
+        // is only ever recorded for a machine the run used.
+        let retained = repository.create_run(run(tenant)).await.unwrap();
+        repository
+            .link_run_sandbox(
+                tenant,
+                RunSandbox {
+                    run_id: retained.id,
+                    sandbox_id,
+                    role: "primary".into(),
+                },
+            )
+            .await
+            .unwrap();
+        repository
+            .retain_run_sandbox(
+                tenant,
+                retained.id,
+                sandbox_id,
+                Utc::now() + chrono::Duration::hours(1),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| panic!("retention of a linked machine: {error:?}"));
+        assert!(
+            matches!(
+                store(&repository).delete_run(tenant, retained.id).await,
+                Err(CoreError::Conflict(_))
+            ),
+            "a run that still retains a machine was deleted before it was reclaimed"
+        );
+
+        // Refused is not the same answer as absent.
+        assert!(matches!(
+            store(&repository).delete_run(tenant, new_id()).await,
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn a_run_with_recorded_history_is_kept_and_one_without_it_is_removed() {
         let Some((repository, tenant)) = repository_and_tenant().await else {
             return;
         };
         let with_history = repository.create_run(run(tenant)).await.unwrap();
         repository
-            .append_run_event(run_event(with_history.id, "run.created", 0))
+            .append_run_event(tenant, run_event(with_history.id, "run.created", 0))
             .await
             .unwrap();
         assert!(
@@ -8165,7 +8539,7 @@ pub(crate) mod tests {
         let mut reported = run(tenant);
         reported.state = RunState::Failed;
         repository.create_run(reported.clone()).await.unwrap();
-        let machine = new_id();
+        let machine = linked_machine(&repository, tenant, reported.id).await;
         let held = repository
             .retain_run_sandbox(
                 tenant,
@@ -8235,14 +8609,15 @@ pub(crate) mod tests {
             Err(StoreError::NotFound)
         ));
 
-        // A report about an earlier machine outlives the release of the one
-        // that follows it. It is recorded while that machine is the retained
-        // one, and clearing a later machine must not take it with it.
+        // A run already keeping a machine cannot be made to keep a different
+        // one. Overwriting is how the first machine ends up with a row nothing
+        // selects: the sweeper acts on `retained_until`, so the displaced
+        // machine is never reclaimed and holds its capacity forever.
         let mut other = run(tenant);
         other.state = RunState::Failed;
         repository.create_run(other.clone()).await.unwrap();
-        let kept = new_id();
-        let released = new_id();
+        let kept = linked_machine(&repository, tenant, other.id).await;
+        let second = linked_machine(&repository, tenant, other.id).await;
         repository
             .retain_run_sandbox(tenant, other.id, kept, now + chrono::Duration::hours(1))
             .await
@@ -8251,21 +8626,33 @@ pub(crate) mod tests {
             .record_retention_cleanup_failure(tenant, other.id, kept, "still broken".into())
             .await
             .unwrap();
-        repository
-            .retain_run_sandbox(tenant, other.id, released, now + chrono::Duration::hours(1))
-            .await
-            .unwrap();
+        assert!(
+            matches!(
+                repository
+                    .retain_run_sandbox(tenant, other.id, second, now + chrono::Duration::hours(1))
+                    .await,
+                Err(StoreError::Conflict(_))
+            ),
+            "a second machine may not displace the one the run is already keeping"
+        );
+        assert_eq!(
+            repository
+                .get_run(tenant, other.id)
+                .await
+                .unwrap()
+                .retained_sandbox_id,
+            Some(kept),
+            "the refused retention left the machine that was already kept in place"
+        );
         let swept = repository
-            .clear_run_retention(tenant, other.id, released)
+            .clear_run_retention(tenant, other.id, kept)
             .await
             .unwrap();
-        let survivor = swept
-            .results
-            .cleanup_failed
-            .expect("another machine's failed teardown is still true");
-        assert_eq!(survivor.sandbox_id, kept);
-        assert_eq!(survivor.error, "still broken");
         assert_eq!(swept.retained_sandbox_id, None);
+        assert!(
+            swept.results.cleanup_failed.is_none(),
+            "the machine that was released takes its own failed teardown with it"
+        );
 
         // A report for a machine this run is not retaining is refused outright
         // rather than filed against whoever currently holds the machine.
@@ -8280,6 +8667,164 @@ pub(crate) mod tests {
         ));
 
         drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// The tables hanging off a run carry no tenant of their own, so the tenant
+    /// has to arrive with the write. Without it the link list - the exact ids
+    /// cleanup reads to tear machines down - accepts any machine id in the
+    /// database: cleanup then fails closed on a machine it can never destroy,
+    /// reports the failure against a run that never held it, and the foreign
+    /// tenant's machine is destroyed instead once the report is acted on.
+    #[tokio::test]
+    async fn a_run_only_links_keeps_and_records_machines_from_its_own_tenant() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let outsider = other_tenant(&repository).await;
+        let until = whole_microsecond_ago(0) + chrono::Duration::hours(1);
+        let value = repository.create_run(run(tenant)).await.unwrap();
+
+        let theirs = sandbox(outsider);
+        let theirs_id = theirs.id;
+        repository.create_sandbox(theirs).await.unwrap();
+
+        assert!(matches!(
+            repository
+                .link_run_sandbox(
+                    tenant,
+                    RunSandbox {
+                        run_id: value.id,
+                        sandbox_id: theirs_id,
+                        role: "primary".into(),
+                    },
+                )
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            repository
+                .list_run_sandboxes(tenant, value.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused link leaves nothing behind for cleanup to find"
+        );
+
+        let mut named = run_event(value.id, "sandbox.assigned", 0);
+        named.sandbox_id = Some(theirs_id);
+        assert!(matches!(
+            repository.append_run_event(tenant, named).await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            repository
+                .list_run_events(tenant, value.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "history is append-only, so a refused event must leave no row either"
+        );
+        assert!(matches!(
+            repository
+                .record_run_attempt(
+                    tenant,
+                    RunAttempt {
+                        id: new_id(),
+                        run_id: value.id,
+                        attempt_number: 1,
+                        sandbox_id: Some(theirs_id),
+                        state: RunState::Running,
+                        failure_reason: None,
+                        started_at: Utc::now(),
+                        completed_at: None,
+                        placement: Default::default(),
+                        results: Default::default(),
+                    },
+                )
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(
+            repository
+                .list_run_attempts(tenant, value.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(matches!(
+            repository
+                .retain_run_sandbox(tenant, value.id, theirs_id, until)
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            repository
+                .get_run(tenant, value.id)
+                .await
+                .unwrap()
+                .retained_sandbox_id,
+            None
+        );
+
+        // A machine of this tenant's own that the run never used is refused for
+        // the neighbouring reason: retention and the link list have to agree,
+        // or cleanup tears down the machine the run asked to keep.
+        let unlinked = sandbox(tenant);
+        let unlinked_id = unlinked.id;
+        repository.create_sandbox(unlinked).await.unwrap();
+        assert!(matches!(
+            repository
+                .retain_run_sandbox(tenant, value.id, unlinked_id, until)
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            repository
+                .get_run(tenant, value.id)
+                .await
+                .unwrap()
+                .retained_sandbox_id,
+            None
+        );
+
+        let kept = linked_machine(&repository, tenant, value.id).await;
+        let second = linked_machine(&repository, tenant, value.id).await;
+        let retained = repository
+            .retain_run_sandbox(tenant, value.id, kept, until)
+            .await
+            .unwrap();
+        assert_eq!(retained.retained_sandbox_id, Some(kept));
+
+        // Restating the same retention is a retry of one decision, not a second
+        // one, so it succeeds and takes the later expiry.
+        let later = whole_microsecond_ago(0) + chrono::Duration::hours(2);
+        let retried = repository
+            .retain_run_sandbox(tenant, value.id, kept, later)
+            .await
+            .unwrap();
+        assert_eq!(retried.retained_until, Some(later));
+
+        assert!(matches!(
+            repository
+                .retain_run_sandbox(tenant, value.id, second, until)
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            repository.get_run(tenant, value.id).await.unwrap(),
+            retried,
+            "the refused second machine left the first one's retention untouched"
+        );
+
+        // Another tenant naming this run gets no answer at all: whether the run
+        // exists is not theirs to learn.
+        assert!(matches!(
+            repository
+                .retain_run_sandbox(outsider, value.id, kept, until)
+                .await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     /// A failure is one fact about a run: what it produced, why it stopped, and
@@ -8375,6 +8920,71 @@ pub(crate) mod tests {
             Err(StoreError::NotFound)
         ));
 
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    #[tokio::test]
+    async fn run_owned_machines_are_not_rebuilt_by_generic_lease_recovery() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let old_worker = register_worker_with(&repository, tenant, 4, 256, 4096).await;
+        let new_worker = register_worker_with(&repository, tenant, 4, 256, 4096).await;
+        for state in [RunState::Running, RunState::Succeeded] {
+            let mut owner = run(tenant);
+            owner.state = state;
+            repository.create_run(owner.clone()).await.unwrap();
+            let scheduled = schedule_test_sandbox(
+                &repository,
+                tenant,
+                new_id(),
+                sandbox(tenant),
+                Some(old_worker),
+            )
+            .await
+            .unwrap();
+            repository
+                .link_run_sandbox(
+                    tenant,
+                    RunSandbox {
+                        run_id: owner.id,
+                        sandbox_id: scheduled.sandbox.id,
+                        role: "primary".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            expire_lease(&repository, scheduled.lease_id).await;
+            let before = repository.get_worker(new_worker).await.unwrap();
+            let recovered = repository
+                .reassign_expired_lease(scheduled.lease_id)
+                .await
+                .unwrap();
+            let after = repository.get_worker(new_worker).await.unwrap();
+            assert!(
+                recovered.is_none(),
+                "generic recovery must not rebuild a run attempt in {state:?}"
+            );
+            assert_eq!(
+                after.registration.available_vcpus,
+                before.registration.available_vcpus
+            );
+            assert_eq!(
+                after.registration.available_memory_bytes,
+                before.registration.available_memory_bytes
+            );
+            assert_eq!(
+                after.registration.available_disk_bytes,
+                before.registration.available_disk_bytes
+            );
+            assert!(
+                repository
+                    .get_active_worker_lease(tenant, scheduled.sandbox.id)
+                    .await
+                    .is_err()
+            );
+        }
         drop_test_schema(&repository, admin, schema).await;
     }
 }

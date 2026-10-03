@@ -389,14 +389,6 @@ impl MemoryRepository {
         Ok(id)
     }
 
-    async fn heartbeat(&self, id: Uuid) -> Result<(), StoreError> {
-        let mut data = self.data.write().await;
-        let node = data.nodes.get_mut(&id).ok_or(StoreError::NotFound)?;
-        node.last_heartbeat = Utc::now();
-        node.healthy = true;
-        Ok(())
-    }
-
     async fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
         Ok(self
             .data
@@ -909,10 +901,6 @@ impl MetadataStore for MemoryRepository {
 
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
         Self::register_node(self, value).await.map_err(core_error)
-    }
-
-    async fn heartbeat(&self, id: Uuid) -> Result<(), CoreError> {
-        Self::heartbeat(self, id).await.map_err(core_error)
     }
 
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {

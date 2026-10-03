@@ -303,12 +303,10 @@ four. The effective limit is now
 `min(DEFAULT_TOOL_OUTPUT_BYTES, 4096, task.max_tool_output_bytes)`.
 
 The compressor itself undercounted: the truncation marker was appended *after*
-the limit was met, so a 1024-byte ceiling produced up to 1024 + marker bytes.
-The head/tail split now counts the marker against `limit` and solves the
-remaining split in a bounded monotone loop, which matters because a single pass
-does not converge when the head byte count snaps back off a UTF-8 boundary. A
-limit smaller than the marker itself (~66 bytes) returns the marker and exceeds
-the limit: returning an empty string or dropping the notice are both worse.
+the limit was met. It now reserves the longest possible marker before splitting
+the remaining head/tail budget on UTF-8 boundaries. A nonzero limit smaller
+than the descriptive marker keeps a UTF-8-safe prefix followed by `~`; a zero
+limit produces no output. Neither marker can exceed the caller's byte ceiling.
 
 ### Every result document reported `head_before: null`
 
@@ -339,27 +337,22 @@ unborn repository, an unreadable index) produced byte-for-byte what a clean
 working tree produces: "the agent changed nothing", asserted as evidence.
 Failures now propagate, and `collect_after` records each one in the new
 `GitEvidence.errors` field instead of defaulting. The `changed_files` fallback
-also split `--name-only` output on newlines rather than the NUL separator, so a
-renamed file produced a single entry naming both paths.
+now requests NUL-separated `--name-only -z` output, preserving paths that Git
+would otherwise C-quote, including filenames containing newlines.
 
-### A provider that had already refused was asked three more times
+### Permanent provider refusals were retried
 
-Every non-success response became `HarnessError::Model`, which `Client::complete`
-retries with a bounded backoff. A bad key, a model the provider has never heard
-of, or a body it will not parse is a statement about *this* request and is
-repeated exactly, so a run that was never going to succeed paid three attempts
-— and, on a billed endpoint, three charges — to learn what one had already said.
-Responses are now classified: 429, 5xx and 3xx stay `Model` (the endpoint or
-its capacity, not the request); every other 4xx becomes the new
-`HarnessError::ModelRefused`, which leaves on the first attempt carrying the
-provider's own text.
+Every non-success response became `HarnessError::Model`, which
+`Client::complete` retries with bounded backoff for three total attempts.
+Permanent request refusals now become `HarnessError::ModelRefused` and return
+after one attempt. HTTP 429, 5xx and 3xx remain retryable. Loopback tests observe
+one request for 401 and three for 503; no provider billing claim is made.
 
-### Truncated validation evidence ended in the literal word `true`
+### Truncated validation evidence ended in a formatted boolean
 
-`tail` appended `text[..start].is_empty()` into the formatted string, so every
-truncated validation's evidence — in the result document, in the summary, and
-in anything reading them as prose — ended with a formatted boolean. The ellipsis
-is the whole marker; the bool is gone.
+`tail` appended `text[..start].is_empty()` into the formatted string, adding
+the literal word `false` to truncated output. The result now contains only the
+ellipsis and retained validation output.
 
 ### A result document that could not be saved still returned the earned code
 
@@ -370,41 +363,141 @@ document and returns 2 when the save fails, and the task's own error is printed
 to stderr *before* the save is attempted, so an unwritable directory cannot
 replace the only complaint the operator gets to read.
 
-Every item in this section ships with a regression that fails on the old
-behaviour. The retry classification is counted rather than inferred: a loopback
-endpoint that answers every request with one status is asked exactly once for a
-401 and exactly three times for a 503.
+Regressions exercise compaction, ledger accounting, output ceilings, Git
+collection, retry classification, validation output and result-save failures.
+The retry test observes one request for 401 and three for 503.
+
+### Comparison summaries discarded successful task output
+
+`SideSummary::from_runs` now includes setup, task and validation stdout/stderr
+in `last_output`, followed by any failure reason. The existing
+`successful_task_and_failed_validation_outputs_remain_visible` regression
+asserts both `TASK_REACHED` and `CHECK_FAILED`. The previously recorded
+observation of empty comparison output described an older build.
+
+## Fixed in the 2026-10-03 audit: ownership boundaries
+
+### A retried provisioning request could destroy the original request's machine
+
+The rollback's state check was not an ownership check. `Creating` is exactly the
+state a retry finds the row in, the read and the destroy were separate
+statements, and both requests carry the same idempotency key, so nothing
+distinguished the winner from the retry that failed its way into teardown.
+
+Ownership is now established and checked atomically:
+
+- `Scheduler::schedule_for_provision` returns `ProvisionAdmission { scheduled,
+  acquired }`, decided inside the store's admission transaction. The default
+  trait implementation answers `Unsupported`: a scheduler that cannot prove who
+  owns a row fails provisioning closed instead of guessing.
+- A replay (`acquired == false`) is refused with `409 sandbox_provisioning`
+  while the row is still `Creating`/`Starting`, and returns the completed
+  sandbox otherwise. It never reaches create/start, so it cannot fail its way
+  into a rollback.
+- Rollback begins teardown with one compare-and-set that moves
+  `Creating`/`Starting` to `Destroying` and is fenced on the lease this call
+  acquired. A lost race destroys nothing and is reported as
+  `409 sandbox_not_owned`. `Destroying` is refused by admission and by lease
+  recovery, so once teardown has started no other path can install a
+  replacement owner.
+- Runtime dispatch inside that call carries the originally acquired
+  `WorkerDispatch` through a task-local provisioning scope rather than
+  re-resolving the current owner, so teardown cannot be delivered to the
+  worker that replaced this attempt.
+- State commits use `update_state_with_lease` with the original lease id.
+  Renewals on the same lease advance the generation and are still accepted, so
+  a machine that is legitimately claimed mid-start is not refused by its owner.
+
+Reproduced against `13f7d3e` with a real PostgreSQL store, the real
+`WorkerRuntime` over a gated worker double, and two concurrent provisions
+sharing one idempotency key while the first was blocked in `create`: the retry
+was refused and still dispatched a `destroy` for the winner's lease.
+
+### Runs could record another tenant's machine
+
+`append_run_event`, `link_run_sandbox` and `record_run_attempt` took no tenant.
+Each was scoped by its run id alone, so the sandbox id they recorded was never
+checked against the run's own tenant: an event, a link or an attempt could name
+another tenant's machine, and `link_run_sandbox` is the list cleanup tears
+down. The three now take the tenant and refuse, atomically and with no row
+written, when the named machine is not that tenant's own. `retain_run_sandbox`
+requires the run to have used the machine before it may keep it.
+
+Reproduced against the pushed revision `13f7d3e` with two PostgreSQL tests
+(`crates/aiec-storage/src/postgres.rs`, run in a worktree at that commit): a run
+accepted tenant B's machine and its link list then held the foreign id, and a
+run retained a machine it had never used.
+
+### Deleting a run stranded the machines it still held
+
+`delete_run` was `DELETE FROM runs WHERE tenant_id = $1 AND id = $2` with one
+refusal, the append-only `run_events` trigger. It had no opinion about
+machines, and the run row plus its `run_sandboxes` links are the only indexes
+that lead to them: the sweeper selects on `retained_until` to know what it owes
+a reclaim, and cleanup reads the links to know what to tear down. Deleting a
+run that still held a machine cascaded the links away and took the retention
+pointer with them, so the machine kept its vCPUs debited and its container
+running with nothing left pointing at it — the same end state as the retention
+displacement above, reached by a different statement.
+
+The delete now refuses, in the same statement that deletes, while the run
+retains a machine or names one, and distinguishes refused from absent so a
+caller that already deleted its run still gets `NotFound`. Reproduced against
+`13f7d3e`: the delete returned `Ok` and the link list read `[]`.
+
+### Retention could be handed to another machine
+
+`retain_run_sandbox` set `retained_sandbox_id` unconditionally after checking
+the run. A second retention for the same run replaced the first, leaving the
+earlier machine with no `retained_until` anywhere: never reclaimed, never
+destroyed, holding its capacity for as long as the process lived. Retention is
+reachable more than once for one run because `allow_retention` is set by
+per-attempt outcome, so an attempt that failed during setup retains, and a
+later attempt can retain its own machine. The decision is now one statement:
+only a machine the run linked may be retained, restating the same retention is
+a retry that takes the later expiry, and a different machine is refused with
+the first retention untouched.
+
+### Lease recovery rebuilt a run's machines
+
+`reassign_expired_lease` is generic lease recovery: it expires a lease and
+rebuilds the sandbox. A run's attempt executor and cleanup own their machines
+and re-places them on retry, so recovery and the executor were two writers for
+one machine — and the six containers observed reappearing with unchanged
+sandbox ids after their runs finished have a path in the repository:
+`crates/aiec-cli` posts `/v1/workers/reconcile` on startup and every ten
+seconds, which reached `recover_expired_leases` and issued runtime
+create/start. Recovery now refuses any sandbox that appears in `run_sandboxes`, under the
+same sandbox row lock that link installation takes, so eligibility and
+association cannot change independently. It remains available for a machine
+whose worker died, which is what it is for. The regression covers both a
+`Running` and a `Succeeded` run: no replacement, and no debit of the candidate
+worker's capacity.
+
+### A dead API could have cleared a node's health
+
+`MetadataStore::heartbeat` issued `UPDATE nodes SET healthy = true ...` with no
+ownership check and no check that the caller still reports anything. Nothing
+called it — not a route, not the scheduler, not the worker — but it was public
+trait surface that any new caller would have got wrong, in the one direction
+that makes a node schedulable again. It and its four implementations are
+removed rather than left as a trap. `register_node` and `list_nodes` stay;
+`list_nodes` backs `/metrics`.
+
+### A healthy heartbeat could refresh a node after its leases were revoked
+
+The refused-heartbeat fix checked lease ownership inside a transaction but
+counted the leases with a plain `SELECT`, which takes no lock. At READ
+COMMITTED a revocation that commits between that count and the node `UPDATE`
+is invisible to the count, so a worker whose leases had just been taken back
+still wrote `healthy = true` and a fresh `last_heartbeat`. The heartbeat now
+locks the node's active lease rows before deciding, in the same lease-then-node
+order `release_capacity` uses, and the interleaving is reproduced with two real
+database backends: one holds the revocation open while the heartbeat is
+observed waiting on the lock in `pg_stat_activity`, and the refused heartbeat
+must leave `healthy` false and the observed count at zero.
 
 ## Open
-
-### A provisioning rollback can destroy another request's machine
-
-**Status: open.** A narrowed blast radius is in place; the defect is not fixed.
-
-A retried `POST /v1/sandboxes` is handed the *same* sandbox id and walks into
-provisioning against a row the original request owns. When the retry fails, its
-rollback destroys that machine.
-
-The rollback now re-reads the row and refuses to tear down anything no longer in
-`Creating`/`Starting`, reporting `409 sandbox_not_owned` instead. That closes the
-case where the original had already committed `Running` and was about to return
-it to its caller. It does not close the defect:
-
-- **A state is not an owner.** `Creating` is exactly the state a retry finds the
-  row in, so a retry that fails before the winner commits `Running` still
-  destroys the winner's machine and reports the failure as its own.
-- **The read and the destroy are separate statements.** A row that becomes live
-  in that window is still torn down.
-- **The idempotency key cannot be the owner.** Both requests carry the same
-  `request_id`, so a token taken from it is the same value twice.
-
-A fix needs ownership that distinguishes the two *attempts*: a
-`provisioning_attempt` column written by whichever attempt created the row,
-claimed once, and checked by the rollback in the same statement that begins the
-teardown — or provisioning serialised per sandbox id, so the second attempt never
-walks into a row the first owns. The regression has to interleave two requests
-across the runtime's `start` with a gated test runtime; `MemoryRepository`
-serialises them, so it cannot be written against the in-memory repository.
 
 ### Accepted, not fixed: placement holds a worker row lock while it waits
 
@@ -420,64 +513,6 @@ the candidate would have to be re-selected and re-validated after the host lock 
 the reservation path this audit has already measured end to end. The bound is
 200 ms and it only occurs when two placements contend for one host, so this is
 recorded as a deliberate trade-off rather than fixed.
-
-### A worker restarts machines for sandboxes whose runs finished
-
-Observed directly: six containers reappeared with "Up about a minute" for
-sandboxes whose runs had finished long before, ids unchanged. The control plane
-believes those sandboxes are stranded while the worker re-materialises them, so
-reclaiming capacity by expiring their leases does not stick. Not yet traced to
-the worker code that does it.
-
-### `aiec_compare_omp` drops the per-run output
-
-**Status:** open. **Severity:** reporting, not correctness — the comparison still
-runs both sides correctly and cleans up.
-
-`aiec_compare_omp` returns `last_output: ""` for every side, even when the run
-succeeded and the same command's output is captured by `aiec_test_omp`.
-
-#### Repro
-
-The same `omp_command` and the same `validation_commands`, against the same
-revisions, on the same cluster:
-
-```
-aiec_test_omp     -> omp.stdout == "PROBE_MARKER\n"    validations == ["CHECKOUT_PRESENT\n"]
-aiec_compare_omp  -> last_output == ""                  validation_passes == 1
-```
-
-Both are called with `omp_command: ["echo", "PROBE_MARKER"]`.
-
-#### What has been ruled out
-
-- **Not concurrency.** `max_parallel: 1` and `max_parallel: 2` both return empty.
-- **Not the command.** The exit code is `0` and the validations pass, so the exec
-  ran; only its captured output is missing.
-- **Not the runtime.** `aiec_exec` on a Docker-runtime sandbox returns stdout and
-  stderr correctly, and `aiec_test_omp` — which calls the very same
-  `run_omp_once` — returns it.
-- **Not a dropped argument.** `setup_command` and `omp_command` reach the tool
-  schema and are propagated into each side's `OmpRunRequest`; before that fix the
-  side silently fell back to `["omp", "run"]` and failed with exit 127, which is
-  how the argument plumbing was found in the first place.
-
-#### Where to look
-
-`SideSummary::from_runs` in `crates/aiec-mcp/src/eval.rs` reads `run.omp.stdout`
-and `run.omp.stderr`, and the value is empty for runs produced by
-`compare_omp` while the same field is populated for runs produced by
-`aiec_test_omp`. Since both call `run_omp_once`, the loss is either in how
-`compare_omp` collects the results of `join_all` into `baseline_runs` /
-`candidate_runs`, or in a move of `run.omp` before aggregation. Adding a
-`tracing::debug!` of the raw per-run stdout inside `from_runs` would settle it in
-one run.
-
-#### Why it matters
-
-A comparison is only checkable if you can see what each side actually did. Two
-sides reporting identical numbers mean nothing without the evidence, so this is
-the first thing to fix before trusting a comparison result.
 
 ### The `initialize` handshake never answers `2026-07-28`
 

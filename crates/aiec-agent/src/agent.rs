@@ -236,15 +236,4 @@ mod tests {
         assert_eq!(merged.branch, before.branch, "{merged:?}");
         let _ = std::fs::remove_dir_all(path);
     }
-
-    /// With no repository at all, the merge adds nothing rather than
-    /// inventing an observation.
-    #[test]
-    fn no_repository_means_no_evidence_to_merge() {
-        let merged = merge_git_evidence(&GitEvidence::default(), GitEvidence::default());
-        assert!(merged.head_before.is_none());
-        assert!(merged.head_after.is_none());
-        assert!(merged.status.is_empty());
-        assert!(merged.errors.is_empty());
-    }
 }

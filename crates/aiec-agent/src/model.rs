@@ -156,13 +156,9 @@ impl Client {
 
     /// One completion. Retries transient failures with a bounded backoff.
     ///
-    /// Only [`HarnessError::Model`] is retried. A provider that has answered
-    /// and said no - a bad key, a model it has never heard of - answers the
-    /// same way to the same request, so retrying it spends three attempts and,
-    /// because a turn that timed out after being accepted is billed, three
-    /// charges to learn what one already said. Those come back as
-    /// [`HarnessError::ModelRefused`] and leave on the first attempt, carrying
-    /// the provider's own words.
+    /// Only [`HarnessError::Model`] is retried. Permanent request refusals
+    /// become [`HarnessError::ModelRefused`] and return on the first attempt
+    /// with the provider's status and error text.
     pub async fn complete(
         &self,
         context: &Context,
@@ -499,9 +495,8 @@ mod tests {
 
     /// A bad key is not a transient failure.
     ///
-    /// It was retried three times with a growing backoff, which delays a run
-    /// that was never going to succeed by two seconds and, on a billed
-    /// endpoint, charges for the privilege of being told the same thing again.
+    /// Previously three total attempts repeated the same permanent refusal.
+    /// A loopback endpoint counts requests to prove that only one is sent.
     #[tokio::test]
     async fn a_refused_request_is_not_sent_again() {
         let (base_url, served) =
