@@ -1620,3 +1620,56 @@ Regressions:
   while the database materialises the whole history. Confirmed — with `LIMIT`
   removed the root plan node is `Index Scan` and the behavioural tests still
   passed.
+
+### The key routes enforced one rule in one branch and a different one in the other
+
+**Fixed.** Two authorization defects on `/v1/keys`, found by reading the
+handlers rather than the routes. Neither had any test coverage: the rules were
+written down in comments and never exercised, so nothing said whether they held.
+
+**Minting.** `POST /v1/keys` decided the grant inside an `if`:
+
+```rust
+let scopes = if body.scopes.is_empty() {
+    account::DEFAULT_KEY_SCOPES.to_vec()   // granted, unchecked
+} else {
+    /* parse, then */ p.authorize(scope)?  // checked
+};
+```
+
+The check that a key cannot grant a privilege it does not hold was inside the
+`else`. So the convenient branch was the unguarded one: a key holding
+`sandboxes:read` and nothing else could omit `scopes` and be handed a key with
+`sandboxes:read`, `sandboxes:write`, `snapshots:read` and `snapshots:write`.
+Reproduced against the handler before the fix - HTTP 200 and
+`"scopes":["sandboxes:read","sandboxes:write","snapshots:read","snapshots:write"]`.
+That is the scope that places machines and runs code in them, so the gap
+between the two branches is the gap between a scoped credential and an
+arbitrary-code-execution one.
+
+**Revoking.** `DELETE /v1/keys/{id}` had one rule, and it was the wrong one for
+the threat: not the key you are authenticating with. That prevents
+self-lockout. It says nothing about authority, so any key could revoke any
+other key in the tenant, including the tenant's `admin` key. Revocation has no
+inverse and a tenant gets back in with an invite, so this was a permanent
+denial of service available to the least privileged credential in the tenant -
+and the platform issues sandbox keys into every sandbox it creates.
+
+Both now answer to the same rule as each other, and as the mint check was
+always meant to: **a key may not grant or destroy a privilege it does not hold.**
+`revoke_key` reads the target first and refuses any scope the caller lacks,
+which needed a `get_key(tenant, id)` on the store rather than listing the
+tenant's key set to find one row - a revocation should not cost what the
+tenant's largest key set ever did.
+
+Regression: `the_default_scopes_are_granted_only_to_a_key_that_holds_them` and
+`a_key_may_not_revoke_one_that_outranks_it`. Both were confirmed to fail when
+the corresponding check is removed, and `a_key_may_not_revoke_one_that_outranks_it`
+also asserts the reverse direction still works, because the failure mode of a
+fix like this is locking the tenant out of its own credentials.
+
+Revoking a key that is not in the caller's tenant still answers 404. That did
+not change: `revoke_key` in the store scopes its update by tenant and reports
+`NotFound` when nothing matched. The handler now rejects earlier, on the
+authority check, but it does not reject differently, and a key in another
+tenant is still indistinguishable from one that does not exist.

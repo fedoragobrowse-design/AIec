@@ -1986,6 +1986,20 @@ impl PostgresRepository {
         rows.iter().map(Self::api_key_from_row).collect()
     }
 
+    async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, StoreError> {
+        // One row by primary key, scoped by tenant. The revocation path needs
+        // to know what a key holds before it destroys it, and reading the
+        // tenant's whole key list to find out would make every revocation cost
+        // as much as the largest key set that tenant has ever had.
+        let row = sqlx::query("SELECT * FROM api_keys WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?;
+        row.map(|row| Self::api_key_from_row(&row)).transpose()
+    }
+
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, StoreError> {
         let row = sqlx::query("SELECT * FROM api_keys WHERE digest = $1")
             .bind(digest.as_slice())
@@ -4510,6 +4524,10 @@ impl MetadataStore for PostgresRepository {
     }
     async fn list_keys(&self, tenant: Uuid) -> Result<Vec<ApiKeyRecord>, CoreError> {
         Self::list_keys(self, tenant).await.map_err(core_error)
+    }
+
+    async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, CoreError> {
+        Self::get_key(self, tenant, id).await.map_err(core_error)
     }
 
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {

@@ -760,34 +760,42 @@ async fn create_key(
     Extension(p): Extension<Principal>,
     Json(body): Json<account::CreateKeyRequest>,
 ) -> ApiResult<Value> {
-    let scopes = if body.scopes.is_empty() {
+    // What was asked for, before any decision about who may ask. The default
+    // is a real grant like any other and has to answer to the same rule; when
+    // this was decided inside the `else`, the convenient branch was the
+    // unguarded one and a key holding a single narrow scope could omit the
+    // field to be handed `sandboxes:write`.
+    let requested = if body.scopes.is_empty() {
         account::DEFAULT_KEY_SCOPES.to_vec()
     } else {
         let mut parsed = Vec::new();
         for scope in &body.scopes {
             parsed.push(Scope::parse(scope).map_err(ApiFailure::from)?);
         }
-        // A key may not grant a privilege its holder does not have. Without
-        // this, a read-only key could mint itself an admin key and then revoke
-        // the tenant's real credentials.
-        if parsed.contains(&Scope::Admin) && !p.scopes.contains(&Scope::Admin) {
-            return Err(ApiFailure::new(
-                StatusCode::FORBIDDEN,
-                "insufficient_scope",
-                "only a key that already holds admin may create another admin key",
-            ));
-        }
-        for scope in parsed.clone() {
-            p.authorize(scope.clone()).map_err(|_| {
-                ApiFailure::new(
-                    StatusCode::FORBIDDEN,
-                    "insufficient_scope",
-                    format!("this key cannot grant the {:?} scope", scope),
-                )
-            })?;
-        }
         parsed
     };
+    // A key may not grant a privilege its holder does not have. Without this,
+    // a read-only key could mint itself an admin key and then revoke the
+    // tenant's real credentials. Admin keeps its own message because it is
+    // the one scope whose absence is a platform problem rather than a
+    // tenant's own over-grant.
+    if requested.contains(&Scope::Admin) && !p.scopes.contains(&Scope::Admin) {
+        return Err(ApiFailure::new(
+            StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            "only a key that already holds admin may create another admin key",
+        ));
+    }
+    for scope in &requested {
+        p.authorize(scope.clone()).map_err(|_| {
+            ApiFailure::new(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                format!("this key cannot grant the {:?} scope", scope),
+            )
+        })?;
+    }
+    let scopes = requested;
     let (created, _record) = account::create_key(
         s.repository().as_ref(),
         p.tenant_id,
@@ -830,6 +838,39 @@ async fn revoke_key(
             "cannot_revoke_current_key",
             "a key cannot revoke itself; create a replacement key first, then revoke this one",
         ));
+    }
+    // A key may only destroy credentials at or below its own authority.
+    //
+    // The only rule here used to be "not the one you are authenticating
+    // with", which stops self-lockout and nothing else. A key holding a single
+    // narrow scope could therefore revoke any other key in the tenant,
+    // including the tenant's `admin` key and every key the platform holds for
+    // it. Revocation is not undoable - there is no un-revoke - and the way
+    // back in is an invite, so that is a permanent denial of service handed to
+    // the least privileged credential in the tenant.
+    //
+    // The rule matches the one that already governs minting: you cannot grant
+    // or destroy a privilege you do not hold yourself.
+    let target = s
+        .repository()
+        .get_key(p.tenant_id, id)
+        .await
+        .map_err(ApiFailure::from)?
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                "key_not_found",
+                format!("no key {id} in this tenant"),
+            )
+        })?;
+    for scope in &target.scopes {
+        p.authorize(scope.clone()).map_err(|_| {
+            ApiFailure::new(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                format!("this key cannot revoke a key holding the {:?} scope", scope),
+            )
+        })?;
     }
     s.repository()
         .revoke_key(p.tenant_id, id)
@@ -4879,6 +4920,10 @@ mod tests {
         async fn put_key(&self, value: ApiKeyRecord) -> Result<(), CoreError> {
             self.inner.put_key(value).await
         }
+        async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, CoreError> {
+            self.inner.get_key(tenant, id).await
+        }
+
         async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {
             self.inner.find_key(digest).await
         }

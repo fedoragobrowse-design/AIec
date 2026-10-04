@@ -3462,3 +3462,200 @@ async fn a_git_diff_executes_in_the_runtime_the_sandbox_lives_on() {
         calls.lock().clone()
     );
 }
+
+/// The default branch of `POST /v1/keys` skipped the privilege check that the
+/// explicit branch performs.
+///
+/// When `scopes` is empty the handler substitutes `DEFAULT_KEY_SCOPES` and
+/// mints them without asking whether the caller holds any of them. The
+/// explicit path checks every scope with `p.authorize`, so the two branches of
+/// one `if` enforce different rules: the safe branch is guarded and the
+/// unguarded one is the convenient one.
+///
+/// The consequence is that any authenticated key at all - a read-only key, a
+/// guard-scoped key, a key issued for exactly one purpose - can mint a
+/// sandbox-write key by simply omitting the `scopes` field. That is the scope
+/// that places machines and drives code inside them, so it is the difference
+/// between a scoped credential and an arbitrary-code-execution credential.
+#[tokio::test]
+async fn the_default_scopes_are_granted_only_to_a_key_that_holds_them() {
+    let repo = MemoryRepository::new();
+    let tenant = Uuid::now_v7();
+    // A key holding one narrow scope and nothing else.
+    let narrow = generate_api_key();
+    repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&narrow),
+        scopes: vec![Scope::SandboxesRead],
+        expires_at: None,
+        name: "read-only".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    })
+    .await
+    .expect("the narrow key is stored");
+
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo.clone(), None);
+    let router = app(AppState::development(platform));
+
+    // Omitting `scopes` asks for the defaults. The caller holds
+    // `SandboxesRead` and not one of the other three, so this must be refused
+    // rather than quietly upgraded.
+    let minted = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/keys")
+                .header("authorization", format!("Bearer {narrow}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"upgraded"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = minted.status();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(minted.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a key must not be able to grant the scopes it does not hold: {body}"
+    );
+
+    // And the refusal has to be about the scopes, not a parse failure or a
+    // missing name: the same request naming them explicitly is refused too.
+    let explicit = router
+        .oneshot(
+            Request::post("/v1/keys")
+                .header("authorization", format!("Bearer {narrow}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"name":"explicit","scopes":["sandboxes:write"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit.status(),
+        StatusCode::FORBIDDEN,
+        "the explicit branch already refused this; the default branch must not be weaker"
+    );
+}
+
+/// A narrow key could revoke the tenant's admin key.
+///
+/// `DELETE /v1/keys/{id}` checked one thing: that the target was not the key
+/// making the request. That rule exists to stop self-lockout, and it is a
+/// different rule from the one that governs minting. So a key issued for a
+/// single purpose - and the platform issues sandbox keys into every sandbox -
+/// could revoke any other credential in the tenant, including its `admin` key.
+///
+/// Revocation cannot be undone and the way back into a tenant is an invite, so
+/// this is a permanent denial of service available to the least privileged
+/// credential the tenant holds. The fix is the same rule minting already used:
+/// you may not destroy a privilege you do not hold.
+#[tokio::test]
+async fn a_key_may_not_revoke_one_that_outranks_it() {
+    let repo = MemoryRepository::new();
+    let tenant = Uuid::now_v7();
+    let narrow = generate_api_key();
+    let admin = generate_api_key();
+    let admin_id = Uuid::now_v7();
+    for (key, id, name, scopes) in [
+        (
+            &narrow,
+            Uuid::now_v7(),
+            "narrow",
+            vec![Scope::SandboxesRead],
+        ),
+        (
+            &admin,
+            admin_id,
+            "admin",
+            vec![Scope::Admin, Scope::SandboxesWrite],
+        ),
+    ] {
+        repo.put_key(ApiKeyRecord {
+            id,
+            tenant_id: tenant,
+            digest: key_digest(key),
+            scopes,
+            expires_at: None,
+            name: name.to_string(),
+            created_at: chrono::Utc::now(),
+            last_used_at: None,
+            revoked_at: None,
+        })
+        .await
+        .expect("the key is stored");
+    }
+
+    let (platform, _artifacts) = development_platform(Arc::new(MockRuntime), repo.clone(), None);
+    let router = app(AppState::development(platform));
+
+    let revoked = router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/keys/{admin_id}"))
+                .header("authorization", format!("Bearer {narrow}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = revoked.status();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(revoked.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a read-only key must not be able to destroy the tenant's admin key: {body}"
+    );
+    assert!(
+        repo.get_key(tenant, admin_id)
+            .await
+            .expect("the key is still there")
+            .expect("the key still exists")
+            .revoked_at
+            .is_none(),
+        "a refused revocation must leave the key working"
+    );
+
+    // The other direction still works, or the fix has just locked the tenant
+    // out of its own credentials: the admin key can revoke the narrow one.
+    let narrow_id = narrow_key_id(&repo, tenant).await;
+    let allowed = router
+        .oneshot(
+            Request::delete(format!("/v1/keys/{narrow_id}"))
+                .header("authorization", format!("Bearer {admin}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed.status(),
+        StatusCode::OK,
+        "a key may still revoke one at or below its own authority"
+    );
+}
+
+async fn narrow_key_id(repo: &MemoryRepository, tenant: Uuid) -> Uuid {
+    repo.list_keys(tenant)
+        .await
+        .expect("the tenant's keys are readable")
+        .into_iter()
+        .find(|key| key.name == "narrow")
+        .expect("the narrow key exists")
+        .id
+}

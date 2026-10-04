@@ -818,6 +818,10 @@ pub trait MetadataStore: Send + Sync {
     async fn put_key(&self, value: ApiKeyRecord) -> Result<(), CoreError>;
     /// Revokes a tenant-owned API key.
     async fn revoke_key(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError>;
+    /// Reads one tenant-owned API key by id, or `None` when the tenant has no
+    /// such key. Exists so a revocation can inspect what it is about to revoke
+    /// without listing the tenant's whole key set to do it.
+    async fn get_key(&self, tenant: TenantId, id: Uuid) -> Result<Option<ApiKeyRecord>, CoreError>;
     /// Finds an API key by digest.
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError>;
     /// Lists a tenant's API keys as metadata. Secrets are never returned:

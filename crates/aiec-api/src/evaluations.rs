@@ -574,6 +574,10 @@ mod tests {
         async fn revoke_key(&self, tenant: TenantId, id: Uuid) -> Result<(), CoreError> {
             self.inner.revoke_key(tenant, id).await
         }
+        async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, CoreError> {
+            self.inner.get_key(tenant, id).await
+        }
+
         async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {
             self.inner.find_key(digest).await
         }

@@ -327,6 +327,17 @@ impl MemoryRepository {
         Ok(keys)
     }
 
+    async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, StoreError> {
+        Ok(self
+            .data
+            .read()
+            .await
+            .keys
+            .get(&id)
+            .filter(|value| value.tenant_id == tenant)
+            .cloned())
+    }
+
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, StoreError> {
         self.data
             .read()
@@ -936,6 +947,10 @@ impl MetadataStore for MemoryRepository {
 
     async fn revoke_key(&self, tenant: Uuid, id: Uuid) -> Result<(), CoreError> {
         Self::revoke_key(self, tenant, id).await.map_err(core_error)
+    }
+
+    async fn get_key(&self, tenant: Uuid, id: Uuid) -> Result<Option<ApiKeyRecord>, CoreError> {
+        Self::get_key(self, tenant, id).await.map_err(core_error)
     }
 
     async fn find_key(&self, digest: &[u8; 32]) -> Result<ApiKeyRecord, CoreError> {
