@@ -1345,6 +1345,68 @@ mod tests {
         tampered.rules[0].rule = "canary credential\n".into();
         assert!(validate_incident(&tampered).is_err());
     }
+    // Report validation must reject rule references outside the evidence page
+    // before rendering indexes that page.
+    #[test]
+    fn a_rule_naming_an_event_past_the_page_is_refused_not_indexed() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let e = event(
+            "credential refused",
+            Category::Credential,
+            GENESIS_HASH,
+            now,
+        );
+        let mut incident = GuardIncident {
+            id: Uuid::from_u128(4),
+            identity: identity(),
+            fence: GuardFence {
+                lease_id: Uuid::from_u128(3),
+                generation: 1,
+            },
+            rules: vec![RuleTrigger {
+                rule: crate::canaries::RULE_CANARY_CREDENTIAL.into(),
+                first_event_sequence: Some(1),
+                evidence_references: vec![format!("event:1:{}", e.current_hash)],
+            }],
+            triggered_at: now,
+            network_cut_at: Some(now),
+            paused_at: Some(now),
+            snapshot_id: Some("incident-id".into()),
+            completed_at: Some(now),
+            event_start_sequence: 1,
+            event_previous_hash: GENESIS_HASH.into(),
+            event_sequence: 1,
+            event_head: e.current_hash.clone(),
+            events: vec![e],
+            errors: Vec::new(),
+            notified_at: None,
+            report: String::new(),
+        };
+        // The boundary event must be rendered, not merely accepted.
+        let report = generate_incident_report(&incident).unwrap();
+        assert!(report.contains(&format!(
+            "- Sequence: 1\n- Event: {}\n",
+            incident.events[0].event_id
+        )));
+
+        // Far past the page. `sequence - event_start_sequence` is 999_999
+        // against a one-element vector, so if the bounds ever stop being
+        // enforced this is a panic rather than a failed assertion.
+        incident.rules[0].first_event_sequence = Some(1_000_000);
+        assert!(validate_incident(&incident).is_err());
+        assert!(generate_incident_report(&incident).is_err());
+
+        // Sequence zero is refused by the same guard, and would underflow the
+        // subtraction had the lower-bound filter not already dropped it.
+        incident.rules[0].first_event_sequence = Some(0);
+        assert!(generate_incident_report(&incident).is_err());
+
+        // An in-range sequence that names a hash the page does not carry is
+        // refused by the evidence check, not merely by the length check.
+        incident.rules[0].first_event_sequence = Some(1);
+        incident.rules[0].evidence_references = vec![format!("event:1:{}", "0".repeat(64))];
+        assert!(generate_incident_report(&incident).is_err());
+    }
     #[tokio::test]
     async fn report_escapes_evidence_and_refuses_false_completion_or_tail() {
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();

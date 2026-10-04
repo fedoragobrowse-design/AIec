@@ -2388,11 +2388,10 @@ Mutation evidence: restoring the unconditional `?` on the ancestor loop fails
 with `Permission denied (os error 13)`, reproduced through the real publication
 path. Restored.
 
-### Audited: reachable panics in shipping code (complete for `unwrap`/`expect`, partial for indexing)
+### Audited: enumerated panic candidates in shipping Rust code
 
-The panic sites in `crates/*/src/**` fall into two pattern sets, and they
-were covered to different depths. Saying one number for both would be a claim
-the second set does not support.
+Two candidate sets were reviewed with different enumeration methods. These
+are scoped source-review results, not a repository-wide panic-free guarantee.
 
 **Set A — `unwrap`/`expect`/`panic!`/`unreachable!`.** The scan drops `tests/`
 directories, drops a basename of `tests.rs` or `*_tests.rs`, and truncates every
@@ -2404,16 +2403,57 @@ are an inherent method on the parser returning a `Result`, not
 `Option::expect`. The remaining **16** are justified below, with line numbers
 so the count can be reconciled against the list.
 
-**Set B — indexing.** This set is *not* exhaustive and is recorded as a
-residual limit rather than a clean result. A scan for non-literal index
-expressions yields **142** candidates in production code, but most are range
-slicing over internally sized buffers, lookups into a `serde_json::Value` (which
-yield `Value::Null`, not a panic), or `format!` placeholders the pattern
-mistakes for indices. The direct-index sites whose index can come from request
-or response data were examined individually and are listed below; the rest were
-not triaged one by one. Three `expect("cidr suffix")` calls in
-`aiec-network-linux/src/lib.rs` sit inside `#[test]` functions the truncation
-did not catch, and were only identified because they were read.
+**Set B — indexing.** The earlier **142** regex-candidate count is withdrawn:
+it included embedded-language/string text and omitted constant indices,
+method-call receivers and multiline expressions. Masking literals reduced that
+scan to 96 candidates but did not make its coverage complete.
+
+A Rust syntax-tree scan now covers **105 source files**, with **zero parse
+errors**, yielding **211 non-test `index_expression` nodes**. A supplementary
+macro-token scan found **17 additional indexing candidates**, all confirmed as
+index expressions by reading their context. All **228 enumerated expressions**
+were reviewed for receiver type, bounds, mutation between guard and use, and
+UTF-8 boundaries where applicable. No actionable indexing defect was confirmed.
+Counts include separate read/write occurrences on the same line.
+
+The scan used Python `tree-sitter` 0.25.2 and `tree-sitter-rust` 0.24.2 on
+`crates/**/src/**/*.rs`. It excludes `tests/`, `tests.rs` and `*_tests.rs`;
+unlike the previous truncation rule, it continues after inline test modules.
+It skips structurally test-only items with `cfg(test)`, `cfg(all(test, unix))`,
+`test` or `tokio::test` attributes and modules named `tests`, inheriting that
+exclusion into descendants. The compound predicate excludes the
+`aiec-core/src/runtime.rs:1426` test helper the first AST pass included.
+The macro supplement recognizes square-bracket token trees immediately after
+an identifier, `self`, or a closing parenthesis/bracket/brace, outside those
+test items. This is a candidate heuristic, **not macro expansion or a complete
+Rust compiler analysis**; generated code, other cfg combinations, code outside
+these source files and more complex macro syntax remain outside this claim.
+
+The reproducible candidate generator is `scripts/audit-rust-indexes.py`:
+install `tree-sitter==0.25.2` and `tree-sitter-rust==0.24.2` in an isolated Python
+environment, then run `python scripts/audit-rust-indexes.py`. It emits counts,
+parser versions, parse errors and every source location as JSON, and exits
+nonzero on a parse error. The retained script produced the counts above with
+exit 0. A synthetic smoke probe confirmed constant and macro indices are
+included, embedded raw-string text is excluded, compound/argument-bearing test
+items are excluded, and shipping code after a test module is retained.
+
+| Crate | AST index nodes | Additional macro indices |
+|---|---:|---:|
+| `aiec-agent` | 20 | 4 |
+| `aiec-api` | 26 | 2 |
+| `aiec-cli` | 4 | 0 |
+| `aiec-client` | 2 | 0 |
+| `aiec-core` | 8 | 1 |
+| `aiec-guard` | 87 | 6 |
+| `aiec-mcp` | 19 | 3 |
+| `aiec-network-linux` | 7 | 1 |
+| `aiec-runtime` | 28 | 0 |
+| `aiec-storage` | 10 | 0 |
+| **Total** | **211** | **17** |
+
+Three `expect("cidr suffix")` calls in `aiec-network-linux/src/lib.rs`
+were classified as tests by reading them, not counted as production defects.
 
 - Set A, the **4** HMAC constructions — `aiec-core/src/image_trust.rs:516`,
   `aiec-core/src/protocol.rs:211`, `aiec-runtime/src/control_identity.rs:475`,
@@ -2440,29 +2480,69 @@ did not catch, and were only identified because they were read.
 - Set A, `aiec-guard/src/dns.rs:229`'s `port.expect("approved DNS port")` is
   reached only past a `port.is_none()` refusal.
 
-Set B, direct indexes whose index can be request- or response-derived:
+Set B, bounds and provenance checked during the per-site review:
 
-- `aiec-mcp/src/eval.rs:1282` indexes `command[0]`; `validate_command` rejects an
-  empty command first, and `explicit_shell_script` — which also indexes `[0]` —
-  has exactly one caller, inside that function.
-- `aiec-guard/src/policy.rs:216` indexes `bytes[0]` and `bytes[len-1]`; an empty
-  label is rejected on the line above.
-- `aiec-guard/src/dns.rs:103` indexes `bytes[0..1]` under `len() >= 2`.
-- `aiec-guard/src/watcher.rs:1094` and `1340` index `batch[0]`; `review_batch`
-  rejects an empty batch before the first, and the `1340` loop body cannot run
-  on an empty slice.
-- `aiec-guard/src/canaries.rs:720` indexes `request.rules[0]`; the vector is a
-  literal `vec![RuleTrigger { .. }]` two lines earlier.
-- `aiec-runtime/src/e2b.rs:1279-1284` indexes a 5-byte frame header under
-  `buffer.len() < ENVELOPE_HEADER` returning early; the frame length it then
-  indexes with is refused above `frame_limit` at line 1287.
+- Fixed-array accesses use IPv4 octets, IPv6 segments, UUID buffers, SHA-256
+  digests, or explicit HEX/base64 masks within the respective array lengths.
+  Read buffers use counts returned from reads into that same buffer.
+- Duplicate-prefix checks in Guard compiler, policy, proposals, L7 validation
+  and memory artifact GC use an index enumerated from the exact receiver.
+  Adjacent-pair checks use `windows(2)`, so both elements exist.
+- JSON reads use `serde_json::Value` string-key indexing, which yields Null for
+  missing keys/nonobjects; JSON writes use locally constructed object values.
+  `core/lib.rs:878` indexes a map with keys collected from that unchanged map.
+- Agent compaction `context.rs:198,206` guards `cut < before` and `cut > 0`
+  respectively; `before` is the unchanged message-vector length.
+  `context.rs:243` assigns element zero only after `first()` returned a user.
+- String clipping in agent, API, core and MCP aligns endpoints to character
+  boundaries. Git porcelain parsers require length >= 4 and an ASCII space at
+  byte 2, proving byte 3 is a character boundary. Repository-cache log slices
+  receive only validated 40/64-byte ASCII hex commits.
+- `mcp/eval.rs:864` receives locally enumerated `run_cells` indices, not indices
+  deserialized from the server; request and planned vectors grow together.
+  Command indexing follows the nonempty-command check, including the sole
+  caller of `explicit_shell_script`.
+- Guard `compiler.rs:498` checks key length before indexing the host separator;
+  `EndpointKey` truncates a byte slice, fits a colon plus at most five digits
+  in its stack buffer, and renders a `u16` in at most five loop iterations.
+- Guard DNS reads require a two-byte header or a validated one-question shape.
+  Raw-question parsing requires >= 17 bytes, checks the question end, and
+  checks an OPT length of exactly 11 before slicing it. TLS parsing reads an
+  exact five-byte header, requires at least four handshake bytes, and checks
+  the full declared handshake length before slicing its body.
+- Guard watcher observation windows use bounded page endpoints; review batches
+  reject emptiness before `batch[0]`, while the identity-comparison loop cannot
+  execute on an empty batch. Canary containment builds its one-rule vector
+  locally before indexing it.
+- E2B requires the five-byte envelope header and the complete bounded frame
+  before indexing; API worker decoding checks header and payload lengths.
+  API chunk groups reject emptiness before taking the first chunk. Snapshot
+  paging clamps the limit to >= 1 and requires more than that many rows before
+  selecting the last returned row.
+- Linux network names slice ASCII UUID/digest strings with fixed sufficient
+  lengths; `guard.rs:845`'s 13-byte suffix is from a 64-byte SHA-256 hex string.
 
-Set A is complete and every site is individually justified above. **Set B is
-not complete**: the 142 candidates were not individually triaged, so this is a
-negative result over the sites examined, not over all indexing.
+**Incident-report invariant, not a new vulnerability.** Guard
+`watchdog.rs:648` validates the incident before indexing its evidence page.
+Page validation proves
+`event_start_sequence - 1 + events.len() == event_sequence`; rule validation
+rejects sequence zero and sequences beyond the total. The report filters out
+sequences before the page start. Together these checks bound the remaining
+index. Caller-controlled rules do not bypass that validation.
 
-This is a negative result over the sites enumerated, not a proof that no panic
-is reachable anywhere in the tree.
+`a_rule_naming_an_event_past_the_page_is_refused_not_indexed` verifies rendering
+the boundary event and returned errors for a far-out sequence, sequence zero,
+and a fabricated in-range evidence hash. The focused test passed. Removing
+only the report's initial `validate_incident(incident)?` made it fail with
+`index out of bounds: the len is 1 but the index is 999999` (Cargo exit 101).
+The validation call was restored immediately and the focused test passed again
+(exit 0). This mutation demonstrates that the regression protects the report
+entry point; it does not establish that every individual validation-check
+removal would be caught.
+
+Set A's listed candidates and all enumerated Set B candidates are individually
+justified. Neither enumeration proves that no panic is reachable anywhere in
+the tree; notably Set A still uses the older file-truncation method.
 
 ### Correction: "60s is ample" was not supported by what was checked
 
@@ -2551,19 +2631,19 @@ result is reproducible rather than asserted. Doing it properly also found one
 production site the entry had missed, `aiec-network-linux/src/guard.rs:988`,
 which is unreachable for the reason recorded.
 
-### Coverage limit carried forward: indexing was not exhaustively triaged
+### Indexing coverage correction
 
-The panic scan is complete for the `unwrap`/`expect`/`panic!`/`unreachable!`
-family — 22 production sites after the documented exclusions, 6 of them a
-method-name false positive, and all 16 remaining ones individually justified with
-line numbers. Indexing is a separate pattern set and was **not** enumerated to
-the same depth: 142 non-literal index expressions survive the same exclusions,
-of which only those whose index can come from request or response data were
-examined individually. The remainder are range slicing over internally sized
-buffers and `serde_json::Value` lookups that yield `Value::Null` rather than
-panicking, but that was inferred from reading the surrounding code, not
-established site by site.
+The earlier indexing count was not supported: regex matches included embedded
+Python/SQL/string text and omitted literal indices and other Rust expressions.
+The replacement Set B inventory above reviews 211 syntax-tree index nodes plus
+17 macro-token candidates across 105 source files, with explicit exclusions and
+remaining limits. Its per-site bounds review supersedes the earlier incomplete
+triage; it does not turn the macro heuristic into exhaustive compiler coverage.
 
-A later round that wants a complete answer here should triage the 142 directly
-rather than trust this grouping. Until then, "no reachable panic" is a claim
-about Set A only.
+Current-tree verification after restoring the mutation: fmt exit **0**, clippy
+(`--workspace --all-features --all-targets -- -D warnings`) exit **0**, and
+workspace tests exit **0**, with **1104 passed / 0 failed / 42 suites**.
+Statuses were captured from the subprocess return values, not filtered output.
+The SDK import contract passed, Python SDK tests reported **69 passed** plus
+two subtests, benchmark tests reported **21 passed**, and syntax checks passed
+for all three acceptance/recovery launcher scripts.
