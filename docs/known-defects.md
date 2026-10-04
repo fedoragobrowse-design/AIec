@@ -2388,62 +2388,81 @@ Mutation evidence: restoring the unconditional `?` on the ancestor loop fails
 with `Permission denied (os error 13)`, reproduced through the real publication
 path. Restored.
 
-### Audited and found clean: reachable panics in shipping code
+### Audited: reachable panics in shipping code (complete for `unwrap`/`expect`, partial for indexing)
 
-Every `.unwrap()`, `.expect()`, `panic!`, `unreachable!` and literal index in
-`crates/*/src/**` was enumerated. The scan drops `tests/` directories, drops a
-basename of `tests.rs` or `*_tests.rs`, and truncates every remaining file at
-its first `#[cfg(test)]` or `mod tests`. Those three rules and nothing more.
-They exclude nine files. Anything a rule misses is classified by reading it,
-which is why the entries below cite guards rather than asserting a count was
-clean.
+The panic sites in `crates/*/src/**` fall into two pattern sets, and they
+were covered to different depths. Saying one number for both would be a claim
+the second set does not support.
 
-The count matters, so it is stated: **22 sites** survive those rules in
-production code, 6 of them the `l7.rs` false positive below, leaving **16**
-`unwrap`/`expect`/`panic!` sites, each individually justified below. The
-literal-index sites are listed separately. Six `self.expect(b'x')?` calls in
-`aiec-guard/src/l7.rs` are an inherent method on the parser returning a
-`Result`, not `Option::expect`, and match the pattern without being panics at
-all.
+**Set A — `unwrap`/`expect`/`panic!`/`unreachable!`.** The scan drops `tests/`
+directories, drops a basename of `tests.rs` or `*_tests.rs`, and truncates every
+remaining file at its first `#[cfg(test)]` or `mod tests`. Those three rules and
+nothing more; they exclude nine files. Anything a rule misses is classified by
+reading it. **22 sites survive in production code and all 22 were read.** Six
+are a false positive — `aiec-guard/src/l7.rs`'s six `self.expect(b'x')?` calls
+are an inherent method on the parser returning a `Result`, not
+`Option::expect`. The remaining **16** are justified below, with line numbers
+so the count can be reconciled against the list.
 
-Three `expect("cidr suffix")` calls in `aiec-network-linux/src/lib.rs` sit
-inside `#[test]` functions the truncation did not catch, and were only
-identified because they were read.
+**Set B — indexing.** This set is *not* exhaustive and is recorded as a
+residual limit rather than a clean result. A scan for non-literal index
+expressions yields **142** candidates in production code, but most are range
+slicing over internally sized buffers, lookups into a `serde_json::Value` (which
+yield `Value::Null`, not a panic), or `format!` placeholders the pattern
+mistakes for indices. The direct-index sites whose index can come from request
+or response data were examined individually and are listed below; the rest were
+not triaged one by one. Three `expect("cidr suffix")` calls in
+`aiec-network-linux/src/lib.rs` sit inside `#[test]` functions the truncation
+did not catch, and were only identified because they were read.
+
+- Set A, the **4** HMAC constructions — `aiec-core/src/image_trust.rs:516`,
+  `aiec-core/src/protocol.rs:211`, `aiec-runtime/src/control_identity.rs:475`,
+  `aiec-storage/src/object_store.rs:1219` — call `new_from_slice`, which
+  accepts a key of any length, so it cannot return `Err`.
+- Set A, `aiec-runtime/src/control_identity.rs:662`'s `parent()` is on a
+  constant absolute path with a known parent.
+- Set A, the **5** MCP ownership locks — `aiec-mcp/src/sandbox.rs:288, 309,
+  642, 659, 668` — have critical sections that are a `Vec::push` and an
+  `iter().map().collect()`, so no user code runs under the lock and poisoning
+  is not reachable.
+- Set A, `aiec-guard/src/compiler.rs:123` parses an array literal of CIDR
+  strings inside a `OnceLock`; every element is a compile-time-written literal,
+  so there is no input to make the parse fail.
+- Set A, `aiec-network-linux/src/guard.rs:988`'s `gateway.as_ref().expect("new
+  gateway")` reads a `Mutex<Option<_>>` nine lines after the same function
+  built it as `Mutex::new(Some(gateway))` in a fresh `Arc` it has not yet
+  handed to anyone.
+- Set A, the **3** gateway sites — `gateway.rs:1339` builds a response from a
+  constant status and header; `gateway.rs:1648`'s `HeaderName::from_bytes` is
+  fed a value already constrained to `ALLOWED_CREDENTIAL_HEADERS` at
+  `policy.rs:831`; `gateway.rs:1666`'s `scheme_str().expect` is preceded by a
+  `matches!(.., Some("http" | "https"))` check.
+- Set A, `aiec-guard/src/dns.rs:229`'s `port.expect("approved DNS port")` is
+  reached only past a `port.is_none()` refusal.
+
+Set B, direct indexes whose index can be request- or response-derived:
 
 - `aiec-mcp/src/eval.rs:1282` indexes `command[0]`; `validate_command` rejects an
   empty command first, and `explicit_shell_script` — which also indexes `[0]` —
   has exactly one caller, inside that function.
 - `aiec-guard/src/policy.rs:216` indexes `bytes[0]` and `bytes[len-1]`; an empty
   label is rejected on the line above.
-- `aiec-guard/src/dns.rs:103` indexes `bytes[0..1]` under `len() >= 2`;
-  `dns.rs:229`'s `port.expect` is reached only past a `port.is_none()` refusal.
+- `aiec-guard/src/dns.rs:103` indexes `bytes[0..1]` under `len() >= 2`.
 - `aiec-guard/src/watcher.rs:1094` and `1340` index `batch[0]`; `review_batch`
   rejects an empty batch before the first, and the `1340` loop body cannot run
   on an empty slice.
 - `aiec-guard/src/canaries.rs:720` indexes `request.rules[0]`; the vector is a
   literal `vec![RuleTrigger { .. }]` two lines earlier.
-- `aiec-guard/src/gateway.rs:1666`'s `scheme_str().expect` is preceded by a
-  `matches!(.., Some("http" | "https"))` check; `gateway.rs:1648`'s
-  `HeaderName::from_bytes` is fed a value already constrained to
-  `ALLOWED_CREDENTIAL_HEADERS` at `policy.rs:831`; `gateway.rs:1339` builds a
-  response from a constant status and header.
 - `aiec-runtime/src/e2b.rs:1279-1284` indexes a 5-byte frame header under
-  `buffer.len() < ENVELOPE_HEADER` returning early.
-- `aiec-network-linux/src/guard.rs:988`'s `gateway.as_ref().expect("new
-  gateway")` reads a `Mutex<Option<_>>` nine lines after the same function
-  built it as `Mutex::new(Some(gateway))` in a fresh `Arc` it has not yet
-  handed to anyone.
-- `aiec-guard/src/compiler.rs:123` parses an array literal of CIDR strings
-  inside a `OnceLock`; every element is a compile-time-written literal, so
-  there is no input to make the parse fail.
-- The remaining `expect`s are HMAC key construction (`new_from_slice` accepts any
-  length), a constant-path `parent()`, and MCP ownership locks whose critical
-  sections are a `Vec::push` and an `iter().map().collect()`, so no user code
-  runs under the lock and poisoning is not reachable.
+  `buffer.len() < ENVELOPE_HEADER` returning early; the frame length it then
+  indexes with is refused above `frame_limit` at line 1287.
+
+Set A is complete and every site is individually justified above. **Set B is
+not complete**: the 142 candidates were not individually triaged, so this is a
+negative result over the sites examined, not over all indexing.
 
 This is a negative result over the sites enumerated, not a proof that no panic
-is reachable. It says only that every `unwrap`/`expect`/index in non-test code
-was located and had its guard read.
+is reachable anywhere in the tree.
 
 ### Correction: "60s is ample" was not supported by what was checked
 
@@ -2531,3 +2550,20 @@ that live in `src/` behind neither marker. They are named in the entry, so the
 result is reproducible rather than asserted. Doing it properly also found one
 production site the entry had missed, `aiec-network-linux/src/guard.rs:988`,
 which is unreachable for the reason recorded.
+
+### Coverage limit carried forward: indexing was not exhaustively triaged
+
+The panic scan is complete for the `unwrap`/`expect`/`panic!`/`unreachable!`
+family — 22 production sites after the documented exclusions, 6 of them a
+method-name false positive, and all 16 remaining ones individually justified with
+line numbers. Indexing is a separate pattern set and was **not** enumerated to
+the same depth: 142 non-literal index expressions survive the same exclusions,
+of which only those whose index can come from request or response data were
+examined individually. The remainder are range slicing over internally sized
+buffers and `serde_json::Value` lookups that yield `Value::Null` rather than
+panicking, but that was inferred from reading the surrounding code, not
+established site by site.
+
+A later round that wants a complete answer here should triage the 142 directly
+rather than trust this grouping. Until then, "no reachable panic" is a claim
+about Set A only.
