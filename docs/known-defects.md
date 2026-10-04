@@ -652,9 +652,32 @@ first with the write returning `Ok(())`.
   with the probe error in `last_error`.
 - The MCP server inferred a 404 from formatted error text rather than matching
   `ClientError::Api { status: 404 }`.
-- `deploy/prometheus.yml` scrapes `host.docker.internal:8080`, which resolves to
-  nothing under plain Docker Engine on Linux. The compose service now maps
-  `host.docker.internal:host-gateway`.
+- **Monitoring was silently dead in the compose deployment, for three
+  independent reasons.** `deploy/prometheus.yml` scraped
+  `host.docker.internal:8080` over plain `http`, but the production listener
+  (`aiec-server`, `crates/aiec-api/src/main.rs`) terminates TLS and has no
+  plaintext listener at all, and it binds `127.0.0.1` by default — which
+  `host.docker.internal` (the docker bridge gateway, `172.17.0.1` /
+  `172.18.0.1`) cannot reach. An earlier pass fixed only the name resolution by
+  adding `extra_hosts: ["host.docker.internal:host-gateway"]`, which made the
+  scrape resolve and then fail on protocol and reachability instead; it never
+  made it work. Reproduced end to end against the real `aiec-server` binary and
+  a real Prometheus:
+  - name only: `health: down`, `no such host`.
+  - scheme only, target reachable: `down`,
+    `malformed HTTP response "\x15\x03\x03..."` — `\x15` is a TLS alert record
+    arriving where Prometheus expected HTTP.
+  - fixed: `health: up`, `lastError: (none)`, and
+    `aiec_node_available_memory_bytes` queryable.
+  Fixed by scraping `https://127.0.0.1:8080` with `insecure_skip_verify` (the
+  operator certificate is self-signed and distributed as no CA) and by putting
+  Prometheus in the host network namespace. Host networking rather than a wider
+  API bind is the deliberate choice: `/metrics` sits outside the authentication
+  layer by design (`GET /metrics` is 200 unauthenticated, `GET /v1/sandboxes`
+  is 401), so binding the API to the bridge network to make scraping work would
+  publish operational metrics to anything that can route to the host. The
+  image was also floating on `latest` while `postgres` and `minio` are pinned;
+  it is now `prom/prometheus:v3.15.0`, overridable as `AIEC_PROMETHEUS_IMAGE`.
 - The guard gateway bound its DNS listener twice — TCP, then UDP on whatever
   port the TCP half had drawn — so a port taken in between failed the whole
   gateway at startup with `AddrInUse`, on a correctly configured host. It now
@@ -691,6 +714,225 @@ fail with `the reservation let two placements take 172.30.8.5`.
 other direction: a full pool refuses, and the guard has to be released anyway
 or every later placement on that worker blocks forever. Forgetting the guard on
 the error path makes it fail with `the reservation wedged`.
+
+### The legacy TAP ruleset contained no IPv6
+
+`firewall_rules` in `crates/aiec-network-linux` builds an `inet` table. Every
+rule in it matches on `ip saddr`/`ip daddr`, and the input and forward chains
+are both `policy accept`. An IPv6 packet from the guest matches none of them, so
+it was accepted by both chains: the guest could reach anything the host binds
+on `::`, including the worker's own control-plane client, and the masquerade
+rule — `ip saddr` only — left that egress un-NATed.
+
+It was reachable without the guest doing anything deliberate. The Firecracker
+guest is given only the IPv4 `ip=` boot argument, so it autoconfigures a
+link-local `fe80::` on its NIC and has a working IPv6 stack.
+
+The Guard renderer already refused IPv6 (`permits_ipv6()` returns false,
+`render_ipv6` drops unconditionally). This was the legacy path — the one taken
+when a sandbox runs without a guard policy — so the two disagreed about what
+the guarantee is.
+
+Both chains now drop IPv6 with `meta nfproto ipv6 drop`, placed **ahead of**
+every accept in their chain, so a later widening of a permit cannot admit IPv6
+in front of the drop. Verified by applying the production output verbatim:
+
+```
+$ unshare -rn -- sh -c 'nft -f /tmp/aiec-real-rules.nft && nft list table inet aieccheck'
+FULL RULESET APPLIED OK
+table inet aieccheck {
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+		iifname "af0123456789ab" meta nfproto ipv6 drop
+		iifname "af0123456789ab" ip saddr 172.30.8.0/30 ip daddr 172.30.8.0/30 accept
+...
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "af0123456789ab" meta nfproto ipv6 drop
+```
+
+Regression: `ipv6_from_the_guest_is_dropped_in_both_chains_before_their_accepts`
+asserts both drops exist and that neither chain accepts ahead of them. Deleting
+the two rules from `firewall_rules` makes it fail.
+
+### The forward chain granted nothing inbound, so one tenant could reach another
+
+The same ruleset, and the more serious of the two. Every forward rule granted
+egress from the guest or the replies to it:
+
+```
+forward iifname "af0123456789ab" ip saddr 172.30.8.0/30 accept
+forward oifname "af0123456789ab" ip daddr 172.30.8.0/30 ct state established,related accept
+(nothing after this)
+```
+
+The chain policy is `accept`, so a packet arriving on some *other* interface and
+bound for the tap matched neither rule and fell off the end — accepted. That is
+not a theoretical gap between siblings: another tenant's sandbox on the same
+host satisfies its own egress rule (`iifname` is its tap, source is its subnet),
+and the return rule requires `ct state established,related`, but a connection
+the far side **initiated** matches neither and was forwarded in. The per-sandbox
+`/30` subnets imply an isolation boundary and the ruleset did not enforce one.
+
+The chain now ends with `forward oifname "{tap}" drop`, after the
+established-return allow so the guest keeps the replies to everything it
+legitimately sent. This also closes the inbound IPv6 direction in one rule,
+since it is protocol-agnostic. Guard states the same intent with its
+`forward_to_guest` chain.
+
+Verified against real nft by applying the production output verbatim — the
+applied forward chain, in order:
+
+```
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		iifname "af0123456789ab" meta nfproto ipv6 drop
+		iifname "af0123456789ab" ip daddr 169.254.169.254 drop
+		iifname "af0123456789ab" ip daddr 10.0.0.0/8 drop
+		iifname "af0123456789ab" ip daddr 172.16.0.0/12 drop
+		iifname "af0123456789ab" ip daddr 192.168.0.0/16 drop
+		iifname "af0123456789ab" ip daddr 127.0.0.0/8 drop
+		iifname "af0123456789ab" ip saddr 172.30.8.0/30 accept
+		oifname "af0123456789ab" ip daddr 172.30.8.0/30 ct state established,related accept
+		oifname "af0123456789ab" drop
+	}
+```
+
+Regression:
+`traffic_bound_for_the_guest_is_dropped_after_the_return_traffic_is_allowed`
+asserts the drop exists, follows the established-return allow, and that **no
+forward rule at all follows it**. Checking position and a rule count separately
+would both still pass with an accept appended after the drop, which is
+precisely the way this defect came back; appending
+`forward iifname != tap oifname tap ip saddr 10.99.0.0/16 accept` after the drop
+makes the test fail, and so does deleting it.
+
+### `find` re-walked the tree through a symlink that pointed at it
+
+The agent's `walk` pushed a path whenever `Path::is_dir` resolved true, and
+`is_dir` follows symlinks. A `loop -> .` entry inside the searched tree
+therefore produced `root/loop`, `root/loop/loop`, and on, with no visited set
+and no depth cap.
+
+The result limit could not catch it: `out` only grows when the glob matches, so
+a pattern matching nothing kept descending until the kernel refused the
+too-long path, and a pattern that did match reported the same file once per
+depth reached. The damage is to the worker process rather than to one sandbox,
+and the tree it walks — a repository checked out for an eval — is
+attacker-supplied, so the link is planted long before it is walked.
+
+The walk now reads `entry.file_type()`, which does not follow, and refuses to
+descend through a symlinked directory. A symlink to a *file* is still a file to
+a glob and is left to match.
+
+`MAX_WALK_DIRECTORIES = 50_000` bounds the walk unconditionally, which the
+result limit never did. **Reaching that cap is an error, not a short answer.**
+Returning the partial list would present it as the complete set of matches,
+which is the one thing a `find` result cannot be: the caller has no way to tell
+the tree was bigger than the bound, so a file they asked for and did not get
+looks like a file that does not exist. `find` propagates the error to the
+model, which reads the search as unfinished. The bound is not expected to fire
+— refusing to descend through a symlink is what stops the loop, and this is
+defence in depth against a hostile tree that is wide rather than deep.
+
+`walk` takes the bound as a parameter so a test can exercise the cap without
+creating fifty thousand directories; `find` passes the constant.
+
+Regression:
+`a_symlink_pointing_back_at_its_own_directory_terminates_the_find_walk`. Run on
+its own thread with a receive timeout so a walk that never returns fails the
+assertion instead of hanging the suite. Against the old walker it fails with
+
+```
+left:  ["nested/keep.txt", "loop/nested/keep.txt", "loop/loop/nested/keep.txt",
+        "loop/loop/loop/nested/keep.txt", ...]
+right: ["nested/keep.txt"]
+```
+
+`a_tree_larger_than_the_directory_bound_is_an_error_not_a_short_list` covers the
+cap: a tree of eight directories against a bound of three must be an error
+naming the bound, and the same tree inside the bound is searched fully.
+Restoring the silent truncation makes it fail.
+
+### The Python SDK returned a capped run page as if it were the whole answer
+
+`GET /v1/runs` clamps `limit` to `MAX_RUN_PAGE` (200) and answers with a bare
+`Vec<Run>` — no cursor, no total, nothing that distinguishes a capped page from
+a complete one. `Runs.list(limit=1000)` sent 1000, got 200, raised nothing, and
+returned a list its docstring called "the caller's runs".
+
+The wire shape is not changed here; adding a cursor is an API decision with
+its own compatibility cost. What is fixed is the SDK's part of it: it now
+refuses a `limit` the control plane cannot honour (`MAX_LIST_LIMIT = 200`,
+validated by `_listed`, matching the existing `_bounded` idiom) instead of
+quietly answering with two hundred runs. The docstring now says it is one page
+and cannot tell a short history from a capped one.
+
+Regressions: `test_a_page_beyond_what_the_control_plane_will_give_is_refused`
+and `test_the_page_the_control_plane_will_still_give_is_accepted`; both fail
+when `_listed` is bypassed.
+
+### Checked, and not defects
+
+Three findings from the sweep did not survive inspection. Recording why, so
+they are not re-raised.
+
+**`sandbox_ownership` returns an expired lease.** It filters `status='active'`
+but not `expires_at`, so it can hand back a lease that has lapsed. That is not a
+hole, and the reason is worth recording because the first reading of it is
+wrong.
+
+`sandbox_ownership` is used in `AppState::commit_state` only to decide *which*
+fenced call to make, and the call in the `Some` branch is
+`Repository::update_state_with_lease`. That is the authoritative check, and it
+enforces the invariant itself: `update_state_with_lease_transaction` reads
+`active_lease()`, whose query is
+
+```
+WHERE tenant_id=$1 AND sandbox_id=$2 AND status='active' AND expires_at > now()
+```
+
+so an expired lease yields `None` and the transition is refused with
+`"sandbox has no active unexpired lease"` — the exact condition the message in
+`commit_state`'s `None` branch claims. The expiry filter the first lookup lacks
+is applied by the second, so choosing the branch cannot bypass it.
+
+The trait states the same contract (`crates/aiec-core/src/storage.rs`): "the
+transition is rejected unless the sandbox's current active, unexpired lease
+*is* `lease_id`: a worker that lost its lease can never commit state, whatever
+generation it presents."
+
+This is already pinned by a database-backed regression that expires a lease and
+then attempts the fenced transition, asserting both the refusal and that the
+sandbox's state is unchanged. The mixed case fails closed too: with both a
+lapsed and a live lease, `sandbox_ownership` may return the lapsed one, and
+`active_lease()` then returns a different `id`, which is refused as a
+reassignment.
+
+An earlier note in this file claimed the opposite — that a worker could commit
+state between expiry and reassignment because it still physically held the
+machine. That was reasoned from `update_state_with_lease` at
+`crates/aiec-api/src/lib.rs`, which is a **test double** (`LeasedRepository`),
+not the production implementation. Corrected here.
+
+**`reclaim_run` early-returns on a non-terminal run.** Its only production
+caller is `reclaim_owned`, reached only after `fail_run_queue` returned `true`,
+and `fail_run_queue` calls `retire_run` — which sets the run to `failed` — in
+the same transaction that moves the queue row to `reclaiming`, before
+`reclaim_run` reads the run back. The guard therefore holds by construction.
+`finish_run_queue` independently requires `r.state IN
+('succeeded','failed','cancelled')`, so even a run that slipped through keeps
+its `reclaiming` row and its lease for durable recovery rather than being
+finished away while holding compute.
+
+**A `Retry-After` is missing from quota 429s.** The rate-limit path emits a real
+value computed from the token bucket. The quota path returns
+`quota_exceeded` for a tenant concurrency limit and for disk quota
+(`runs.rs`, `"disk quota exceeded"`), neither of which has an honest retry
+window — there is no computable moment to retry at, and a fabricated number
+would be worse than none. The retry queue also already treats `QuotaExceeded`
+as non-retryable (`runs.rs`, `is_retryable`). Supplying a header here is a
+product decision, not a defect fix.
 
 ## Fixed in the 2026-10-03 audit: lifecycle and rollback
 
@@ -798,24 +1040,30 @@ anything, and `create` completes before `start` and before
 running on the worker. That reads like a leak, and it was worth the
 investigation — but closing it here is a fencing bug, not a fix.
 
-`Destroy` carries a sandbox id and nothing else, and the worker acts on it
-without checking the lease: `WorkerState::execute` passes the operation to
-`self.runtime.destroy(&sandbox)` and the machine is looked up by sandbox id.
-So a destroy issued from a path that has just been told it no longer owns the
-sandbox removes whichever machine that sandbox has *now* — which on a takeover
-is the replacement owner's, on the same node, which is the ordinary shape of a
-lease handover. The regression already in the tree,
-`replaced_owner_failure_never_destroys_the_new_lease_machine`, fails with
-`stale owner dispatched teardown` if the rollback is made to destroy
-unconditionally.
+The instinct to close it here is to destroy on the way out, and that is exactly
+what the regression in the tree forbids:
+`replaced_owner_failure_never_destroys_the_new_lease_machine` fails with
+`stale owner dispatched teardown` if the rollback destroys unconditionally.
 
-The asymmetry is the point: the original owner cannot safely destroy, because
-it cannot prove the machine it would destroy is still its own. Cleanup for that
-machine belongs to recovery, which fences on the lease it holds. Recorded so
-the early return is a decision rather than an oversight. **The real fix is at
-the other end** — a `Destroy` that carries a lease id and generation the worker
-checks, which would make this rollback's destroy safe and would let every other
-teardown path stop trusting the dispatch scope to mean anything.
+The first draft of this entry blamed the worker for acting on an unfenced
+`Destroy` — "`Destroy` carries a sandbox id and nothing else, and the worker
+acts on it without checking the lease." **That was wrong**, and it was wrong in
+the direction that would have justified the unsafe fix. `Destroy` does carry a
+lease id and generation: `WorkerRequest` has `lease_id` and `lease_generation`
+on every operation, `lifecycle_sandbox` classifies `Destroy` as a lifecycle
+operation, and the handler calls `authorize` for those under the same
+per-sandbox guard that keeps a destroy behind a create. `authorize` re-asks the
+control plane who owns the sandbox *at the moment it runs* and refuses with
+`stale sandbox lease generation` unless the dispatched `lease_id` matches the
+current owner's. So a stale owner's destroy is rejected at the worker; the
+existing test asserts that, using a per-lease-keyed fake that mirrors it.
+
+The early return is therefore correct rather than merely tolerable: the original
+owner cannot destroy its machine, because doing so safely requires the worker to
+confirm the machine is still the one it created, and `Destroy` is addressed by
+sandbox. Cleanup for that machine belongs to recovery, which fences on the lease
+it holds. Recorded so the early return is a decision rather than an oversight,
+and so the claim above is not re-derived wrongly a third time.
 
 ### A Docker exec that times out keeps running until its sandbox is destroyed
 

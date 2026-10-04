@@ -2,5 +2,17 @@ global:
   scrape_interval: 15s
 scrape_configs:
   - job_name: aiec
+    # The production listener (`aiec-server`) terminates TLS; there is no
+    # plaintext listener to fall back to. Scraping this target with the default
+    # `http` scheme gets an HTTP/0.9 error and silently yields no metrics.
+    scheme: https
+    # The operator's certificate is self-signed by default and is not
+    # distributed as a CA, so there is nothing to verify it against. This
+    # scrape stays on loopback — prometheus runs in the host network namespace
+    # (see docker-compose.yml) precisely so that the API can keep binding
+    # 127.0.0.1 rather than exposing its unauthenticated `/metrics` to the
+    # bridge network — which keeps an unverified transport off-host.
+    tls_config:
+      insecure_skip_verify: true
     static_configs:
-      - targets: ["host.docker.internal:8080"]
+      - targets: ["127.0.0.1:8080"]

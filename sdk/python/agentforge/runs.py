@@ -84,6 +84,12 @@ RETENTIONS = ("destroy", "keep_on_failure", "keep_always")
 #: The page size the control plane uses when a caller states none.
 DEFAULT_LIST_LIMIT = 50
 
+#: The control plane clamps a run page to this and answers with a bare list:
+#: no cursor, no total, nothing that says a page was cut short. A caller who
+#: asked for more than this therefore cannot tell a full answer from a capped
+#: one, so the clamp is refused here rather than discovered later.
+MAX_LIST_LIMIT = 200
+
 #: The same bound the control plane puts on a client-side batch.
 MAX_BATCH_PARALLEL = 64
 
@@ -190,6 +196,23 @@ def _bounded(max_parallel: int) -> int:
     if max_parallel < 1 or max_parallel > MAX_BATCH_PARALLEL:
         raise ValueError(f"max_parallel must be between 1 and {MAX_BATCH_PARALLEL}")
     return max_parallel
+
+
+def _listed(limit: int) -> int:
+    """Checks the caller's page size against what the control plane will give.
+
+    ``GET /v1/runs`` clamps ``limit`` to 200 and returns a bare list, so asking
+    for a thousand answers with two hundred runs and no indication that the page
+    was cut. ``list`` returning "the caller's runs" when it is actually the
+    newest two hundred of them is a wrong answer that looks like a right one,
+    and the caller has no cursor to ask for the rest. Refusing the impossible
+    request keeps the answer honest; there is no wire change here.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("limit is an integer")
+    if limit < 1 or limit > MAX_LIST_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+    return limit
 
 
 def _error_text(error: BaseException) -> str:
@@ -360,8 +383,15 @@ class Runs:
     # -- reading runs ---------------------------------------------------
 
     def list(self, state: str | None = None, limit: int = DEFAULT_LIST_LIMIT) -> list:
-        """The caller's runs, newest first."""
-        query: dict[str, Any] = {"limit": int(limit)}
+        """The caller's runs, newest first.
+
+        One page, capped at ``MAX_LIST_LIMIT``: the control plane clamps a run
+        page and sends no cursor, so this returns the newest ``limit`` runs and
+        cannot tell a short history from a capped page. A larger ``limit`` is
+        refused rather than silently clamped.
+        """
+        page = _listed(limit)
+        query: dict[str, Any] = {"limit": page}
         if state is not None:
             query["state"] = state
         return self.client._request("GET", f"/v1/runs?{urlencode(query)}")

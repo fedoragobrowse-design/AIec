@@ -21,13 +21,15 @@ services:
     ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     volumes: ["minio-data:/data"]
   prometheus:
-    image: prom/prometheus:latest
-    ports: ["127.0.0.1:9090:9090"]
+    image: ${AIEC_PROMETHEUS_IMAGE:-prom/prometheus:v3.15.0}
+    # Host networking is what makes the scrape work at all. The API binds
+    # 127.0.0.1 by default, and `/metrics` sits outside the authentication
+    # layer on purpose, so the bridge network cannot be the answer: reaching it
+    # would mean widening the API's bind and publishing operational metrics to
+    # anything that can route to the host. Joining the host namespace keeps the
+    # API on loopback and lets prometheus reach it there.
+    network_mode: host
     volumes: ["./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
-    # `host.docker.internal` is injected by Docker Desktop and is resolved by
-    # plain Docker Engine on Linux only when the host gateway is mapped. Without
-    # this the scrape target does not resolve and metrics are silently empty.
-    extra_hosts: ["host.docker.internal:host-gateway"]
 volumes:
   postgres-data:
   minio-data:

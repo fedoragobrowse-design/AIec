@@ -386,7 +386,7 @@ fn find(root: &Path, args: &Value) -> Result<String, HarnessError> {
             .collect();
         return Ok(matches.join("\n"));
     }
-    Ok(walk(root, &pattern, limit)?.join("\n"))
+    Ok(walk(root, &pattern, limit, MAX_WALK_DIRECTORIES)?.join("\n"))
 }
 
 fn grep(root: &Path, args: &Value) -> Result<String, HarnessError> {
@@ -665,9 +665,22 @@ fn wildcard(pattern: &str, text: &str, _crosses: bool) -> bool {
     rest.len() >= suffix.len()
 }
 
-fn walk(root: &Path, pattern: &str, limit: usize) -> Result<Vec<String>, HarnessError> {
+/// Most directories one `find` call will open.
+///
+/// The walk has to stay bounded even when nothing matches: `out` only grows on
+/// a glob hit, so the caller's result limit cannot bound a walk that is
+/// descending. This is the unconditional bound that does.
+const MAX_WALK_DIRECTORIES: usize = 50_000;
+
+fn walk(
+    root: &Path,
+    pattern: &str,
+    limit: usize,
+    max_directories: usize,
+) -> Result<Vec<String>, HarnessError> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
+    let mut inspected = 0usize;
     while let Some(directory) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
@@ -678,8 +691,41 @@ fn walk(root: &Path, pattern: &str, limit: usize) -> Result<Vec<String>, Harness
             if name == ".git" || name == "node_modules" || name == "target" {
                 continue;
             }
-            if path.is_dir() {
+            // `entry.file_type` reads the directory entry itself and does not
+            // follow, where `Path::is_dir` resolves the link. A link that
+            // points back into the tree (`loop -> .`) therefore produced
+            // `root/loop`, `root/loop/loop`, ... with no visited set and no
+            // depth cap: `out` grew only on a match, so a pattern matching
+            // nothing walked the whole path-length space twice over - once to
+            // find nothing, once to report every file under it once per
+            // distinct depth reached - and only stopped when the kernel
+            // refused the too-long path. The damage is to the worker process
+            // rather than to one sandbox, and the repository this walks is
+            // attacker-supplied in the eval flow, so the link is planted long
+            // before it is walked.
+            //
+            // A symlink to a file is still a file to a glob, so it is left to
+            // match below; only descending through one is refused.
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                inspected += 1;
+                // Reaching the cap is an error, not a short answer. Returning
+                // the partial list would present it as the complete set of
+                // matches, which is the one thing a `find` result cannot be:
+                // the caller has no way to tell that the tree was bigger than
+                // the bound and that something it asked for is missing. The
+                // cap is not expected to fire - refusing to descend through a
+                // symlink is what stops the loop - so when it does, the honest
+                // answer is that the search did not finish.
+                if inspected > max_directories {
+                    return Err(HarnessError::Tool(format!(
+                        "find stopped after {max_directories} directories: \
+                         the tree is larger than this search will walk"
+                    )));
+                }
                 stack.push(path);
+                continue;
+            }
+            if path.is_dir() {
                 continue;
             }
             if let Ok(relative) = path.strip_prefix(root) {
@@ -717,6 +763,80 @@ mod tests {
         assert!(glob_match("**/*.toml", "a/b/Cargo.toml"));
         assert!(glob_match("src/*", "src/main.rs"));
         assert!(!glob_match("src/*", "src/a/b.rs"));
+    }
+
+    /// A symlink pointing back at its own directory must not make `find`
+    /// re-walk its own tree.
+    ///
+    /// The walk pushed a path whenever `Path::is_dir` resolved true, and
+    /// `is_dir` follows links, so `loop -> .` produced `root/loop`,
+    /// `root/loop/loop`, ... The result limit could not catch it: `out` only
+    /// grows when a glob matches, so a pattern matching nothing kept
+    /// descending until the kernel refused the too-long path, and a pattern
+    /// that did match reported the same file once per depth reached. The
+    /// damage is to the worker process rather than to one sandbox, and the
+    /// repository this walks is attacker-supplied in the eval flow.
+    ///
+    /// The walk runs on its own thread and is waited for with a timeout, so a
+    /// walk that never returns fails this assertion instead of hanging the
+    /// suite.
+    #[test]
+    fn a_symlink_pointing_back_at_its_own_directory_terminates_the_find_walk() {
+        let root = scratch("find-loop");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/keep.txt"), "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+
+        // The walk runs on its own thread and is waited on with a timeout, so
+        // the pre-fix behaviour is this assertion rather than a hung suite.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let walked = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                let _ = tx.send(walk(&root, "**/*.missing", 10, MAX_WALK_DIRECTORIES));
+            }
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the walk over a self-referential symlink must terminate")
+            .expect("walk");
+        walked.join().expect("walker thread");
+
+        // Refusing to descend through a link is not the same as refusing to
+        // walk: the files that are really there are still found.
+        let found = walk(&root, "**/keep.txt", 10, MAX_WALK_DIRECTORIES).expect("walk");
+        assert_eq!(found, vec!["nested/keep.txt".to_owned()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tree larger than the directory bound must say so, not answer with the
+    /// part of it that was searched.
+    ///
+    /// Returning the partial list is the one answer a `find` result cannot
+    /// give: the caller cannot tell it apart from a complete search, so a file
+    /// they asked for and did not get looks like a file that does not exist.
+    /// The bound exists so a walk terminates on a hostile tree; when it fires,
+    /// the search genuinely did not finish and the error is the true result.
+    #[test]
+    fn a_tree_larger_than_the_directory_bound_is_an_error_not_a_short_list() {
+        let root = scratch("find-cap");
+        for index in 0..8 {
+            let directory = root.join(format!("d{index}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("hit.txt"), "hit").unwrap();
+        }
+
+        let refused = walk(&root, "**/hit.txt", 100, 3)
+            .expect_err("a bounded walk must not pass a partial list off as complete");
+        assert!(
+            refused.to_string().contains("3 directories"),
+            "the error must state the bound that stopped it: {refused}"
+        );
+
+        // Under the bound the same tree answers completely.
+        let found = walk(&root, "**/hit.txt", 100, 8).expect("walk");
+        assert_eq!(found.len(), 8, "a tree inside the bound is searched fully");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

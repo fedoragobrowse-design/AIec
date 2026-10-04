@@ -388,18 +388,42 @@ async fn run_tool(program: &str, args: &[String], failure: &str) -> Result<(), C
 /// The guest subnet is private space, so it is accepted explicitly before the
 /// wide private-range drops that protect host services, and masqueraded on the
 /// way out so the guest never needs an address the internet can route back to.
+///
+/// IPv6 is dropped rather than permitted-then-filtered. Every other rule here
+/// matches on `ip saddr`/`ip daddr`, which do not match an IPv6 packet at all,
+/// and both chains are `policy accept`, so without an explicit drop an IPv6
+/// packet from the guest was accepted by the input and forward chains alike.
+/// The Firecracker guest autoconfigures a link-local `fe80::` on its NIC
+/// because only the IPv4 `ip=` boot argument is set, which is enough to reach
+/// host link-local neighbours and anything the host binds on `::` — including
+/// the worker's own control-plane client. The masquerade rule is `ip saddr`-only
+/// too, so that egress left un-NATed as well. This matches the Guard renderer,
+/// which states the same intent (`permits_ipv6()` returns false and
+/// `render_ipv6` drops unconditionally).
+///
+/// The forward chain also ends with a terminal drop on traffic bound for the
+/// guest. The rules above it only ever granted egress (`iifname tap`) and the
+/// replies to it, and the chain policy is `accept`, so without this last rule
+/// anything else arriving on another interface and bound for the tap fell off
+/// the end and was forwarded in. That includes another tenant's sandbox on the
+/// same host: its egress rule accepts its own subnet, and the return rule
+/// requires `ct state established`, but a connection the far side *initiated*
+/// matched neither and was accepted anyway. Guard states the same intent with
+/// its `forward_to_guest` chain.
 fn firewall_rules(table: &str, tap: &str, subnet: &str) -> String {
     format!(
         "add table inet {table}; \
 add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}; \
 add chain inet {table} forward {{ type filter hook forward priority -10; policy accept; }}; \
 add chain inet {table} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}; \
+add rule inet {table} input iifname \"{tap}\" meta nfproto ipv6 drop; \
 add rule inet {table} input iifname \"{tap}\" ip saddr {subnet} ip daddr {subnet} accept; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
+add rule inet {table} forward iifname \"{tap}\" meta nfproto ipv6 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
@@ -407,6 +431,7 @@ add rule inet {table} forward iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip saddr {subnet} accept; \
 add rule inet {table} forward oifname \"{tap}\" ip daddr {subnet} ct state established,related accept; \
+add rule inet {table} forward oifname \"{tap}\" drop; \
 add rule inet {table} postrouting oifname != \"{tap}\" ip saddr {subnet} masquerade"
     )
 }
@@ -450,6 +475,79 @@ mod tests {
         ] {
             assert!(rules.contains(destination));
         }
+    }
+
+    /// The ruleset is an `inet` table whose input and forward chains are both
+    /// `policy accept`, and every other rule matches on `ip saddr`/`ip daddr`.
+    /// Those do not match an IPv6 packet, so before the explicit drop an IPv6
+    /// packet from the guest was accepted by both chains and reached whatever
+    /// the host binds on `::` — including the worker's own control-plane
+    /// client — and the `ip saddr`-only masquerade left that egress un-NATed.
+    ///
+    /// The drop has to come before the chain's accepts, so that widening a
+    /// permit later cannot silently admit IPv6 ahead of it. The Firecracker
+    /// guest autoconfigures a link-local `fe80::` because only the IPv4 `ip=`
+    /// boot argument is set, so this is reachable without the guest doing
+    /// anything deliberate.
+    #[test]
+    fn ipv6_from_the_guest_is_dropped_in_both_chains_before_their_accepts() {
+        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let input_drop = rules
+            .find("input iifname \"af0123456789ab\" meta nfproto ipv6 drop")
+            .expect("input chain drops IPv6");
+        let forward_drop = rules
+            .find("forward iifname \"af0123456789ab\" meta nfproto ipv6 drop")
+            .expect("forward chain drops IPv6");
+
+        // Nothing in either chain may accept ahead of the drop.
+        assert!(
+            input_drop < rules.find("input iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 ip daddr 172.30.8.0/30 accept").expect("input accept"),
+            "an IPv4 accept must not precede the IPv6 drop in the input chain"
+        );
+        assert!(
+            forward_drop
+                < rules
+                    .find("forward iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 accept")
+                    .expect("forward accept"),
+            "an accept must not precede the IPv6 drop in the forward chain"
+        );
+    }
+
+    /// The forward chain must end in a drop, or it grants nothing inbound.
+    ///
+    /// Every rule before the last one granted egress from the guest or the
+    /// replies to it, and the chain policy is `accept`. A packet arriving on
+    /// some other interface and bound for the tap matched none of them and was
+    /// forwarded in. Concretely, another tenant's sandbox on the same host
+    /// could open a connection to this one: its egress rule accepts its own
+    /// subnet, and the return rule requires `ct state established`, but a
+    /// connection the far side *initiated* satisfies neither and was accepted
+    /// anyway. This is the tenant boundary the guest subnets imply and the
+    /// chain did not enforce.
+    ///
+    /// The drop has to come *after* the established-return allow, or the
+    /// guest loses the replies to everything it legitimately sent.
+    #[test]
+    fn traffic_bound_for_the_guest_is_dropped_after_the_return_traffic_is_allowed() {
+        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let return_allow = rules
+            .find("forward oifname \"af0123456789ab\" ip daddr 172.30.8.0/30 ct state established,related accept")
+            .expect("return traffic is allowed");
+        let terminal_drop = rules
+            .find("forward oifname \"af0123456789ab\" drop;")
+            .expect("the forward chain ends in a drop");
+        assert!(
+            return_allow < terminal_drop,
+            "the drop must follow the established-return allow or the guest loses its replies"
+        );
+        // Terminal means terminal. Ordering and a rule count are not enough:
+        // a single forward rule appended after this one would still satisfy
+        // both, and would grant inbound access again for whatever it admits.
+        let after = &rules[terminal_drop..];
+        assert!(
+            !after.contains("add rule inet aiec_0123456789ab forward"),
+            "no forward rule may follow the terminal drop: {after}"
+        );
     }
 
     #[test]

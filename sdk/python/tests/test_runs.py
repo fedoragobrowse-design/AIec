@@ -10,6 +10,7 @@ import time
 import unittest
 
 from agentforge import AIec, AIecError, Runs
+from agentforge import runs as runs_module
 
 
 class FakeTransport:
@@ -215,6 +216,28 @@ class RunReadTest(unittest.TestCase):
         method, path, payload = self.transport.calls[0]
         self.assertEqual((method, payload), ("GET", None))
         self.assertEqual(path, "/v1/runs?limit=5&state=running")
+
+    def test_a_page_beyond_what_the_control_plane_will_give_is_refused(self):
+        # `GET /v1/runs` clamps `limit` to MAX_RUN_PAGE (200, crates/aiec-api/
+        # src/lib.rs) and answers with a bare `Vec<Run>`: no cursor, no total,
+        # nothing that distinguishes a capped page from a complete one. Asking
+        # for a thousand used to answer with two hundred runs and no error, so
+        # `list` claimed to be "the caller's runs" while returning the newest
+        # two hundred of them - a wrong answer indistinguishable from a right
+        # one, with no way to ask for the rest.
+        with self.assertRaises(ValueError):
+            self.runs.list(limit=1000)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_the_page_the_control_plane_will_still_give_is_accepted(self):
+        # The guard refuses only what cannot be honoured. A caller asking for
+        # the ceiling gets it, and a caller asking for one more than the
+        # server clamps to is told so rather than quietly answered.
+        self.runs.list(limit=runs_module.MAX_LIST_LIMIT)
+        path = self.transport.calls[-1][1]
+        self.assertEqual(path, f"/v1/runs?limit={runs_module.MAX_LIST_LIMIT}")
+        with self.assertRaises(ValueError):
+            self.runs.list(limit=runs_module.MAX_LIST_LIMIT + 1)
 
     def test_each_read_uses_its_own_documented_route(self):
         self.runs.get("run-1")

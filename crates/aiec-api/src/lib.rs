@@ -1890,17 +1890,19 @@ async fn provision_admitted_sandbox(
             commit_provision_state(s, &x, x.state, SandboxState::Destroying, dispatch.as_ref())
                 .await
         {
-            // Losing this CAS means another actor owns the sandbox now, so
-            // nothing may be stopped on its behalf: `Destroy` carries only a
-            // sandbox id and the worker acts on it without a lease fence, so a
-            // destroy issued from here would remove whichever machine that
-            // sandbox has *now* — including the replacement owner's, on the
-            // same node, which is the ordinary shape of a takeover. The
-            // original owner keeps its machine's cleanup to recovery, which
-            // fences on the lease it still holds.
+            // Losing this CAS means another actor owns the sandbox now, and
+            // this path may not stop anything on its behalf. The machine's
+            // cleanup belongs to recovery, which fences on the lease it holds.
             //
-            // Regression:
-            // `replaced_owner_failure_never_destroys_the_new_lease_machine`.
+            // Dispatching a destroy from here instead is refused by the
+            // regression `replaced_owner_failure_never_destroys_the_new_lease_machine`.
+            // `Destroy` is addressed by sandbox id rather than by machine, so
+            // destroying here would act on whichever machine this sandbox has
+            // *now* — on a takeover, the replacement owner's, on the same node,
+            // which is the ordinary shape of a lease handover. The worker would
+            // reject the dispatch as a superseded lease, but a rollback that
+            // depends on being refused is not a rollback: it only stops the
+            // machine when the control plane and the worker happen to disagree.
             return Err(ApiFailure::new(
                 StatusCode::CONFLICT,
                 "sandbox_not_owned",
@@ -2416,16 +2418,29 @@ async fn upload_artifact(
             "artifact exceeds the 64 MiB limit",
         ));
     }
+    let object_key = artifact_key(p.tenant_id, id, &name)?;
+    // Reserved before the write and completed after it. The artifact sweeper
+    // discovers reclaimable objects by scanning `artifact_objects`
+    // (claim_artifact_deletions, artifact_gc.rs:283), so an object written
+    // without a row there is invisible to the GC for the life of the
+    // deployment: this route was the only production writer of the object
+    // store that skipped the pairing, which made every artifact uploaded
+    // through it permanent storage, up to 64 MiB per request.
+    s.repository()
+        .reserve_artifact_upload(p.tenant_id, None, &object_key)
+        .await
+        .map_err(ApiFailure::from)?;
     let metadata = tokio::time::timeout(
         std::time::Duration::from_secs(artifact_gc::MAX_ARTIFACT_UPLOAD_SECONDS),
-        store.put(
-            &artifact_key(p.tenant_id, id, &name)?,
-            bytes::Bytes::from(bytes),
-        ),
+        store.put(&object_key, bytes::Bytes::from(bytes)),
     )
     .await
     .map_err(|_| ApiFailure::from(CoreError::Unavailable("artifact upload timed out".into())))?
     .map_err(ApiFailure::from)?;
+    s.repository()
+        .complete_artifact_upload(p.tenant_id, None, &object_key)
+        .await
+        .map_err(ApiFailure::from)?;
     Ok(Json(ArtifactResponse {
         metadata: Some(metadata),
         content_base64: None,
@@ -7125,6 +7140,115 @@ mod tests {
             .await
             .expect("run sandboxes");
         assert_eq!(stopped, vec![linked[0].sandbox_id]);
+    }
+
+    /// An artifact uploaded to a sandbox must be something the sweeper can
+    /// find.
+    ///
+    /// The sweeper discovers reclaimable objects by scanning the
+    /// `artifact_objects` ledger, and only `reserve_artifact_upload` writes
+    /// rows into it. This route wrote straight to the object store, so the
+    /// bytes landed with nothing pointing at them: no row, no claim, no
+    /// deletion, for the life of the deployment - 64 MiB per request that
+    /// nothing could take back. Every other production writer of the object
+    /// store pairs the reserve with the put; this one did not.
+    ///
+    /// The assertion is the sweeper's own output rather than a ledger read:
+    /// aged past the pending grace, a claim must name this key.
+    #[tokio::test]
+    async fn an_artifact_uploaded_to_a_sandbox_is_reclaimable() {
+        let store = aiec_storage::MemoryRepository::new();
+        let tenant = new_id();
+        let key = run_api_key();
+        let sandbox_id = new_id();
+        let root = std::env::temp_dir().join(format!("af-artifact-gc-{}", new_id()));
+        let objects: Arc<dyn ArtifactStore> =
+            Arc::new(aiec_storage::FilesystemObjectStore::new(&root));
+        let metadata: Arc<dyn MetadataStore> = store.clone();
+        let platform = Platform::builder()
+            .runtime(Arc::new(RunRuntime::recording(DestroyRecorder::default())))
+            .metadata_store(metadata)
+            .scheduler(Arc::new(DevelopmentScheduler))
+            .artifact_store(objects)
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        let state = AppState::development(platform).with_worker_token("worker-token");
+
+        store
+            .put_key(ApiKeyRecord {
+                id: new_id(),
+                tenant_id: tenant,
+                digest: key_digest(&key),
+                scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+                expires_at: None,
+                revoked_at: None,
+                name: "artifact gc".to_owned(),
+                created_at: Utc::now(),
+                last_used_at: None,
+            })
+            .await
+            .expect("put key");
+        let now = Utc::now();
+        store
+            .create_sandbox(Sandbox {
+                id: sandbox_id,
+                tenant_id: tenant,
+                node_id: None,
+                image_id: "alpine:3.21".into(),
+                state: aiec_core::SandboxState::Running,
+                runtime: RuntimeKind::Docker,
+                cpu: 1,
+                memory_mb: 128,
+                disk_mb: 512,
+                timeout_seconds: 60,
+                network: NetworkPolicy::Disabled,
+                environment: Default::default(),
+                created_at: now,
+                updated_at: now,
+                runtime_path: None,
+            })
+            .await
+            .expect("sandbox exists");
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v1/sandboxes/{sandbox_id}/artifacts/report.txt"))
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "content_base64": "Y2hhcmdlIHN0YXlsIHVucmVhY2hhYmxl" })
+                    .to_string(),
+            ))
+            .expect("artifact request");
+        let response = app(state.clone()).oneshot(request).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the upload itself must succeed; this is about what it leaves behind"
+        );
+
+        // Past the pending grace, so a key written at upload time is claimable.
+        let claims = store
+            .claim_artifact_deletions(
+                Utc::now() + chrono::Duration::seconds(3_600),
+                3_600,
+                600,
+                100,
+                300,
+            )
+            .await
+            .expect("claim");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            claims.iter().any(|claim| claim.key.contains("report.txt")),
+            "the uploaded artifact is invisible to the sweeper; it claimed {:?}",
+            claims
+                .iter()
+                .map(|claim| claim.key.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The same idempotency key must not run the workload twice.

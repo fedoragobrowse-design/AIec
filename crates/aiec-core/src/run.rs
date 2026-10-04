@@ -31,6 +31,21 @@ pub const MAX_SETUP_COMMANDS: usize = 32;
 /// unbounded list is unbounded work *and* unbounded stored output.
 pub const MAX_VALIDATION_COMMANDS: usize = 32;
 
+/// Most artifact paths a workload may carry.
+///
+/// The same reasoning as [`MAX_SETUP_COMMANDS`], applied to the one caller-
+/// supplied list that was left unbounded while its siblings were capped. Each
+/// path is collected from the sandbox, uploaded, and then written by
+/// `put_run_artifacts` as one `INSERT` inside a single transaction that holds
+/// the run row `FOR UPDATE` for its duration — so the list length is the number
+/// of round trips during which every other writer of that run is blocked, and
+/// afterwards it is the number of rows `GET /v1/runs/{id}/artifacts` reads back
+/// and `GET /v1/runs/{id}/artifacts/{name}` materialises in order to find one.
+/// A request is also not capped in bytes here, only in count, so the count cap
+/// is what keeps a single request from turning one row lock into an unbounded
+/// wait.
+pub const MAX_ARTIFACTS: usize = 64;
+
 /// Per-command cap for a setup step's stored preview, stdout and stderr
 /// together. Setup output is the least interesting part of a run and the most
 /// likely to be a long install log.
@@ -217,6 +232,12 @@ impl WorkloadSpec {
             return Err(crate::CoreError::LimitExceeded(format!(
                 "a workload may carry at most {MAX_VALIDATION_COMMANDS} validation commands, not {}",
                 self.validations.len()
+            )));
+        }
+        if self.artifacts.len() > MAX_ARTIFACTS {
+            return Err(crate::CoreError::LimitExceeded(format!(
+                "a workload may carry at most {MAX_ARTIFACTS} artifact paths, not {}",
+                self.artifacts.len()
             )));
         }
         if self.command.is_empty() {
@@ -1057,6 +1078,42 @@ mod tests {
             workload.validate(),
             Err(crate::CoreError::LimitExceeded(_))
         ));
+    }
+
+    /// The artifact path list was the one caller-supplied workload list left
+    /// unbounded while `setup` and `validations` were capped. Every path
+    /// becomes a stored object and a row, and `put_run_artifacts` writes them
+    /// one `INSERT` at a time inside a transaction holding the run row
+    /// `FOR UPDATE`, so the list length is the number of round trips during
+    /// which every other writer of that run is blocked.
+    #[test]
+    fn a_workload_asking_for_more_artifacts_than_a_run_can_hold_is_refused() {
+        let mut workload = WorkloadSpec {
+            command: vec!["true".to_owned()],
+            ..Default::default()
+        };
+
+        workload.artifacts = (0..MAX_ARTIFACTS)
+            .map(|index| format!("out/{index}"))
+            .collect();
+        assert!(
+            workload.validate().is_ok(),
+            "{MAX_ARTIFACTS} artifact paths are allowed"
+        );
+        workload.artifacts.push("out/one-too-many".into());
+        assert!(
+            matches!(workload.validate(), Err(crate::CoreError::LimitExceeded(_))),
+            "{} artifact paths must be refused, not trimmed",
+            MAX_ARTIFACTS + 1
+        );
+
+        // The cap is the artifact list's own, and the siblings keep theirs: an
+        // over-long artifact list must not be masked by, or mask, the others.
+        workload.artifacts.clear();
+        workload.setup = (0..MAX_SETUP_COMMANDS)
+            .map(|_| vec!["true".to_owned()])
+            .collect();
+        assert!(workload.validate().is_ok());
     }
 
     /// A clipped preview that cuts a codepoint in half is not a shorter string,
