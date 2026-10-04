@@ -2459,10 +2459,19 @@ async fn an_approved_call_is_allowed_once_and_refused_afterwards() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{queue}");
-    let pending = queue.as_array().expect("an array of requests");
+    // A page rather than a bare array: the queue is only appended to, so the
+    // listing is bounded and a caller has to be able to tell a complete queue
+    // from the first page of a long one.
+    let pending = queue["approvals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a page of requests: {queue}"));
     assert_eq!(pending.len(), 1, "one request is waiting: {queue}");
     assert_eq!(pending[0]["state"], "pending");
     assert_eq!(pending[0]["request_digest"], digest.as_str());
+    assert!(
+        queue["next"].is_null(),
+        "one request is the whole queue, so nothing follows it: {queue}"
+    );
     let request_id = pending[0]["id"].as_str().unwrap();
 
     let (status, granted) = call(
@@ -2533,7 +2542,7 @@ async fn a_grant_does_not_authorise_different_content() {
         serde_json::Value::Null,
     )
     .await;
-    let request_id = queue[0]["id"].as_str().unwrap().to_string();
+    let request_id = queue["approvals"][0]["id"].as_str().unwrap().to_string();
     call(
         &router,
         &keys.decider,
@@ -2590,7 +2599,7 @@ async fn a_sandbox_write_key_cannot_decide_its_own_request() {
         serde_json::Value::Null,
     )
     .await;
-    let request_id = queue[0]["id"].as_str().unwrap().to_string();
+    let request_id = queue["approvals"][0]["id"].as_str().unwrap().to_string();
 
     // The asker, without GuardApprove.
     let (status, body) = call(
@@ -2632,7 +2641,7 @@ async fn a_sandbox_write_key_cannot_decide_its_own_request() {
     )
     .await;
     assert_eq!(
-        after[0]["state"], "pending",
+        after["approvals"][0]["state"], "pending",
         "a refused decision grants nothing: {after}"
     );
 }
@@ -2665,7 +2674,7 @@ async fn a_denial_is_not_spendable_and_cannot_be_overturned() {
         serde_json::Value::Null,
     )
     .await;
-    let request_id = queue[0]["id"].as_str().unwrap().to_string();
+    let request_id = queue["approvals"][0]["id"].as_str().unwrap().to_string();
     let (status, denied) = call(
         &router,
         &keys.decider,
@@ -2786,7 +2795,9 @@ async fn the_queue_records_the_authenticated_requester() {
         serde_json::Value::Null,
     )
     .await;
-    let label = queue[0]["requested_by_label"].as_str().expect("a label");
+    let label = queue["approvals"][0]["requested_by_label"]
+        .as_str()
+        .expect("a label");
     assert!(
         label.starts_with("key:") && Uuid::parse_str(&label[4..]).is_ok(),
         "the requester is a key id, not free text: {label}"

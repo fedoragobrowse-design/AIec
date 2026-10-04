@@ -17,11 +17,34 @@ use aiec_core::{
     UsageSummary,
     storage::{
         AuditEvent, BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident,
-        MetadataStore, Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation,
-        SandboxOwnership, StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat,
-        WorkerLease, WorkerRegistration, WorkerStatus,
+        GuardProposalPage, GuardToolApprovalPage, MAX_GUARD_PAGE, MetadataStore, PageCursor,
+        Reassignment, ReconciliationAction, SandboxEvent, SandboxOperation, SandboxOwnership,
+        StoredSnapshot, TenantRecord, WorkerAssignment, WorkerHeartbeat, WorkerLease,
+        WorkerRegistration, WorkerStatus,
     },
 };
+/// Splits an ordered list into one bounded page and the cursor that follows it.
+///
+/// The cursor names the last row the page returned, not the row held back to
+/// prove another page exists: pointing at that row would skip it, and a caller
+/// paging to the end would never be shown it.
+fn page<T>(
+    mut ordered: Vec<T>,
+    limit: usize,
+    key: impl Fn(&T) -> (DateTime<Utc>, Uuid),
+) -> (Vec<T>, Option<PageCursor>) {
+    let more = ordered.len() > limit;
+    ordered.truncate(limit);
+    let next = match (more, ordered.last()) {
+        (true, Some(last)) => {
+            let (created_at, id) = key(last);
+            Some(PageCursor { created_at, id })
+        }
+        _ => None,
+    };
+    (ordered, next)
+}
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 pub use images::{SignedImageResolver, StandardImageResolver};
@@ -180,7 +203,7 @@ impl MemoryRepository {
         &self,
         tenant: Uuid,
         limit: u32,
-        after: Option<aiec_core::storage::SandboxCursor>,
+        after: Option<aiec_core::storage::PageCursor>,
     ) -> Result<aiec_core::storage::SandboxPage, StoreError> {
         let limit = limit.clamp(1, aiec_core::storage::MAX_SANDBOX_PAGE);
         // Sorted rather than taken from the map: the map iterates in an
@@ -209,7 +232,7 @@ impl MemoryRepository {
         // held back to prove another page exists: pointing at that row would
         // skip it, and a caller paging to the end would never be shown it.
         let next = match (more, page.last()) {
-            (true, Some(last)) => Some(aiec_core::storage::SandboxCursor {
+            (true, Some(last)) => Some(aiec_core::storage::PageCursor {
                 created_at: last.created_at,
                 id: last.id,
             }),
@@ -658,16 +681,24 @@ impl MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardToolApproval>, StoreError> {
+        limit: u32,
+        after: Option<PageCursor>,
+    ) -> Result<GuardToolApprovalPage, StoreError> {
+        let limit = limit.clamp(1, MAX_GUARD_PAGE) as usize;
         let data = self.data.read().await;
         let mut listed: Vec<GuardToolApproval> = data
             .guard_tool_approvals
             .values()
             .filter(|approval| approval.tenant_id == tenant && approval.sandbox_id == sandbox)
+            .filter(|approval| match after {
+                None => true,
+                Some(cursor) => (approval.created_at, approval.id) < (cursor.created_at, cursor.id),
+            })
             .cloned()
             .collect();
         listed.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-        Ok(listed)
+        let (approvals, next) = page(listed, limit, |row| (row.created_at, row.id));
+        Ok(GuardToolApprovalPage { approvals, next })
     }
 }
 
@@ -717,8 +748,10 @@ impl MetadataStore for MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardProposal>, CoreError> {
-        Self::list_guard_proposals(self, tenant, sandbox)
+        limit: u32,
+        after: Option<PageCursor>,
+    ) -> Result<GuardProposalPage, CoreError> {
+        Self::list_guard_proposals(self, tenant, sandbox, limit, after)
             .await
             .map_err(core_error)
     }
@@ -787,8 +820,10 @@ impl MetadataStore for MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardToolApproval>, CoreError> {
-        Self::list_guard_tool_approvals(self, tenant, sandbox)
+        limit: u32,
+        after: Option<PageCursor>,
+    ) -> Result<GuardToolApprovalPage, CoreError> {
+        Self::list_guard_tool_approvals(self, tenant, sandbox, limit, after)
             .await
             .map_err(core_error)
     }
@@ -857,7 +892,7 @@ impl MetadataStore for MemoryRepository {
         &self,
         tenant: Uuid,
         limit: u32,
-        after: Option<aiec_core::storage::SandboxCursor>,
+        after: Option<aiec_core::storage::PageCursor>,
     ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
         Self::list_sandboxes(self, tenant, limit, after)
             .await

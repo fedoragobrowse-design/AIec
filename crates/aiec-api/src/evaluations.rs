@@ -536,7 +536,7 @@ mod tests {
             &self,
             tenant: TenantId,
             limit: u32,
-            after: Option<aiec_core::storage::SandboxCursor>,
+            after: Option<aiec_core::storage::PageCursor>,
         ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
             self.inner.list_sandboxes(tenant, limit, after).await
         }

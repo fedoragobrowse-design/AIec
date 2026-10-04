@@ -9,7 +9,9 @@
 use std::collections::BTreeSet;
 
 use aiec_core::{
-    ApprovalDecisionRequest, ApprovalState, GuardProposal, GuardToolApproval, Sandbox, Scope,
+    ApprovalDecisionRequest, ApprovalState, CoreError, GuardProposal, GuardToolApproval, Sandbox,
+    Scope,
+    storage::{GuardProposalPage, GuardToolApprovalPage, PageCursor},
 };
 use aiec_guard::{
     control::{GuardControlCommand, GuardControlResponse, GuardFence},
@@ -17,10 +19,10 @@ use aiec_guard::{
 };
 use axum::{
     Json,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -159,21 +161,70 @@ pub(crate) async fn submit_proposal(
     Ok(Json(stored))
 }
 
+/// Page size for either Guard history listing when the caller states none.
+const DEFAULT_GUARD_PAGE: u32 = 50;
+
+/// One bounded page of a sandbox's Guard history.
+///
+/// Shared by both listings because they are the same question asked of two
+/// tables that both only grow: no proposal row is ever reclaimed, and a decided
+/// tool approval is deliberately retained as history. A sandbox that is left
+/// running accumulates both without bound, so the page carries its own
+/// successor and a caller that stops knows it stopped at a boundary rather than
+/// having been handed a truncated list that reads as complete.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct ListGuardQuery {
+    /// Rows to return. The store clamps this to `MAX_GUARD_PAGE`, so a caller
+    /// cannot ask for a response the control plane has no bound on.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// The previous page's last row: when it was created, and which one.
+    ///
+    /// Both halves or neither. A cursor with only a timestamp has no row to
+    /// start after, and one with only an id cannot order a page that has not
+    /// been read; guessing either would silently return the wrong page.
+    #[serde(default)]
+    after_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    after_id: Option<Uuid>,
+}
+
+/// Reads the paired cursor, refusing half of one.
+fn guard_page_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PageCursor>, ApiFailure> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PageCursor { created_at, id })),
+        _ => Err(ApiFailure::from(CoreError::InvalidRequest(
+            "after_created_at and after_id must be given together".into(),
+        ))),
+    }
+}
+
 pub(crate) async fn list_proposals(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Vec<GuardProposal>> {
+    Query(query): Query<ListGuardQuery>,
+) -> ApiResult<GuardProposalPage> {
     principal
         .authorize(Scope::GuardRead)
         .map_err(ApiFailure::from)?;
     let _ = sandbox_of(&state, &principal, id).await?;
-    let proposals = state
+    let after = guard_page_cursor(query.after_created_at, query.after_id)?;
+    let page = state
         .repository()
-        .list_guard_proposals(principal.tenant_id, id)
+        .list_guard_proposals(
+            principal.tenant_id,
+            id,
+            query.limit.unwrap_or(DEFAULT_GUARD_PAGE),
+            after,
+        )
         .await
         .map_err(ApiFailure::from)?;
-    Ok(Json(proposals))
+    Ok(Json(page))
 }
 
 pub(crate) async fn get_proposal(
@@ -618,7 +669,8 @@ async fn list_tool_approvals(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Vec<GuardToolApproval>> {
+    Query(query): Query<ListGuardQuery>,
+) -> ApiResult<GuardToolApprovalPage> {
     principal
         .authorize(Scope::GuardApprove)
         .map_err(ApiFailure::from)?;
@@ -628,12 +680,18 @@ async fn list_tool_approvals(
         .get_sandbox(principal.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    let approvals = state
+    let after = guard_page_cursor(query.after_created_at, query.after_id)?;
+    let page = state
         .repository()
-        .list_guard_tool_approvals(principal.tenant_id, id)
+        .list_guard_tool_approvals(
+            principal.tenant_id,
+            id,
+            query.limit.unwrap_or(DEFAULT_GUARD_PAGE),
+            after,
+        )
         .await
         .map_err(ApiFailure::from)?;
-    Ok(Json(approvals))
+    Ok(Json(page))
 }
 
 #[derive(Clone, Debug, Serialize)]

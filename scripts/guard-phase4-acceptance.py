@@ -101,7 +101,12 @@ def observe(sid):
 def snapshot(sid):
     host = observe(sid)
     row = require(*p2.http("GET", f"/v1/sandboxes/{sid}"))
-    proposals = require(*p2.http("GET", f"/v1/sandboxes/{sid}/guard/proposals", token=OBSERVER))
+    # A page envelope, not a bare array: the listing is bounded and says
+    # whether more follows, so a snapshot taken here is a snapshot of the first
+    # page and the harness never pretends it saw the whole history.
+    page = require(*p2.http("GET", f"/v1/sandboxes/{sid}/guard/proposals", token=OBSERVER))
+    proposals = page["proposals"]
+    require(page.get("next") is None, "acceptance snapshots must fit inside one page")
     return {"network_cut": host["network_cut"], "paused": host["paused"], "quarantined": host["budget"]["quarantined"],
             "state": row["state"], "policy_hash": row["environment"]["guard_policy_hash"],
             "proposals": [{"id": p["id"], "state": p["state"], "decided_by": p.get("decided_by")} for p in proposals],

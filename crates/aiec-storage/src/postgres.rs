@@ -1789,7 +1789,7 @@ impl PostgresRepository {
         &self,
         tenant: Uuid,
         limit: u32,
-        after: Option<aiec_core::storage::SandboxCursor>,
+        after: Option<aiec_core::storage::PageCursor>,
     ) -> Result<aiec_core::storage::SandboxPage, StoreError> {
         let limit = limit.clamp(1, aiec_core::storage::MAX_SANDBOX_PAGE);
         let (at, before) = match after {
@@ -1824,7 +1824,7 @@ impl PostgresRepository {
         // held back to prove another page exists: pointing at that row would
         // skip it, and a caller paging to the end would never be shown it.
         let next = match (rows.len() > limit as usize, sandboxes.last()) {
-            (true, Some(last)) => Some(aiec_core::storage::SandboxCursor {
+            (true, Some(last)) => Some(aiec_core::storage::PageCursor {
                 created_at: last.created_at,
                 id: last.id,
             }),
@@ -4326,8 +4326,10 @@ impl MetadataStore for PostgresRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardProposal>, CoreError> {
-        Self::list_guard_proposals(self, tenant, sandbox).await
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::GuardProposalPage, CoreError> {
+        Self::list_guard_proposals(self, tenant, sandbox, limit, after).await
     }
 
     async fn get_guard_proposal(
@@ -4385,8 +4387,10 @@ impl MetadataStore for PostgresRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardToolApproval>, CoreError> {
-        Self::list_guard_tool_approvals(self, tenant, sandbox).await
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::GuardToolApprovalPage, CoreError> {
+        Self::list_guard_tool_approvals(self, tenant, sandbox, limit, after).await
     }
 
     async fn get_guard_budget(
@@ -4462,7 +4466,7 @@ impl MetadataStore for PostgresRepository {
         &self,
         tenant: Uuid,
         limit: u32,
-        after: Option<aiec_core::storage::SandboxCursor>,
+        after: Option<aiec_core::storage::PageCursor>,
     ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
         Self::list_sandboxes(self, tenant, limit, after)
             .await
@@ -5388,7 +5392,7 @@ pub(crate) mod tests {
         // therefore unproven here — it is there to keep the transfer small, and
         // the page bound the length assertion pins holds either way.
         let mut walked = Vec::new();
-        let mut cursor: Option<aiec_core::storage::SandboxCursor> = None;
+        let mut cursor: Option<aiec_core::storage::PageCursor> = None;
         let mut guard = 0;
         loop {
             let page = repository.list_sandboxes(tenant, 4, cursor).await.unwrap();
@@ -5458,6 +5462,44 @@ pub(crate) mod tests {
              without the tie-breaker the whole tie bucket is sorted before LIMIT \
              applies. Found: {definition}"
         );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// The same assertion for the two Guard history listings, whose indexes had
+    /// the same missing tie-breaker. Nothing about correctness detects it: the
+    /// page reads correctly from `(tenant_id, sandbox_id, created_at DESC)`
+    /// too, just by sorting everything tied before the `LIMIT` applies, and
+    /// neither table is ever pruned, so the tie bucket only grows.
+    #[tokio::test]
+    async fn the_guard_history_indexes_carry_the_keyset_tie_breaker() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        if database_url.is_empty() {
+            return;
+        }
+        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        repository.migrate().await.unwrap();
+
+        for index in [
+            "guard_proposals_by_sandbox",
+            "guard_tool_approvals_by_sandbox",
+        ] {
+            let definition: Option<String> =
+                sqlx::query_scalar("SELECT pg_get_indexdef(to_regclass($1))")
+                    .bind(index)
+                    .fetch_one(&repository.pool)
+                    .await
+                    .expect("the index lookup must run");
+            let definition =
+                definition.unwrap_or_else(|| panic!("{index} must exist in the search path"));
+            assert!(
+                definition.ends_with("(tenant_id, sandbox_id, created_at DESC, id DESC)"),
+                "{index} pages on (created_at, id), so it needs both columns in \
+                 that order; without the tie-breaker every row sharing a \
+                 timestamp is sorted before LIMIT applies. Found: {definition}"
+            );
+        }
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 

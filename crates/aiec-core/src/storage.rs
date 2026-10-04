@@ -457,24 +457,38 @@ pub struct MatrixCellPage {
     pub next: Option<MatrixCursor>,
 }
 
-/// Ceiling on one page of a tenant's sandboxes.
+/// Ceiling on one page of any tenant-scoped history listing.
 ///
 /// Declared once, here, because the route clamps to it and the store clamps to
 /// it: two copies of this number would drift, and the drift would show up as a
 /// caller inside the process asking the database for more rows than the route
 /// would ever have returned.
-pub const MAX_SANDBOX_PAGE: u32 = 200;
+pub const MAX_HISTORY_PAGE: u32 = 200;
 
-/// Where the next page of a tenant's sandboxes starts.
+/// Ceiling on one page of a tenant's sandboxes.
+pub const MAX_SANDBOX_PAGE: u32 = MAX_HISTORY_PAGE;
+
+/// Ceiling on one page of a sandbox's Guard history.
+pub const MAX_GUARD_PAGE: u32 = MAX_HISTORY_PAGE;
+
+/// Where the next page of a tenant-scoped history listing starts.
 ///
-/// The two fields together are the sandbox's own position in the ordering, so a
+/// The two fields together are the row's own position in the ordering, so a
 /// page boundary is a value that already exists rather than an offset a reader
 /// would have to keep consistent against rows created or destroyed meanwhile.
+///
+/// One type for every listing that pages, because each of them orders on the
+/// same `(created_at DESC, id DESC)` tuple. A separate copy per table would be
+/// a shape that could drift rather than a value that is shared.
+/// Sandboxes, Guard proposals and Guard tool approvals all order on that same
+/// tuple and so share this one shape. `MatrixCursor` is deliberately separate:
+/// it keys on `requested_at`, which is a different column and a different
+/// order.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SandboxCursor {
-    /// `created_at` of the last sandbox of the previous page.
+pub struct PageCursor {
+    /// `created_at` of the last row of the previous page.
     pub created_at: DateTime<Utc>,
-    /// Identifier of that sandbox, which breaks a `created_at` tie.
+    /// Identifier of that row, which breaks a `created_at` tie.
     pub id: Uuid,
 }
 
@@ -488,7 +502,29 @@ pub struct SandboxPage {
     /// Sandboxes newest first, at most the requested limit.
     pub sandboxes: Vec<Sandbox>,
     /// Where the next page starts, or `None` when this page is the last.
-    pub next: Option<SandboxCursor>,
+    pub next: Option<PageCursor>,
+}
+
+/// One bounded page of a sandbox's Guard proposals, newest first.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GuardProposalPage {
+    /// Proposals newest first, at most the requested limit.
+    pub proposals: Vec<GuardProposal>,
+    /// Where the next page starts, or `None` when this page is the last.
+    pub next: Option<PageCursor>,
+}
+
+/// One bounded page of a sandbox's Guard tool approvals, newest first.
+///
+/// Decided rows are deliberately retained as history, so this table only ever
+/// grows for the life of the sandbox. That is why it is paged rather than read
+/// whole.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GuardToolApprovalPage {
+    /// Approvals newest first, at most the requested limit.
+    pub approvals: Vec<GuardToolApproval>,
+    /// Where the next page starts, or `None` when this page is the last.
+    pub next: Option<PageCursor>,
 }
 
 /// What one pass of the orphaned-lease reclaim did.
@@ -627,12 +663,19 @@ pub trait MetadataStore: Send + Sync {
         let _ = proposal;
         Err(CoreError::Unsupported("put_guard_proposal".into()))
     }
-    /// Lists a sandbox's proposals, newest first.
+    /// One bounded page of a sandbox's proposals, newest first.
+    ///
+    /// Paged because no proposal row is ever reclaimed and `guard:propose` is
+    /// unbounded, so a sandbox's history grows for as long as the sandbox lives.
+    /// Implementations must apply the bound in the query rather than
+    /// materializing the history and truncating it.
     async fn list_guard_proposals(
         &self,
         _tenant: TenantId,
         _sandbox: SandboxId,
-    ) -> Result<Vec<GuardProposal>, CoreError> {
+        _limit: u32,
+        _after: Option<PageCursor>,
+    ) -> Result<GuardProposalPage, CoreError> {
         Err(CoreError::Unsupported("list_guard_proposals".into()))
     }
     /// One proposal.
@@ -700,12 +743,18 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<Option<GuardToolApproval>, CoreError> {
         Err(CoreError::Unsupported("consume_guard_tool_approval".into()))
     }
-    /// Every request recorded against a sandbox, newest first.
+    /// One bounded page of the requests recorded against a sandbox, newest first.
+    ///
+    /// Paged because a decided row is retained as history and the sandbox
+    /// itself can ask for one with nothing but `sandboxes:write`, so the rows
+    /// grow from inside the sandbox rather than from operator action.
     async fn list_guard_tool_approvals(
         &self,
         _tenant: TenantId,
         _sandbox: SandboxId,
-    ) -> Result<Vec<GuardToolApproval>, CoreError> {
+        _limit: u32,
+        _after: Option<PageCursor>,
+    ) -> Result<GuardToolApprovalPage, CoreError> {
         Err(CoreError::Unsupported("list_guard_tool_approvals".into()))
     }
     /// Creates a sandbox.
@@ -723,7 +772,7 @@ pub trait MetadataStore: Send + Sync {
         &self,
         tenant: TenantId,
         limit: u32,
-        after: Option<SandboxCursor>,
+        after: Option<PageCursor>,
     ) -> Result<SandboxPage, CoreError>;
 
     /// Performs a compare-and-set state transition.

@@ -5,7 +5,7 @@ use aiec_core::{
     run::{CleanupReport, Run, RunArtifactRef, RunEvent, RunState},
     runtime::SandboxRuntime,
     snapshots::{SnapshotKind, SnapshotRequest, verify_archive_checksum},
-    storage::{ArtifactStore, GetObjectOptions, MetadataStore, SandboxCursor, SandboxPage},
+    storage::{ArtifactStore, GetObjectOptions, MetadataStore, PageCursor, SandboxPage},
 };
 use chrono::DateTime;
 pub mod account;
@@ -2610,7 +2610,7 @@ async fn list_sandboxes(
         .map_err(ApiFailure::from)?;
     let after = match (query.after_created_at, query.after_id) {
         (None, None) => None,
-        (Some(created_at), Some(id)) => Some(SandboxCursor { created_at, id }),
+        (Some(created_at), Some(id)) => Some(PageCursor { created_at, id }),
         _ => {
             return Err(ApiFailure::from(CoreError::InvalidRequest(
                 "after_created_at and after_id must be given together".into(),
@@ -4833,7 +4833,7 @@ mod tests {
             &self,
             tenant: TenantId,
             limit: u32,
-            after: Option<SandboxCursor>,
+            after: Option<PageCursor>,
         ) -> Result<SandboxPage, CoreError> {
             self.inner.list_sandboxes(tenant, limit, after).await
         }
@@ -5984,7 +5984,7 @@ mod tests {
             key_id: new_id(),
             scopes: vec![Scope::SandboxesRead],
         };
-        let page = |limit: Option<u32>, after: Option<SandboxCursor>| {
+        let page = |limit: Option<u32>, after: Option<PageCursor>| {
             let state = fixture.state.clone();
             let caller = caller.clone();
             async move {
@@ -6009,7 +6009,7 @@ mod tests {
         // count.
         let per_page = 7;
         let mut walked: Vec<Uuid> = Vec::with_capacity(total);
-        let mut cursor: Option<SandboxCursor> = None;
+        let mut cursor: Option<PageCursor> = None;
         let mut pages = 0usize;
         loop {
             let response = page(Some(per_page), cursor).await;
@@ -6084,7 +6084,7 @@ mod tests {
 
         // One at a time, so the cursor is re-read between every pair.
         let mut walked = Vec::new();
-        let mut cursor: Option<SandboxCursor> = None;
+        let mut cursor: Option<PageCursor> = None;
         loop {
             let response = fixture
                 .repository

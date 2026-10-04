@@ -15,6 +15,21 @@ fn map(error: StoreError) -> CoreError {
     core_error(error)
 }
 
+/// The proposal page, as one statement.
+///
+/// Hoisted so the regression can `EXPLAIN` the statement this actually runs.
+/// Nothing about the returned page can detect a missing `LIMIT`: the rows are
+/// trimmed in Rust afterwards, so dropping it from the SQL would leave every
+/// behavioural test passing while the database went on materialising the whole
+/// history. The bound has to be pushed down, and the only way to show that is
+/// to ask the planner.
+pub(crate) const LIST_PROPOSALS_SQL: &str = "SELECT id, sandbox_id, tenant_id, agent_id, request, \
+     base_policy_hash, state, decided_by, decided_at, created_at FROM guard_proposals \
+     WHERE tenant_id = $1 AND sandbox_id = $2 \
+       AND ($3::timestamptz IS NULL \
+            OR (created_at, id) < ($3::timestamptz, $4::uuid)) \
+     ORDER BY created_at DESC, id DESC LIMIT $5";
+
 impl PostgresRepository {
     pub(crate) async fn update_guard_policy(
         &self,
@@ -257,18 +272,46 @@ impl PostgresRepository {
         &self,
         tenant: uuid::Uuid,
         sandbox: uuid::Uuid,
-    ) -> Result<Vec<GuardProposal>, CoreError> {
-        let rows = sqlx::query(
-            "SELECT id, sandbox_id, tenant_id, agent_id, request, base_policy_hash, state, \
-             decided_by, decided_at, created_at FROM guard_proposals \
-             WHERE tenant_id = $1 AND sandbox_id = $2 ORDER BY created_at DESC, id",
-        )
-        .bind(tenant)
-        .bind(sandbox)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| map(e.into()))?;
-        rows.into_iter().map(Self::proposal_row).collect()
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::GuardProposalPage, CoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_GUARD_PAGE);
+        let (at, before) = match after {
+            Some(cursor) => (Some(cursor.created_at), Some(cursor.id)),
+            None => (None, None),
+        };
+        // The bound and the cursor are both in the query. Nothing reclaims a
+        // proposal row, and an agent holding `guard:propose` can submit as
+        // many as it likes, so a sandbox's proposal history is unbounded and
+        // reading it whole to serve a page would make the page size a fiction.
+        // `(created_at, id) < ...` is the row-value form of the keyset and is
+        // compared against the order the page is returned in, so the two
+        // cannot disagree at a tie.
+        let rows = sqlx::query(LIST_PROPOSALS_SQL)
+            .bind(tenant)
+            .bind(sandbox)
+            .bind(at)
+            .bind(before)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map(e.into()))?;
+
+        let mut proposals = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.iter().take(limit as usize) {
+            proposals.push(Self::proposal_row(row)?);
+        }
+        // The cursor names the last proposal this page returned, not the row
+        // held back to prove another page exists: pointing at that row would
+        // skip it, and a caller paging to the end would never be shown it.
+        let next = match (rows.len() > limit as usize, proposals.last()) {
+            (true, Some(last)) => Some(aiec_core::storage::PageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }),
+            _ => None,
+        };
+        Ok(aiec_core::storage::GuardProposalPage { proposals, next })
     }
 
     pub(crate) async fn get_guard_proposal(
@@ -289,10 +332,10 @@ impl PostgresRepository {
         .await
         .map_err(|e| map(e.into()))?
         .ok_or(CoreError::NotFound("no such policy proposal".into()))?;
-        Self::proposal_row(row)
+        Self::proposal_row(&row)
     }
 
-    fn proposal_row(row: sqlx::postgres::PgRow) -> Result<GuardProposal, CoreError> {
+    fn proposal_row(row: &sqlx::postgres::PgRow) -> Result<GuardProposal, CoreError> {
         let request: serde_json::Value = row.try_get("request").map_err(|e| map(e.into()))?;
         let state: serde_json::Value = row.try_get("state").map_err(|e| map(e.into()))?;
         Ok(GuardProposal {

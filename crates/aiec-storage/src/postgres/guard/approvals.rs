@@ -72,6 +72,20 @@ const COLUMNS: &str = "id, tenant_id, sandbox_id, tool, request_digest, detail, 
                        requested_by_key_id, requested_by_label, state, decided_by_key_id, \
                        decided_by_label, decided_at, expires_at, consumed_at, created_at";
 
+/// The approval page, as one statement. Hoisted for the same reason as
+/// `LIST_PROPOSALS_SQL`: the bound is only real if the database applies it, and
+/// only the plan can show that. `COLUMNS` is spelled into the literal because
+/// `concat!` will not take a named constant, and a statement the regression
+/// cannot name is a statement it cannot check.
+pub(crate) const LIST_APPROVALS_SQL: &str = "SELECT id, tenant_id, sandbox_id, tool, request_digest, detail, \
+     requested_by_key_id, requested_by_label, state, decided_by_key_id, \
+     decided_by_label, decided_at, expires_at, consumed_at, created_at \
+     FROM guard_tool_approvals \
+     WHERE tenant_id = $1 AND sandbox_id = $2 \
+       AND ($3::timestamptz IS NULL \
+            OR (created_at, id) < ($3::timestamptz, $4::uuid)) \
+     ORDER BY created_at DESC, id DESC LIMIT $5";
+
 impl PostgresRepository {
     /// Records the asker's request. The state is always `pending`: this path
     /// cannot decide anything, which is what keeps an asker from approving.
@@ -254,20 +268,42 @@ impl PostgresRepository {
         &self,
         tenant: uuid::Uuid,
         sandbox: uuid::Uuid,
-    ) -> Result<Vec<GuardToolApproval>, CoreError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {COLUMNS} FROM guard_tool_approvals \
-             WHERE tenant_id = $1 AND sandbox_id = $2 ORDER BY created_at DESC, id"
-        ))
-        .bind(tenant)
-        .bind(sandbox)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(refused)?;
-        rows.iter()
-            .map(approval_from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(map)
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::GuardToolApprovalPage, CoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_GUARD_PAGE);
+        let (at, before) = match after {
+            Some(cursor) => (Some(cursor.created_at), Some(cursor.id)),
+            None => (None, None),
+        };
+        // The bound and the cursor are both in the query, and this table is the
+        // more exposed of the two: a decided approval row is retained as
+        // history, and the sandbox itself can ask for one with nothing but
+        // `sandboxes:write`, so the rows grow from inside the sandbox.
+        let rows = sqlx::query(LIST_APPROVALS_SQL)
+            .bind(tenant)
+            .bind(sandbox)
+            .bind(at)
+            .bind(before)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(refused)?;
+
+        let mut approvals = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.iter().take(limit as usize) {
+            approvals.push(approval_from_row(row).map_err(map)?);
+        }
+        // Names the last row this page returned, not the one held back to prove
+        // another page exists, which would skip it.
+        let next = match (rows.len() > limit as usize, approvals.last()) {
+            (true, Some(last)) => Some(aiec_core::storage::PageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }),
+            _ => None,
+        };
+        Ok(aiec_core::storage::GuardToolApprovalPage { approvals, next })
     }
 
     /// Spends a granted, unspent, unexpired approval for exactly this call.
@@ -734,9 +770,10 @@ mod tests {
             "an expired request must stay undecided rather than be granted"
         );
         let after = repository
-            .list_guard_tool_approvals(tenant, sandbox_id)
+            .list_guard_tool_approvals(tenant, sandbox_id, 50, None)
             .await
-            .unwrap();
+            .unwrap()
+            .approvals;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].state, ApprovalState::Pending);
         assert!(after[0].decided_at.is_none());
@@ -866,9 +903,10 @@ mod tests {
         // And the request is still waiting, not quietly granted on the way to
         // being reported as a refusal.
         let after = repository
-            .list_guard_tool_approvals(tenant, sandbox_id)
+            .list_guard_tool_approvals(tenant, sandbox_id, 50, None)
             .await
-            .unwrap();
+            .unwrap()
+            .approvals;
         assert_eq!(after[0].state, ApprovalState::Pending);
         assert!(after[0].decided_by_key_id.is_none());
         drop_test_schema(&repository, admin, schema).await;
@@ -920,9 +958,10 @@ mod tests {
         // The original decision is the one that stands, with the operator who
         // actually made it.
         let after = repository
-            .list_guard_tool_approvals(tenant, sandbox_id)
+            .list_guard_tool_approvals(tenant, sandbox_id, 50, None)
             .await
-            .unwrap();
+            .unwrap()
+            .approvals;
         assert_eq!(after[0].state, ApprovalState::Denied);
         assert_eq!(after[0].decided_by_label.as_deref(), Some("key:operator"));
         drop_test_schema(&repository, admin, schema).await;
@@ -1030,15 +1069,92 @@ mod tests {
         let stored = repository.put_guard_tool_approval(approval).await.unwrap();
 
         let listed = repository
-            .list_guard_tool_approvals(tenant, sandbox_id)
+            .list_guard_tool_approvals(tenant, sandbox_id, 50, None)
             .await
-            .unwrap();
+            .unwrap()
+            .approvals;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, stored.id);
         assert_eq!(listed[0].state, ApprovalState::Pending);
         // The digest travels with it, so the operator decides about a specific
         // call rather than about a tool.
         assert_eq!(listed[0].request_digest, DIGEST);
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A sandbox's tool-approval queue is paged, and the page says where it
+    /// stopped.
+    ///
+    /// This is the more exposed of the two history tables: a decided row is
+    /// deliberately retained, and the sandbox itself can ask for one with
+    /// nothing but `sandboxes:write`, so the rows grow from inside the sandbox
+    /// rather than from operator action.
+    #[tokio::test]
+    async fn the_approval_queue_is_paged_and_says_where_it_stopped() {
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let sandbox_id = sandbox_for(&repository, tenant).await;
+        let requester = new_id();
+
+        // One timestamp for all of them, so the id tie-breaker is what makes the
+        // page boundary a value rather than a guess.
+        // One timestamp and one timestamp only: the id tie-breaker is what
+        // makes the page boundary a value rather than a guess. Each row needs
+        // its own digest, because the store deliberately joins a repeat of an
+        // identical still-open request instead of minting a second row.
+        let created_at = Utc::now();
+        for index in 0..5u8 {
+            let digest = format!("{index:02x}").repeat(32);
+            let mut approval = pending(sandbox_id, requester, &digest, created_at);
+            approval.tenant_id = tenant;
+            repository.put_guard_tool_approval(approval).await.unwrap();
+        }
+
+        let first = repository
+            .list_guard_tool_approvals(tenant, sandbox_id, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(first.approvals.len(), 2, "the bound must reach the query");
+        let cursor = first.next.expect("three more rows cannot fit in one page");
+
+        let second = repository
+            .list_guard_tool_approvals(tenant, sandbox_id, 2, Some(cursor))
+            .await
+            .unwrap();
+        assert_eq!(second.approvals.len(), 2);
+
+        let third = repository
+            .list_guard_tool_approvals(tenant, sandbox_id, 2, Some(second.next.unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            third.approvals.len(),
+            1,
+            "the last page is short and must say so"
+        );
+        assert!(
+            third.next.is_none(),
+            "a page that returned the last row must not claim another follows"
+        );
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = repository
+                .list_guard_tool_approvals(tenant, sandbox_id, 2, cursor)
+                .await
+                .unwrap();
+            seen.extend(page.approvals.iter().map(|row| row.id));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "a row was skipped or repeated: {seen:?}");
         drop_test_schema(&repository, admin, schema).await;
     }
 

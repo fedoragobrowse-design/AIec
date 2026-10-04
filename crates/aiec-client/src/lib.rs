@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub use aiec_core::run::{
     BatchOptions, CommandOutcome, Placement, RepoSpec, RunResults, RunSandbox,
 };
-pub use aiec_core::storage::{MatrixCell, MatrixCursor, SandboxCursor, SandboxPage};
+pub use aiec_core::storage::{MatrixCell, MatrixCursor, PageCursor, SandboxPage};
 
 /// The ceiling on a client-side batch, matching the control plane's own limit
 /// so a client cannot be the thing that makes a batch unbounded.
@@ -450,7 +450,7 @@ impl AIecClient {
     pub async fn list_sandboxes_after(
         &self,
         limit: u32,
-        after: &SandboxCursor,
+        after: &PageCursor,
     ) -> Result<SandboxPage, ClientError> {
         self.send(self.request(reqwest::Method::GET, "/v1/sandboxes").query(&[
             ("limit", limit.to_string()),
@@ -467,7 +467,7 @@ impl AIecClient {
     /// rather than one response the control plane had to build in full.
     pub async fn list_all_sandboxes(&self, limit: u32) -> Result<Vec<Sandbox>, ClientError> {
         let mut all = Vec::new();
-        let mut after: Option<SandboxCursor> = None;
+        let mut after: Option<PageCursor> = None;
         let mut seen: Vec<(DateTime<Utc>, Uuid)> = Vec::new();
         loop {
             let page = match &after {
@@ -1394,7 +1394,7 @@ mod tests {
         let (url, serving) = stub_control_plane(stub.clone()).await;
         let client = AIecClient::new(&url, "af_live_key").expect("a client");
 
-        let cursor = SandboxCursor {
+        let cursor = PageCursor {
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
                 .expect("a valid instant")
                 .with_timezone(&Utc),

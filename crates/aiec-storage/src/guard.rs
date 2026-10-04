@@ -1,8 +1,9 @@
-use crate::{MemoryData, MemoryRepository, StoreError, owned};
+use crate::{MemoryData, MemoryRepository, StoreError, owned, page};
 use aiec_core::{
     GuardProposal, Sandbox, SandboxState,
     storage::{
-        BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident, WorkerLease,
+        BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident, GuardProposalPage,
+        MAX_GUARD_PAGE, PageCursor, WorkerLease,
     },
 };
 use aiec_guard::proposals::ProposalState;
@@ -481,17 +482,27 @@ impl MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<GuardProposal>, StoreError> {
+        limit: u32,
+        after: Option<PageCursor>,
+    ) -> Result<GuardProposalPage, StoreError> {
+        let limit = limit.clamp(1, MAX_GUARD_PAGE) as usize;
         let data = self.data.read().await;
         owned(&data, tenant, sandbox)?;
         let mut rows: Vec<GuardProposal> = data
             .guard_proposals
             .values()
             .filter(|row| row.tenant_id == tenant && row.sandbox_id == sandbox)
+            .filter(|row| match after {
+                None => true,
+                Some(cursor) => (row.created_at, row.id) < (cursor.created_at, cursor.id),
+            })
             .cloned()
             .collect();
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
-        Ok(rows)
+        // Newest first, and the id breaks a tie in the same direction the
+        // database's `id DESC` does, so both stores page identically.
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        let (proposals, next) = page(rows, limit, |row| (row.created_at, row.id));
+        Ok(GuardProposalPage { proposals, next })
     }
 
     pub(crate) async fn get_guard_proposal(

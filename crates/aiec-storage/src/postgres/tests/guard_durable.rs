@@ -534,6 +534,163 @@ async fn postgres_guard_budget_rebinds_its_policy_hash_without_moving_ownership(
 /// caller round-tripping the row gets a value that is no longer equal to the
 /// one it sent. Rebuilding from the stored proposal is not incidental: it is
 /// what a caller that read the row actually holds.
+/// A sandbox's proposal history is paged, and the page says where it stopped.
+///
+/// Nothing reclaims a proposal row and `guard:propose` is unbounded, so this
+/// table grows for as long as the sandbox lives. Reading it whole made the
+/// response a function of how long the tenant had been on the system. The page
+/// carries its successor for the same reason the sandbox list does: a caller
+/// that stops has to be able to say it stopped at a boundary rather than having
+/// been handed a truncated list that reads as complete.
+#[tokio::test]
+async fn a_sandbox_proposal_history_is_paged_and_says_where_it_stopped() {
+    let Some((repository, owner, _admin, _schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let worker = super::register_test_worker(&repository, owner).await;
+    let sandbox_id =
+        schedule_test_sandbox(&repository, owner, new_id(), sandbox(owner), Some(worker))
+            .await
+            .unwrap()
+            .sandbox
+            .id;
+
+    // Every row shares one timestamp, which is the case that makes the id
+    // tie-breaker load-bearing rather than decorative: without it a keyset
+    // predicate has no way to say which rows a page already returned.
+    let created_at = Utc::now();
+    for _ in 0..5 {
+        repository
+            .put_guard_proposal(GuardProposal {
+                id: new_id(),
+                tenant_id: owner,
+                sandbox_id,
+                agent_id: "key:owner".into(),
+                request: ProposalRequest {
+                    summary: "add an egress destination".into(),
+                    allow: Vec::new(),
+                },
+                base_policy_hash: "b".repeat(64),
+                state: ProposalState::Pending,
+                decided_by: None,
+                decided_at: None,
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = repository
+        .list_guard_proposals(owner, sandbox_id, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(first.proposals.len(), 2, "the bound must reach the query");
+    let cursor = first.next.expect("three more rows cannot fit in one page");
+
+    let second = repository
+        .list_guard_proposals(owner, sandbox_id, 2, Some(cursor))
+        .await
+        .unwrap();
+    assert_eq!(second.proposals.len(), 2);
+
+    let third = repository
+        .list_guard_proposals(owner, sandbox_id, 2, Some(second.next.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        third.proposals.len(),
+        1,
+        "the last page is short and must say so"
+    );
+    assert!(
+        third.next.is_none(),
+        "a page that returned the last row must not claim another follows"
+    );
+
+    // Paging to the end must show every row exactly once. This is the failure a
+    // cursor pointing at the held-back row would cause: that row is skipped and
+    // a caller paging to the end is never shown it.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = repository
+            .list_guard_proposals(owner, sandbox_id, 2, cursor)
+            .await
+            .unwrap();
+        seen.extend(page.proposals.iter().map(|row| row.id));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "a row was skipped or repeated: {seen:?}");
+}
+/// The bound has to reach the database, and nothing else can show that.
+///
+/// The rows are trimmed in Rust after the fetch, so removing `LIMIT` from the
+/// SQL leaves every behavioural test in this file passing while the database
+/// goes on materialising the sandbox's entire proposal history for a page of
+/// fifty. That is the exact shape of the defect the paging exists to remove,
+/// reached by a code change that reads like a simplification. So the plan is
+/// asked instead of the result: a top-level `Limit` node is the push-down, and
+/// its absence is the bug.
+#[tokio::test]
+async fn the_proposal_page_bound_is_pushed_down_to_the_database() {
+    let Some((repository, owner, _admin, _schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        crate::postgres::guard::proposals::LIST_PROPOSALS_SQL
+    ))
+    .bind(owner)
+    .bind(new_id())
+    .bind(None::<chrono::DateTime<Utc>>)
+    .bind(None::<Uuid>)
+    .bind(50_i64)
+    .fetch_one(&repository.pool)
+    .await
+    .expect("the plan must run");
+
+    assert!(
+        has_top_level_limit(&plan),
+        "the proposal page must be limited by the database, not only trimmed \
+         afterwards: {plan}"
+    );
+
+    // The approval queue, which is the more exposed of the two: the sandbox
+    // itself can ask for a row with nothing but `sandboxes:write`.
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        crate::postgres::guard::approvals::LIST_APPROVALS_SQL
+    ))
+    .bind(owner)
+    .bind(new_id())
+    .bind(None::<chrono::DateTime<Utc>>)
+    .bind(None::<Uuid>)
+    .bind(50_i64)
+    .fetch_one(&repository.pool)
+    .await
+    .expect("the plan must run");
+    assert!(
+        has_top_level_limit(&plan),
+        "the approval page must be limited by the database, not only trimmed \
+         afterwards: {plan}"
+    );
+}
+
+/// Walks an `EXPLAIN (FORMAT JSON)` document looking for a `Limit` node.
+///
+/// The document is an array whose first element holds the root under `Plan`,
+/// and `Plans` holds its children. A limit buried under a scan is not the same
+/// as a limit bounding the whole statement, so this reads the root only.
+fn has_top_level_limit(plan: &serde_json::Value) -> bool {
+    plan[0]["Plan"]["Node Type"] == "Limit"
+}
+
 #[tokio::test]
 async fn a_proposal_id_from_another_tenant_cannot_be_decided_through_it() {
     let Some((repository, owner, _admin, _schema)) = isolated_repository_and_tenant().await else {

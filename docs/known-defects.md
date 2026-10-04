@@ -1574,3 +1574,49 @@ filtered because a container cannot use it; the nameservers a sandbox actually
 receives (`169.254.1.1`, `192.168.1.1`) come from the worker's own container
 configuration. That is why the change is a no-op when read from the host and a
 fix when read from the worker.
+
+### The Guard history tables were the last unbounded tenant reads
+
+**Fixed.** Two more listings had the defect the sandbox list had. Neither
+`guard_proposals` nor `guard_tool_approvals` is ever pruned — a decided
+approval is deliberately retained as history — and both were read whole into a
+`Vec` and returned as a JSON array. The response size was a function of how
+long the sandbox had been running.
+
+The approval queue is the more exposed of the two. A row is created by
+`POST /v1/sandboxes/{id}/guard/approval`, which a sandbox reaches with nothing
+but `sandboxes:write`, so the growth is driven from inside the sandbox rather
+than by an operator. `guard_proposals` is bounded only by what a
+`guard:propose` key chooses to send.
+
+Both are now keyset pages on `(created_at DESC, id DESC)`, mirroring the
+sandbox list: `limit` default 50 clamped to `MAX_GUARD_PAGE = 200`, a paired
+`after_created_at`/`after_id` cursor that must be given together or refused,
+`LIMIT limit + 1` in the query with the extra row trimmed in Rust, and `next`
+naming the last row *returned*. Migration `0027_guard_history_keyset_index.sql`
+replaces both indexes with `(tenant_id, sandbox_id, created_at DESC, id DESC)`.
+
+`SandboxCursor` is now `PageCursor`, shared by all three listings, because they
+order on the same tuple and three copies of one page shape is how the missing
+index happened in the first place. `MatrixCursor` stays separate: it keys on
+`requested_at`, which is a different column and a different order.
+
+Regressions:
+
+- `a_sandbox_proposal_history_is_paged_and_says_where_it_stopped` and
+  `the_approval_queue_is_paged_and_says_where_it_stopped` write five rows
+  sharing one timestamp, so the id tie-breaker is what makes the page boundary
+  a value rather than a guess, then page at 2 and require every row exactly
+  once. Both fail if the cursor names the held-back row instead of the last
+  returned one — the mutation that silently skips one row per page.
+- `the_guard_history_indexes_carry_the_keyset_tie_breaker` asserts both index
+  definitions directly, because nothing about the returned page detects a
+  missing tie-breaker: the page reads correctly from the shorter index too,
+  just by sorting every tied row before the `LIMIT` applies.
+- `the_proposal_page_bound_is_pushed_down_to_the_database` `EXPLAIN`s both
+  statements and requires a top-level `Limit` node. It exists because the
+  behavioural tests cannot see this: the rows are trimmed in Rust after the
+  fetch, so deleting `LIMIT` from the SQL leaves every one of them passing
+  while the database materialises the whole history. Confirmed — with `LIMIT`
+  removed the root plan node is `Index Scan` and the behavioural tests still
+  passed.

@@ -328,7 +328,15 @@ def ask(sandbox: str, tool: str, request_digest: str, token: str | None = None, 
 
 
 def queue(sandbox: str, token: str | None = None):
-    return http("GET", f"/v1/sandboxes/{sandbox}/guard/tool-approvals", token=token)
+    """One bounded page of the operator queue.
+
+    A page envelope rather than a bare array, because the queue is only ever
+    appended to and the listing is bounded. The acceptance runs keep well under
+    the page size, so every caller here is reading a complete page; asking for
+    more than one and asserting that would say which.
+    """
+    status, page = http("GET", f"/v1/sandboxes/{sandbox}/guard/tool-approvals", token=token)
+    return status, page
 
 
 def decide(sandbox: str, request_id: str, decision: str, token: str | None = None):
@@ -409,8 +417,10 @@ def main() -> int:
     )
 
     # ---------------------------------------------------------------- case 2
-    status_as_operator, as_operator = queue(sandbox, token=APPROVER_KEY)
-    status_as_harness, as_harness = queue(sandbox)
+    status_as_operator, as_operator_page = queue(sandbox, token=APPROVER_KEY)
+    as_operator = as_operator_page["approvals"]
+    status_as_harness, as_harness_page = queue(sandbox)
+    as_harness = as_harness_page["approvals"]
     pending = [row for row in (as_operator or []) if row.get("state") == "pending"]
     case(
         "the-operator-queue-is-readable-only-with-the-approve-scope",
@@ -468,7 +478,8 @@ def main() -> int:
     # asked about `sandbox.write_file`, so the only `sandbox.destroy` request
     # on this sandbox is the one this key just made.
     self_status, _ = ask(sandbox, "sandbox.destroy", digest("sandbox.destroy", {}), token=BOTH_KEY)
-    _, both_queue = queue(sandbox, token=APPROVER_KEY)
+    _, both_queue_page = queue(sandbox, token=APPROVER_KEY)
+    both_queue = both_queue_page["approvals"]
     own = next(
         (r for r in (both_queue or [])
          if r.get("state") == "pending" and r.get("tool") == "sandbox.destroy"),
@@ -481,7 +492,8 @@ def main() -> int:
     # would pass with the constraint removed.
     own_is_self = bool(own) and own.get("requested_by_key_id") == _requester_of_self_ask()
     both_decision = decide(sandbox, own_id, "granted", token=BOTH_KEY)[0] if own_id else None
-    _, still = queue(sandbox, token=APPROVER_KEY)
+    _, still_page = queue(sandbox, token=APPROVER_KEY)
+    still = still_page["approvals"]
     still_pending = [
         r for r in (still or [])
         if r.get("id") in (request_id, own_id) and r.get("state") == "pending"
@@ -556,7 +568,8 @@ def main() -> int:
     deny_sandbox = create_sandbox("case-8")
     deny_digest = digest("sandbox.write_file", WRITE_ARGS)
     ask(deny_sandbox, "sandbox.write_file", deny_digest)
-    _, listed = queue(deny_sandbox, token=APPROVER_KEY)
+    _, listed_page = queue(deny_sandbox, token=APPROVER_KEY)
+    listed = listed_page["approvals"]
     deny_request = next(
         (r for r in (listed or []) if r.get("state") == "pending" and r.get("request_digest") == deny_digest),
         None,
@@ -567,7 +580,8 @@ def main() -> int:
         status, denied = decide(deny_sandbox, deny_request["id"], "denied", token=APPROVER_KEY)
         _, answer = ask(deny_sandbox, "sandbox.write_file", deny_digest)
         overturn_status, _ = decide(deny_sandbox, deny_request["id"], "granted", token=APPROVER_KEY)
-        _, after = queue(deny_sandbox, token=APPROVER_KEY)
+        _, after_page = queue(deny_sandbox, token=APPROVER_KEY)
+        after = after_page["approvals"]
         row = next((r for r in (after or []) if r["id"] == deny_request["id"]), {})
         case(
             "a-denial-is-not-spendable-and-cannot-be-overturned",

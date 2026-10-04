@@ -47,6 +47,18 @@ A grant is spendable once, only for the digest it was made for, and only by the
 key that asked. Self-approval is refused however much authority the key holds.
 See [GUARD.md](GUARD.md#approving-a-high-risk-call).
 
+Both Guard history listings are paged the same way, for the same reason. A
+proposal row is never reclaimed, and a decided tool approval is deliberately
+retained, so a sandbox left running grows both without bound. `GET
+/v1/sandboxes/{id}/guard/proposals` (scope `GuardRead`) and `GET
+/v1/sandboxes/{id}/guard/tool-approvals` (scope `GuardApprove`) take the same
+`limit` (default 50, store-clamped to 200) and the same paired
+`after_created_at` + `after_id` cursor, and return `{proposals, next}` and
+`{approvals, next}` respectively, ordered `created_at DESC, id DESC`, with
+`next` non-null exactly when another page follows. The id half of the cursor is
+not decoration: `created_at` is not unique, and a keyset that cannot break a
+tie either re-reads or skips the rows sharing a timestamp.
+
 `resources.guard` selects an out-of-guest policy: either
   `{"policy_template": "no-network" | "model-only" | "model-plus-allowlist" | "read-only-api"}`
   with optional `model_endpoint` and `allowlist` inputs, or a full

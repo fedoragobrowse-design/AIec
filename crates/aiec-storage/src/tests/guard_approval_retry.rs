@@ -65,9 +65,10 @@ async fn a_retry_joins_the_request_already_open() {
     );
     assert_eq!(
         store
-            .list_guard_tool_approvals(stored.tenant_id, sandbox)
+            .list_guard_tool_approvals(stored.tenant_id, sandbox, 50, None)
             .await
             .unwrap()
+            .approvals
             .len(),
         1,
         "the operator queue must not grow on retry"
