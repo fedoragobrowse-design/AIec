@@ -474,6 +474,16 @@ pub const MAX_GUARD_PAGE: u32 = MAX_HISTORY_PAGE;
 /// Ceiling on one page of a sandbox's snapshots.
 pub const MAX_SNAPSHOT_PAGE: u32 = MAX_HISTORY_PAGE;
 
+/// How many expired Guard budgets one tick of the durable budget reaper takes.
+///
+/// This is a window, not a cap on the backlog: a tick that leaves work behind
+/// picks it up on the next one. That is only true while the window is filled
+/// with budgets the reaper can act on, which is why the store excludes the ones
+/// it cannot — an already-quarantined sandbox is not destroyed until an
+/// operator releases it, so those rows accumulate, and they used to sort to
+/// the front and consume the window.
+pub const REAPER_GUARD_WINDOW: usize = 64;
+
 /// Where the next page of a tenant-scoped history listing starts.
 ///
 /// The two fields together are the row's own position in the ordering, so a
@@ -620,10 +630,22 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<GuardIncident, CoreError> {
         Err(CoreError::Unsupported("get_guard_incident".into()))
     }
-    /// Includes expired or exhausted rows, even when quarantine still needs completion.
+    /// Budgets that still need quarantine: expired or exhausted, and not
+    /// already quarantined.
+    ///
+    /// The store bounds the result to `limit` rows and orders it, because the
+    /// caller is a periodic reaper that works through a fixed window per tick.
+    /// Both halves of that contract matter. Rows that are already quarantined
+    /// are excluded rather than returned-and-skipped: the caller has no work to
+    /// do for them, and returning them lets enough of them fill the window and
+    /// starve the budgets that do need enforcement.
+    ///
+    /// The reaper's window is [`REAPER_GUARD_WINDOW`]. It lives beside the
+    /// contract so the caller and the stores cannot drift apart on it.
     async fn list_expired_guard_budgets(
         &self,
         _now: DateTime<Utc>,
+        _limit: usize,
     ) -> Result<Vec<GuardBudgetState>, CoreError> {
         Err(CoreError::Unsupported("list_expired_guard_budgets".into()))
     }
@@ -873,6 +895,22 @@ pub trait MetadataStore: Send + Sync {
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError>;
     /// Lists registered legacy nodes.
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError>;
+    /// Proves the metadata store answers, without reading a collection.
+    ///
+    /// Readiness is served on an unauthenticated, unthrottled route because a
+    /// load balancer has no credential to present, so its cost is paid by
+    /// whoever happens to send the request. It previously proved the database
+    /// was reachable by listing every worker and discarding the result, which
+    /// made an anonymous probe a full-table read — the cheaper way to ask the
+    /// same question is to ask it directly.
+    async fn ping(&self) -> Result<(), CoreError>;
+    /// Sums the fleet's free capacity without materialising the fleet.
+    ///
+    /// `/metrics` is likewise public, and Prometheus is only one of its
+    /// callers: anyone can ask. It reports two totals, so shipping every node
+    /// row to the process to add them up in Rust made an anonymous scrape
+    /// proportional to the size of the fleet.
+    async fn node_capacity_totals(&self) -> Result<crate::NodeCapacity, CoreError>;
     /// Stores a tenant.
     async fn put_tenant(&self, value: TenantRecord) -> Result<(), CoreError>;
     /// Gets a tenant.

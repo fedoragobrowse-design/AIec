@@ -1653,6 +1653,11 @@ pub(crate) const LIST_SNAPSHOTS_SQL: &str = "\
      AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4)) \
      ORDER BY created_at DESC, id DESC LIMIT $5";
 
+/// Re-exported for the same reason as [`LIST_SNAPSHOTS_SQL`]: the plan
+/// assertion has to run against the statement that actually executes.
+#[cfg(test)]
+pub(crate) use guard::EXPIRED_GUARD_BUDGETS_SQL;
+
 impl PostgresRepository {
     /// Creates a run, or returns the run this idempotency key already produced.
     async fn set_run_failure(
@@ -2182,6 +2187,40 @@ impl PostgresRepository {
             last_heartbeat: value.last_heartbeat,
         })
         .await
+    }
+
+    async fn ping(&self) -> Result<(), StoreError> {
+        sqlx::query("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, StoreError> {
+        // Same predicate as `list_nodes`: healthy and inside the heartbeat
+        // TTL. Aggregating without it would report capacity the fleet has
+        // already given up, which is a different number than the one /metrics
+        // has always reported.
+        let row = sqlx::query(
+            // Both sums are cast back to bigint: Postgres widens sum(int4) to
+            // int8 but sum(int8) to numeric, and the caller wants a byte count,
+            // not an arbitrary-precision decimal.
+            "SELECT COALESCE(SUM(available_vcpus), 0)::bigint AS vcpus, \
+             COALESCE(SUM(available_memory_bytes), 0)::bigint AS memory \
+             FROM nodes WHERE healthy = true \
+             AND last_heartbeat >= now() - ($1 * interval '1 second')",
+        )
+        .bind(NODE_HEARTBEAT_TTL_SECONDS)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(aiec_core::NodeCapacity {
+            // `sum(integer)` widens to bigint in Postgres, so this is an
+            // int8 even though the column it sums is an int4.
+            available_vcpus: row.try_get::<i64, _>("vcpus")?.max(0) as u32,
+            available_memory_bytes: row.try_get::<i64, _>("memory")?.max(0) as u64,
+        })
     }
 
     async fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
@@ -4486,8 +4525,9 @@ impl MetadataStore for PostgresRepository {
     async fn list_expired_guard_budgets(
         &self,
         now: DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<GuardBudgetState>, CoreError> {
-        Self::list_expired_guard_budgets(self, now)
+        Self::list_expired_guard_budgets(self, now, limit)
             .await
             .map_err(core_error)
     }
@@ -4610,6 +4650,14 @@ impl MetadataStore for PostgresRepository {
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
         Self::register_node(self, value).await.map_err(core_error)
     }
+    async fn ping(&self) -> Result<(), CoreError> {
+        Self::ping(self).await.map_err(core_error)
+    }
+
+    async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, CoreError> {
+        Self::node_capacity_totals(self).await.map_err(core_error)
+    }
+
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
         Self::list_nodes(self).await.map_err(core_error)
     }
@@ -5331,6 +5379,7 @@ async fn release_capacity(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    mod capacity;
     mod guard_durable;
     use sqlx::postgres::PgPoolOptions;
 

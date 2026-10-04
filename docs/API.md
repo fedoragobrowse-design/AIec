@@ -157,7 +157,30 @@ The stored object is the file's own bytes: `size_bytes` and `checksum_sha256` de
 
 Collection failures fail the run rather than returning a shorter list than was asked for. A requested artifact that cannot be read, exceeds the limit, changes while it is being read, or cannot be stored sets `failure_reason` naming the artifact, and the run settles `failed`. Artifacts collected before the failure are still recorded and downloadable, because a failed run is the one whose evidence somebody opens.
 
-Operational endpoints: `/health`, `/ready`, `/metrics`. `POST /v1/keys`, `/v1/keys/{id}/revoke`, and `/v1/keys/{id}/rotate` are administrative bootstrap/management operations and are disabled unless `AIEC_DEV_API_KEY` bootstraps a local tenant.
+Operational endpoints: `/health`, `/ready`, `/metrics`.
+
+### API keys
+
+Three routes, and only three: `GET /v1/keys` lists the caller's own tenant's
+keys; `POST /v1/keys` mints one; `DELETE /v1/keys/{id}` revokes one. There is no
+rotate route and there is no `POST /v1/keys/{id}/revoke` — revocation is the
+`DELETE` verb on the key itself.
+
+Key management is the one place where **omitting a field grants authority**, so
+it is worth being explicit. `POST /v1/keys` with no `scopes` is a request for
+the default set — `sandboxes:read`, `sandboxes:write`, `snapshots:read`,
+`snapshots:write` — and that is a grant, not a shortcut. Every scope that would
+be granted, defaulted or explicit, must be held by the calling credential, so a
+key carrying only `sandboxes:read` is refused both an omitted `scopes` field and
+an explicit `["sandboxes:write"]`. The rule is the same on both paths on purpose:
+the default is a way of asking for four scopes, not a way around needing them.
+
+Revocation follows the same principle, because destroying a credential is a use
+of authority. To revoke a key, the caller must hold **every** scope the target
+holds. A `sandboxes:read` key cannot revoke a key that can write, and neither
+can it revoke a tenant admin key. A key from another tenant, or one that does
+not exist, is `404` — a key's existence is not disclosed across a tenant
+boundary. Revoking a key revokes it immediately; there is no grace period.
 
 ## Status codes
 

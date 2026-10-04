@@ -889,6 +889,14 @@ mod tests {
             true
         }
 
+        async fn ping(&self) -> Result<(), CoreError> {
+            self.inner.ping().await
+        }
+
+        async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, CoreError> {
+            self.inner.node_capacity_totals().await
+        }
+
         async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
             Ok(self.nodes.clone())
         }

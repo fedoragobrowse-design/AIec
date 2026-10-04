@@ -128,7 +128,7 @@ async fn concurrent_reservations_commit_exact_ceiling_and_all_dimensions_atomica
     );
     assert!(
         repository
-            .list_expired_guard_budgets(Utc::now())
+            .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
             .await
             .unwrap()
             .contains(&state)
@@ -215,7 +215,7 @@ async fn lifetime_byte_ceiling_and_overflow_refuse_without_partial_debits() {
     ));
     assert_eq!(
         repository
-            .list_expired_guard_budgets(Utc::now())
+            .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
             .await
             .unwrap()[0]
             .expires_at,
@@ -539,5 +539,178 @@ async fn incident_evidence_extends_only_its_original_verified_prefix() {
             .unwrap()
             .id,
         original.id
+    );
+}
+
+/// A sandbox plus the lease the reaper's own quarantine path fences against, so
+/// these tests exercise the production handling rather than poking a flag.
+async fn budgeted_sandbox(
+    repository: &MemoryRepository,
+    tenant: Uuid,
+    quarantined: bool,
+    now: chrono::DateTime<Utc>,
+) -> (Uuid, GuardFence) {
+    let sandbox_id = Uuid::now_v7();
+    let node_id = Uuid::new_v4();
+    let state = if quarantined {
+        SandboxState::Quarantined
+    } else {
+        SandboxState::Running
+    };
+    repository
+        .create_sandbox(Sandbox {
+            id: sandbox_id,
+            tenant_id: tenant,
+            node_id: Some(node_id),
+            image_id: "test".into(),
+            state,
+            runtime: RuntimeKind::Firecracker,
+            cpu: 1,
+            memory_mb: 64,
+            disk_mb: 512,
+            timeout_seconds: 600,
+            network: Default::default(),
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        })
+        .await
+        .unwrap();
+    let fence = GuardFence {
+        lease_id: Uuid::new_v4(),
+        generation: 2,
+    };
+    repository.data.write().await.leases.insert(
+        fence.lease_id,
+        WorkerLease {
+            id: fence.lease_id,
+            tenant_id: tenant,
+            sandbox_id,
+            node_id,
+            generation: 3,
+            status: "active".into(),
+            reason: None,
+            expires_at: now + Duration::minutes(10),
+            created_at: now,
+            updated_at: now,
+        },
+    );
+    let stored = repository
+        .put_guard_budget(GuardBudgetState {
+            identity: GuardIdentity {
+                sandbox_id,
+                tenant_id: tenant,
+                policy_hash: "a".repeat(64),
+            },
+            expires_at: now - Duration::hours(1),
+            max_model_requests: 10,
+            max_bytes_in: 10,
+            max_bytes_out: 10,
+            model_requests: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            quarantined: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.quarantined, quarantined,
+        "a budget inherits quarantine from the state of its sandbox"
+    );
+    (sandbox_id, fence)
+}
+
+/// The reaper takes a fixed window per tick, so what the store hands back has
+/// to be work rather than candidates.
+///
+/// A quarantined sandbox is not destroyed until an operator releases it, so its
+/// budget row is still in the collection indefinitely. When the store reported
+/// those rows the reaper skipped them, and because sandbox ids are time-ordered
+/// the handled rows were the oldest and sorted to the front of the window:
+/// enough of them and every tick was 64 no-ops and no budget that still needed
+/// enforcing was ever reached. That is the control that stops a guarded machine
+/// running past its budget, so this is a liveness property, not a nicety.
+#[tokio::test]
+async fn handled_guard_budgets_cannot_fill_the_reapers_window() {
+    let repository = MemoryRepository::new();
+    let tenant = Uuid::new_v4();
+    let now = Utc::now();
+    let window = aiec_core::storage::REAPER_GUARD_WINDOW;
+
+    // A full window of already-handled budgets, created first so they also hold
+    // the lowest ids, then one that still needs enforcing.
+    for _ in 0..window {
+        budgeted_sandbox(&repository, tenant, true, now).await;
+    }
+    let (pending, _fence) = budgeted_sandbox(&repository, tenant, false, now).await;
+
+    let tick = repository
+        .list_expired_guard_budgets(Utc::now(), window)
+        .await
+        .unwrap();
+    assert_eq!(
+        tick.len(),
+        1,
+        "the window should hold the one budget that needs work, not a full page \
+         of budgets the reaper would skip"
+    );
+    assert_eq!(
+        tick[0].identity.sandbox_id, pending,
+        "the budget still needing quarantine is the one the reaper gets"
+    );
+}
+
+/// The window bounds a tick's work; it does not discard the backlog. Budgets
+/// past the window come back once the ones in front of them are handled, which
+/// is the same path the reaper drives.
+#[tokio::test]
+async fn guard_budgets_beyond_the_window_come_back_on_the_next_tick() {
+    let repository = MemoryRepository::new();
+    let tenant = Uuid::new_v4();
+    let now = Utc::now();
+    let window = aiec_core::storage::REAPER_GUARD_WINDOW;
+
+    let mut fences = Vec::new();
+    for _ in 0..(window + 5) {
+        fences.push(budgeted_sandbox(&repository, tenant, false, now).await);
+    }
+    let mut expected: Vec<Uuid> = fences.iter().map(|(id, _)| *id).collect();
+    expected.sort();
+
+    let mut seen = Vec::new();
+    let mut ticks = 0;
+    loop {
+        let tick = repository
+            .list_expired_guard_budgets(Utc::now(), window)
+            .await
+            .unwrap();
+        if tick.is_empty() {
+            break;
+        }
+        assert!(
+            tick.len() <= window,
+            "a tick returned more than its own window"
+        );
+        ticks += 1;
+        assert!(ticks <= 2, "the backlog should drain in a second tick");
+        for budget in &tick {
+            // Exactly what the reaper does with what it is handed.
+            let fence = fences
+                .iter()
+                .find(|(id, _)| *id == budget.identity.sandbox_id)
+                .expect("a fence for every budget")
+                .1;
+            repository
+                .mark_guard_quarantined(tenant, budget.identity.sandbox_id, fence)
+                .await
+                .unwrap();
+            seen.push(budget.identity.sandbox_id);
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen, expected,
+        "ticking through the backlog should reach every budget exactly once"
     );
 }

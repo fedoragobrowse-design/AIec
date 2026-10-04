@@ -7,13 +7,31 @@ use super::{
 };
 use crate::guard::{initialize, merge_incident, reserve, validate_fence};
 use aiec_core::{
-    Sandbox, SandboxState,
+    CoreError, Sandbox, SandboxState,
     storage::{BudgetDebit, GuardBudgetState, GuardFence, GuardIdentity, GuardIncident},
 };
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+/// The reaper's work list, bounded and ordered.
+///
+/// Already-quarantined budgets are excluded rather than returned: the reaper
+/// has no work for them, and because they are the oldest sandboxes they sort
+/// to the front of the window. Returning them is how a long-lived tenant kept
+/// the reaper from ever reaching a budget that still needed enforcing. `LIMIT`
+/// is pushed into the query so the bound is on the read, not on a `take` after
+/// it.
+pub(crate) const EXPIRED_GUARD_BUDGETS_SQL: &str = "SELECT b.payload FROM guard_budgets b \
+JOIN sandboxes s ON s.id=b.sandbox_id AND s.tenant_id=b.tenant_id \
+WHERE s.state NOT IN ('destroyed','destroying') \
+AND NOT COALESCE((b.payload->>'quarantined')::boolean, false) \
+AND (b.expires_at <= $1 \
+  OR (b.payload->>'model_requests')::numeric >= (b.payload->>'max_model_requests')::numeric \
+  OR (b.payload->>'bytes_in')::numeric >= (b.payload->>'max_bytes_in')::numeric \
+  OR (b.payload->>'bytes_out')::numeric >= (b.payload->>'max_bytes_out')::numeric) \
+ORDER BY b.sandbox_id \
+LIMIT $2";
 // Match capacity release/recovery: lease -> sandbox -> budget -> incident. No
 // Guard transaction holds a sandbox lock while waiting for its owning lease.
 async fn lock_owned(
@@ -186,9 +204,18 @@ impl PostgresRepository {
     pub(crate) async fn list_expired_guard_budgets(
         &self,
         now: DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<GuardBudgetState>, StoreError> {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT b.payload FROM guard_budgets b JOIN sandboxes s ON s.id=b.sandbox_id AND s.tenant_id=b.tenant_id WHERE s.state NOT IN ('destroyed','destroying') AND (b.expires_at <= $1 OR (b.payload->>'quarantined')::boolean OR (b.payload->>'model_requests')::numeric >= (b.payload->>'max_model_requests')::numeric OR (b.payload->>'bytes_in')::numeric >= (b.payload->>'max_bytes_in')::numeric OR (b.payload->>'bytes_out')::numeric >= (b.payload->>'max_bytes_out')::numeric) ORDER BY b.sandbox_id")
-            .bind(now).fetch_all(&self.pool).await.map_err(database_error)?;
+        let rows: Vec<serde_json::Value> = sqlx::query_scalar(EXPIRED_GUARD_BUDGETS_SQL)
+            .bind(now)
+            .bind(i64::try_from(limit).map_err(|_| {
+                StoreError::Core(CoreError::InvalidRequest(
+                    "reaper window is out of range".into(),
+                ))
+            })?)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
         rows.into_iter()
             .map(|value| serde_json::from_value(value).map_err(StoreError::Json))
             .collect()

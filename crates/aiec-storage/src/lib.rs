@@ -393,21 +393,16 @@ impl MemoryRepository {
             })
             .cloned()
             .collect();
+        // `page` truncates an already-ordered list; it does not sort. The
+        // order is the query's: `created_at DESC, id DESC`.
         matching.sort_by(|left, right| {
             right
                 .created_at
                 .cmp(&left.created_at)
                 .then_with(|| right.id.cmp(&left.id))
         });
-        let next = matching.get(limit).map(|last| PageCursor {
-            created_at: last.created_at,
-            id: last.id,
-        });
-        matching.truncate(limit);
-        Ok(aiec_core::storage::SnapshotPage {
-            snapshots: matching,
-            next,
-        })
+        let (snapshots, next) = page(matching, limit, |value| (value.created_at, value.id));
+        Ok(aiec_core::storage::SnapshotPage { snapshots, next })
     }
 
     async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
@@ -482,6 +477,26 @@ impl MemoryRepository {
         node.id = id;
         nodes.nodes.insert(id, node);
         Ok(id)
+    }
+
+    async fn ping(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, StoreError> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(30);
+        let data = self.data.read().await;
+        let mut totals = aiec_core::NodeCapacity::default();
+        for node in data.nodes.values() {
+            if node.healthy && node.last_heartbeat > cutoff {
+                totals.available_vcpus =
+                    totals.available_vcpus.saturating_add(node.available_vcpus);
+                totals.available_memory_bytes = totals
+                    .available_memory_bytes
+                    .saturating_add(node.available_memory_bytes);
+            }
+        }
+        Ok(totals)
     }
 
     async fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
@@ -908,8 +923,9 @@ impl MetadataStore for MemoryRepository {
     async fn list_expired_guard_budgets(
         &self,
         now: chrono::DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<GuardBudgetState>, CoreError> {
-        Self::list_expired_guard_budgets(self, now)
+        Self::list_expired_guard_budgets(self, now, limit)
             .await
             .map_err(core_error)
     }
@@ -1033,6 +1049,14 @@ impl MetadataStore for MemoryRepository {
 
     async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
         Self::register_node(self, value).await.map_err(core_error)
+    }
+
+    async fn ping(&self) -> Result<(), CoreError> {
+        Self::ping(self).await.map_err(core_error)
+    }
+
+    async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, CoreError> {
+        Self::node_capacity_totals(self).await.map_err(core_error)
     }
 
     async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {

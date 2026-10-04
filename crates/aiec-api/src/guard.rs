@@ -766,17 +766,29 @@ async fn persist(state: &AppState, incident: GuardIncident) -> Result<GuardIncid
         .map_err(ApiFailure::from)
 }
 
+/// How many budgets one tick of the reaper takes.
+///
+/// The bound is pushed into the store query rather than applied to the returned
+/// rows, so a tick costs one bounded read instead of reading the whole set and
+/// discarding most of it. Rows the reaper cannot act on are excluded by the
+/// store as well, so the window is work rather than candidates.
+pub use aiec_core::storage::REAPER_GUARD_WINDOW as REAPER_WINDOW;
+
 /// Quarantines every guarded sandbox whose durable lifetime or budget is spent.
 ///
 /// The reaper holds no timers of its own: what is expired is read from the same
 /// durable rows a worker restart does not reset, so neither a worker restart nor
 /// a control-plane restart hands a machine a fresh allowance.
 pub async fn reap_guard_budgets(state: &AppState, now: chrono::DateTime<Utc>) {
-    let Ok(expired) = state.repository().list_expired_guard_budgets(now).await else {
+    let Ok(expired) = state
+        .repository()
+        .list_expired_guard_budgets(now, REAPER_WINDOW)
+        .await
+    else {
         tracing::warn!("durable Guard budget reaper could not read expired budgets");
         return;
     };
-    for budget in expired.into_iter().take(64) {
+    for budget in expired {
         if budget.quarantined {
             continue;
         }

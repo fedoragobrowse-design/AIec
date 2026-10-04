@@ -1628,8 +1628,14 @@ async fn ready(State(state): State<AppState>) -> Response {
     let mut checks = serde_json::Map::new();
     let mut ready = true;
 
-    match state.repository().list_workers(true).await {
-        Ok(_) => {
+    // `ping`, not a worker listing. Readiness answers on an unauthenticated
+    // and unthrottled route — a load balancer has no credential to present —
+    // and its only question is whether the database responds. Listing every
+    // worker to discard the result made an anonymous probe cost a full-table
+    // read, which is the shape of an amplification bug rather than a health
+    // check.
+    match state.repository().ping().await {
+        Ok(()) => {
             checks.insert("database".to_string(), json!("ok"));
         }
         // A store that does not implement worker listing is a development
@@ -1659,12 +1665,15 @@ async fn ready(State(state): State<AppState>) -> Response {
     (code, Json(json!({"status": status, "checks": checks}))).into_response()
 }
 async fn metrics(State(state): State<AppState>) -> Response {
-    let nodes = state.repository().list_nodes().await.unwrap_or_default();
-    let available_vcpus = nodes.iter().map(|node| node.available_vcpus).sum::<u32>();
-    let available_memory = nodes
-        .iter()
-        .map(|node| node.available_memory_bytes)
-        .sum::<u64>();
+    // Summed by the database. Two totals are the whole report, and `/metrics`
+    // is public like `/ready`, so shipping the fleet to the process to add it
+    // up made the cost of an anonymous scrape proportional to the fleet.
+    let (available_vcpus, available_memory) = state
+        .repository()
+        .node_capacity_totals()
+        .await
+        .map(|totals| (totals.available_vcpus, totals.available_memory_bytes))
+        .unwrap_or_default();
     let body = format!(
         "# TYPE aiec_api_requests_total counter\naiec_api_requests_total {}\n# TYPE aiec_node_available_vcpus gauge\naiec_node_available_vcpus {}\n# TYPE aiec_node_available_memory_bytes gauge\naiec_node_available_memory_bytes {}\n",
         state.requests.load(Ordering::Relaxed),
@@ -3613,14 +3622,17 @@ async fn list_snapshots(
     p.authorize(Scope::SnapshotsRead)
         .map_err(ApiFailure::from)?;
     let after = page_cursor(query.after_created_at, query.after_id)?;
+    // Clamped at the route as well as in the store, so the response and the
+    // query agree about what a limit is: the caller cannot read past the
+    // maximum by naming it, and a store that forgot to clamp is not the thing
+    // that gets to decide.
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_PAGE)
+        .clamp(1, aiec_core::storage::MAX_SNAPSHOT_PAGE);
     Ok(Json(
         s.repository()
-            .list_snapshots(
-                p.tenant_id,
-                id,
-                query.limit.unwrap_or(DEFAULT_HISTORY_PAGE),
-                after,
-            )
+            .list_snapshots(p.tenant_id, id, limit, after)
             .await
             .map_err(ApiFailure::from)?,
     ))
@@ -5005,6 +5017,14 @@ mod tests {
         async fn register_node(&self, value: Node) -> Result<Uuid, CoreError> {
             self.inner.register_node(value).await
         }
+        async fn ping(&self) -> Result<(), CoreError> {
+            self.inner.ping().await
+        }
+
+        async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, CoreError> {
+            self.inner.node_capacity_totals().await
+        }
+
         async fn list_nodes(&self) -> Result<Vec<Node>, CoreError> {
             self.inner.list_nodes().await
         }

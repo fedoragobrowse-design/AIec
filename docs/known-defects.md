@@ -920,8 +920,30 @@ when `_listed` is bypassed.
 
 ### Checked, and not defects
 
-Three findings from the sweep did not survive inspection. Recording why, so
+Four findings from the sweep did not survive inspection. Recording why, so
 they are not re-raised.
+
+**A sandbox key can mint a key that outlives its own revocation.** Re-checked,
+and the alarming half of it is not reachable. There is one authentication
+mechanism in the control plane: a Bearer token resolved against `api_keys`. A
+"sandbox key" is an ordinary tenant credential that gets written into the
+sandbox, not a separate principal with its own route access, so it reaches
+`POST /v1/keys` only as itself — and `create_key` now authorizes every scope it
+issues against the scopes the caller holds, defaults included. A caller holding
+`sandboxes:write` can mint a key, but only carrying `sandboxes:write`, which is
+authority it already had.
+
+What is true, and is left as is: `expires_in_days: null` is a permanent key, so
+the minted credential survives revocation of the credential that minted it.
+Revocation is per-key and there is no parent/child cascade. Capping a minted
+key's lifetime at its parent's would break the rotation this API exists for —
+the replacement credential has to be able to outlive the one being replaced —
+so the bound is deliberately not there. The mitigating property is that `POST
+/v1/keys` writes an `api_key.created` audit event naming the actor key and the
+subject key, so the sibling a compromised credential minted is discoverable in
+the database. Residual limit, recorded honestly: there is no HTTP surface for
+querying that audit trail, so finding it means an operator goes to the database
+directly.
 
 **`sandbox_ownership` returns an expired lease.** It filters `status='active'`
 but not `expires_at`, so it can hand back a lease that has lapsed. That is not a
@@ -1730,11 +1752,17 @@ the remaining collections that are read whole, with the reason each one is
 accepted rather than overlooked. Recorded so a later reader does not have to
 re-derive them, and does not mistake an assessment for an oversight.
 
-- **Worker nodes** (`list_nodes` in `/metrics`, `list_workers` in `/ready`).
-  Both read the whole fleet on every scrape and every readiness poll. The fleet
-  is machines an operator provisions, so the row count is bounded by hardware
-  rather than by anything a tenant can do, and the `/ready` check genuinely has
-  to prove that workers are visible. Paging a sum would break it.
+- **Worker nodes and workers.** No longer read whole. `/ready` used to call
+  `list_workers(true)` and discard the result, and `/metrics` materialised
+  every node before summing it, so an unauthenticated request paid a full-table
+  scan on every scrape and every readiness poll. `/ready` now asks the store
+  `ping()` and `/metrics` asks for `node_capacity_totals()`, an aggregate that
+  returns two numbers and counts rows inside the database. The aggregate keeps
+  `list_nodes`' semantics exactly — only `healthy` nodes, only heartbeats inside
+  `NODE_HEARTBEAT_TTL_SECONDS` — and a mutation of that predicate fails the
+  parity test. Neither route gained a rate limiter: a load balancer polling
+  readiness is not an abusive caller, and 429-ing a probe is worse than the
+  scan was.
 - **API keys** (`GET /v1/keys`). The tenant's own credential set, read whole.
   Creating one is now bounded by the authorization rule that was missing, so a
   caller must already hold every scope it grants, and each key is a metadata
@@ -1748,3 +1776,107 @@ re-derive them, and does not mistake an assessment for an oversight.
   constants: `MAX_RUN_ATTEMPTS = 10`, `MAX_ARTIFACTS = 64`, and events
   transitively around 700 rows. They are complete per-Run reads by design and
   are not tenant-growable, because the write paths refuse past the bound.
+
+### MCP and the CLI: no remaining unbounded collection read
+
+The MCP server reaches exactly seven route shapes, and each was checked against
+the store call behind it: `/v1/sandboxes` (keyset-paginated, capped at
+`MAX_SANDBOX_PAGE`), `/v1/runs` (`list_runs` clamps to `DEFAULT_RUN_PAGE` = 50
+and `MAX_RUN_PAGE` = 200), `/v1/runs/{id}` (one row), and the three run-scoped
+collections already bounded by their write-path constants. The sandbox-history
+call that walks owned sandboxes is capped at `MAX_OWNED_SANDBOXES = 200` with
+concurrency 8. There is no MCP route that reads a collection whole.
+
+The CLI's `guard proposals` prints the response body verbatim, which after the
+Guard pagination work is the `{proposals, next}` envelope. It fetches one page
+rather than looping, so a tenant with more than `MAX_GUARD_PAGE` proposals sees
+the first page only — but the `next` cursor it does not follow is printed
+alongside it, so the truncation is visible rather than silent. A human-facing
+print command that followed cursors until exhausted would be a different
+command, and changing this one to do it would bury the useful page under paging
+noise. Left as is, deliberately.
+
+## Fixed in the 2026-10-03 audit: the Guard budget reaper could starve
+
+### A full window of budgets it had already handled
+
+`reap_guard_budgets` bounds its work with `.take(64)`, and the store it reads
+from sorted by `sandbox_id`. Those two composed badly. A quarantined sandbox is
+not destroyed until an operator releases it, so its budget row is still in
+`guard_budgets` indefinitely; both the SQL predicate and the in-memory
+`expired()` helper reported those rows as expired; and the reaper then skipped
+every one of them. Because sandbox ids are time-ordered, the handled rows were
+the oldest and sorted to the front of the window.
+
+So the window filled with work the reaper had no action for. Sixty-four
+quarantined-but-unreleased sandboxes were enough to make every subsequent tick
+sixty-four no-ops, and a budget that genuinely needed enforcement would never be
+reached. This is the control that stops a guarded machine running past its
+lifetime or its budget, so it is a liveness property of a security control
+rather than a throughput question. The `.take(64)` also read as a bound on the
+query while the query itself was unbounded.
+
+Three changes, in `aiec_core::storage` and both stores:
+
+- `list_expired_guard_budgets` now takes a `limit` and the stores apply it —
+  `LIMIT` in the query, `truncate` after an explicit sort in memory. The bound
+  is on the read, not on a `take` after it.
+- Already-quarantined budgets are excluded rather than returned-and-skipped.
+  The store's contract is now "budgets that still need quarantine", and the
+  reaper's `continue` is kept only as a defensive check.
+- The window is `aiec_core::storage::REAPER_GUARD_WINDOW`, declared beside the
+  trait method it bounds so the caller and the contract cannot drift apart.
+
+Regressions, in both stores: `handled_guard_budgets_cannot_fill_the_reapers_window`
+puts a full window of already-handled budgets in front of one that needs work
+and asserts the window holds the latter; mutating the memory filter to
+`state.quarantined || ...` reproduces the original bug exactly (`left: 64,
+right: 1`), and removing the SQL `NOT COALESCE(...)` predicate fails the
+PostgreSQL parity test. `guard_budgets_beyond_the_window_come_back_on_the_next_tick`
+drives the same window repeatedly, quarantining each tick's budgets through the
+production `mark_guard_quarantined` path, and asserts the backlog drains with
+each budget reached exactly once — the window bounds a tick, it does not
+discard work. `the_guard_reaper_window_is_pushed_down_to_the_database` `EXPLAIN`s
+the production `EXPIRED_GUARD_BUDGETS_SQL` constant and asserts the plan root is
+`Limit`; deleting `LIMIT $2` changes the root to `Sort`. The constant is
+re-exported for the same reason as `LIST_SNAPSHOTS_SQL`: a test carrying its own
+copy of the SQL proves the copy has a `LIMIT`, which is not the question.
+
+Not claimed: an end-to-end reaper test that drives `quarantine()` itself was
+attempted and abandoned. `current_fence` requires a scheduler, and
+`DevelopmentScheduler::dispatch_target` returns `Unsupported` unconditionally,
+so the development path cannot reach quarantine at all; exercising it needs a
+scheduler stub, a matching lease and a Guard journal, which is fixture weight
+well beyond the property being pinned. The store-level tests above pin the
+selection that the reaper's window depends on, which is where the defect was.
+
+## Fixed in the 2026-10-03 audit: the snapshot history was bounded in the store
+and not at the route
+
+`list_snapshots` in the HTTP layer passed `query.limit.unwrap_or(50)` straight
+through, relying on the store to clamp. The store does clamp, so this was never
+an unbounded read — but it left the route's response contract decided by an
+implementation detail of the store rather than by the route, which is the
+inversion that let `list_runs` and `list_snapshots` disagree about the same
+concept. The route now clamps to `MAX_SNAPSHOT_PAGE`, as `list_runs` clamps to
+`MAX_RUN_PAGE`.
+
+The regression is
+`a_snapshot_history_is_paged_at_the_route_with_a_clamped_bound`: sixty seeded
+snapshots, read through the real router. It asserts the default page holds
+fifty, walks the cursor to exhaustion and checks that all sixty arrive exactly
+once, then asks for `?limit=100000` and requires a `200` carrying all sixty and
+a null `next` — a clamp rather than a refusal.
+
+Two mutations were checked against it. Replacing the default with `100_000`
+fails on the default-page assertion. Ignoring the parsed cursor — keeping the
+parse and discarding the value — makes the walk re-serve the first page and is
+caught by the walk's own bound; that bound exists because without it the failure
+arrived as a `429` from the rate limiter rather than as an assertion about
+duplicates, which is a worse signal about what broke.
+
+The snapshots are seeded through `MetadataStore::put_snapshot` rather than
+`POST /v1/sandboxes/{id}/snapshots`. Sixty captures is sixty archives, and the
+capture route is rate limited per tenant, so the listing would have been
+refused before it was ever asked. What is under test is the listing route, and
+it reads the same rows either way.

@@ -633,6 +633,95 @@ async fn metrics_counts_requests_and_omits_sandbox_gauge() {
     assert!(!text.contains("aiec_sandboxes_total"));
 }
 
+/// `/metrics` and `/ready` are public routes: a load balancer and Prometheus
+/// both reach them with no credential. They used to answer by reading a whole
+/// table — every node for the gauges, every worker for readiness — which made
+/// an anonymous request cost a full-table scan. Both now ask for exactly the
+/// answer they report, and these pin that they still report it.
+#[tokio::test]
+async fn the_public_probe_routes_report_the_fleet_without_listing_it() {
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::SandboxesRead],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    futures::executor::block_on(repo.register_node(Node {
+        id: Uuid::now_v7(),
+        name: "probe-node".into(),
+        available_vcpus: 4,
+        available_memory_bytes: 8_589_934_592,
+        available_disk_bytes: 0,
+        sandbox_count: 0,
+        healthy: true,
+        last_heartbeat: chrono::Utc::now(),
+    }))
+    .unwrap();
+
+    let runtime = Arc::new(MockRuntime);
+    let registry = Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+        RuntimeKind::Docker,
+        runtime.clone(),
+    ));
+    let platform = Platform::builder()
+        .runtime(runtime)
+        .runtime_registry(registry)
+        .metadata_store(repo)
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy))
+        .build()
+        .unwrap();
+    let router = app(AppState::development(platform).with_runtime_kind(RuntimeKind::Docker));
+
+    let metrics = router
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("aiec_node_available_vcpus 4"),
+        "the vcpu gauge did not report the registered node: {text}"
+    );
+    assert!(
+        text.contains("aiec_node_available_memory_bytes 8589934592"),
+        "the memory gauge did not report the registered node: {text}"
+    );
+
+    // Readiness asks the store whether it answers. A live backend must be
+    // reported healthy rather than degrading to the development-backend
+    // "not_applicable" branch.
+    let ready = router
+        .oneshot(Request::get("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(ready.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["checks"]["database"], json!("ok"), "{body}");
+    assert_eq!(body["status"], json!("ready"), "{body}");
+}
+
 #[tokio::test]
 async fn lifecycle_exec_and_typed_error() {
     let (router, key, _) = setup();
@@ -3658,4 +3747,193 @@ async fn narrow_key_id(repo: &MemoryRepository, tenant: Uuid) -> Uuid {
         .find(|key| key.name == "narrow")
         .expect("the narrow key exists")
         .id
+}
+
+/// The snapshot history is a paged envelope with a bound, at the route as well
+/// as in the store: a caller who asks for a thousand snapshots gets the clamp
+/// rather than a refusal and rather than a thousand.
+#[tokio::test]
+async fn a_snapshot_history_is_paged_at_the_route_with_a_clamped_bound() {
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![
+            Scope::SandboxesRead,
+            Scope::SandboxesWrite,
+            Scope::SnapshotsRead,
+            Scope::SnapshotsWrite,
+        ],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+
+    let (platform, _artifacts) = development_platform(
+        Arc::new(MockRuntime),
+        repo.clone(),
+        Some(Arc::new(RecordingSnapshots {
+            kinds: Arc::new(Mutex::new(Vec::new())),
+        })),
+    );
+    let router = app(AppState::development(platform));
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/sandboxes")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"image":"ubuntu","cpu":1,"memory_mb":128,"disk_mb":512}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "creating a sandbox failed: {}",
+        created.status()
+    );
+    let sandbox: Value = serde_json::from_slice(
+        &axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let sandbox: Uuid = Uuid::parse_str(sandbox["id"].as_str().unwrap()).unwrap();
+
+    // More than one default page, so the default is observable. Seeded through
+    // the store rather than the capture route: sixty real captures is sixty
+    // archives, and the capture route is rate limited per tenant, so the route
+    // would refuse before the listing was ever asked for. What is under test
+    // here is the listing, and it reads the same rows either way.
+    let total = 60u32;
+    for index in 0..total {
+        futures::executor::block_on(repo.put_snapshot(Snapshot {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            sandbox_id: sandbox,
+            object_key: format!("snapshots/{sandbox}/{}", Uuid::now_v7()),
+            size_bytes: 1,
+            image_id: "ubuntu".into(),
+            created_at: chrono::Utc::now() - chrono::Duration::seconds(i64::from(total - index)),
+        }))
+        .unwrap();
+    }
+
+    let list = |query: String| {
+        let router = router.clone();
+        let url = format!("/v1/sandboxes/{sandbox}/snapshots{query}");
+        let key = key.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::get(url)
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // No limit at all: the default page, and an explicit successor.
+    let first = list(String::new()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let page: Value = serde_json::from_slice(
+        &axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        page["snapshots"].as_array().unwrap().len() == 50,
+        "the default page should hold 50 snapshots: {page}"
+    );
+    let mut seen: Vec<String> = page["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        page["next"].is_object(),
+        "the page must say where it stopped"
+    );
+
+    let mut cursor = page["next"].clone();
+    let mut pages = 1;
+    while let Some(next) = cursor.as_object() {
+        // Bounded so that a cursor which is ignored fails as a duplicate rather
+        // than walking until the rate limiter answers instead.
+        assert!(
+            pages < 10,
+            "the walk did not terminate: {pages} pages so far"
+        );
+        let query = format!(
+            "?limit=50&after_created_at={}&after_id={}",
+            next["created_at"].as_str().unwrap(),
+            next["id"].as_str().unwrap()
+        );
+        let response = list(query).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        seen.extend(
+            page["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_string()),
+        );
+        pages += 1;
+        cursor = page["next"].clone();
+    }
+    assert_eq!(pages, 2, "60 snapshots should be two pages of 50");
+    assert_eq!(
+        seen.len(),
+        total as usize,
+        "paging the route should surface every snapshot exactly once"
+    );
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        total as usize,
+        "no snapshot should appear twice"
+    );
+
+    // An absurd limit is clamped, not refused: the caller gets a page rather
+    // than an error, and no more than the maximum.
+    let clamped = list("?limit=100000".to_string()).await;
+    assert_eq!(
+        clamped.status(),
+        StatusCode::OK,
+        "an over-large limit must be clamped rather than rejected"
+    );
+    let page: Value = serde_json::from_slice(
+        &axum::body::to_bytes(clamped.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["snapshots"].as_array().unwrap().len(), total as usize);
+    assert!(
+        page["next"].is_null(),
+        "the clamped page covered everything, so there is no successor"
+    );
 }

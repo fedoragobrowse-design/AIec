@@ -113,12 +113,19 @@ pub(crate) fn reserve(
     Ok(result)
 }
 
+/// Whether this budget still needs the reaper's attention.
+///
+/// `quarantined` is deliberately not a reason. A quarantined budget has had
+/// the work done, but the sandbox it belongs to is not destroyed until an
+/// operator releases it, so the row stays in the collection for a long time.
+/// Reporting it as expired is what let handled budgets crowd the reaper's
+/// window.
 pub(crate) fn expired(state: &GuardBudgetState, now: DateTime<Utc>) -> bool {
-    state.quarantined
-        || state.expires_at <= now
-        || state.model_requests >= state.max_model_requests
-        || state.bytes_in >= state.max_bytes_in
-        || state.bytes_out >= state.max_bytes_out
+    !state.quarantined
+        && (state.expires_at <= now
+            || state.model_requests >= state.max_model_requests
+            || state.bytes_in >= state.max_bytes_in
+            || state.bytes_out >= state.max_bytes_out)
 }
 
 fn validate_incident_evidence(incident: &GuardIncident) -> Result<(), StoreError> {
@@ -351,8 +358,9 @@ impl MemoryRepository {
     pub(crate) async fn list_expired_guard_budgets(
         &self,
         now: DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<GuardBudgetState>, StoreError> {
-        Ok(self
+        let mut matching: Vec<GuardBudgetState> = self
             .data
             .read()
             .await
@@ -360,7 +368,12 @@ impl MemoryRepository {
             .values()
             .filter(|state| expired(state, now))
             .cloned()
-            .collect())
+            .collect();
+        // Ordered so the window the reaper takes is the same one the database
+        // would return, and so consecutive ticks drain rather than repeat.
+        matching.sort_by_key(|state| state.identity.sandbox_id);
+        matching.truncate(limit);
+        Ok(matching)
     }
     pub(crate) async fn mark_guard_quarantined(
         &self,

@@ -624,6 +624,16 @@ pub struct Node {
     pub healthy: bool,
     pub last_heartbeat: DateTime<Utc>,
 }
+/// The fleet's free capacity, summed by the database.
+///
+/// `/metrics` reports these two totals and nothing else, so it is answered by
+/// an aggregate rather than by shipping every node to the caller to add up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeCapacity {
+    pub available_vcpus: u32,
+    pub available_memory_bytes: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageRecord {
     pub id: String,

@@ -193,7 +193,7 @@ async fn postgres_guard_exact_ceiling_survives_reopen_and_cannot_be_reset() {
     assert!(durable_pending.completed_at.is_none());
     assert!(
         reopened
-            .list_expired_guard_budgets(Utc::now())
+            .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
             .await
             .unwrap()
             .contains(&spent)
@@ -243,7 +243,7 @@ async fn postgres_guard_lifetime_quarantine_and_pending_progress_are_durable_and
     ));
     assert!(
         repository
-            .list_expired_guard_budgets(Utc::now())
+            .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
             .await
             .unwrap()
             .contains(&expired)
@@ -905,4 +905,127 @@ async fn the_snapshot_page_bound_is_pushed_down_to_the_database() {
          afterwards: {plan}"
     );
     let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+}
+
+/// The reaper's window is work, not candidates.
+///
+/// Already-quarantined budgets are never destroyed until an operator releases
+/// the sandbox, so those rows accumulate for as long as the tenant keeps the
+/// machine. Reporting them meant the oldest rows - sandbox ids are time-ordered
+/// - filled the window with work the reaper skips, and a budget that still
+/// needed enforcing was never reached. Same property the memory store holds.
+#[tokio::test]
+async fn handled_guard_budgets_cannot_fill_the_reapers_window() {
+    let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let window = aiec_core::storage::REAPER_GUARD_WINDOW;
+
+    // The reaper's list is not tenant-scoped and quarantined sandboxes are the
+    // ones a tenant has not released, so a realistic backlog spans tenants. The
+    // default quota of eight active sandboxes per tenant is also why it cannot
+    // all belong to one.
+    let mut fleets: Vec<(Uuid, Uuid)> = Vec::new();
+    for index in 0..12 {
+        let owner = if index == 0 {
+            tenant
+        } else {
+            let id = new_id();
+            repository
+                .put_tenant(TenantRecord {
+                    id,
+                    name: format!("reaper-window-{index}-{id}"),
+                    created_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+            id
+        };
+        // Each test worker offers two vCPUs.
+        for _ in 0..4 {
+            fleets.push((owner, register_test_worker(&repository, owner).await));
+        }
+    }
+    let mut expected = Vec::new();
+    for index in 0..(window + 5) {
+        let handled = index < window;
+        let (owner, worker) = fleets[index % fleets.len()];
+        let (mut state, fence) = place(&repository, owner, worker).await;
+        state.expires_at = Utc::now() - chrono::Duration::hours(1);
+        repository.put_guard_budget(state.clone()).await.unwrap();
+        if handled {
+            repository
+                .mark_guard_quarantined(owner, state.identity.sandbox_id, fence)
+                .await
+                .unwrap();
+        } else {
+            expected.push(state.identity.sandbox_id);
+        }
+    }
+    expected.sort();
+
+    let mut seen = Vec::new();
+    let mut ticks = 0;
+    loop {
+        let tick = repository
+            .list_expired_guard_budgets(Utc::now(), window)
+            .await
+            .unwrap();
+        if tick.is_empty() {
+            break;
+        }
+        assert!(
+            tick.len() <= window,
+            "a tick returned more than its own window"
+        );
+        ticks += 1;
+        assert!(ticks <= 2, "the backlog should drain in a second tick");
+        for budget in &tick {
+            seen.push(budget.identity.sandbox_id);
+        }
+        // Quarantine so the next tick sees past them, as the reaper does.
+        for budget in &tick {
+            let _ = sqlx::query(
+                "UPDATE guard_budgets SET payload = jsonb_set(payload, '{quarantined}', 'true') \
+                 WHERE sandbox_id = $1",
+            )
+            .bind(budget.identity.sandbox_id)
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen, expected,
+        "ticking through the backlog should reach every budget that still needs \
+         enforcing, exactly once"
+    );
+    repository.pool.close().await;
+    drop_test_schema(&repository, admin, schema).await;
+}
+
+/// The window reaches the database. Without this the query materialises every
+/// expired budget in the deployment and the bound only exists afterwards.
+#[tokio::test]
+async fn the_guard_reaper_window_is_pushed_down_to_the_database() {
+    let Some((repository, _tenant, admin, schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        crate::postgres::EXPIRED_GUARD_BUDGETS_SQL
+    ))
+    .bind(Utc::now())
+    .bind(aiec_core::storage::REAPER_GUARD_WINDOW as i64)
+    .fetch_one(&repository.pool)
+    .await
+    .expect("the plan must run");
+    assert_eq!(
+        plan[0]["Plan"]["Node Type"], "Limit",
+        "the reaper's window must bound the query, not only the rows kept \
+         afterwards: {plan}"
+    );
+    repository.pool.close().await;
+    drop_test_schema(&repository, admin, schema).await;
 }
