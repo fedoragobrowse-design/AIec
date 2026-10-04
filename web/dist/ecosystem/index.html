@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ecosystem — AIec</title>
+<meta name="description" content="Where AIec sits among execution substrates, evaluation runners, task standards, benchmarks and protocols — and why comparing them is a category error.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/ecosystem">
+<meta property="og:title" content="Ecosystem — AIec">
+<meta property="og:description" content="Where AIec sits among execution substrates, evaluation runners, task standards, benchmarks and protocols — and why comparing them is a category error.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://aiec.gobrowse.dev/ecosystem">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AIec — run agents safely, reproduce failures, compare versions.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Ecosystem — AIec">
+<meta name="twitter:description" content="Where AIec sits among execution substrates, evaluation runners, task standards, benchmarks and protocols — and why comparing them is a category error.">
+<meta name="twitter:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem" aria-current="page">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail__group">
+      <span class="rail__caption">The one idea</span>
+      <dl>
+        <dt>substrate</dt><dd>runs code</dd>
+        <dt>runner</dt><dd>scores it</dd>
+        <dt>standard</dt><dd>describes it</dd>
+        <dt>benchmark</dt><dd>is the test set</dd>
+        <dt>protocol</dt><dd>connects tools</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Read next</span>
+      <dl>
+        <dt><a href="/roadmap">Roadmap</a></dt><dd>status of everything</dd>
+        <dt><a href="/limitations">Limitations</a></dt><dd>what is unproven</dd>
+      </dl>
+    </div>
+  </aside>
+  <main class="content">
+<!-- meta:title=Ecosystem -->
+<!-- meta:description=Where AIec sits among execution substrates, evaluation runners, task standards, benchmarks and protocols — and why comparing them is a category error. -->
+
+
+
+<h1>Ecosystem</h1>
+<p class="lead">Most confusion about tools in this space comes from comparing
+things that occupy different layers. E2B and SWE-bench are not competitors. MCP
+and a task standard are not competitors. Putting them in one ranking is a
+category error, and this page exists to stop it.</p>
+
+<h2 id="layers">The layers</h2>
+<div class="table-wrap">
+  <table class="table">
+    <caption>The layers the ecosystem divides into, and the question each one answers.</caption>
+    <thead>
+      <tr>
+        <th scope="col">Layer</th>
+        <th scope="col">Question it answers</th>
+        <th scope="col">Examples</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Execution substrate</strong></td>
+        <td>Where does this code actually run?</td>
+        <td>E2B, Daytona, Modal, AIec, Firecracker, Docker</td>
+      </tr>
+      <tr>
+        <td><strong>Local process confinement</strong></td>
+        <td>How do I sandbox a process on my own machine?</td>
+        <td>Bubblewrap, Anthropic Sandbox Runtime</td>
+      </tr>
+      <tr>
+        <td><strong>Evaluation runner</strong></td>
+        <td>How do I score an agent on a set of tasks?</td>
+        <td>Inspect AI</td>
+      </tr>
+      <tr>
+        <td><strong>Task standard</strong></td>
+        <td>How is one task specified so any harness can run it?</td>
+        <td>METR Task Standard</td>
+      </tr>
+      <tr>
+        <td><strong>Benchmark</strong></td>
+        <td>Which tasks are the test set, and what is the score?</td>
+        <td>SWE-bench</td>
+      </tr>
+      <tr>
+        <td><strong>Protocol</strong></td>
+        <td>How do tools and models talk to each other?</td>
+        <td>MCP</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+<p class="muted">AIec occupies the execution-substrate and orchestration layers,
+and provides an evaluation surface on top of its own substrate. It is not a
+benchmark, not a task standard, and not a protocol.</p>
+
+<h2 id="projects">Project by project</h2>
+
+<h3>E2B</h3>
+<p><strong>Layer:</strong> execution substrate. E2B provides cloud-hosted secure
+sandboxes for AI agents, with SDKs for creating and running code in an isolated
+environment.</p>
+<p><strong>The boundary:</strong> both AIec and E2B answer "where does this code
+run, and what can it reach". The difference is where the machines live. E2B is a
+hosted service; AIec runs on hardware you operate, which means the isolation
+boundary is one you can inspect, and there is no per-run billed dependency on
+someone else's capacity. AIec is not a hosted offering and does not compete for
+that use case.</p>
+
+<h3>Daytona</h3>
+<p><strong>Layer:</strong> execution substrate. Daytona provides development
+environments and infrastructure for running code.</p>
+<p><strong>The boundary:</strong> a development-environment lifecycle overlaps
+AIec's sandbox lifecycle, but AIec's concern is short-lived machines for
+untrusted agent-written code rather than long-lived workspaces a human works in.
+A durable developer workspace and an ephemeral agent sandbox want opposite
+retention policies.</p>
+
+<h3>Modal</h3>
+<p><strong>Layer:</strong> execution substrate, with its own serverless
+scheduling model. Modal runs functions and containers on managed GPU and CPU
+capacity.</p>
+<p><strong>The boundary:</strong> Modal is capacity you rent per unit of work.
+AIec's capacity is machines you already own, and it refuses a placement rather
+than spilling work elsewhere. If the question is "who provides compute when my
+cluster is full", the answers differ by design, not by quality.</p>
+
+<h3>Inspect AI</h3>
+<p><strong>Layer:</strong> evaluation runner. Inspect AI provides a framework for
+building evaluations, with solvers, scorers and a logging and inspection
+interface.</p>
+<p><strong>The boundary:</strong> Inspect AI scores agents; AIec puts them
+somewhere to run. They compose — an Inspect evaluation can target sandboxes as
+its execution environment — and AIec includes its own evaluation surface so that
+a run's environment, policy and artifacts are recorded with its score. The two
+are not alternatives.</p>
+
+<h3>METR Task Standard</h3>
+<p><strong>Layer:</strong> task standard. It specifies how a single task should
+be expressed so that different harnesses can run and compare it.</p>
+<p><strong>The boundary:</strong> a task standard says how to describe work; AIec
+says where that work runs and under what policy. AIec is not a task standard and
+does not define a competing one.</p>
+
+<h3>SWE-bench</h3>
+<p><strong>Layer:</strong> benchmark. A fixed set of real software issues, each
+with a test that determines whether a patch fixed it, and a leaderboard of
+results.</p>
+<p><strong>The boundary:</strong> SWE-bench is the test set; AIec is the
+environment the agent works in while attempting it. Running an agent against
+SWE-bench needs somewhere to run it — that is the layer AIec provides. AIec is
+not a benchmark and publishes no leaderboard position.</p>
+
+<h3>MCP</h3>
+<p><strong>Layer:</strong> protocol. The Model Context Protocol is how clients and
+tools expose capabilities to models.</p>
+<p><strong>The boundary:</strong> AIec ships an MCP server so an agent can drive
+sandboxes through a standard interface rather than a bespoke one. MCP is the
+wire format; it says nothing about where the sandbox lives or how it is
+isolated. AIec implements a server for the protocol, it does not define or own
+the protocol.</p>
+
+<h3>Anthropic Sandbox Runtime</h3>
+<p><strong>Layer:</strong> local process confinement. A tool wrapping Bubblewrap
+and network filtering for running commands locally under constraints.</p>
+<p><strong>The boundary:</strong> this is the closest neighbour in spirit, and
+the difference in scope is the point. Local confinement runs a process on your
+own machine with a namespace and seccomp profile. AIec distributes machines across
+workers, owns their lifecycle and leasing, enforces policy from outside the
+guest, and records evidence that survives the machine. AIec uses Bubblewrap as
+one of its own runtimes rather than competing with a wrapper around it.</p>
+
+<h3>AIec</h3>
+<p><strong>Layer:</strong> execution substrate and orchestration, with
+evaluation on top. It places, leases, isolates and destroys machines; governs
+what a run can reach from outside the guest; and retains the artifacts and
+policy evidence after the machine is gone.</p>
+
+<h2 id="notfit">Where AIec is not the right tool</h2>
+<ul class="tight">
+  <li><strong>If you want a hosted service.</strong> There is no managed AIec and
+  no sign-up. Capacity comes from your hardware.</li>
+  <li><strong>If you want to run one command locally with tight sandboxing.</strong>
+  Use Bubblewrap directly. AIec's machinery earns its cost across many machines
+  with lifecycle, tenancy and evidence requirements.</li>
+  <li><strong>If you want a benchmark or a leaderboard.</strong> Use one that
+  exists. AIec is not a test set.</li>
+  <li><strong>If you want a protocol.</strong> Use MCP. AIec implements a server
+  for it.</li>
+</ul>
+
+<div class="callout callout--calm">
+  <span class="callout__head">On not competing</span>
+  <p>Most of the projects above are useful and, where they overlap, often
+  complementary. A substrate can host an evaluation runner; an evaluation runner
+  can use a task standard; a task standard can describe benchmark tasks. The
+  genuinely contested ground here is narrow — where a substrate owns its own
+  policy enforcement and evidence retention — and that is the only place worth
+  arguing about.</p>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/roadmap">What is implemented</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/ECOSYSTEM.md">Full ecosystem doc</a>
+</div>
+
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

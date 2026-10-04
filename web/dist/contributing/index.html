@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contribute — AIec</title>
+<meta name="description" content="How to build, test and contribute to AIec: the crate map, the real commands, the gate every change must pass, and where the open work is.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/contributing">
+<meta property="og:title" content="Contribute — AIec">
+<meta property="og:description" content="How to build, test and contribute to AIec: the crate map, the real commands, the gate every change must pass, and where the open work is.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://aiec.gobrowse.dev/contributing">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AIec — run agents safely, reproduce failures, compare versions.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Contribute — AIec">
+<meta name="twitter:description" content="How to build, test and contribute to AIec: the crate map, the real commands, the gate every change must pass, and where the open work is.">
+<meta name="twitter:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail__group">
+      <span class="rail__caption">Jump to</span>
+      <dl>
+        <dt><a href="#setup">Setup</a></dt><dd>build and run</dd>
+        <dt><a href="#gate">The gate</a></dt><dd>what must pass</dd>
+        <dt><a href="#crates">Crates</a></dt><dd>where things live</dd>
+        <dt><a href="#work">Open work</a></dt><dd>good first issues</dd>
+      </dl>
+    </div>
+  </aside>
+  <main class="content">
+<!-- meta:title=Contribute -->
+<!-- meta:description=How to build, test and contribute to AIec: the crate map, the real commands, the gate every change must pass, and where the open work is. -->
+
+
+
+<h1>Contribute</h1>
+<p class="lead">AIec is Apache 2.0 and the whole system is in this repository.
+Building it needs a Linux host with KVM, PostgreSQL and an S3-compatible object
+store. Below is what actually works, verified against the current tree.</p>
+
+<h2 id="setup">Setup</h2>
+<pre><code>git clone https://github.com/fedoragobrowse-design/AIec
+cd AIec
+cargo build --workspace --all-features</code></pre>
+<p>Check your prerequisites before anything else. <code>aiec doctor</code> reports
+the operating system, the runtime, the Bubblewrap and Docker binaries,
+<code>/dev/kvm</code>, the Firecracker binary and kernel, the guest artifact and
+the database configuration. It reports; it does not configure a cluster, and it
+does not verify the guest image digest, probe object storage or check TLS.</p>
+
+<h2 id="gate">The gate</h2>
+<p>Every change passes the same four checks. This is the whole gate:</p>
+<pre><code>cargo fmt --all --check
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/aiec \
+  cargo test --workspace --all-features
+python3 scripts/check-sdk-contract.py</code></pre>
+<p>The database-backed tests are real tests against a real PostgreSQL instance —
+they do not skip when the URL is absent, they just fail. The Python suites are
+separate and also part of the gate:</p>
+<pre><code>(cd sdk/python &amp;&amp; python3 -m pytest tests/ -q)
+(cd benchmarks &amp;&amp; python3 -m pytest tests/ -q)</code></pre>
+<p>The website is a small static builder with no dependencies:</p>
+<pre><code>python3 web/build.py</code></pre>
+
+<h2 id="crates">The crate map</h2>
+<div class="table-wrap">
+  <table class="table">
+    <caption>The crates in the workspace and what each one owns.</caption>
+    <thead>
+      <tr><th scope="col">Crate</th><th scope="col">Owns</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>aiec-core</code></td><td>Domain types, errors and the traits everything else implements against</td></tr>
+      <tr><td><code>aiec-runtime</code></td><td>Firecracker, Docker, Bubblewrap and e2b sandbox runtimes</td></tr>
+      <tr><td><code>aiec-network-linux</code></td><td>Linux network primitives, including the TAP driver</td></tr>
+      <tr><td><code>aiec-guard</code></td><td>Out-of-guest policy enforcement and the proposal queue</td></tr>
+      <tr><td><code>aiec-storage</code></td><td>Metadata stores and object stores, in-memory and PostgreSQL</td></tr>
+      <tr><td><code>aiec-api</code></td><td>The HTTP control plane and its routes</td></tr>
+      <tr><td><code>aiec-client</code></td><td>The Rust client</td></tr>
+      <tr><td><code>aiec-cli</code></td><td>The <code>aiec</code> command line</td></tr>
+      <tr><td><code>aiec-mcp</code></td><td>The MCP server — nineteen tools</td></tr>
+      <tr><td><code>aiec-agent</code></td><td>The in-process agent runner</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>There is also a Python SDK under <code>sdk/python</code> and the benchmark
+harness under <code>benchmarks</code>.</p>
+
+<h2 id="conventions">Conventions worth knowing</h2>
+<ul class="tight">
+  <li><strong>Migrations are append-only.</strong> Once a migration has been
+  applied anywhere, do not edit it — not even trailing whitespace, because the
+  checksum is verified. Add a new one.</li>
+  <li><strong>Tenant scope belongs in the query,</strong> not in a check
+  afterwards. Every tenant-scoped lookup filters by tenant and id together.</li>
+  <li><strong>Unbounded reads are defects.</strong> List routes paginate with a
+  stable keyset cursor and push the limit into the database.</li>
+  <li><strong>Evidence is committed.</strong> Acceptance and benchmark results
+  live as JSON under <code>benchmarks/</code>, and the website's published
+  numbers are reviewed by hand rather than regenerated.</li>
+</ul>
+
+<h2 id="work">Open work</h2>
+<p>The project keeps a running list of what is known to be wrong or missing, in
+<code>docs/known-defects.md</code>, and what is intended next, in
+<code>docs/ROADMAP.md</code>. Both are written to be useful to a new
+contributor rather than as a private notebook.</p>
+<p>Work that is genuinely open and well-scoped:</p>
+<ul class="tight">
+  <li><strong>Second isolation provider.</strong> The e2b runtime is implemented
+  but the least exercised. Live acceptance evidence for it does not exist.</li>
+  <li><strong>Network-enabled Firecracker.</strong> The worker lacks the
+  capability to create a TAP device, so microVM runs are exercised with
+  networking off. Closing this is the single most valuable piece of work for the
+  isolation story.</li>
+  <li><strong>Storage byte quotas.</strong> CPU and memory are enforced;
+  aggregate storage ceilings are designed but not implemented.</li>
+  <li><strong>Per-run pagination.</strong> Run-scoped event, attempt and
+  artifact reads are still complete reads. The measured cost is small today, but
+  the bound is absent rather than holding.</li>
+  <li><strong>aarch64.</strong> Cross-build evidence only — no hardware, no
+  runtime, no performance claim.</li>
+</ul>
+
+<h2 id="security">Security reports</h2>
+<div class="callout">
+  <span class="callout__head">Do not open a public issue for a vulnerability</span>
+  <p>Security issues go through the private contact documented in the
+  repository's <code>SECURITY.md</code>. Please read that file for the current
+  route rather than assuming one — it is the authoritative source.</p>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="https://github.com/fedoragobrowse-design/AIec">Repository</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/CONTRIBUTING.md">Contributing guide</a>
+  <a class="btn" href="/roadmap">Roadmap</a>
+</div>
+
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

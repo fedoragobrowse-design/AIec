@@ -1,0 +1,693 @@
+/* AIec — engineering-instrumentation design system.
+ *
+ * Subject: ephemeral, leased, isolated machines. The visual language is
+ * measurement, not marketing: a cold paper ground, navy ink, one cobalt
+ * signal for live state, rust only for limits and destruction. Colour and
+ * rules are spent on the hero lifecycle strip; everything else stays quiet.
+ */
+
+:root {
+  /* Ground and surfaces */
+  --ground: #edf0f4;
+  --surface: #ffffff;
+  --surface-sunk: #e4e9f0;
+
+  /* Ink */
+  --ink: #0f1a2e;
+  --ink-soft: #566579;
+  --ink-faint: #566579;
+  /* Both secondary tiers are set to #566579 so each clears WCAG AA (4.5:1)
+   * on every surface it is used on: --paper 5.20:1, --surface-sunk — the code
+   * block background — 4.87:1, white 5.94:1. The worst surface is the code
+   * block, not the page, so ratios measured against white alone both
+   * under-report and can pass a build that is unreadable in the one place
+   * the colour is densest.
+   *
+   * They were previously #5b6b84 and #93a1b6; #93a1b6 measured 2.29:1 on the
+   * page tint, well under the 4.5:1 that 11.5-12.5px labels, table headers
+   * and evidence paths require. The two tiers are now one colour because the
+   * ladder the palette wanted and the legibility floor it needed did not fit
+   * in the same range; legibility won. */
+
+
+  /* Structure */
+  --rule: #c9d2e0;
+  --rule-firm: #0f1a2e;
+
+  /* Signal: one accent, live state only */
+  --signal: #1b44e8;
+  --signal-wash: #e4eaff;
+  /* Alert: limits, refusal, destruction only */
+  --alert: #a83b22;
+  --alert-wash: #fbeae5;
+
+  --sans: "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --rail: 244px;
+  --gutter: 28px;
+  --measure: 68ch;
+}
+
+* { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: var(--signal); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, pre, .mono, .tnum { font-family: var(--mono); }
+
+pre {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink);
+  border-radius: 2px;
+  padding: 18px 20px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.62;
+  margin: 0;
+}
+
+:not(pre) > code {
+  background: var(--surface-sunk);
+  border-radius: 2px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.masthead {
+  border-bottom: 1px solid var(--rule);
+  background: var(--ground);
+}
+
+.masthead__inner {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  min-height: 64px;
+}
+
+.wordmark {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 19px;
+  letter-spacing: -0.02em;
+}
+.wordmark:hover { text-decoration: none; }
+
+/* The mark is a leased-machine glyph: a box with a liveness tick. */
+.wordmark__mark {
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--ink);
+  position: relative;
+  align-self: center;
+}
+.wordmark__mark::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  background: var(--signal);
+}
+
+.masthead__nav {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+
+.masthead__nav a {
+  color: var(--ink-soft);
+  padding: 7px 11px;
+  font-size: 15px;
+  font-weight: 450;
+  border-bottom: 2px solid transparent;
+}
+.masthead__nav a:hover {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom-color: var(--rule);
+}
+.masthead__nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--signal);
+}
+
+/* ----------------------------------------------------------------- shell */
+
+.shell {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  gap: 0 40px;
+  align-items: start;
+}
+
+/* The telemetry rail: measured facts, set apart from prose. */
+.rail {
+  position: sticky;
+  top: 24px;
+  padding: 34px 0 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink-faint);
+  border-right: 1px solid var(--rule);
+  padding-right: 30px;
+  min-height: 60vh;
+}
+
+.rail dl { margin: 0; display: grid; grid-template-columns: 5.6rem 1fr; gap: 3px 12px; align-items: baseline; }
+.rail dt { color: var(--ink-faint); }
+.rail dd { margin: 0; color: var(--ink); font-weight: 500; }
+.rail__group + .rail__group { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--rule); }
+.rail__caption {
+  color: var(--ink-faint);
+  display: block;
+  margin-bottom: 6px;
+  letter-spacing: 0.01em;
+}
+
+.content {
+  padding: 44px 0 96px;
+  min-width: 0;
+  max-width: var(--measure);
+}
+.content--wide { max-width: 78ch; }
+
+.content > * + * { margin-top: 22px; }
+
+h1 {
+  font-size: clamp(2.1rem, 5.4vw, 3.35rem);
+  line-height: 1.04;
+  letter-spacing: -0.035em;
+  font-weight: 700;
+  font-stretch: 112%;
+  margin: 0;
+  max-width: 18ch;
+}
+
+h2 {
+  font-size: clamp(1.35rem, 2.4vw, 1.7rem);
+  line-height: 1.18;
+  letter-spacing: -0.022em;
+  font-weight: 650;
+  margin: 68px 0 0;
+  padding-top: 22px;
+  border-top: 1px solid var(--rule);
+  max-width: 26ch;
+}
+
+h3 {
+  font-size: 1.02rem;
+  font-weight: 650;
+  letter-spacing: -0.012em;
+  margin: 0 0 4px;
+}
+
+p { margin: 0; color: var(--ink-soft); }
+p + p { margin-top: 16px; }
+
+.lede {
+  font-size: 1.16rem;
+  line-height: 1.55;
+  color: var(--ink);
+  max-width: 54ch;
+  margin-top: 20px;
+}
+
+a strong, strong { color: var(--ink); font-weight: 650; }
+
+ul, ol { margin: 0; padding-left: 1.15em; color: var(--ink-soft); }
+li { margin-bottom: 7px; }
+li::marker { color: var(--ink-faint); }
+
+/* ------------------------------------------------- measurement rule/ticks */
+
+/* A hairline with real tick marks. Used only where real units are shown. */
+.rule {
+  height: 9px;
+  border-bottom: 1px solid var(--rule-firm);
+  background-image: linear-gradient(to right, var(--rule-firm) 1px, transparent 1px);
+  background-size: 10% 100%;
+  background-position: bottom left;
+  background-repeat: repeat-x;
+  margin: 8px 0 0;
+}
+
+/* ------------------------------------------------------------------- hero */
+
+/* The one memorable element: a leased machine's whole life, with its real
+ * resource draw, in a single orchestrated read-out. */
+.lifecycle {
+  margin: 34px 0 0;
+  border: 1px solid var(--rule-firm);
+  background: var(--surface);
+}
+
+.lifecycle__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.lifecycle__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.lifecycle__pulse {
+  width: 8px;
+  height: 8px;
+  background: var(--signal);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.lifecycle__track {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.stage {
+  padding: 16px;
+  border-right: 1px solid var(--rule);
+  position: relative;
+}
+.stage:last-child { border-right: 0; }
+
+/* Stage progress is drawn on the stage's own top edge. */
+.stage::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 0;
+  height: 3px;
+  background: var(--signal);
+  width: var(--progress, 0%);
+}
+
+.stage__name {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.stage__value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  display: block;
+}
+
+.stage__unit {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  display: block;
+  margin-top: 5px;
+}
+
+.stage--spent { color: var(--alert); }
+.stage--spent .stage__value { color: var(--alert); }
+.stage--spent::before { background: var(--alert); }
+
+/* The hero typesets its own code as the design element, not a neutral box. */
+.specimen {
+  margin: 30px 0 0;
+  font-size: 1.02rem;
+  line-height: 1.7;
+  letter-spacing: -0.005em;
+}
+.specimen .kw { color: var(--signal); font-weight: 600; }
+.specimen .fn { color: var(--ink); font-weight: 600; }
+.specimen .str { color: var(--alert); }
+.specimen .cm { color: var(--ink-faint); }
+
+/* ------------------------------------------------------------------ actions */
+
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 30px; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 20px;
+  font-weight: 600;
+  font-size: 15.5px;
+  border: 1.5px solid var(--ink);
+  border-radius: 2px;
+  color: var(--ink);
+  background: transparent;
+}
+.btn:hover { text-decoration: none; background: var(--ink); color: var(--surface); }
+.btn--solid { background: var(--ink); color: var(--surface); }
+.btn--solid:hover { background: var(--signal); border-color: var(--signal); }
+.btn:focus-visible { outline: 3px solid var(--signal); outline-offset: 2px; }
+
+a:focus-visible, .masthead__nav a:focus-visible {
+  outline: 3px solid var(--signal);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------ blocks */
+
+/* Information blocks, not a card kit: one rule, no radius, no shadow. */
+.block {
+  border-top: 1px solid var(--rule-firm);
+  padding: 20px 0 0;
+  margin-top: 0;
+}
+
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(248px, 1fr)); gap: 26px 34px; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(206px, 1fr)); gap: 24px 30px; }
+
+.grid-2 > p, .grid-3 > p { margin-top: 5px; }
+.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 20px 26px; }
+
+/* A data table, not a layout grid: figures are tabular and align on the
+ * decimal, so the numbers in a column are readable as a column. */
+.table-wrap { overflow-x: auto; margin: 30px 0 0; }
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+  min-width: 560px;
+}
+
+/* Seven columns with a prose column among them. At the default measure the
+ * notes wrap to one word per line, which reads as broken rather than narrow,
+ * so this one earns a wider table and scrolls inside its own wrapper. */
+.table--wide { min-width: 880px; }
+.table caption { caption-side: top; text-align: left; color: var(--ink-soft); padding-bottom: 10px; }
+.table th, .table td {
+  text-align: left;
+  padding: 11px 16px 11px 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+.table thead th {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1.5px solid var(--rule-firm);
+  white-space: nowrap;
+}
+.table td { font-variant-numeric: tabular-nums; }
+.table tbody tr:hover { background: var(--surface); }
+.table td:first-child { color: var(--ink); }
+
+/* Signed change. A regression is never dressed up as neutral. */
+.delta { font-family: var(--mono); font-size: 13.5px; font-weight: 500; white-space: nowrap; }
+.delta--good { color: #17603f; }
+.delta--bad { color: var(--alert); }
+
+/* Provenance tag: artifact-backed and prose-only are not the same confidence. */
+.prov {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  border: 1px solid var(--rule);
+  color: var(--ink-soft);
+  background: var(--surface);
+  white-space: nowrap;
+}
+.prov--prose { border-style: dashed; color: var(--ink-faint); }
+
+/* Status vocabulary, coloured by the four meanings the project defines. */
+.status {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.status--stable { color: #17603f; }
+.status--alpha { color: var(--signal); }
+.status--experimental { color: #8a5a12; }
+/* The dashed edge already says "not implemented"; the colour does not also
+ * have to be too faint to read. --ink-faint measured 2.29:1 on white at this
+ * size, well under the 4.5:1 AA floor for body text. --ink-soft measures
+ * 5.41:1 and keeps the same recessive role against --ink. */
+.status--planned { color: var(--ink-soft); border-style: dashed; }
+
+.stat { font-family: var(--mono); font-size: 30px; font-weight: 500; margin: 6px 0 0; }
+
+/* A term and its definition, for the status glossary and metric caveats. */
+.deflist { margin: 30px 0 0; }
+.deflist dt { margin-top: 16px; }
+.deflist dd { margin: 4px 0 0; color: var(--ink-soft); }
+
+.muted { color: var(--ink-faint); font-size: 0.94em; }
+
+/* Terminal: the same paper and navy as the rest of the page, because a
+ * terminal is a quotation of the product, not a screenshot pasted in. */
+.terminal {
+  margin: 26px 0 0;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+}
+.terminal__bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--surface-sunk);
+}
+.terminal__dots { display: flex; gap: 6px; }
+.terminal__dots::before, .terminal__dots::after {
+  content: "";
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--rule);
+}
+.terminal__title {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.terminal__body {
+  border: 0;
+  border-left: 3px solid var(--ink);
+  border-radius: 0;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.75;
+}
+.c-prompt { color: var(--signal); font-weight: 500; }
+.c-str { color: #17603f; }
+.c-ok { color: var(--signal); }
+.c-dim { color: var(--ink-faint); }
+
+/* Diagrams are drawn in the same palette and scale with their container. */
+.diagram { margin: 30px 0 0; }
+.diagram svg { width: 100%; height: auto; display: block; }
+.diagram figcaption {
+  margin-top: 14px;
+  color: var(--ink-soft);
+  font-size: 15px;
+  border-left: 2px solid var(--rule);
+  padding-left: 14px;
+}
+
+.kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+.kv caption { caption-side: top; text-align: left; color: var(--ink-soft); padding-bottom: 10px; }
+.kv th, .kv td { text-align: left; padding: 9px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+.kv th {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-faint);
+  width: 40%;
+  padding-right: 20px;
+}
+.kv td { color: var(--ink-soft); }
+.kv td:first-of-type { color: var(--ink); font-weight: 500; }
+
+/* Real status values, so a real status colour is earned. */
+.state { font-family: var(--mono); font-size: 13px; }
+.state--on { color: var(--signal); }
+.state--off { color: var(--alert); }
+.state--idle { color: var(--ink-faint); }
+
+.callout {
+  border-left: 3px solid var(--alert);
+  background: var(--alert-wash);
+  padding: 16px 20px;
+  margin: 30px 0 0;
+}
+.callout p { color: #6d2617; }
+.callout--calm { border-left-color: var(--signal); background: var(--signal-wash); }
+.callout--calm p { color: #12307f; }
+
+.callout__head {
+  font-weight: 650;
+  color: #6d2617;
+  display: block;
+  margin-bottom: 3px;
+}
+.callout--calm .callout__head { color: #12307f; }
+
+/* ------------------------------------------------------------------ steps */
+
+/* Genuinely a sequence, so it is numbered. */
+.steps { list-style: none; counter-reset: step; padding: 0; }
+.steps > li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 46px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 0;
+}
+.steps > li:last-child { border-bottom: 0; }
+.steps > li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+  border: 1.5px solid var(--ink);
+}
+.steps > li::after {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 30px;
+  bottom: 4px;
+  width: 1px;
+  background: var(--rule);
+}
+.steps > li:last-child::after { display: none; }
+
+/* ------------------------------------------------------------------ footer */
+
+.colophon {
+  border-top: 1px solid var(--rule-firm);
+  margin-top: 0;
+}
+.colophon__inner {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 26px var(--gutter) 46px;
+  display: flex;
+  gap: 20px 32px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  color: var(--ink-faint);
+  font-size: 14.5px;
+}
+.colophon__nav { margin-left: auto; display: flex; gap: 18px; flex-wrap: wrap; }
+.colophon__nav a { color: var(--ink-soft); }
+
+/* ------------------------------------------------------------- responsive */
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail {
+    position: static;
+    min-height: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+    padding: 22px 0 18px;
+    margin-bottom: 8px;
+  }
+  .rail dl { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .content { padding-top: 30px; max-width: none; }
+  h1 { max-width: none; }
+  h2 { max-width: none; }
+  .table { min-width: 480px; }
+  .table-wrap { margin-inline: calc(var(--gutter) * -1); padding-inline: var(--gutter); }
+  /* The diagram is SVG, so it would scale to any width — but below about
+   * 620px its labels stop being readable rather than merely small. Hold the
+   * legible size and let this one element scroll sideways, the same way
+   * `.table-wrap` does, instead of letting it widen the whole page. */
+  .diagram { margin-inline: calc(var(--gutter) * -1); overflow-x: auto; }
+  .diagram svg { min-width: 620px; }
+}
+
+@media (max-width: 620px) {
+  :root { --gutter: 18px; }
+  body { font-size: 16px; }
+  .masthead__inner { flex-direction: column; align-items: flex-start; gap: 10px; padding: 14px var(--gutter); }
+  .masthead__nav { margin-left: 0; }
+  .lifecycle__track { grid-template-columns: 1fr 1fr; }
+  .stage:nth-child(2) { border-right: 0; }
+  .stage:nth-child(-n + 2) { border-bottom: 1px solid var(--rule); }
+  .colophon__nav { margin-left: 0; }
+}

@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run agents safely. Reproduce failures. Compare versions. — AIec</title>
+<meta name="description" content="AIec is an open-source control plane for running, isolating, reproducing and evaluating AI agents in disposable computers. Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Self-hosted, Apache 2.0, with published benchmarks and explicit limits.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/">
+<meta property="og:title" content="Run agents safely. Reproduce failures. Compare versions. — AIec">
+<meta property="og:description" content="AIec is an open-source control plane for running, isolating, reproducing and evaluating AI agents in disposable computers. Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Self-hosted, Apache 2.0, with published benchmarks and explicit limits.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://aiec.gobrowse.dev/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AIec — run agents safely, reproduce failures, compare versions.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Run agents safely. Reproduce failures. Compare versions. — AIec">
+<meta name="twitter:description" content="AIec is an open-source control plane for running, isolating, reproducing and evaluating AI agents in disposable computers. Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Self-hosted, Apache 2.0, with published benchmarks and explicit limits.">
+<meta name="twitter:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/" aria-current="page">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail__group">
+      <span class="rail__caption">Runtime</span>
+      <dl>
+        <dt>isolation</dt><dd>Firecracker microVM</dd>
+        <dt>lifetime</dt><dd>minutes, not months</dd>
+        <dt>network</dt><dd>governed from outside</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Deployment</span>
+      <dl>
+        <dt>hosting</dt><dd>self-hosted</dd>
+        <dt>license</dt><dd>Apache 2.0</dd>
+        <dt>capacity</dt><dd>your hosts</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Evidence</span>
+      <dl>
+        <dt><a href="/benchmarks">Benchmarks</a></dt><dd>with artifacts</dd>
+        <dt><a href="/roadmap">Roadmap</a></dt><dd>status of everything</dd>
+        <dt><a href="/limitations">Limitations</a></dt><dd>what is unproven</dd>
+      </dl>
+    </div>
+  </aside>
+  <main class="content">
+<!-- meta:title=Run agents safely. Reproduce failures. Compare versions. -->
+<!-- meta:description=AIec is an open-source control plane for running, isolating, reproducing and evaluating AI agents in disposable computers. Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Self-hosted, Apache 2.0, with published benchmarks and explicit limits. -->
+
+
+
+<h1>Run agents safely. Reproduce failures. Compare versions.</h1>
+<p class="lead">An open-source control plane that gives an AI agent a disposable,
+isolated computer to work in — and keeps the evidence after the machine is
+gone.</p>
+
+<p>An agent that writes code needs somewhere to run it, a way to reach a model
+without holding a raw credential, and someone who can reproduce what happened.
+AIec provides the machine, the policy boundary, and the record. The agent gets a
+computer. It does not get to decide what that computer may reach.</p>
+
+<div class="actions">
+  <a class="btn btn--solid" href="https://github.com/fedoragobrowse-design/AIec">Clone the repository</a>
+  <a class="btn" href="/docs">Read the docs</a>
+  <a class="btn" href="/benchmarks">See the measurements</a>
+</div>
+
+<div class="rule" aria-hidden="true"></div>
+
+<h2 id="how">Give an agent a computer it can throw away</h2>
+<p>One command: a repository, the command to run, and the tests that decide
+whether it worked. The repository is cloned, the task executes in an isolated
+machine, the diff comes back, and the machine is destroyed.</p>
+
+<div class="terminal">
+  <div class="terminal__bar"><span class="terminal__dots" aria-hidden="true"></span><span class="terminal__title">aiec run submit</span></div>
+  <pre class="terminal__body"><code><span class="c-prompt">$</span> aiec run submit \
+    --repo https://github.com/octocat/Hello-World \
+    --validate <span class="c-str">'["pytest", "-q"]'</span> \
+    -- <span class="c-str">pytest -q</span>
+
+<span class="c-dim">{</span>
+  <span class="c-str">"id"</span><span class="c-dim">:</span> <span class="c-str">"01a0f629-78f8-726d-a46c-8459f5fed4f0"</span><span class="c-dim">,</span>
+  <span class="c-str">"state"</span><span class="c-dim">:</span> <span class="c-ok">"succeeded"</span><span class="c-dim">,</span>
+  <span class="c-str">"placement"</span><span class="c-dim">:</span> <span class="c-dim">{</span>
+    <span class="c-str">"runtime"</span><span class="c-dim">:</span> <span class="c-str">"docker"</span><span class="c-dim">,</span>
+    <span class="c-str">"reasons"</span><span class="c-dim">:</span> <span class="c-dim">[</span>
+      <span class="c-str">"policy selected Docker from available capable runtimes"</span>
+    <span class="c-dim">]</span>
+  <span class="c-dim">},</span>
+  <span class="c-str">"results"</span><span class="c-dim">:</span> <span class="c-dim">{</span>
+    <span class="c-str">"validations"</span><span class="c-dim">:</span> <span class="c-dim">[</span>
+      <span class="c-dim">{</span>
+        <span class="c-str">"command"</span><span class="c-dim">:</span> <span class="c-dim">[</span> <span class="c-str">"pytest"</span><span class="c-dim">,</span> <span class="c-str">"-q"</span> <span class="c-dim">],</span>
+        <span class="c-str">"exit_code"</span><span class="c-dim">:</span> <span class="c-ok">0</span><span class="c-dim">,</span>
+        <span class="c-str">"duration_ms"</span><span class="c-dim">:</span> <span class="c-dim">2186</span>
+      <span class="c-dim">}</span>
+    <span class="c-dim">],</span>
+    <span class="c-str">"phase_ms"</span><span class="c-dim">:</span> <span class="c-dim">{</span>
+      <span class="c-str">"placement"</span><span class="c-dim">:</span> <span class="c-dim">5978,</span>
+      <span class="c-str">"task"</span><span class="c-dim">:</span> <span class="c-dim">11230,</span>
+      <span class="c-str">"validation"</span><span class="c-dim">:</span> <span class="c-dim">2186,</span>
+      <span class="c-str">"cleanup"</span><span class="c-dim">:</span> <span class="c-dim">2960</span>
+    <span class="c-dim">}</span>
+  <span class="c-dim">},</span>
+  <span class="c-str">"retained_sandbox_id"</span><span class="c-dim">:</span> <span class="c-dim">null</span>
+<span class="c-dim">}</span></code></pre>
+</div>
+<p class="muted">An excerpt of real output from
+<code>benchmarks/omp-after-2026-09-30.json</code>, with the command shortened. The
+CLI prints the settled Run record as JSON because the record is the product: it
+is what a reviewer reads, what a CI job archives, and what a later run is
+compared against. The command to execute comes after the <code>--</code>
+separator, and <code>--validate</code> takes a JSON argument vector, so the work
+and the test that judges it are declared together.</p>
+
+<h2 id="compare">Compare two revisions, not two opinions</h2>
+<p>The comparison that ships is an <strong>OMP</strong> comparison: the same
+task, the same target repository at a pinned commit, the same image and the same
+resources, run once against the baseline revision of an agent and once against
+the candidate. Each side gets its own machine, each machine is destroyed, and
+both Run records are kept.</p>
+
+<div class="table-wrap">
+<table class="table">
+  <caption>A real run of that comparison, recorded in
+  <code>benchmarks/omp-after-2026-09-30.json</code>. One repetition, so this is
+  an observation rather than a distribution — and it is published because it is
+  what was measured.</caption>
+  <thead><tr>
+    <th scope="col">OMP revision</th>
+    <th scope="col">Task</th>
+    <th scope="col">Placement</th>
+    <th scope="col">Cleanup</th>
+    <th scope="col">Validation</th>
+    <th scope="col">Changed</th>
+  </tr></thead>
+  <tbody>
+    <tr>
+      <th scope="row">baseline <code>v9.7.0</code></th>
+      <td>11.23 s</td><td>5.98 s</td><td>2.96 s</td><td>3 / 3</td><td><code>PROOF.md</code></td>
+    </tr>
+    <tr>
+      <th scope="row">candidate <code>v9.8.0</code></th>
+      <td>18.90 s</td><td>6.75 s</td><td>3.13 s</td><td>3 / 3</td><td><code>PROOF.md</code></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+<p class="muted">Both revisions passed, so this run shows a
+<strong>cost</strong> difference and not a regression: the candidate spent 68 %
+more wall time inside the agent, which the Run record states and nothing
+interprets. An earlier sample of the same comparison failed its judgement and
+that artifact is in the repository too — the passing number is not the only one
+on file. Comparisons are driven through
+<a href="/docs">the API</a>, the CLI, or the <code>aiec_compare_omp</code>
+<abbr title="Model Context Protocol">MCP</abbr> tool.</p>
+
+<h2 id="guard">The agent does not own the boundary</h2>
+<p>Guard enforces policy from <strong>outside</strong> the guest. The machine
+holds no firewall configuration it can rewrite, no credential it can read, and
+no DNS it controls. Policy is applied by the host: nftables for egress, a Guard
+broker in front of the model endpoint, and credential substitution so the guest
+sees a proxy token rather than the real key.</p>
+<div class="grid-2">
+  <div class="block">
+    <h3>Start with nothing</h3>
+    <p>No network, model-only access, a model plus an allowlist, or a read-only
+    API policy. A governed encrypted tunnel is refused rather than forwarded
+    without checks — if the host cannot see inside it, it does not pass it.</p>
+  </div>
+  <div class="block">
+    <h3>Approval is not the agent's to give</h3>
+    <p>An agent can <em>propose</em> a policy change. A human approves it. The
+    proposal, the decision and the actor are recorded, so the question "who
+    widened this and when" has an answer.</p>
+  </div>
+</div>
+<div class="callout callout--calm">
+  <span class="callout__head">If a worker cannot enforce policy, it says so</span>
+  <p>A runtime advertises <code>network_policy: true</code> only when its network
+  backend actually reports DNS control and restricted allowlists — the
+  capability is read from the backend rather than hardcoded. A worker that
+  cannot promise it advertises <code>false</code> and <strong>refuses</strong>
+  governed placements. It does not run them ungoverned and hope.</p>
+</div>
+<p><a href="/security">Read the security model</a> or
+<a href="/mcp">drive it from an agent through MCP</a> — nineteen tools covering
+the lifecycle, exec and files, plus run, compare and agent operations.</p>
+
+<h2 id="evidence">The evidence is published, including the failures</h2>
+<div class="grid-3">
+  <div class="block">
+    <h3 class="tnum">25.50 → 14.56 s</h3>
+    <p>Run p50 on matched conditions — same host, same workers, same images,
+    fingerprint <code>602f511b90348c50</code>, 25 attempts per side. Cleanup
+    phase −76.5%.</p>
+  </div>
+  <div class="block">
+    <h3 class="tnum">100 / 100</h3>
+    <p>Sequential soak, every run succeeding and the resource census afterwards
+    matching the census before it.</p>
+  </div>
+  <div class="block">
+    <h3 class="tnum">77 / 80</h3>
+    <p>The parallel soak, which is the least flattering number here. Three runs
+    were refused for capacity. It is on the benchmarks page for that reason.</p>
+  </div>
+</div>
+<p>Each figure names the JSON artifact it came from. One optimization is
+published because measurement rejected it: the repository object cache moved
+<strong>26× more</strong> network bytes than the clone it replaced, because its
+per-run safety re-check cost 29× the whole shallow clone. It ships off.</p>
+<div class="actions">
+  <a class="btn btn--solid" href="/benchmarks">All measurements</a>
+  <a class="btn" href="/limitations">What we have not proven</a>
+</div>
+
+<h2 id="shape">How it fits together</h2>
+<figure class="diagram">
+<svg viewBox="0 0 720 300" role="img" aria-labelledby="arch-title arch-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="arch-title">AIec architecture: a control plane that is durable, and workers whose machines are disposable</title>
+  <desc id="arch-desc">A client talks to a durable control plane over HTTP. The control plane holds metadata in PostgreSQL and artifacts in object storage, and places leases on workers. Workers run Firecracker microVMs, Docker containers or Bubblewrap processes. Guard sits on the worker and enforces network and credential policy from outside the guest.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6b84"/>
+    </marker>
+  </defs>
+  <rect x="235" y="14" width="230" height="46" rx="3" fill="#ffffff" stroke="#0f1a2e"/>
+  <text x="350" y="42" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="14" fill="#0f1a2e">client · SDK / CLI / MCP</text>
+  <line x1="350" y1="60" x2="350" y2="98" stroke="#5b6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="98" width="300" height="58" rx="3" fill="#ffffff" stroke="#0f1a2e" stroke-width="2"/>
+  <text x="350" y="122" text-anchor="middle" font-family="Archivo, sans-serif" font-size="15" font-weight="700" fill="#0f1a2e">control plane — durable</text>
+  <text x="350" y="142" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#5b6b84">placement · leases · policy · records</text>
+
+  <rect x="14" y="190" width="170" height="64" rx="3" fill="#ffffff" stroke="#c9d2e0"/>
+  <text x="99" y="214" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#0f1a2e">PostgreSQL</text>
+  <text x="99" y="234" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="#93a1b6">metadata, tenants</text>
+
+  <rect x="526" y="190" width="180" height="64" rx="3" fill="#ffffff" stroke="#c9d2e0"/>
+  <text x="616" y="214" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#0f1a2e">object storage</text>
+  <text x="616" y="234" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="#93a1b6">artifacts, diffs, logs</text>
+
+  <line x1="250" y1="156" x2="120" y2="190" stroke="#5b6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="450" y1="156" x2="600" y2="190" stroke="#5b6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="350" y1="156" x2="350" y2="190" stroke="#5b6b84" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="200" y="190" width="300" height="70" rx="3" fill="#ffffff" stroke="#1b44e8" stroke-width="2"/>
+  <text x="350" y="214" text-anchor="middle" font-family="Archivo, sans-serif" font-size="15" font-weight="700" fill="#0f1a2e">worker — disposable</text>
+  <text x="350" y="234" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#5b6b84">Firecracker · Docker · Bubblewrap</text>
+  <text x="350" y="251" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="#1b44e8">Guard · nftables · DNS · credentials</text>
+
+  <line x1="500" y1="225" x2="526" y2="225" stroke="#a83b22" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <text x="513" y="276" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="#a83b22">destroyed</text>
+</svg>
+<figcaption>The control plane is durable and survives the machines; the machines
+are disposable and leave evidence behind. Guard is drawn on the worker because
+that is where policy is actually applied — outside the guest, which is the point.
+</figcaption>
+</figure>
+
+<h2 id="run">Self-hosted, and staying that way</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>There is no sign-up</h3>
+    <p>No hosted API and no account. The control plane, the workers and the
+    sandboxes run on hardware you choose — PostgreSQL for metadata, an
+    S3-compatible store for artifacts, your own KVM hosts. You pick the capacity,
+    the retention and the blast radius.</p>
+  </div>
+  <div class="block">
+    <h3>It will not spill your work</h3>
+    <p>When every worker is at capacity, AIec refuses the placement rather than
+    quietly moving the workload to someone else's machines. A failed request is a
+    smaller problem than a silent change of isolation boundary.</p>
+  </div>
+  <div class="block">
+    <h3>Bring your own agent</h3>
+    <p>Python SDK, Rust client, CLI, or the local MCP server for any MCP-capable
+    coding agent. A governed run is placed only on a worker that advertised it
+    can enforce the policy; one that cannot refuses rather than running
+    ungoverned.</p>
+  </div>
+  <div class="block">
+    <h3>Know what is not done</h3>
+    <p>Network-enabled Firecracker, the hosted isolation provider, aarch64 and
+    storage byte quotas are all unproven or unbuilt. The
+    <a href="/roadmap">roadmap</a> labels every capability, and
+    <a href="/limitations">limitations</a> lists what has no evidence at all.</p>
+  </div>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="https://github.com/fedoragobrowse-design/AIec">Clone the repository</a>
+  <a class="btn" href="/docs">Read the docs</a>
+  <a class="btn" href="/contributing">Contribute</a>
+</div>
+
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap — AIec</title>
+<meta name="description" content="What AIec implements today, what is designed but not built, and what is deliberately out of scope. Status words are defined, not decorative.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/roadmap">
+<meta property="og:title" content="Roadmap — AIec">
+<meta property="og:description" content="What AIec implements today, what is designed but not built, and what is deliberately out of scope. Status words are defined, not decorative.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://aiec.gobrowse.dev/roadmap">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="AIec — run agents safely, reproduce failures, compare versions.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Roadmap — AIec">
+<meta name="twitter:description" content="What AIec implements today, what is designed but not built, and what is deliberately out of scope. Status words are defined, not decorative.">
+<meta name="twitter:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body>
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="shell">
+  <aside class="rail">
+    <div class="rail__group">
+      <span class="rail__caption">Sections</span>
+      <dl>
+        <dt><a href="#statuses">Status words</a></dt><dd>what each one means</dd>
+        <dt><a href="#inventory">Inventory</a></dt><dd>every capability</dd>
+        <dt><a href="#planned">Not built</a></dt><dd>designed only</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Honest</span>
+      <dl>
+        <dt><a href="/limitations">Limitations</a></dt><dd>what is unproven</dd>
+        <dt><a href="/benchmarks">Benchmarks</a></dt><dd>with artifacts</dd>
+      </dl>
+    </div>
+  </aside>
+  <main class="content">
+<!-- meta:title=Roadmap -->
+<!-- meta:description=What AIec implements today, what is designed but not built, and what is deliberately out of scope. Status words are defined, not decorative. -->
+
+
+
+<h1>Roadmap</h1>
+<p class="lead">Every capability the project has, labelled with what it actually
+is. The point of publishing the whole list — including the parts that are only
+designed — is that a reader can tell the difference without asking.</p>
+
+<h2 id="statuses">What the status words mean</h2>
+<dl class="deflist">
+<dt><span class="status status--stable">stable</span></dt><dd>Implemented, regression-tested, and exercised by a recorded live acceptance artifact.</dd>
+<dt><span class="status status--alpha">alpha</span></dt><dd>Implemented and tested, but the proof is a test rather than a recorded live deployment, or the interface may still move before 1.0.</dd>
+<dt><span class="status status--experimental">experimental</span></dt><dd>Implemented and deliberately not relied on. Read its caveat before using it.</dd>
+<dt><span class="status status--planned">planned</span></dt><dd>Designed and documented. Not implemented. Nothing on the website may present this as available.</dd>
+</dl>
+
+<div class="callout callout--calm">
+  <span class="callout__head">Planned means not implemented</span>
+  <p>Nothing on this site presents a planned capability as available. If you
+  need something from the planned list, it is a design conversation, not a
+  configuration change.</p>
+</div>
+
+<h2 id="inventory">The inventory</h2>
+<div class="grid-4" style="margin-bottom:34px">
+<div class="block"><h3><span class="status status--stable">stable</span></h3><p class="stat"><strong>12</strong></p></div>
+<div class="block"><h3><span class="status status--alpha">alpha</span></h3><p class="stat"><strong>10</strong></p></div>
+<div class="block"><h3><span class="status status--experimental">experimental</span></h3><p class="stat"><strong>2</strong></p></div>
+<div class="block"><h3><span class="status status--planned">planned</span></h3><p class="stat"><strong>3</strong></p></div>
+</div>
+
+<div class="table-wrap">
+  <table class="table">
+    <caption>Every capability with its reviewed status and the file that implements it.</caption>
+    <thead>
+      <tr>
+        <th scope="col">Capability</th>
+        <th scope="col">Status</th>
+        <th scope="col">Note and implementation evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+<tr><td><strong>Firecracker microVM sandboxes</strong><br><span class="muted mono">Isolation</span></td><td><span class="status status--stable">stable</span></td><td>Forced by runtime policy for untrusted workloads. A tenant cannot request a weaker runtime to downgrade their own boundary.<br><span class="muted mono">crates/aiec-runtime/src/lib.rs → FirecrackerRuntime; benchmarks/guard-core-acceptance.json</span></td></tr>
+<tr><td><strong>Docker sandbox runtime</strong><br><span class="muted mono">Isolation</span></td><td><span class="status status--alpha">alpha</span></td><td>Available for trusted self-hosted deployments, local development and operator tasks. Not offered to untrusted public workloads.<br><span class="muted mono">crates/aiec-runtime/src/docker.rs</span></td></tr>
+<tr><td><strong>Bubblewrap development runtime</strong><br><span class="muted mono">Isolation</span></td><td><span class="status status--experimental">experimental</span></td><td>Local development. Workspace snapshots have been exercised by restoring into a distinct sandbox; it is not the untrusted-workload boundary.<br><span class="muted mono">crates/aiec-runtime/src/lib.rs → BubblewrapRuntime</span></td></tr>
+<tr><td><strong>External hosted isolation provider</strong><br><span class="muted mono">Isolation</span></td><td><span class="status status--alpha">alpha</span></td><td>The isolation boundary would be owned by the provider, not by AIec, so this kind never runs on a managed worker node. NOT exercised against a real provider; no live evidence exists.<br><span class="muted mono">crates/aiec-core/src/lib.rs → RuntimeKind::Hosted</span></td></tr>
+<tr><td><strong>Create, exec, files, pause, resume, destroy</strong><br><span class="muted mono">Sandboxes</span></td><td><span class="status status--stable">stable</span></td><td>Workspace paths are confined and reject traversal and symlink escapes. Directory listings are bounded rather than truncated.<br><span class="muted mono">crates/aiec-api/src/lib.rs; scripts/smoke.sh</span></td></tr>
+<tr><td><strong>Bounded CPU, memory, disk and wall clock</strong><br><span class="muted mono">Sandboxes</span></td><td><span class="status status--stable">stable</span></td><td>Quotas are enforced in the same transaction as placement, under a per-tenant advisory lock.<br><span class="muted mono">crates/aiec-core/src/lib.rs → QuotaLimits; enforcement in crates/aiec-storage</span></td></tr>
+<tr><td><strong>Runs: submit, results, events, artifacts, cancel</strong><br><span class="muted mono">Durability</span></td><td><span class="status status--stable">stable</span></td><td>Events, attempts and artifacts for one run are bounded by construction, not by pagination.<br><span class="muted mono">crates/aiec-api/src/runs.rs; scripts/firecracker-coding-dogfood.sh</span></td></tr>
+<tr><td><strong>Lease and generation fencing</strong><br><span class="muted mono">Durability</span></td><td><span class="status status--stable">stable</span></td><td>A superseded worker cannot execute, write, stop, destroy or complete against a reassigned sandbox.<br><span class="muted mono">crates/aiec-core/src/scheduler.rs; enforcement in crates/aiec-storage</span></td></tr>
+<tr><td><strong>Cross-worker recovery from a workspace archive</strong><br><span class="muted mono">Durability</span></td><td><span class="status status--alpha">alpha</span></td><td>PostgreSQL leases plus an S3-compatible workspace archive. Running VM memory is not the portable recovery unit, and multi-host recovery has not been validated by the recorded evidence.<br><span class="muted mono">docs/DEPLOYMENT.md; benchmarks/snapshot-acceptance.json</span></td></tr>
+<tr><td><strong>Workspace snapshot, destroy source, restore into a new sandbox</strong><br><span class="muted mono">Snapshots</span></td><td><span class="status status--stable">stable</span></td><td>This is the portable kind.<br><span class="muted mono">benchmarks/snapshot-acceptance.json (12/12 against real S3 storage)</span></td></tr>
+<tr><td><strong>Full VM and memory-only Firecracker snapshots</strong><br><span class="muted mono">Snapshots</span></td><td><span class="status status--experimental">experimental</span></td><td>Worker-local recovery artifacts. Do not present them as portable workspace snapshots; compatible host and device-path portability is unproven.<br><span class="muted mono">docs/SNAPSHOTS.md; crates/aiec-core/src/snapshots.rs</span></td></tr>
+<tr><td><strong>Guard: out-of-guest network, DNS and credential boundary</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--stable">stable</span></td><td>Default is no network. A sandbox asking for a network without selecting a policy is refused, not quietly filtered.<br><span class="muted mono">benchmarks/guard-core-acceptance.json (48/48); docs/GUARD_THREAT_MODEL.md</span></td></tr>
+<tr><td><strong>Watchdog, dead-man switch and quarantine</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--stable">stable</span></td><td>Loss of the watchdog is fail-closed and latches. The guest is not destroyed, so a forensic capture is still possible.<br><span class="muted mono">benchmarks/guard-phase2-acceptance.json (29/29)</span></td></tr>
+<tr><td><strong>Guard tool-approval proposals and operator decisions</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--alpha">alpha</span></td><td>An agent can propose a policy change and cannot approve one. Proposal ownership is tenant-checked.<br><span class="muted mono">benchmarks/guard-phase3-acceptance.json (47/47); benchmarks/guard-approval-acceptance.json</span></td></tr>
+<tr><td><strong>Per-VM identity, image trust and canaries</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--alpha">alpha</span></td><td>Trusted host file APIs can observe reads; arbitrary in-guest exec reads are not observable through those APIs.<br><span class="muted mono">benchmarks/guard-phase5-acceptance.json (37/37)</span></td></tr>
+<tr><td><strong>Durable lifetime reaper</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--stable">stable</span></td><td>The second run goes through the external-database relay.<br><span class="muted mono">benchmarks/guard-reaper-acceptance.json (16/16); benchmarks/guard-reaper-external-db-acceptance.json (16/16)</span></td></tr>
+<tr><td><strong>Layer 7 visibility (method, path, tool) for governed traffic</strong><br><span class="muted mono">Governance</span></td><td><span class="status status--planned">planned</span></td><td>Not implemented. Opaque TLS is not inspected. A CONNECT tunnel needing Layer 7 visibility is REFUSED rather than forwarded ungoverned, and TLS interception is not claimed as a validated deployment mode.<br><span class="muted mono">docs/GUARD_THREAT_MODEL.md</span></td></tr>
+<tr><td><strong>Eval batch, repetitions and matrix</strong><br><span class="muted mono">Evaluation</span></td><td><span class="status status--stable">stable</span></td><td>Every cell gets its own machine and is kept whole. A bounded request returns the runs.<br><span class="muted mono">crates/aiec-api/src/evaluations.rs; sdk/python/agentforge/evals.py</span></td></tr>
+<tr><td><strong>Suite expansion and baseline-versus-candidate compare</strong><br><span class="muted mono">Evaluation</span></td><td><span class="status status--alpha">alpha</span></td><td>Counts and measurements over the same runs. No pass rate dressed up as a score, and no percentiles invented from a handful of samples.<br><span class="muted mono">evaluations/omp-regression.json; sdk/python/agentforge/evals.py → Comparison</span></td></tr>
+<tr><td><strong>Run Capsules and trajectories</strong><br><span class="muted mono">Evaluation</span></td><td><span class="status status--planned">planned</span></td><td>Not implemented. Do not advertise as shipped.<br><span class="muted mono">docs/ROADMAP.md</span></td></tr>
+<tr><td><strong>Python SDK</strong><br><span class="muted mono">Interfaces</span></td><td><span class="status status--stable">stable</span></td><td>Known gap: `run_cells` chunking is unimplemented because changing it breaks the `#[tool]` macro boundary.<br><span class="muted mono">sdk/python/agentforge; scripts/check-sdk-contract.py</span></td></tr>
+<tr><td><strong>Rust client and CLI</strong><br><span class="muted mono">Interfaces</span></td><td><span class="status status--stable">stable</span></td><td>JSON output, so anything pipes into jq.<br><span class="muted mono">crates/aiec-client; crates/aiec-cli</span></td></tr>
+<tr><td><strong>Local MCP server</strong><br><span class="muted mono">Interfaces</span></td><td><span class="status status--alpha">alpha</span></td><td>Exposes the same lifecycle as tools. The owned-sandbox listing is bounded and prunes finished machines.<br><span class="muted mono">docs/MCP.md; crates/aiec-mcp (a Rust binary, not part of the Python SDK)</span></td></tr>
+<tr><td><strong>`aiec doctor`</strong><br><span class="muted mono">Interfaces</span></td><td><span class="status status--alpha">alpha</span></td><td>Reports OS, runtime, bubblewrap, Docker, KVM, database configuration and the Firecracker binary, kernel, guest artifact and wire protocol. It REPORTS; it does not refuse to start.<br><span class="muted mono">crates/aiec-cli/src/main.rs → doctor</span></td></tr>
+<tr><td><strong>Tenant-scoped API keys with scopes</strong><br><span class="muted mono">Tenancy</span></td><td><span class="status status--alpha">alpha</span></td><td>Keys are stored hashed and compared in constant time. Granting scopes and revoking keys both require the caller to hold the authority being granted or destroyed. API may change before 1.0.<br><span class="muted mono">crates/aiec-api/src/lib.rs (the /v1/keys routes); crates/aiec-api/tests/routes.rs</span></td></tr>
+<tr><td><strong>Per-tenant usage accounting and Prometheus export</strong><br><span class="muted mono">Tenancy</span></td><td><span class="status status--alpha">alpha</span></td><td>Usage events are append-only and idempotent, so retries do not double-count.<br><span class="muted mono">the GET /v1/usage route in crates/aiec-api/src/lib.rs; the Prometheus exporter in crates/aiec-api</span></td></tr>
+<tr><td><strong>Aggregate per-tenant snapshot and persistent-storage byte quotas</strong><br><span class="muted mono">Tenancy</span></td><td><span class="status status--planned">planned</span></td><td>Per-request size ceilings exist. Aggregate byte quotas do not.<br><span class="muted mono">docs/known-defects.md</span></td></tr>
+    </tbody>
+  </table>
+</div>
+<p class="muted">The evidence column names the file and symbol that implements
+each capability. If a row looks wrong, that file is where to check it.</p>
+
+<h2 id="planned">Designed but not built</h2>
+<p>These are the capabilities whose status is
+<strong>planned</strong>. They are not available, not configurable, and not
+imminent. They are here so the design is reviewable before anyone depends on
+it.</p>
+<ul class="tight">
+  <li><strong>Aggregate byte quotas across snapshots and persistent storage.</strong>
+  CPU and memory are enforced today. A storage ceiling is a design decision
+  about retention, not a counter.</li>
+  <li><strong>Layer 7 governed traffic.</strong> Guard filters by destination at
+  the network layer. Understanding an allowed HTTPS request is a different
+  problem with a different failure mode.</li>
+  <li><strong>Run Capsules</strong> — the ability to capture a sandbox and
+  resume it later in a materially different way.</li>
+</ul>
+
+<h2 id="notdoing">Deliberately out of scope</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>A hosted AIec</h3>
+    <p>There is no managed service and no sign-up. Capacity comes from the hosts
+    you run. This is a self-hosted product and its distribution is the source
+    code.</p>
+  </div>
+  <div class="block">
+    <h3>Moving your work to a cloud provider</h3>
+    <p>When every local worker is at capacity, AIec refuses the placement. It
+    does not quietly spill a workload somewhere else, because a silent change of
+    isolation boundary and jurisdiction is not a reasonable default.</p>
+  </div>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/limitations">Limitations</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/ROADMAP.md">Full roadmap</a>
+</div>
+
+  </main>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>
