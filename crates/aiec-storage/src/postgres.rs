@@ -5532,9 +5532,10 @@ pub(crate) mod tests {
     /// so changing it takes a deliberate edit.
     #[test]
     fn the_migration_lock_key_matches_sqlx() {
-        // SQLx 0.8's migrator takes MIGRATION_LOCK_ID * crc32_iso_hdlc(database)
-        // with MIGRATION_LOCK_ID = 0x3d32ad9e. CRC-32/ISO-HDLC("aiec") is
-        // 0x29e910d5.
+        // SQLx 0.8.6, `sqlx-postgres-0.8.6/src/migrate.rs::generate_lock_id`:
+        // `0x3d32ad9e * CRC_32_ISO_HDLC(database_name)`, where the multiplier is a
+        // bare literal in SQLx's source, not a named constant. Verified against
+        // the vendored crate. CRC-32/ISO-HDLC("aiec") is 0x29e910d5.
         assert_eq!(migration_lock_id("aiec"), 0x3d32ad9e * 0x29e910d5u32 as i64);
         // Distinct databases must not collide, or unrelated deployments on one
         // server would serialize against each other's migrations.

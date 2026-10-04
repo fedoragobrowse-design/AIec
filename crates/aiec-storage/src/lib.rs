@@ -1391,9 +1391,19 @@ pub(crate) fn migration_lock_id(database: &str) -> i64 {
 /// Nothing bounds it from above: no unit in `deploy/` sets a
 /// `TimeoutStartSec`, so a caller waiting here is not racing an external kill
 /// and the constant only has to clear real migration time. Every statement in
-/// `migrations/` is DDL — 28 `CREATE TABLE`, 71 `ALTER TABLE` and one `CREATE
-/// INDEX CONCURRENTLY` — so 60s is ample, and it is the value to revisit if a
-/// data-heavy migration is ever added.
+/// `migrations/` is DDL — 28 `CREATE TABLE`, 71 `ALTER TABLE` and exactly one
+/// `CREATE INDEX CONCURRENTLY` (`0029`), the only one that holds the lock for a
+/// non-trivial time.
+///
+/// 60s is a deliberately generous tunable, not a measured requirement. The one
+/// statement that could approach it was timed against the real database:
+/// `0029`'s index built concurrently on a 3446-row copy of `runs` took 5ms,
+/// three times. That is three orders of magnitude of headroom for this dataset
+/// and proves nothing about a large one — `CREATE INDEX CONCURRENTLY` scans
+/// twice and is O(n log n), so a table orders of magnitude larger can exceed
+/// 60s. Raising this is the correct response to that case, and the caller
+/// surfaces it as `StoreError::Transient` naming the database, so an operator
+/// can see which migration outran the bound.
 const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PostgresRepository {

@@ -2204,10 +2204,17 @@ production value is never waited out; only the branch is.
 The lock key itself is pinned by `the_migration_lock_key_matches_sqlx`. Nothing
 in the timeout test could catch a change to it, because the test takes the lock
 through the same helper the migrator uses — a mutated key still contends with
-itself and the test passes. That is verified: changing `MIGRATION_LOCK_ID` to
+itself and the test passes. That is verified: changing the multiplier to
 `0x3d32ad9f` left the contention test green and failed the pinned-key test. The
 pinned value is `0x3d32ad9e * 0x29e910d5`, where `0x29e910d5` is
 CRC-32/ISO-HDLC of `"aiec"`.
+
+The multiplier is a bare literal in SQLx's own source, not a named constant —
+`sqlx-postgres-0.8.6/src/migrate.rs::generate_lock_id` reads
+`0x3d32ad9e * CRC_32_ISO_HDLC(database_name)` under the comment "chosen by fair
+dice roll". It was checked against the vendored crate rather than recalled, so
+there is no `MIGRATION_LOCK_ID` symbol to grep for; `MIGRATION_LOCK_TIMEOUT` is
+the only lock-related constant in this tree.
 
 The concurrency fixtures continue to prove that four processes migrating at once
 serialize safely; neither test replaces them.
@@ -2346,6 +2353,7 @@ without it, because `Quarantined` is refused by `consumes()` either way. The
 latch cannot be folded into `consumes()` — it stays set while the sandbox is
 `running`, and only an authorized release clears it, so it is a property of the
 budget row rather than of the machine.
+
 ## Fixed in the 2026-10-04 audit: an ancestor's permissions could stop a worker starting
 
 `sync_node_id_directory` opened and `fsync`ed every ancestor of the state
@@ -2377,3 +2385,57 @@ mints and re-reads an identity underneath it.
 Mutation evidence: restoring the unconditional `?` on the ancestor loop fails
 with `Permission denied (os error 13)`, reproduced through the real publication
 path. Restored.
+
+### Audited and found clean: reachable panics in shipping code
+
+Every `.unwrap()`, `.expect()`, `panic!`, `unreachable!` and literal index in
+`crates/*/src/**` was enumerated, with each file truncated at its first
+`#[cfg(test)]` or `mod tests` so test code was excluded, and integration-test
+directories excluded separately. Each surviving production site was read in
+context rather than pattern-matched. The result is no reachable panic.
+
+- `aiec-mcp/src/eval.rs:1282` indexes `command[0]`; `validate_command` rejects an
+  empty command first, and `explicit_shell_script` — which also indexes `[0]` —
+  has exactly one caller, inside that function.
+- `aiec-guard/src/policy.rs:216` indexes `bytes[0]` and `bytes[len-1]`; an empty
+  label is rejected on the line above.
+- `aiec-guard/src/dns.rs:103` indexes `bytes[0..1]` under `len() >= 2`;
+  `dns.rs:229`'s `port.expect` is reached only past a `port.is_none()` refusal.
+- `aiec-guard/src/watcher.rs:1094` and `1340` index `batch[0]`; `review_batch`
+  rejects an empty batch before the first, and the `1340` loop body cannot run
+  on an empty slice.
+- `aiec-guard/src/canaries.rs:720` indexes `request.rules[0]`; the vector is a
+  literal `vec![RuleTrigger { .. }]` two lines earlier.
+- `aiec-guard/src/gateway.rs:1666`'s `scheme_str().expect` is preceded by a
+  `matches!(.., Some("http" | "https"))` check; `gateway.rs:1648`'s
+  `HeaderName::from_bytes` is fed a value already constrained to
+  `ALLOWED_CREDENTIAL_HEADERS` at `policy.rs:831`; `gateway.rs:1339` builds a
+  response from a constant status and header.
+- `aiec-runtime/src/e2b.rs:1279-1284` indexes a 5-byte frame header under
+  `buffer.len() < ENVELOPE_HEADER` returning early.
+- The remaining `expect`s are HMAC key construction (`new_from_slice` accepts any
+  length), a constant-path `parent()`, and MCP ownership locks whose critical
+  sections are a `Vec::push` and an `iter().map().collect()`, so no user code
+  runs under the lock and poisoning is not reachable.
+
+This is a negative result over the sites enumerated, not a proof that no panic
+is reachable. It says only that every `unwrap`/`expect`/index in non-test code
+was located and had its guard read.
+
+### Correction: "60s is ample" was not supported by what was checked
+
+The `MIGRATION_LOCK_TIMEOUT` rationale originally argued the bound was sufficient
+from the *kinds* of statement in `migrations/`. That is the same unverified
+inference as an earlier "verified against the real database" claim, corrected
+once already in this ledger.
+
+Measured instead: `0029_run_list_keyset_index.sql` is the only
+`CREATE INDEX CONCURRENTLY` in the tree and the only statement that holds the
+lock for a non-trivial time. Building it against the real database on a
+3446-row copy of `runs` took 5ms, three consecutive times. The rationale now
+says exactly that, and states its limit rather than generalising from it:
+three orders of magnitude of headroom for this dataset, and no evidence at all
+about a large one, since `CREATE INDEX CONCURRENTLY` scans twice and is
+`O(n log n)`. The bound is documented as a tunable whose correct response to a
+larger table is to raise it, with the caller naming the database in the
+`StoreError::Transient` it raises.

@@ -158,11 +158,19 @@ acceptance_netns_loopback_up() {
 # path component is then the authority — `user:password@host:port` — so
 # `${url##*/}` would hand back credentials, and the caller that prints this name
 # for a diagnostic would print a password. A component carrying `@` or `:` is
-# therefore refused: neither can appear unescaped in a URL path component that
-# names a database, and both are how an authority looks after this stripping.
-# Callers must not rely on an isolation check running first to make that
-# unreachable; this function's contract is "a database name and nothing else",
-# so a credential is not a database name.
+# therefore refused. `:` is legal unescaped in a URL path segment per RFC 3986
+# (`pchar` includes it), so this is not a standards rule — it is the conservative
+# reading. An authority without userinfo, `host:port`, carries no `@` and the
+# `*:*` arm is what stops it, which is why that arm is here and not just `*@*`.
+# A database name legitimately containing `:` would be refused; that is a
+# deliberate trade against printing a password, and no caller in this tree uses
+# one.
+#
+# Callers must not rely on an isolation check running first to make the
+# credential case unreachable; this function's contract is "a database name and
+# nothing else", so a credential is not a database name. Verified directly,
+# including with `ACCEPTANCE_DB_NAME_PATTERN` set to `*`: the refusal happens
+# before any pattern is consulted, so a wildcard pattern does not reopen it.
 acceptance_database_url_name() {
   local url=$1
   url=${url%%\?*}
