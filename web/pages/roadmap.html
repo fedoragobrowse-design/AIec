@@ -1,0 +1,97 @@
+<!-- meta:title=Roadmap -->
+<!-- meta:description=What AIec implements today, what is designed but not built, and what is deliberately out of scope. Status words are defined, not decorative. -->
+
+<!-- block:rail -->
+    <div class="rail__group">
+      <span class="rail__caption">Sections</span>
+      <dl>
+        <dt><a href="#statuses">Status words</a></dt><dd>what each one means</dd>
+        <dt><a href="#inventory">Inventory</a></dt><dd>every capability</dd>
+        <dt><a href="#planned">Not built</a></dt><dd>designed only</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Honest</span>
+      <dl>
+        <dt><a href="/limitations">Limitations</a></dt><dd>what is unproven</dd>
+        <dt><a href="/benchmarks">Benchmarks</a></dt><dd>with artifacts</dd>
+      </dl>
+    </div>
+<!-- /block:rail -->
+
+<h1>Roadmap</h1>
+<p class="lead">Every capability the project has, labelled with what it actually
+is. The point of publishing the whole list — including the parts that are only
+designed — is that a reader can tell the difference without asking.</p>
+
+<h2 id="statuses">What the status words mean</h2>
+<dl class="deflist">
+<!-- data:status_terms -->
+</dl>
+
+<div class="callout callout--calm">
+  <span class="callout__head">Planned means not implemented</span>
+  <p>Nothing on this site presents a planned capability as available. If you
+  need something from the planned list, it is a design conversation, not a
+  configuration change.</p>
+</div>
+
+<h2 id="inventory">The inventory</h2>
+<div class="grid-4" style="margin-bottom:34px">
+<!-- data:capability_summary -->
+</div>
+
+<div class="table-wrap">
+  <table class="table">
+    <caption>Every capability with its reviewed status and the file that implements it.</caption>
+    <thead>
+      <tr>
+        <th scope="col">Capability</th>
+        <th scope="col">Status</th>
+        <th scope="col">Note and implementation evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+<!-- data:capability_rows -->
+    </tbody>
+  </table>
+</div>
+<p class="muted">The evidence column names the file and symbol that implements
+each capability. If a row looks wrong, that file is where to check it.</p>
+
+<h2 id="planned">Designed but not built</h2>
+<p>These are the capabilities whose status is
+<strong>planned</strong>. They are not available, not configurable, and not
+imminent. They are here so the design is reviewable before anyone depends on
+it.</p>
+<ul class="tight">
+  <li><strong>Aggregate byte quotas across snapshots and persistent storage.</strong>
+  CPU and memory are enforced today. A storage ceiling is a design decision
+  about retention, not a counter.</li>
+  <li><strong>Layer 7 governed traffic.</strong> Guard filters by destination at
+  the network layer. Understanding an allowed HTTPS request is a different
+  problem with a different failure mode.</li>
+  <li><strong>Run Capsules</strong> — the ability to capture a sandbox and
+  resume it later in a materially different way.</li>
+</ul>
+
+<h2 id="notdoing">Deliberately out of scope</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>A hosted AIec</h3>
+    <p>There is no managed service and no sign-up. Capacity comes from the hosts
+    you run. This is a self-hosted product and its distribution is the source
+    code.</p>
+  </div>
+  <div class="block">
+    <h3>Moving your work to a cloud provider</h3>
+    <p>When every local worker is at capacity, AIec refuses the placement. It
+    does not quietly spill a workload somewhere else, because a silent change of
+    isolation boundary and jurisdiction is not a reasonable default.</p>
+  </div>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/limitations">Limitations</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/ROADMAP.md">Full roadmap</a>
+</div>

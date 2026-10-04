@@ -1,0 +1,158 @@
+<!-- meta:title=Benchmarks -->
+<!-- meta:description=Measured results with the artifact each number came from: run latency, soak pass rates, Guard overhead, and one optimization that measurement rejected. -->
+
+<!-- block:rail -->
+    <div class="rail__group">
+      <span class="rail__caption">Headline</span>
+      <dl>
+        <dt>run p50</dt><dd>25.50 s → 14.56 s</dd>
+        <dt>cleanup</dt><dd>−76.5%</dd>
+        <dt>sequential soak</dt><dd>100 / 100</dd>
+        <dt>parallel soak</dt><dd>77 / 80</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Read next</span>
+      <dl>
+        <dt><a href="/limitations">Limitations</a></dt><dd>what was not measured</dd>
+        <dt><a href="/ecosystem">Ecosystem</a></dt><dd>where this fits</dd>
+        <dt><a href="/roadmap">Roadmap</a></dt><dd>what is next</dd>
+      </dl>
+    </div>
+<!-- /block:rail -->
+
+<h1>Benchmarks</h1>
+<p class="lead">Every number on this page is published with the artifact it came
+from, and one optimization is published because measurement rejected it. Where a
+figure exists only in a hand-written report, it is marked as weaker evidence
+rather than presented with the same confidence as a harness run.</p>
+
+<h2 id="method">Method</h2>
+<p>Baseline and after runs are matched on a conditions fingerprint — the same
+hardware, the same workers, the same images, the same runtime. That fingerprint
+is <code>602f511b90348c50</code>. Twenty-five attempts were made per side.</p>
+<div class="grid-2">
+  <div class="block">
+    <h3>Baseline side</h3>
+    <p><strong>22 of 25</strong> attempts succeeded. The three failures were
+    stale-generation placement errors, and they are part of the result rather
+    than a discard.</p>
+  </div>
+  <div class="block">
+    <h3>After side</h3>
+    <p><strong>25 of 25</strong> attempts succeeded, with none of the baseline's
+    stale-generation failures.</p>
+  </div>
+</div>
+
+<div class="callout callout--calm">
+  <span class="callout__head">One statistic convention</span>
+  <p>The harness reports both <code>p50_s</code> and <code>median_s</code> for
+  the same runs, and the hand-written reports mix the two. This page uses
+  <strong>p50 throughout</strong>, read straight from the artifacts. A table
+  transcribed from prose can differ from this one in the second decimal; that is
+  why the difference is recorded here rather than silently averaged away.</p>
+</div>
+
+<h2 id="results">Measured results</h2>
+<div class="table-wrap">
+  <table class="table table--wide">
+    <caption>Matched before and after: 25 samples per side, same host, workers, images and fingerprint.</caption>
+    <thead><tr><!-- data:benchmark_heads --></tr></thead>
+    <tbody>
+<!-- data:benchmark_rows -->
+    </tbody>
+  </table>
+</div>
+<p class="muted">Change is before to after. <strong>Machine-checked artifact</strong>
+means the value is readable from a named key in a committed harness report;
+<strong>prose only</strong> means it exists solely in a hand-written report.</p>
+
+<h2 id="caveats">What the numbers qualify</h2>
+<dl class="deflist">
+<!-- data:benchmark_caveats -->
+</dl>
+
+<h2 id="soaks">Soaks</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>Sequential — 100 / 100</h3>
+    <p>One hundred runs, one at a time. Every run succeeded and the resource
+    census after the run matched the census before it: no leaked containers, no
+    leftover TAP devices, no stranded directories, no non-terminal sandboxes.
+    This is the measurement that says the system does not degrade under
+    sustained load, and it is the one that was fixed by correcting a
+    bookkeeping bug rather than by optimizing anything.</p>
+  </div>
+  <div class="block">
+    <h3>Parallel — 77 / 80</h3>
+    <p>Twenty batches of four. Three runs were refused with
+    <code>no schedulable worker has capacity</code>. This is the least flattering
+    published number on this page and it is here for that reason: at four-way
+    concurrency the admission gate refuses work when every worker is at its
+    measured capacity, rather than oversubscribing the host. The census still
+    balanced. Those three refusals have not been fully explained.</p>
+  </div>
+</div>
+
+<h2 id="guard">Guard overhead</h2>
+<p>Measured against an unguarded control across seven paired samples, on a local
+network connection. Median CPU and RSS for the governed and unguarded cases are
+in the table above.</p>
+<div class="callout">
+  <span class="callout__head">These numbers are narrower than they look</span>
+  <p>Local HTTP, not a real network. The measurement excludes the guest, the
+  nftables rules themselves, the watcher, and all control-plane cost. There is no
+  confidence interval. Read this as "the policy evaluation itself is cheap on
+  this hardware under these conditions", and nothing stronger.</p>
+</div>
+
+<h2 id="rejected">The optimization we threw away</h2>
+<div class="callout">
+  <span class="callout__head">Repository object cache: off by default</span>
+  <p><strong>Expected:</strong> less network traffic per Run, because a shared
+  object store would replace a fresh shallow clone.</p>
+  <p><strong>Measured:</strong> 26× more network bytes and roughly two seconds
+  slower per Run. Guest receive bytes were 9 280 on first use and 9 654 median
+  thereafter with the cache off, against 260 690 first and <strong>253 223
+  median</strong> with it on.</p>
+  <p><strong>Why:</strong> the cache re-resolved the repository ref on every Run,
+  including a cache hit, to re-check that a repository which was public is still
+  anonymously readable. In a calibrated guest, <code>git clone --depth 1</code>
+  moved 8 580 bytes while <code>git ls-remote -- &lt;url&gt; HEAD</code> moved
+  250 950. The safety check cost 29× the entire shallow clone it was protecting.</p>
+  <p>The guard was correct and the optimization was wrong. It ships off, and
+  stays off until the re-check is redesigned. A cache bypass run matched the
+  cache-off phase exactly, which is the authorization fix working.</p>
+</div>
+
+<h2 id="weaker">Weaker evidence</h2>
+<p>These figures are published because they describe real work, but no JSON
+artifact backs them and they were recorded by hand.</p>
+<ul class="tight">
+  <li><strong>Artifact collection.</strong> 129 360 ms with one read per 64 KiB
+  chunk against 8 945 ms with bounded groups of 32, and 39 ownership calls for a
+  1 MiB collection because the chunk endpoint brackets every read with two lease
+  checks. This is the mechanism behind the per-Run request-cost row.</li>
+  <li><strong>Repository cache calibration.</strong> The 8 580 and 250 950 byte
+  counts are single-guest readings with the interface counter read either side of
+  one command, not a distribution.</li>
+</ul>
+
+<h2 id="reproduce">Reproducing this</h2>
+<p>The harness scripts live in <code>benchmarks/</code> and the operational
+validation scripts in <code>scripts/</code>. The committed JSON reports are the
+inputs this page reads.</p>
+<pre><code>python3 -m pytest benchmarks/tests/ -q     # benchmark harness tests</code></pre>
+<div class="callout callout--calm">
+  <span class="callout__head">These claims cannot be regenerated by accident</span>
+  <p><code>web/data/benchmarks.json</code> is reviewed by hand and is never
+  auto-regenerated by a benchmark run. A new measurement does not silently
+  rewrite the project's published numbers; someone has to read the artifact and
+  decide whether the claim is still true.</p>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/limitations">What was not measured</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/BENCHMARKS.md">Full benchmark doc</a>
+</div>

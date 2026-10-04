@@ -1,0 +1,120 @@
+<!-- meta:title=Limitations -->
+<!-- meta:description=What AIec has not proven, where the evidence is thin, and which properties are claimed only by test rather than by a recorded deployment. -->
+
+<!-- block:rail -->
+    <div class="rail__group">
+      <span class="rail__caption">Sections</span>
+      <dl>
+        <dt><a href="#unmeasured">Not measured</a></dt><dd>no evidence at all</dd>
+        <dt><a href="#thin">Thin evidence</a></dt><dd>test, not deployment</dd>
+        <dt><a href="#constraints">Constraints</a></dt><dd>by design</dd>
+      </dl>
+    </div>
+    <div class="rail__group">
+      <span class="rail__caption">Read next</span>
+      <dl>
+        <dt><a href="/benchmarks">Benchmarks</a></dt><dd>with artifacts</dd>
+        <dt><a href="/roadmap">Roadmap</a></dt><dd>status of everything</dd>
+        <dt><a href="/security">Security</a></dt><dd>threat model</dd>
+      </dl>
+    </div>
+<!-- /block:rail -->
+
+<h1>Limitations</h1>
+<p class="lead">The page that would be missing from a launch if the launch were
+being written for advertising. These are the properties AIec does not claim, the
+measurements that were never taken, and the places where the proof is a unit
+test rather than a recorded deployment.</p>
+
+<h2 id="unmeasured">Not measured at all</h2>
+<p>These are not weak results. They are questions the project has not answered,
+and it would be misleading to imply otherwise.</p>
+<ul class="tight">
+  <li><strong>Network-enabled Firecracker.</strong> The worker still lacks the
+  capability to create a TAP device, so microVM runs are exercised with
+  networking switched off. Every Firecracker measurement on this site is a
+  no-network measurement.</li>
+  <li><strong>The hosted isolation provider.</strong> <code>RuntimeKind::Hosted</code>
+  exists in the code and is not exercised against a real provider. No live
+  evidence for that path exists anywhere.</li>
+  <li><strong>Repository cache on Firecracker or a hosted runtime.</strong> The
+  cache was rejected on its own numbers on Docker; it was never carried to the
+  other substrates.</li>
+  <li><strong>PID-namespace isolation.</strong> No artifact asserts it. The only
+  namespace fact recorded anywhere is Guard's: a fresh user and network
+  namespace, a recorded host inode that differs, and no external interface.</li>
+  <li><strong><code>pressure.observed_at</code> staleness.</strong> Accepted and
+  unproven. Admission actually gates on <code>last_heartbeat</code> freshness,
+  which is the documented contract, so this is a gap in the resource-pressure
+  signal rather than in the admission path.</li>
+  <li><strong>aarch64.</strong> Cross-build evidence only. No hardware, no
+  runtime, no performance claim.</li>
+</ul>
+
+<h2 id="thin">Thin evidence</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>Firecracker latency</h3>
+    <p>Three samples. The harness deliberately withholds p50, p95 and p99 below
+    twenty samples, and this page follows that rule rather than printing
+    percentiles from three runs. What exists is a live proof that the path
+    works — rootfs copy-on-write, guest destruction, lease release — not a
+    throughput claim.</p>
+  </div>
+  <div class="block">
+    <h3>Guard overhead</h3>
+    <p>Seven paired samples over a local HTTP connection. Excludes the guest,
+    the nftables rules, the watcher and all control-plane cost. No confidence
+    interval. It supports "policy evaluation is cheap on this hardware", not a
+    general performance statement.</p>
+  </div>
+</div>
+
+<h2 id="constraints">Constraints that are by design</h2>
+<div class="grid-2">
+  <div class="block">
+    <h3>Refusal under capacity</h3>
+    <p>When every worker is at measured capacity, placement is refused. Three of
+    eighty runs in the final parallel soak were refused this way. That is the
+    admission gate working, but those three refusals have not been fully
+    explained and are not counted as a clean sweep.</p>
+  </div>
+  <div class="block">
+    <h3>No silent spillover</h3>
+    <p>AIec will not move a workload to a cloud provider when the local cluster
+    is full. A failed request is a smaller problem than a workload that quietly
+    changed isolation boundary or jurisdiction.</p>
+  </div>
+  <div class="block">
+    <h3>Guard needs privileges</h3>
+    <p>A worker without <code>CAP_NET_ADMIN</code> advertises
+    <code>network_policy: false</code> and refuses governed placements rather
+    than running them ungoverned. Governed workloads are therefore unavailable
+    on a worker that was not set up for them.</p>
+  </div>
+  <div class="block">
+    <h3>Single-host tap allocation</h3>
+    <p>Cross-process TAP address allocation is inventory-probe based and cannot
+    be reserved atomically, so the network driver carries this limitation. It is
+    recorded in the project's known-defects file rather than worked around.</p>
+  </div>
+</div>
+
+<h2 id="text">Prose-only numbers</h2>
+<p>Some figures on the <a href="/benchmarks">benchmarks page</a> exist only in
+hand-written reports because no JSON artifact was committed for them. They are
+labelled as weaker evidence there. They are included because they describe work
+that really happened, not because they are as trustworthy as a harness run.</p>
+
+<div class="callout callout--calm">
+  <span class="callout__head">Why publish this page at all</span>
+  <p>Every item here is also in the repository's own known-defects file, where
+  it is tracked with more detail. Putting it on the site means a reader does not
+  have to audit the source to discover the project's own limits — which is the
+  only way the limits are worth anything.</p>
+</div>
+
+<div class="actions">
+  <a class="btn btn--solid" href="/benchmarks">See the measurements</a>
+  <a class="btn" href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/known-defects.md">Known defects</a>
+</div>

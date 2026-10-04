@@ -4,7 +4,14 @@
 # Deploy with:           npx wrangler deploy
 #
 # The site is plain static HTML built by `web/build.py`; there is no framework
-# and no bundler, so what is in `web/` is what ships.
+# and no bundler. `web/dist/` holds only rendered pages, generated cards and
+# the assets they link to.
+#
+# Assets come from `./dist`, never from `./`. With `./`, the publish root was
+# also the source root, so the deployed site served `/build.py` and
+# `/pages/home.html` — the renderer source and an unrendered fragment — to
+# anyone who asked for them. `web/build.py` refuses to write a publish root
+# that contains source; this is the other half of that guarantee.
 
 name = "aiec-site"
 main = "src/worker.js"
@@ -18,7 +25,7 @@ routes = [
 ]
 
 [assets]
-directory = "./"
+directory = "./dist"
 binding = "ASSETS"
 # Extensionless routes such as /docs are served from /docs/index.html.
 html_handling = "auto-trailing-slash"

@@ -1,0 +1,221 @@
+{
+  "_comment": [
+    "One structured answer to 'what does AIec actually do right now'.",
+    "",
+    "`status` is deliberately coarse and deliberately unfashionable:",
+    "",
+    "  stable       - the path is implemented, has regression tests, and has",
+    "                 live acceptance evidence in benchmarks/",
+    "  alpha        - implemented and tested, but the evidence is a unit or",
+    "                 integration test rather than a recorded live run, or the",
+    "                 interface is expected to move before 1.0",
+    "  experimental - implemented, and deliberately not relied on",
+    "  planned      - designed and documented, NOT implemented",
+    "",
+    "Nothing here says 'planned' and links to a README promise. If a row says",
+    "planned, the product does not do it today and the site must not imply",
+    "otherwise.",
+    "",
+    "Each row names where the thing lives so a claim can be checked rather than",
+    "believed. `evidence` is a repository path, not a link to a claim about it."
+  ],
+
+  "status_terms": {
+    "stable": "Implemented, regression-tested, and exercised by a recorded live acceptance artifact.",
+    "alpha": "Implemented and tested, but the proof is a test rather than a recorded live deployment, or the interface may still move before 1.0.",
+    "experimental": "Implemented and deliberately not relied on. Read its caveat before using it.",
+    "planned": "Designed and documented. Not implemented. Nothing on the website may present this as available."
+  },
+
+  "capabilities": [
+    {
+      "area": "Isolation",
+      "capability": "Firecracker microVM sandboxes",
+      "status": "stable",
+      "evidence": "crates/aiec-runtime/src/lib.rs → FirecrackerRuntime; benchmarks/guard-core-acceptance.json",
+      "note": "Forced by runtime policy for untrusted workloads. A tenant cannot request a weaker runtime to downgrade their own boundary."
+    },
+    {
+      "area": "Isolation",
+      "capability": "Docker sandbox runtime",
+      "status": "alpha",
+      "evidence": "crates/aiec-runtime/src/docker.rs",
+      "note": "Available for trusted self-hosted deployments, local development and operator tasks. Not offered to untrusted public workloads."
+    },
+    {
+      "area": "Isolation",
+      "capability": "Bubblewrap development runtime",
+      "status": "experimental",
+      "evidence": "crates/aiec-runtime/src/lib.rs → BubblewrapRuntime",
+      "note": "Local development. Workspace snapshots have been exercised by restoring into a distinct sandbox; it is not the untrusted-workload boundary."
+    },
+    {
+      "area": "Isolation",
+      "capability": "External hosted isolation provider",
+      "status": "alpha",
+      "evidence": "crates/aiec-core/src/lib.rs → RuntimeKind::Hosted",
+      "note": "The isolation boundary would be owned by the provider, not by AIec, so this kind never runs on a managed worker node. NOT exercised against a real provider; no live evidence exists."
+    },
+    {
+      "area": "Sandboxes",
+      "capability": "Create, exec, files, pause, resume, destroy",
+      "status": "stable",
+      "evidence": "crates/aiec-api/src/lib.rs; scripts/smoke.sh",
+      "note": "Workspace paths are confined and reject traversal and symlink escapes. Directory listings are bounded rather than truncated."
+    },
+    {
+      "area": "Sandboxes",
+      "capability": "Bounded CPU, memory, disk and wall clock",
+      "status": "stable",
+      "evidence": "crates/aiec-core/src/lib.rs → QuotaLimits; enforcement in crates/aiec-storage",
+      "note": "Quotas are enforced in the same transaction as placement, under a per-tenant advisory lock."
+    },
+    {
+      "area": "Durability",
+      "capability": "Runs: submit, results, events, artifacts, cancel",
+      "status": "stable",
+      "evidence": "crates/aiec-api/src/runs.rs; scripts/firecracker-coding-dogfood.sh",
+      "note": "Events, attempts and artifacts for one run are bounded by construction, not by pagination."
+    },
+    {
+      "area": "Durability",
+      "capability": "Lease and generation fencing",
+      "status": "stable",
+      "evidence": "crates/aiec-core/src/scheduler.rs; enforcement in crates/aiec-storage",
+      "note": "A superseded worker cannot execute, write, stop, destroy or complete against a reassigned sandbox."
+    },
+    {
+      "area": "Durability",
+      "capability": "Cross-worker recovery from a workspace archive",
+      "status": "alpha",
+      "evidence": "docs/DEPLOYMENT.md; benchmarks/snapshot-acceptance.json",
+      "note": "PostgreSQL leases plus an S3-compatible workspace archive. Running VM memory is not the portable recovery unit, and multi-host recovery has not been validated by the recorded evidence."
+    },
+    {
+      "area": "Snapshots",
+      "capability": "Workspace snapshot, destroy source, restore into a new sandbox",
+      "status": "stable",
+      "evidence": "benchmarks/snapshot-acceptance.json (12/12 against real S3 storage)",
+      "note": "This is the portable kind."
+    },
+    {
+      "area": "Snapshots",
+      "capability": "Full VM and memory-only Firecracker snapshots",
+      "status": "experimental",
+      "evidence": "docs/SNAPSHOTS.md; crates/aiec-core/src/snapshots.rs",
+      "note": "Worker-local recovery artifacts. Do not present them as portable workspace snapshots; compatible host and device-path portability is unproven."
+    },
+    {
+      "area": "Governance",
+      "capability": "Guard: out-of-guest network, DNS and credential boundary",
+      "status": "stable",
+      "evidence": "benchmarks/guard-core-acceptance.json (48/48); docs/GUARD_THREAT_MODEL.md",
+      "note": "Default is no network. A sandbox asking for a network without selecting a policy is refused, not quietly filtered."
+    },
+    {
+      "area": "Governance",
+      "capability": "Watchdog, dead-man switch and quarantine",
+      "status": "stable",
+      "evidence": "benchmarks/guard-phase2-acceptance.json (29/29)",
+      "note": "Loss of the watchdog is fail-closed and latches. The guest is not destroyed, so a forensic capture is still possible."
+    },
+    {
+      "area": "Governance",
+      "capability": "Guard tool-approval proposals and operator decisions",
+      "status": "alpha",
+      "evidence": "benchmarks/guard-phase3-acceptance.json (47/47); benchmarks/guard-approval-acceptance.json",
+      "note": "An agent can propose a policy change and cannot approve one. Proposal ownership is tenant-checked."
+    },
+    {
+      "area": "Governance",
+      "capability": "Per-VM identity, image trust and canaries",
+      "status": "alpha",
+      "evidence": "benchmarks/guard-phase5-acceptance.json (37/37)",
+      "note": "Trusted host file APIs can observe reads; arbitrary in-guest exec reads are not observable through those APIs."
+    },
+    {
+      "area": "Governance",
+      "capability": "Durable lifetime reaper",
+      "status": "stable",
+      "evidence": "benchmarks/guard-reaper-acceptance.json (16/16); benchmarks/guard-reaper-external-db-acceptance.json (16/16)",
+      "note": "The second run goes through the external-database relay."
+    },
+    {
+      "area": "Governance",
+      "capability": "Layer 7 visibility (method, path, tool) for governed traffic",
+      "status": "planned",
+      "evidence": "docs/GUARD_THREAT_MODEL.md",
+      "note": "Not implemented. Opaque TLS is not inspected. A CONNECT tunnel needing Layer 7 visibility is REFUSED rather than forwarded ungoverned, and TLS interception is not claimed as a validated deployment mode."
+    },
+    {
+      "area": "Evaluation",
+      "capability": "Eval batch, repetitions and matrix",
+      "status": "stable",
+      "evidence": "crates/aiec-api/src/evaluations.rs; sdk/python/agentforge/evals.py",
+      "note": "Every cell gets its own machine and is kept whole. A bounded request returns the runs."
+    },
+    {
+      "area": "Evaluation",
+      "capability": "Suite expansion and baseline-versus-candidate compare",
+      "status": "alpha",
+      "evidence": "evaluations/omp-regression.json; sdk/python/agentforge/evals.py → Comparison",
+      "note": "Counts and measurements over the same runs. No pass rate dressed up as a score, and no percentiles invented from a handful of samples."
+    },
+    {
+      "area": "Evaluation",
+      "capability": "Run Capsules and trajectories",
+      "status": "planned",
+      "evidence": "docs/ROADMAP.md",
+      "note": "Not implemented. Do not advertise as shipped."
+    },
+    {
+      "area": "Interfaces",
+      "capability": "Python SDK",
+      "status": "stable",
+      "evidence": "sdk/python/agentforge; scripts/check-sdk-contract.py",
+      "note": "Known gap: `run_cells` chunking is unimplemented because changing it breaks the `#[tool]` macro boundary."
+    },
+    {
+      "area": "Interfaces",
+      "capability": "Rust client and CLI",
+      "status": "stable",
+      "evidence": "crates/aiec-client; crates/aiec-cli",
+      "note": "JSON output, so anything pipes into jq."
+    },
+    {
+      "area": "Interfaces",
+      "capability": "Local MCP server",
+      "status": "alpha",
+      "evidence": "docs/MCP.md; crates/aiec-mcp (a Rust binary, not part of the Python SDK)",
+      "note": "Exposes the same lifecycle as tools. The owned-sandbox listing is bounded and prunes finished machines."
+    },
+    {
+      "area": "Interfaces",
+      "capability": "`aiec doctor`",
+      "status": "alpha",
+      "evidence": "crates/aiec-cli/src/main.rs → doctor",
+      "note": "Reports OS, runtime, bubblewrap, Docker, KVM, database configuration and the Firecracker binary, kernel, guest artifact and wire protocol. It REPORTS; it does not refuse to start."
+    },
+    {
+      "area": "Tenancy",
+      "capability": "Tenant-scoped API keys with scopes",
+      "status": "alpha",
+      "evidence": "crates/aiec-api/src/lib.rs (the /v1/keys routes); crates/aiec-api/tests/routes.rs",
+      "note": "Keys are stored hashed and compared in constant time. Granting scopes and revoking keys both require the caller to hold the authority being granted or destroyed. API may change before 1.0."
+    },
+    {
+      "area": "Tenancy",
+      "capability": "Per-tenant usage accounting and Prometheus export",
+      "status": "alpha",
+      "evidence": "the GET /v1/usage route in crates/aiec-api/src/lib.rs; the Prometheus exporter in crates/aiec-api",
+      "note": "Usage events are append-only and idempotent, so retries do not double-count."
+    },
+    {
+      "area": "Tenancy",
+      "capability": "Aggregate per-tenant snapshot and persistent-storage byte quotas",
+      "status": "planned",
+      "evidence": "docs/known-defects.md",
+      "note": "Per-request size ceilings exist. Aggregate byte quotas do not."
+    }
+  ]
+}

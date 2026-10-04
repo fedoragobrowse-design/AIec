@@ -7,6 +7,15 @@
 .DS_Store
 __pycache__/
 *.pyc
-dist/
+# Bare `dist/` collided with the Rust build output. The site's publish root is
+# web/dist and is deliberately committed, so it is published by copying that
+# directory to a web root.
+**/target*/dist/
+/crates/*/dist/
+/target/dist/
 /.agentforge
 /.agentforge/
+
+# Wrangler local cache holds the account id and owner email; it is machine
+# state, never a build input.
+.wrangler/
