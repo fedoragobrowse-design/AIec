@@ -695,14 +695,14 @@ fn walk(
             // follow, where `Path::is_dir` resolves the link. A link that
             // points back into the tree (`loop -> .`) therefore produced
             // `root/loop`, `root/loop/loop`, ... with no visited set and no
-            // depth cap: `out` grew only on a match, so a pattern matching
-            // nothing walked the whole path-length space twice over - once to
-            // find nothing, once to report every file under it once per
-            // distinct depth reached - and only stopped when the kernel
-            // refused the too-long path. The damage is to the worker process
-            // rather than to one sandbox, and the repository this walks is
-            // attacker-supplied in the eval flow, so the link is planted long
-            // before it is walked.
+            // depth cap, re-enumerating the same subtree once per path depth
+            // the stack reached. A pattern matching nothing never grew `out`
+            // at all, so it ignored `limit` entirely and stopped only once
+            // `read_dir` hit the OS path-length bound; a pattern that did
+            // match reported the same file once per depth reached. The damage
+            // is to the worker process rather than to one sandbox, and the
+            // repository this walks is attacker-supplied in the eval flow, so
+            // the link is planted long before it is walked.
             //
             // A symlink to a file is still a file to a glob, so it is left to
             // match below; only descending through one is refused.
@@ -780,12 +780,15 @@ mod tests {
     /// The walk runs on its own thread and is waited for with a timeout, so a
     /// walk that never returns fails this assertion instead of hanging the
     /// suite.
+    // The whole test is Unix-gated, not just the `symlink` call: without the
+    // link there is no loop, the walk trivially terminates, and the test would
+    // report this regression covered while asserting nothing about it.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_pointing_back_at_its_own_directory_terminates_the_find_walk() {
         let root = scratch("find-loop");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/keep.txt"), "keep").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
 
         // The walk runs on its own thread and is waited on with a timeout, so

@@ -254,7 +254,7 @@ impl NetworkBackend for LinuxNetworkManager {
         };
         if let Some(stdin) = child.stdin.as_mut()
             && let Err(error) = stdin
-                .write_all(firewall_rules(&table, &tap, &plan.network).as_bytes())
+                .write_all(firewall_rules(&table, &tap, &plan.network, &plan.guest).as_bytes())
                 .await
         {
             drop(child.stdin.take());
@@ -395,9 +395,9 @@ async fn run_tool(program: &str, args: &[String], failure: &str) -> Result<(), C
 /// packet from the guest was accepted by the input and forward chains alike.
 /// The Firecracker guest autoconfigures a link-local `fe80::` on its NIC
 /// because only the IPv4 `ip=` boot argument is set, which is enough to reach
-/// host link-local neighbours and anything the host binds on `::` — including
-/// the worker's own control-plane client. The masquerade rule is `ip saddr`-only
-/// too, so that egress left un-NATed as well. This matches the Guard renderer,
+/// host link-local neighbours and anything the host binds on `::`. The
+/// masquerade rule is `ip saddr`-only too, so that egress left un-NATed as
+/// well. This matches the Guard renderer,
 /// which states the same intent (`permits_ipv6()` returns false and
 /// `render_ipv6` drops unconditionally).
 ///
@@ -410,29 +410,48 @@ async fn run_tool(program: &str, args: &[String], failure: &str) -> Result<(), C
 /// requires `ct state established`, but a connection the far side *initiated*
 /// matched neither and was accepted anyway. Guard states the same intent with
 /// its `forward_to_guest` chain.
-fn firewall_rules(table: &str, tap: &str, subnet: &str) -> String {
+///
+/// Source matches are pinned to the guest's own address, and each chain
+/// enforces that rather than merely preferring it. Both chains carry
+/// `policy accept`, so an accept that never matched was not a restriction: a
+/// packet from the tap with a forged source missed every rule and was let
+/// through anyway. The `ip saddr !=` drop is what actually refuses it, and it
+/// sits directly after the IPv6 drop so it is reached before any destination
+/// rule could accept on the strength of where the packet was going.
+///
+/// The address worth forging is the host's. A `/30` is four addresses — network,
+/// host at `.1`, guest at `.2`, broadcast — so the host's own address is the
+/// only one a guest can reach that carries traffic, and a guest sourcing as
+/// `.1` had its egress masqueraded like any other permitted source while
+/// appearing on the far side to come from the host. Destination matches stay
+/// on the subnet, because that is about which hosts are on this link rather
+/// than about who is allowed to be the sender. Guard matches the exact guest
+/// address for the same reason.
+fn firewall_rules(table: &str, tap: &str, subnet: &str, guest: &str) -> String {
     format!(
         "add table inet {table}; \
 add chain inet {table} input {{ type filter hook input priority -10; policy accept; }}; \
 add chain inet {table} forward {{ type filter hook forward priority -10; policy accept; }}; \
 add chain inet {table} postrouting {{ type nat hook postrouting priority srcnat; policy accept; }}; \
 add rule inet {table} input iifname \"{tap}\" meta nfproto ipv6 drop; \
-add rule inet {table} input iifname \"{tap}\" ip saddr {subnet} ip daddr {subnet} accept; \
+add rule inet {table} input iifname \"{tap}\" ip saddr != {guest} drop; \
+add rule inet {table} input iifname \"{tap}\" ip saddr {guest} ip daddr {subnet} accept; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
 add rule inet {table} input iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
 add rule inet {table} forward iifname \"{tap}\" meta nfproto ipv6 drop; \
+add rule inet {table} forward iifname \"{tap}\" ip saddr != {guest} drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 169.254.169.254 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 10.0.0.0/8 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 172.16.0.0/12 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 192.168.0.0/16 drop; \
 add rule inet {table} forward iifname \"{tap}\" ip daddr 127.0.0.0/8 drop; \
-add rule inet {table} forward iifname \"{tap}\" ip saddr {subnet} accept; \
-add rule inet {table} forward oifname \"{tap}\" ip daddr {subnet} ct state established,related accept; \
+add rule inet {table} forward iifname \"{tap}\" ip saddr {guest} accept; \
+add rule inet {table} forward oifname \"{tap}\" ip daddr {guest} ct state established,related accept; \
 add rule inet {table} forward oifname \"{tap}\" drop; \
-add rule inet {table} postrouting oifname != \"{tap}\" ip saddr {subnet} masquerade"
+add rule inet {table} postrouting oifname != \"{tap}\" ip saddr {guest} masquerade"
     )
 }
 
@@ -462,7 +481,12 @@ mod tests {
 
     #[test]
     fn firewall_is_scoped_to_tap() {
-        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let rules = firewall_rules(
+            "aiec_0123456789ab",
+            "af0123456789ab",
+            "172.30.8.0/30",
+            "172.30.8.2",
+        );
         assert!(rules.contains("hook input"));
         assert!(rules.contains("hook forward"));
         assert!(!rules.contains("hook output"));
@@ -491,7 +515,12 @@ mod tests {
     /// anything deliberate.
     #[test]
     fn ipv6_from_the_guest_is_dropped_in_both_chains_before_their_accepts() {
-        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let rules = firewall_rules(
+            "aiec_0123456789ab",
+            "af0123456789ab",
+            "172.30.8.0/30",
+            "172.30.8.2",
+        );
         let input_drop = rules
             .find("input iifname \"af0123456789ab\" meta nfproto ipv6 drop")
             .expect("input chain drops IPv6");
@@ -501,13 +530,13 @@ mod tests {
 
         // Nothing in either chain may accept ahead of the drop.
         assert!(
-            input_drop < rules.find("input iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 ip daddr 172.30.8.0/30 accept").expect("input accept"),
+            input_drop < rules.find("input iifname \"af0123456789ab\" ip saddr 172.30.8.2 ip daddr 172.30.8.0/30 accept").expect("input accept"),
             "an IPv4 accept must not precede the IPv6 drop in the input chain"
         );
         assert!(
             forward_drop
                 < rules
-                    .find("forward iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 accept")
+                    .find("forward iifname \"af0123456789ab\" ip saddr 172.30.8.2 accept")
                     .expect("forward accept"),
             "an accept must not precede the IPv6 drop in the forward chain"
         );
@@ -529,9 +558,14 @@ mod tests {
     /// guest loses the replies to everything it legitimately sent.
     #[test]
     fn traffic_bound_for_the_guest_is_dropped_after_the_return_traffic_is_allowed() {
-        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let rules = firewall_rules(
+            "aiec_0123456789ab",
+            "af0123456789ab",
+            "172.30.8.0/30",
+            "172.30.8.2",
+        );
         let return_allow = rules
-            .find("forward oifname \"af0123456789ab\" ip daddr 172.30.8.0/30 ct state established,related accept")
+            .find("forward oifname \"af0123456789ab\" ip daddr 172.30.8.2 ct state established,related accept")
             .expect("return traffic is allowed");
         let terminal_drop = rules
             .find("forward oifname \"af0123456789ab\" drop;")
@@ -939,15 +973,20 @@ mod tests {
 
     #[test]
     fn firewall_masquerades_guest_traffic_and_keeps_guest_subnet_reachable() {
-        let rules = firewall_rules("aiec_0123456789ab", "af0123456789ab", "172.30.8.0/30");
+        let rules = firewall_rules(
+            "aiec_0123456789ab",
+            "af0123456789ab",
+            "172.30.8.0/30",
+            "172.30.8.2",
+        );
         assert!(rules.contains("type nat hook postrouting priority srcnat"));
-        assert!(rules.contains("oifname != \"af0123456789ab\" ip saddr 172.30.8.0/30 masquerade"));
-        assert!(rules.contains("forward iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 accept"));
-        assert!(rules.contains("forward oifname \"af0123456789ab\" ip daddr 172.30.8.0/30 ct state established,related accept"));
+        assert!(rules.contains("oifname != \"af0123456789ab\" ip saddr 172.30.8.2 masquerade"));
+        assert!(rules.contains("forward iifname \"af0123456789ab\" ip saddr 172.30.8.2 accept"));
+        assert!(rules.contains("forward oifname \"af0123456789ab\" ip daddr 172.30.8.2 ct state established,related accept"));
         // The guest gateway lives inside 172.16.0.0/12, so its allow rule must be
         // evaluated before the private-range drops or the guest loses its default route.
         let gateway = rules
-            .find("input iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 ip daddr 172.30.8.0/30 accept")
+            .find("input iifname \"af0123456789ab\" ip saddr 172.30.8.2 ip daddr 172.30.8.0/30 accept")
             .expect("guest subnet input allow rule");
         let private_drop = rules
             .find("input iifname \"af0123456789ab\" ip daddr 172.16.0.0/12 drop")
@@ -957,9 +996,62 @@ mod tests {
             .find("forward iifname \"af0123456789ab\" ip daddr 169.254.169.254 drop")
             .expect("metadata drop rule");
         let outbound = rules
-            .find("forward iifname \"af0123456789ab\" ip saddr 172.30.8.0/30 accept")
+            .find("forward iifname \"af0123456789ab\" ip saddr 172.30.8.2 accept")
             .expect("outbound accept rule");
         assert!(metadata_drop < outbound);
+
+        // Every permit is keyed to the guest's own address, not to its `/30`.
+        // The host's own address is the one a guest can forge that carries
+        // traffic, and masquerading it attributes the guest's egress to the
+        // host while the replies never come back to the guest.
+        assert!(
+            !rules.contains("ip saddr 172.30.8.0/30"),
+            "no permit may key on the subnet as a source: {}",
+            rules
+        );
+    }
+
+    /// Pinning the source is not enforcement on its own: both chains end in
+    /// `policy accept`, so a packet from the tap whose source matched none of
+    /// the accepts fell through the whole chain and was accepted by the policy
+    /// anyway. Asserting the permits name the guest proves nothing unless
+    /// something refuses the rest.
+    ///
+    /// This asserts the refusal exists, sits ahead of every accept in its
+    /// chain so no destination-based accept can run first, and covers the
+    /// input chain too — the host side is where a forged `.1` arrives.
+    #[test]
+    fn a_forged_source_from_the_guest_is_dropped_before_any_accept_runs() {
+        let rules = firewall_rules(
+            "aiec_0123456789ab",
+            "af0123456789ab",
+            "172.30.8.0/30",
+            "172.30.8.2",
+        );
+        for chain in ["input", "forward"] {
+            let prefix =
+                format!("add rule inet aiec_0123456789ab {chain} iifname \"af0123456789ab\"");
+            let drop = rules
+                .find(&format!("{prefix} ip saddr != 172.30.8.2 drop;"))
+                .unwrap_or_else(|| panic!("{chain} refuses a forged source"));
+
+            // Ahead of every accept in this chain. A drop placed after one is
+            // dead for whatever that accept already let through.
+            for rule in rules.split_terminator("add rule inet ") {
+                if !rule.starts_with(&format!("aiec_0123456789ab {chain} "))
+                    || !rule.contains(" accept")
+                {
+                    continue;
+                }
+                let position = rules
+                    .find(&format!("add rule inet {rule}"))
+                    .expect("every rule is found in the rendered text");
+                assert!(
+                    drop < position,
+                    "{chain} accepts before refusing a forged source: {rule}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

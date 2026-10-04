@@ -720,10 +720,10 @@ the error path makes it fail with `the reservation wedged`.
 `firewall_rules` in `crates/aiec-network-linux` builds an `inet` table. Every
 rule in it matches on `ip saddr`/`ip daddr`, and the input and forward chains
 are both `policy accept`. An IPv6 packet from the guest matches none of them, so
-it was accepted by both chains: the guest could reach anything the host binds
-on `::`, including the worker's own control-plane client, and the masquerade
-rule — `ip saddr` only — left that egress un-NATed.
-
+it was accepted by both chains: the guest could send to anything the host binds
+on `::` — host-local IPv6 listeners and link-local neighbours on the host's
+interfaces — and anything forwarded to it, with the masquerade rule
+(`ip saddr`-only) leaving that egress un-NATed.
 It was reachable without the guest doing anything deliberate. The Firecracker
 guest is given only the IPv4 `ip=` boot argument, so it autoconfigures a
 link-local `fe80::` on its NIC and has a working IPv6 stack.
@@ -806,6 +806,43 @@ would both still pass with an accept appended after the drop, which is
 precisely the way this defect came back; appending
 `forward iifname != tap oifname tap ip saddr 10.99.0.0/16 accept` after the drop
 makes the test fail, and so does deleting it.
+
+### The guest could send under any source address on its `/30`
+
+Both legacy TAP chains carry `policy accept`, so the rules only ever described
+what was *permitted*; anything they failed to match fell out of the chain and
+was accepted by the policy. The permits keyed `ip saddr` on the whole `/30`,
+which combined with the policy into no source restriction at all.
+
+The address worth forging is the host's. A `/30` is four addresses — network,
+host at `.1`, guest at `.2`, broadcast — so `.1` is the only one a guest can
+source that carries traffic, and it is the host's own address on that link.
+Masquerade is a source-range rewrite, so a packet claiming `.1` was rewritten
+like any permitted source and appeared on the far side to come from the host,
+while conntrack sent the replies to the host address where the guest cannot
+see them.
+
+Fix: every source match is pinned to `plan.guest`, and each chain enforces it
+with `ip saddr != {guest} drop` placed directly after the IPv6 drop, ahead of
+every accept so no destination rule can run first. Destination matches stay on
+the subnet, because that is about which hosts are on the link rather than who
+may be the sender. This is the structure Guard already renders
+(`crates/aiec-guard/src/enforcement/render.rs:391` and `:404`), so the two paths
+now agree and the legacy one is the stricter-correct of the pair.
+
+Regression: `a_forged_source_from_the_guest_is_dropped_before_any_accept_runs`
+asserts the refusal exists in both chains and precedes every accept in them.
+Deleting the forward drop fails it with "forward refuses a forged source";
+moving that drop after the `ip saddr` accept fails it with "forward accepts
+before refusing a forged source". A separate assertion in
+`firewall_masquerades_guest_traffic_and_keeps_guest_subnet_reachable` rejects
+any rule keyed on the subnet as a source at all, and was checked against a
+freshly added subnet-wide permit that the specific string matches cannot see.
+
+Evidence: the ruleset rendered by `firewall_rules` was applied verbatim under
+`unshare -rn -- nft -f`, accepted by real nft, and `nft list table` shows both
+chains with the IPv6 drop and the anti-spoof drop ahead of every accept and the
+metadata drop restored in the forward chain.
 
 ### `find` re-walked the tree through a symlink that pointed at it
 
@@ -902,12 +939,19 @@ transition is rejected unless the sandbox's current active, unexpired lease
 *is* `lease_id`: a worker that lost its lease can never commit state, whatever
 generation it presents."
 
-This is already pinned by a database-backed regression that expires a lease and
-then attempts the fenced transition, asserting both the refusal and that the
-sandbox's state is unchanged. The mixed case fails closed too: with both a
-lapsed and a live lease, `sandbox_ownership` may return the lapsed one, and
-`active_lease()` then returns a different `id`, which is refused as a
-reassignment.
+This is pinned by a database-backed regression,
+`an_expired_or_absent_lease_cannot_commit_and_says_which_it_was`
+(`crates/aiec-storage/src/postgres.rs`): it leaves the row `status='active'`,
+expires its timestamp, attempts the fenced transition, and asserts both the
+refusal and that the sandbox's state is unchanged.
+
+There is no ambiguous middle case. `sandbox_leases_one_active_per_sandbox` is a
+partial UNIQUE index on `sandbox_id WHERE status='active'`
+(`migrations/0002_control_plane.sql`), so a sandbox has at most one active
+lease, and the two lookups cannot disagree about *which* active row they mean:
+`sandbox_ownership` finds that row, and `active_lease()` either returns the
+same one (the transition proceeds) or `None` because it has lapsed (the
+transition is refused).
 
 An earlier note in this file claimed the opposite — that a worker could commit
 state between expiry and reassignment because it still physically held the
