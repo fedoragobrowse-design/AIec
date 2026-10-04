@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -603,8 +604,30 @@ def main() -> int:
         http("DELETE", f"/v1/sandboxes/{_sandbox_id}")
     remaining: list = []
     try:
-        status, census_sandboxes = http("GET", "/v1/sandboxes", timeout=15.0)
-        remaining = [row for row in (census_sandboxes or [])
+        # The listing is a page, not a bare array, so iterating the body
+        # directly walked its keys and every lookup below raised. It is also
+        # bounded: reading only the first page would miss a sandbox older than
+        # that page, which is exactly the residue this is looking for.
+        status, census_sandboxes = http("GET", "/v1/sandboxes?limit=200", timeout=15.0)
+        rows: list = []
+        cursor_page = census_sandboxes
+        for _ in range(64):
+            if not isinstance(cursor_page, dict):
+                raise ValueError(f"census page was {type(cursor_page).__name__}, not a page")
+            rows.extend(cursor_page.get("sandboxes") or [])
+            nxt = cursor_page.get("next")
+            if not nxt:
+                break
+            status, cursor_page = http(
+                "GET",
+                "/v1/sandboxes?limit=200"
+                f"&after_created_at={quote(str(nxt['created_at']), safe='')}"
+                f"&after_id={quote(str(nxt['id']), safe='')}",
+                timeout=15.0,
+            )
+        else:
+            raise ValueError("census still had a cursor after 64 pages")
+        remaining = [row for row in rows
                      if row.get("id") == _sandbox_id and row.get("state") != "destroyed"]
     except Exception as error:
         remaining = [{"census_error": str(error)[:120]}]

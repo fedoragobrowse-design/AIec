@@ -1155,6 +1155,36 @@ rather than a style:
   still claims a successor. The first of those is caught by the test hanging to
   its timeout with the guard removed, which is the point.
 
+Paginating it broke three more consumers, and the pattern is worth recording
+because it repeated almost verbatim each time: a script asks the route for a
+list, gets a page, and either raises or unwraps one page and calls the result
+complete.
+
+- `benchmarks/aiecbench/observe.py::sandbox_census` reported
+  `{"available": false}` for every sandbox reading — the one signal the soak
+  tooling keeps distinct from "nothing leaked".
+- `benchmarks/bug-hunt-live.py::check_no_residue` asked for `limit=256` and was
+  served 200, then read only that page. Verified directly: with a live sandbox on
+  page two, the old check reports clean. It now walks the cursor, percent-encodes
+  it, and reports how many pages it read.
+- `scripts/guard-phase2-acceptance.py` iterated the body directly, so a page
+  object yielded its *keys* and `row.get("id")` raised on a string. The
+  surrounding `except Exception` turned that into a `census_error` row, which
+  then failed the quarantine assertion — so that acceptance case was failing for
+  a reason that had nothing to do with quarantine.
+
+Two of these were invisible to their own test suites, because the fixtures fed
+them a hand-written bare list. The fixture is the page object now. Any future
+response-shape change needs `benchmarks/tests/support.py` and
+`benchmarks/bug-hunt-live.py` in the same commit as the route, or the tooling
+will keep reporting the *measurement* as broken while the thing being measured
+is fine.
+
+The Python SDK's cursor regression used `Z`-suffixed timestamps throughout,
+which pass through the encoder without touching the defect: the bug needs a
+positive offset. A regression now walks a `+00:00` cursor and fails if a raw
+`+` reaches the query string.
+
 The MCP server no longer reads this route at all — it fetched the tenant's list
 and intersected it with its own ownership set, which under paging would have
 hidden any owned sandbox older than the first page, so it now fetches each owned

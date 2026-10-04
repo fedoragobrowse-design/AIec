@@ -118,6 +118,30 @@ class SandboxPageTest(unittest.TestCase):
         self.assertIn("after_id=a", seen[1])
         self.assertIn("after_created_at=2023-01-01T00%3A00%3A00Z", seen[2])
 
+    def test_a_cursor_carrying_a_positive_offset_is_encoded_not_interpolated(self):
+        """The cursor is not always ``Z``.
+
+        A ``+00:00`` offset is what ``datetime.isoformat`` and most RFC3339
+        writers produce, and a bare ``+`` in a query string decodes as a space.
+        The page then arrives as ``2024-01-01T00:00:00 00:00``, the control
+        plane refuses a cursor this caller never got wrong, and it does so on
+        every page after the first -- so the walk that worked against a
+        one-page tenant fails against a real history. Fixtures using ``Z`` pass
+        through the same code without ever touching this.
+        """
+        client, seen = self.paged([
+            {"sandboxes": [{"id": "a"}],
+             "next": {"created_at": "2024-01-01T00:00:00+00:00", "id": "a"}},
+            {"sandboxes": [{"id": "b"}], "next": None},
+        ])
+
+        self.assertEqual([s["id"] for s in client.sandboxes.list_all()], ["a", "b"])
+        self.assertIn("after_created_at=2024-01-01T00%3A00%3A00%2B00%3A00", seen[1])
+        self.assertNotIn(
+            "+00:00", seen[1],
+            "a raw plus in the query is a space by the time the server decodes it",
+        )
+
     def test_a_cursor_without_both_halves_is_refused_before_the_request(self):
         client, seen = self.paged([{"sandboxes": [], "next": None}])
         for cursor in ({"created_at": "2024-01-01T00:00:00Z"}, {"id": "a"}, {}):

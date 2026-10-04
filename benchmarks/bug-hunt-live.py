@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
 BASE = os.environ.get("AIEC_BASE", "https://127.0.0.1:18443")
 KEY = os.environ["AIEC_API_KEY"]
@@ -307,18 +308,74 @@ def check_default_image():
 
 
 def check_no_residue():
-    status, body = call("GET", "/v1/sandboxes?limit=256")
-    if status != 200:
-        record("no sandbox left running by this round", False, f"{status}")
+    # The listing is paginated, and this used to ask for 256 while the control
+    # plane serves at most 200. Reading page one and calling the result "no
+    # residue" reports clean on the strength of a request that was silently
+    # capped, so the cursor is followed and the result says how much it saw.
+    items, pages, cursor = [], 0, None
+    for _ in range(64):
+        path = "/v1/sandboxes?limit=200"
+        if cursor:
+            # Percent-encoded, never interpolated: an RFC3339 timestamp can end
+            # in "+00:00", and a bare "+" in a query decodes as a space.
+            path += (
+                f"&after_created_at={quote(cursor[0], safe='')}"
+                f"&after_id={quote(cursor[1], safe='')}"
+            )
+        status, body = call("GET", path)
+        if status != 200:
+            record(
+                "no sandbox left running by this round",
+                False,
+                f"{status} on page {pages + 1}",
+            )
+            return
+        if not isinstance(body, dict) or not isinstance(body.get("sandboxes"), list):
+            record(
+                "no sandbox left running by this round",
+                False,
+                f"GET {path} did not return a sandbox page "
+                f"(body was {type(body).__name__})",
+            )
+            return
+        items.extend(body["sandboxes"])
+        pages += 1
+        nxt = body.get("next")
+        if nxt is None:
+            break
+        if not isinstance(nxt, dict) or "created_at" not in nxt or "id" not in nxt:
+            record(
+                "no sandbox left running by this round",
+                False,
+                "a page carried a cursor that is not a cursor",
+            )
+            return
+        position = (str(nxt["created_at"]), str(nxt["id"]))
+        if position == cursor:
+            record(
+                "no sandbox left running by this round",
+                False,
+                "the control plane repeated a cursor, so the walk never ends",
+            )
+            return
+        cursor = position
+    else:
+        record(
+            "no sandbox left running by this round",
+            False,
+            "still paging after 64 pages; the walk was cut short",
+        )
         return
-    items = body if isinstance(body, list) else body.get("sandboxes", [])
     live = [
-        s for s in items if s.get("state") in ("running", "starting", "creating", "paused")
+        s
+        for s in items
+        if isinstance(s, dict) and s.get("state") in ("running", "starting", "creating", "paused")
     ]
     record(
         "no sandbox left running by this round",
         not live,
-        f"{len(live)} live: {[s['id'] for s in live][:4]}",
+        f"{len(live)} live across {pages} page(s), {len(items)} sandboxes: "
+        f"{[s['id'] for s in live][:4]}",
     )
 
 
