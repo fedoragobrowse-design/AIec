@@ -2391,23 +2391,24 @@ path. Restored.
 ### Audited and found clean: reachable panics in shipping code
 
 Every `.unwrap()`, `.expect()`, `panic!`, `unreachable!` and literal index in
-`crates/*/src/**` was enumerated. The scan truncates each file at its first
-`#[cfg(test)]` or `mod tests`, and skips `tests/` directories — those two rules
-and nothing more. It does not exclude test-shaped modules that live in `src/`
-behind neither marker, and several exist: `aiec-api/src/provision_ownership_tests.rs`,
-`aiec-api/src/run_paging_tests.rs`, `aiec-guard/src/events/tests.rs` and
-`aiec-storage/src/guard/tests.rs` were all enumerated and then classified as
-test code by reading them. Three `expect("cidr suffix")` calls in
-`aiec-network-linux/src/lib.rs` are likewise inside `#[test]` functions the
-truncation did not catch, and were only identified because they were read.
-Every surviving site was read in context rather than pattern-matched. The
-result is no reachable panic in production code.
+`crates/*/src/**` was enumerated. The scan drops `tests/` directories, drops a
+basename of `tests.rs` or `*_tests.rs`, and truncates every remaining file at
+its first `#[cfg(test)]` or `mod tests`. Those three rules and nothing more.
+They exclude nine files. Anything a rule misses is classified by reading it,
+which is why the entries below cite guards rather than asserting a count was
+clean.
 
-Two classes of match are false positives worth naming, because a future scan
-will rediscover them: the six `self.expect(b'x')?` calls in
-`aiec-guard/src/l7.rs` are an inherent method on the parser that returns a
-`Result`, not `Option::expect`, and the `unwrap`s in `events/tests.rs` and
-`guard/tests.rs` are the test files above.
+The count matters, so it is stated: **22 sites** survive those rules in
+production code, 6 of them the `l7.rs` false positive below, leaving **16**
+`unwrap`/`expect`/`panic!` sites, each individually justified below. The
+literal-index sites are listed separately. Six `self.expect(b'x')?` calls in
+`aiec-guard/src/l7.rs` are an inherent method on the parser returning a
+`Result`, not `Option::expect`, and match the pattern without being panics at
+all.
+
+Three `expect("cidr suffix")` calls in `aiec-network-linux/src/lib.rs` sit
+inside `#[test]` functions the truncation did not catch, and were only
+identified because they were read.
 
 - `aiec-mcp/src/eval.rs:1282` indexes `command[0]`; `validate_command` rejects an
   empty command first, and `explicit_shell_script` — which also indexes `[0]` —
@@ -2432,6 +2433,9 @@ will rediscover them: the six `self.expect(b'x')?` calls in
   gateway")` reads a `Mutex<Option<_>>` nine lines after the same function
   built it as `Mutex::new(Some(gateway))` in a fresh `Arc` it has not yet
   handed to anyone.
+- `aiec-guard/src/compiler.rs:123` parses an array literal of CIDR strings
+  inside a `OnceLock`; every element is a compile-time-written literal, so
+  there is no input to make the parse fail.
 - The remaining `expect`s are HMAC key construction (`new_from_slice` accepts any
   length), a constant-path `parent()`, and MCP ownership locks whose critical
   sections are a `Vec::push` and an `iter().map().collect()`, so no user code
