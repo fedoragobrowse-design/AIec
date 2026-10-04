@@ -1123,6 +1123,38 @@ cursor above it uses, and the regression reads the raw query off the wire and
 decodes it the way a server does rather than trusting the client to have encoded
 it.
 
+Paginating the route broke the leak census in `benchmarks/aiecbench`, which
+checked `isinstance(response.body, list)` and therefore reported
+`{"available": false}` for every sandbox reading from then on — the exact
+signal the soak tooling exists to distinguish from "nothing leaked". Its tests
+stayed green through the whole of it, because the fixture they fed it was a
+hand-written bare list rather than a page. The census now walks every page and
+refuses rather than reporting a partial count, and the fixture is the shape the
+control plane actually sends.
+
+Three things in the same area are worth stating because each was a real defect
+rather than a style:
+
+- **The census interpolated its cursor into the path**, reproducing the `+00:00`
+  bug one layer over. It percent-encodes now, and a mutation run confirms the
+  test fails when it does not.
+- **The sandbox list index did not carry the tie-breaker.** `0001` built
+  `(tenant_id, created_at DESC)`; the keyset page orders and filters on
+  `(tenant_id, created_at DESC, id DESC)`. The plan then reads the index in
+  `created_at DESC` order and sorts whatever falls out of it before `LIMIT`
+  applies, so a burst — and a soak creates sandboxes in bursts — puts the whole
+  history in one timestamp bucket. `0026` replaces the index rather than adding
+  beside it, because this table takes an index write on every placement, pause,
+  resume and teardown. No behavioural test can catch this: the page reads
+  correctly from the old index too, only slower, so the index definition itself
+  is asserted.
+- **`list_all_sandboxes` had no termination guarantee.** It ends when the server
+  stops naming a successor, which makes an unbounded fetch loop out of a control
+  plane that does not — the same defect the paging was added to remove, one
+  layer down. It now refuses on a repeated cursor and on an empty page that
+  still claims a successor. The first of those is caught by the test hanging to
+  its timeout with the guard removed, which is the point.
+
 The MCP server no longer reads this route at all — it fetched the tenant's list
 and intersected it with its own ownership set, which under paging would have
 hidden any owned sandbox older than the first page, so it now fetches each owned

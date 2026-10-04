@@ -29,6 +29,7 @@ import sys
 import tempfile
 from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import quote
 from typing import Any
 
 from .stats import unavailable
@@ -41,6 +42,16 @@ TERMINAL_SANDBOX_STATES = frozenset({"destroyed", "failed"})
 #: always reported; the ids are a sample, and anything derived from them is
 #: refused when the sample is short.
 CENSUS_ID_CAP = 50
+
+#: Pages a census will walk before it refuses rather than loops. The sandbox
+#: list is paginated, and a census that read one page of many and still claimed
+#: completeness would be the silent undercount this module exists to refuse.
+#: The bound is a backstop against a control plane that never stops handing out
+#: cursors, not a claim about how many sandboxes a tenant may own.
+CENSUS_PAGE_LIMIT = 500
+
+#: Page size the census asks for; the control plane clamps to its own ceiling.
+CENSUS_PAGE_SIZE = 200
 
 #: Environment variable holding the database connection string. Read from the
 #: environment rather than a flag so the password never reaches a process
@@ -62,32 +73,84 @@ def sandbox_census(client: Any) -> dict[str, Any]:
 
     The leak question is answered here: a non-terminal sandbox whose run has
     finished is a machine the platform still believes is running.
+
+    The route is paginated, so every page is walked rather than the first one
+    measured and forgotten. A census that stopped at the first page would report
+    a *complete* count drawn from an arbitrary slice, which is worse than a
+    refusal: the leak tooling prints these numbers beside a container census,
+    and a short sandbox list reads as "nothing leaked".
     """
-    response = client.request("GET", "/v1/sandboxes", timeout=30)
-    if not response.ok:
-        return unavailable(
-            "sandboxes",
-            f"GET /v1/sandboxes returned {response.status} ({response.error_code()})",
+    states: Counter[str] = Counter()
+    live: list[str] = []
+    total = 0
+    after: dict[str, str] | None = None
+    seen_cursors: set[tuple[str, str]] = set()
+    for page_number in range(CENSUS_PAGE_LIMIT):
+        path = f"/v1/sandboxes?limit={CENSUS_PAGE_SIZE}"
+        if after is not None:
+            # Percent-encoded, not interpolated. The cursor's timestamp ends in
+            # "+00:00", and a bare "+" in a query string decodes as a space, so
+            # the control plane would refuse a cursor the harness never got
+            # wrong on every page after the first.
+            path += f"&after_created_at={quote(after['created_at'], safe='')}"
+            path += f"&after_id={quote(after['id'], safe='')}"
+        response = client.request("GET", path, timeout=30)
+        if not response.ok:
+            return unavailable(
+                "sandboxes",
+                f"GET {path} returned {response.status} ({response.error_code()})",
+            )
+        body = response.body
+        if not isinstance(body, dict) or not isinstance(body.get("sandboxes"), list):
+            # A bare list is the pre-pagination shape. Refusing is still right,
+            # but name the shape that arrived so the reader can tell an older
+            # control plane from a malformed response.
+            return unavailable(
+                "sandboxes",
+                f"GET {path} did not return a sandbox page "
+                f"(body was {type(body).__name__}, not a page object)",
+            )
+        rows = [row for row in body["sandboxes"] if isinstance(row, dict)]
+        states.update(str(row.get("state", "unknown")) for row in rows)
+        live.extend(
+            str(row.get("id"))
+            for row in rows
+            if str(row.get("state", "")) not in TERMINAL_SANDBOX_STATES
         )
-    if not isinstance(response.body, list):
-        return unavailable("sandboxes", "GET /v1/sandboxes did not return a list")
-    states = Counter(
-        str(item.get("state", "unknown")) for item in response.body if isinstance(item, dict)
+        total += len(rows)
+        nxt = body.get("next")
+        if nxt is None:
+            return {
+                "available": True,
+                "at": now_iso(),
+                "total": total,
+                "pages": page_number + 1,
+                "by_state": dict(sorted(states.items())),
+                "nonterminal_count": len(live),
+                "nonterminal_sandbox_ids": live[:CENSUS_ID_CAP],
+                "nonterminal_truncated": len(live) > CENSUS_ID_CAP,
+            }
+        if not isinstance(nxt, dict) or "created_at" not in nxt or "id" not in nxt:
+            return unavailable(
+                "sandboxes", f"GET {path} returned a page with an unusable cursor"
+            )
+        cursor = (str(nxt["created_at"]), str(nxt["id"]))
+        if cursor in seen_cursors:
+            # A repeated cursor means a repeated page. Continuing would inflate
+            # the count with duplicates until the backstop above fired, and a
+            # doubled total is a number somebody would optimise against.
+            return unavailable(
+                "sandboxes",
+                f"GET /v1/sandboxes repeated cursor {cursor[1]} after "
+                f"{page_number + 1} pages",
+            )
+        seen_cursors.add(cursor)
+        after = {"created_at": cursor[0], "id": cursor[1]}
+    return unavailable(
+        "sandboxes",
+        f"GET /v1/sandboxes still offered a next cursor after {CENSUS_PAGE_LIMIT} "
+        "pages; the census is refused rather than reported as a partial count",
     )
-    live = [
-        str(item.get("id"))
-        for item in response.body
-        if isinstance(item, dict) and str(item.get("state", "")) not in TERMINAL_SANDBOX_STATES
-    ]
-    return {
-        "available": True,
-        "at": now_iso(),
-        "total": len(response.body),
-        "by_state": dict(sorted(states.items())),
-        "nonterminal_count": len(live),
-        "nonterminal_sandbox_ids": live[:CENSUS_ID_CAP],
-        "nonterminal_truncated": len(live) > CENSUS_ID_CAP,
-    }
 
 
 def capacity(client: Any) -> dict[str, Any]:

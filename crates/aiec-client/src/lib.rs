@@ -468,15 +468,39 @@ impl AIecClient {
     pub async fn list_all_sandboxes(&self, limit: u32) -> Result<Vec<Sandbox>, ClientError> {
         let mut all = Vec::new();
         let mut after: Option<SandboxCursor> = None;
+        let mut seen: Vec<(DateTime<Utc>, Uuid)> = Vec::new();
         loop {
             let page = match &after {
                 Some(cursor) => self.list_sandboxes_after(limit, cursor).await?,
                 None => self.list_sandboxes_page(limit).await?,
             };
-            let cursor = page.next;
+            // The walk is bounded by the server saying it is done, so it needs
+            // its own termination guarantee. A control plane that keeps
+            // offering a cursor without advancing past it turns this into an
+            // unbounded fetch loop -- the same defect the paging was added to
+            // stop, one layer down, and it never ends on its own.
+            let next = page.next;
+            if let Some(cursor) = next {
+                let position = (cursor.created_at, cursor.id);
+                if seen.contains(&position) {
+                    return Err(ClientError::Decode(format!(
+                        "GET /v1/sandboxes returned the cursor {} twice; \
+                         the page walk was stopped rather than repeated",
+                        cursor.id
+                    )));
+                }
+                if page.sandboxes.is_empty() {
+                    return Err(ClientError::Decode(format!(
+                        "GET /v1/sandboxes returned an empty page and a cursor ({}); \
+                         there is nothing to advance past",
+                        cursor.id
+                    )));
+                }
+                seen.push(position);
+            }
             all.extend(page.sandboxes);
-            match cursor {
-                Some(next) => after = Some(next),
+            match next {
+                Some(cursor) => after = Some(cursor),
                 None => return Ok(all),
             }
         }
@@ -1066,6 +1090,21 @@ mod tests {
         in_flight: Arc<AtomicUsize>,
         peak_in_flight: Arc<AtomicUsize>,
         slow: bool,
+        paging: SandboxPaging,
+    }
+
+    /// How `/v1/sandboxes` behaves when the client keeps walking. A well
+    /// behaved control plane stops handing out cursors; these are the two ways
+    /// it can fail to, and each is a loop a client without a termination guard
+    /// never leaves.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SandboxPaging {
+        /// Two distinct pages, the second terminal.
+        Finite,
+        /// The same cursor on every page, forever.
+        RepeatsCursor,
+        /// No rows at all, but still a successor to follow.
+        EmptyWithCursor,
     }
 
     impl Stub {
@@ -1075,6 +1114,16 @@ mod tests {
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 peak_in_flight: Arc::new(AtomicUsize::new(0)),
                 slow: false,
+                paging: SandboxPaging::Finite,
+            }
+        }
+
+        /// A stub whose sandbox list misbehaves the way a broken control plane
+        /// would, for the tests that exercise the client's own guard.
+        fn paging(mode: SandboxPaging) -> Self {
+            Self {
+                paging: mode,
+                ..Self::new()
             }
         }
 
@@ -1292,7 +1341,14 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.path == "/v1/sandboxes")
                     .count();
-                let page = sandbox_page(served);
+                let page = match stub.paging {
+                    SandboxPaging::Finite => sandbox_page(served),
+                    SandboxPaging::RepeatsCursor => sandbox_page(1),
+                    SandboxPaging::EmptyWithCursor => serde_json::json!({
+                        "sandboxes": [],
+                        "next": sandbox_page(1)["next"],
+                    }),
+                };
                 (AxumStatus::OK, page)
             }
             other if other.ends_with("/events") => (AxumStatus::OK, serde_json::json!([])),
@@ -1441,6 +1497,66 @@ mod tests {
             "the second page must carry the cursor the first one named: {}",
             pages[1]
         );
+        drop(serving);
+    }
+
+    /// The walk ends when the server says it has ended. A control plane that
+    /// keeps naming a successor must not be able to keep this call running
+    /// forever: the paging exists to bound the work, and a client with no
+    /// termination guarantee reintroduces the unbounded read one layer down.
+    #[tokio::test]
+    async fn a_control_plane_that_repeats_a_sandbox_cursor_cannot_walk_forever() {
+        let stub = Stub::paging(SandboxPaging::RepeatsCursor);
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_all_sandboxes(50),
+        )
+        .await
+        .expect("the walk stops instead of running until the timeout");
+        let message = outcome
+            .expect_err("a repeated cursor is not a result")
+            .to_string();
+        assert!(
+            message.contains("twice"),
+            "the refusal must name the cause: {message}"
+        );
+        drop(serving);
+    }
+
+    /// An empty page carrying a cursor is the other way round the same loop:
+    /// there is no row to advance past, so following it again returns the same
+    /// emptiness. A page that is empty and still claims a successor is a
+    /// contradiction, and repeating it is how a walk hangs.
+    #[tokio::test]
+    async fn an_empty_sandbox_page_with_a_cursor_is_refused_not_repeated() {
+        let stub = Stub::paging(SandboxPaging::EmptyWithCursor);
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_all_sandboxes(50),
+        )
+        .await
+        .expect("the walk stops instead of running until the timeout");
+        let message = outcome
+            .expect_err("an empty page is not a result")
+            .to_string();
+        assert!(
+            message.contains("empty page"),
+            "the refusal must name the cause: {message}"
+        );
+        let pages = stub
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.path == "/v1/sandboxes")
+            .count();
+        assert_eq!(pages, 1, "the contradiction is caught on the first page");
         drop(serving);
     }
 

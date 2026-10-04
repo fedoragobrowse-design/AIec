@@ -103,6 +103,46 @@ class ListClient:
         return message
 
 
-def sandboxes(*ids: str, state: str = "running") -> list[dict[str, Any]]:
-    """A ``GET /v1/sandboxes`` body."""
-    return [{"id": sandbox_id, "state": state} for sandbox_id in ids]
+def sandboxes(*ids: str, state: str = "running") -> dict[str, Any]:
+    """A one-page ``GET /v1/sandboxes`` body.
+
+    The route returns ``{"sandboxes": [...], "next": ...}``. Returning a bare
+    list here would let every leak-census test pass against a response the
+    control plane no longer sends, which is how the census silently reported
+    ``available: false`` after the route was paginated.
+    """
+    return {
+        "sandboxes": [{"id": sandbox_id, "state": state} for sandbox_id in ids],
+        "next": None,
+    }
+
+
+class PagedSandboxClient:
+    """Serves prepared sandbox pages in order and records the paths it was asked for.
+
+    A census that reads one page and stops passes a single-page fixture
+    perfectly, so the multi-page behaviour needs a fixture that has more than
+    one page to hand.
+    """
+
+    def __init__(self, pages: list[Any], *, vary_cursor: bool = False) -> None:
+        self.pages = pages
+        #: Hand out a distinct cursor on every call. The repeated-cursor guard
+        #: and the page-limit backstop are different refusals, so a fixture
+        #: that can never advance only exercises the first of them.
+        self.vary_cursor = vary_cursor
+        self.requests: list[tuple[str, str]] = []
+
+    def request(self, method, path, body=None, *, timeout=None, text=False):  # noqa: ANN001
+        self.requests.append((method, path))
+        index = min(len(self.requests) - 1, len(self.pages) - 1)
+        page = self.pages[index]
+        if self.vary_cursor and isinstance(page, dict) and page.get("next") is not None:
+            page = {
+                **page,
+                "next": {**page["next"], "id": f"{page['next']['id']}-{len(self.requests)}"},
+            }
+        return response(200, page, method=method, path=path)
+
+    def redact(self, message: str) -> str:
+        return message

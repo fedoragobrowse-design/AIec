@@ -1,0 +1,27 @@
+-- The sandbox list is a keyset page, but its index only covered half the key.
+--
+-- 0001 built `sandboxes(tenant_id, created_at DESC)` to serve "this tenant's
+-- newest sandboxes first". The paged route orders and filters on
+-- `(tenant_id, created_at DESC, id DESC)` -- the id is the tie-breaker, because
+-- `created_at` alone is not unique and a keyset predicate has to compare the
+-- whole tuple or it pages past and re-reads rows sharing a timestamp.
+--
+-- The mismatch was not visible in review because both halves are a prefix of
+-- the same idea and the index is named for the query it was made for. At
+-- runtime it means the plan can only read the index in `created_at DESC` order
+-- and then has to sort whatever falls out of it, which is every row tied on
+-- `created_at`. Under a burst -- and a soak creates sandboxes in bursts -- the
+-- tenant's whole history can share a timestamp bucket, and a `LIMIT` does not
+-- help because the sort happens before the limit is applied.
+--
+-- The index is replaced rather than added beside the old one. Two indexes on
+-- the same prefix cost writes on every sandbox state transition, which this
+-- table takes on every placement, pause, resume and teardown. A migration is
+-- the one moment where dropping the old one is free, and the brief lock it
+-- takes is on an index, not on the table.
+--
+-- The migration table is append-only: this corrects the published 0001 rather
+-- than editing it, and a database created fresh from 0001 to 0026 ends up with
+-- exactly the index a database upgraded from 0001 ends up with.
+DROP INDEX IF EXISTS sandboxes_tenant_created_idx;
+CREATE INDEX sandboxes_tenant_created_idx ON sandboxes(tenant_id, created_at DESC, id DESC);

@@ -5423,6 +5423,44 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    /// The page is correct in isolation and slow in the worst case if the index
+    /// does not carry the tie-breaker. Nothing about correctness detects that:
+    /// `created_at DESC, id DESC` reads correctly from `(tenant_id,
+    /// created_at DESC)` too, just by sorting everything the index returns
+    /// before the `LIMIT` applies. Only the index definition can catch it, so
+    /// the definition is asserted the way the guard migrations assert their
+    /// own constraints.
+    #[tokio::test]
+    async fn the_sandbox_list_index_carries_the_keyset_tie_breaker() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        if database_url.is_empty() {
+            return;
+        }
+        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        repository.migrate().await.unwrap();
+
+        let definition: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_indexdef(to_regclass('sandboxes_tenant_created_idx'))",
+        )
+        .fetch_one(&repository.pool)
+        .await
+        .expect("the index lookup must run");
+        // `to_regclass` rather than a `pg_class` name filter: the test suite
+        // creates isolated schemas, and an unscoped name lookup finds whichever
+        // of them answers first -- so this assertion could pass or fail
+        // depending on which tests ran before it.
+        let definition = definition.expect("the sandbox list index must exist in the search path");
+        assert!(
+            definition.ends_with("(tenant_id, created_at DESC, id DESC)"),
+            "a keyset page on (created_at, id) needs both columns in that order; \
+             without the tie-breaker the whole tie bucket is sorted before LIMIT \
+             applies. Found: {definition}"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
     async fn schedule_test_sandbox(
         repository: &PostgresRepository,
         tenant: Uuid,
