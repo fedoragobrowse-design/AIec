@@ -1785,15 +1785,52 @@ impl PostgresRepository {
         fetch_sandbox(&self.pool, tenant, id).await
     }
 
-    async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, StoreError> {
+    async fn list_sandboxes(
+        &self,
+        tenant: Uuid,
+        limit: u32,
+        after: Option<aiec_core::storage::SandboxCursor>,
+    ) -> Result<aiec_core::storage::SandboxPage, StoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_SANDBOX_PAGE);
+        let (at, before) = match after {
+            Some(cursor) => (Some(cursor.created_at), Some(cursor.id)),
+            None => (None, None),
+        };
+        // The bound and the cursor are both in the query. Sandbox rows are
+        // never deleted, so a tenant's list is their whole history and reading
+        // it to serve a bounded page would make the page size a fiction.
+        // `(created_at, id) < ...` is the row-value form of the keyset, and it
+        // is compared against the ordering the page is actually returned in, so
+        // the two cannot disagree at a tie.
         let rows = sqlx::query(
-            "SELECT * FROM sandboxes WHERE tenant_id = $1 ORDER BY created_at DESC, id",
+            "SELECT * FROM sandboxes \
+             WHERE tenant_id = $1 \
+               AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid)) \
+             ORDER BY created_at DESC, id DESC LIMIT $4",
         )
         .bind(tenant)
+        .bind(at)
+        .bind(before)
+        .bind(i64::from(limit) + 1)
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
-        rows.iter().map(sandbox_from_row).collect()
+
+        let mut sandboxes = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.iter().take(limit as usize) {
+            sandboxes.push(sandbox_from_row(row)?);
+        }
+        // The cursor names the last sandbox this page returned, not the row
+        // held back to prove another page exists: pointing at that row would
+        // skip it, and a caller paging to the end would never be shown it.
+        let next = match (rows.len() > limit as usize, sandboxes.last()) {
+            (true, Some(last)) => Some(aiec_core::storage::SandboxCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }),
+            _ => None,
+        };
+        Ok(aiec_core::storage::SandboxPage { sandboxes, next })
     }
 
     async fn update_state(
@@ -4421,8 +4458,15 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, CoreError> {
-        Self::list_sandboxes(self, tenant).await.map_err(core_error)
+    async fn list_sandboxes(
+        &self,
+        tenant: Uuid,
+        limit: u32,
+        after: Option<aiec_core::storage::SandboxCursor>,
+    ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
+        Self::list_sandboxes(self, tenant, limit, after)
+            .await
+            .map_err(core_error)
     }
     async fn update_state(
         &self,
@@ -5283,6 +5327,100 @@ pub(crate) mod tests {
             updated_at: now,
             runtime_path: None,
         }
+    }
+
+    /// The sandbox page is a keyset read, so its correctness lives in the SQL:
+    /// the predicate, the ordering, and the row held back to decide whether
+    /// `next` exists. None of that is exercised by the in-memory store, whose
+    /// filter-and-sort is a different implementation of the same idea.
+    #[tokio::test]
+    async fn the_sql_sandbox_page_walks_the_whole_history_without_repeating_or_skipping() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        if database_url.is_empty() {
+            return;
+        }
+        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        repository.migrate().await.unwrap();
+        let tenant = new_id();
+        repository
+            .put_tenant(TenantRecord {
+                id: tenant,
+                name: format!("sandbox-page-{}", tenant),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // Stated timestamps, so the expected order is known rather than read
+        // back out of whatever the clock happened to do.
+        let base = DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant");
+        // The tie is placed where the walk rests on it: with a page of four the
+        // first page ends on the pair's higher id, so the second page can only
+        // contain the other half of the pair if the predicate compares the id
+        // as well as the timestamp. A tie at either end of the history would
+        // pass under a timestamp-only comparison by luck, because the cursor
+        // would never come to rest on it.
+        let stamps: Vec<DateTime<Utc>> = (0..8)
+            .map(|index| base + chrono::Duration::seconds(index))
+            .chain(std::iter::repeat_n(base + chrono::Duration::seconds(7), 2))
+            .chain((8..11).map(|index| base + chrono::Duration::seconds(index)))
+            .collect();
+        let mut expected: Vec<(DateTime<Utc>, Uuid)> = Vec::with_capacity(stamps.len());
+        for created_at in stamps {
+            let mut value = sandbox(tenant);
+            value.created_at = created_at;
+            value.updated_at = created_at;
+            repository.create_sandbox(value.clone()).await.unwrap();
+            expected.push((created_at, value.id));
+        }
+        expected.sort_by(|a, b| b.cmp(a));
+        let newest_first: Vec<Uuid> = expected.iter().map(|(_, id)| *id).collect();
+
+        // Four does not divide twelve, so a cursor that dropped or repeated a
+        // single row changes the walk rather than being rounded away.
+        //
+        // The page length is asserted below, but the query's own `LIMIT` is
+        // not: the rows are trimmed in Rust as well, so deleting `LIMIT` from
+        // the SQL leaves this test green while the database goes on
+        // transferring every row the tenant owns. The statement-level bound is
+        // therefore unproven here — it is there to keep the transfer small, and
+        // the page bound the length assertion pins holds either way.
+        let mut walked = Vec::new();
+        let mut cursor: Option<aiec_core::storage::SandboxCursor> = None;
+        let mut guard = 0;
+        loop {
+            let page = repository.list_sandboxes(tenant, 4, cursor).await.unwrap();
+            assert!(
+                page.sandboxes.len() <= 4,
+                "the query returned more rows than the limit"
+            );
+            let more = page.next.is_some();
+            if let Some(next) = page.next {
+                let last = page
+                    .sandboxes
+                    .last()
+                    .expect("a page with a next is not empty");
+                assert_eq!(
+                    (next.created_at, next.id),
+                    (last.created_at, last.id),
+                    "the cursor must name the last row returned, not the held-back row"
+                );
+                cursor = Some(next);
+            }
+            walked.extend(page.sandboxes.iter().map(|s| s.id));
+            guard += 1;
+            if !more {
+                break;
+            }
+            assert!(guard <= newest_first.len(), "the cursor never ran out");
+        }
+        assert_eq!(
+            walked, newest_first,
+            "the SQL page must reproduce the tenant's sandboxes exactly once, newest first"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
     async fn schedule_test_sandbox(

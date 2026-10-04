@@ -5,8 +5,9 @@ use aiec_core::{
     run::{CleanupReport, Run, RunArtifactRef, RunEvent, RunState},
     runtime::SandboxRuntime,
     snapshots::{SnapshotKind, SnapshotRequest, verify_archive_checksum},
-    storage::{ArtifactStore, GetObjectOptions, MetadataStore},
+    storage::{ArtifactStore, GetObjectOptions, MetadataStore, SandboxCursor, SandboxPage},
 };
+use chrono::DateTime;
 pub mod account;
 pub mod artifact_gc;
 mod composition;
@@ -2571,15 +2572,58 @@ async fn list_artifacts(
         .map_err(ApiFailure::from)?;
     Ok(Json(objects))
 }
+/// Sandbox page size when the caller states none.
+const DEFAULT_SANDBOX_PAGE: u32 = 50;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ListSandboxesQuery {
+    /// Sandboxes to return. The store clamps this to
+    /// `aiec_core::storage::MAX_SANDBOX_PAGE`, so a caller cannot ask for a
+    /// response the control plane has no bound on.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// The previous page's last sandbox: when it was created, and which one.
+    ///
+    /// Both halves or neither. A cursor with only a timestamp has no sandbox to
+    /// start after, and one with only an id cannot order a page that has not
+    /// been read; guessing either would silently return the wrong page.
+    #[serde(default)]
+    after_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    after_id: Option<Uuid>,
+}
+
+/// Reads one bounded page of the caller's sandboxes, newest first.
+///
+/// This used to return the tenant's entire sandbox list in one response. That
+/// list is their whole history and only grows — destroying a sandbox is a state
+/// transition, and nothing deletes the row — so the response size was a
+/// function of how long the tenant had been on the system. The page now carries
+/// its own successor, so a caller that stops reading knows it stopped at a page
+/// boundary rather than having silently been given a truncated list.
 async fn list_sandboxes(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
-) -> ApiResult<Vec<Sandbox>> {
+    Query(query): Query<ListSandboxesQuery>,
+) -> ApiResult<SandboxPage> {
     p.authorize(Scope::SandboxesRead)
         .map_err(ApiFailure::from)?;
+    let after = match (query.after_created_at, query.after_id) {
+        (None, None) => None,
+        (Some(created_at), Some(id)) => Some(SandboxCursor { created_at, id }),
+        _ => {
+            return Err(ApiFailure::from(CoreError::InvalidRequest(
+                "after_created_at and after_id must be given together".into(),
+            )));
+        }
+    };
     Ok(Json(
         s.repository()
-            .list_sandboxes(p.tenant_id)
+            .list_sandboxes(
+                p.tenant_id,
+                query.limit.unwrap_or(DEFAULT_SANDBOX_PAGE),
+                after,
+            )
             .await
             .map_err(ApiFailure::from)?,
     ))
@@ -4785,8 +4829,13 @@ mod tests {
         async fn get_sandbox(&self, tenant: TenantId, id: SandboxId) -> Result<Sandbox, CoreError> {
             self.inner.get_sandbox(tenant, id).await
         }
-        async fn list_sandboxes(&self, tenant: TenantId) -> Result<Vec<Sandbox>, CoreError> {
-            self.inner.list_sandboxes(tenant).await
+        async fn list_sandboxes(
+            &self,
+            tenant: TenantId,
+            limit: u32,
+            after: Option<SandboxCursor>,
+        ) -> Result<SandboxPage, CoreError> {
+            self.inner.list_sandboxes(tenant, limit, after).await
         }
         async fn update_state(
             &self,
@@ -5816,7 +5865,17 @@ mod tests {
         }
 
         async fn sandbox(&self, tenant: Uuid) -> Sandbox {
-            let now = Utc::now();
+            self.sandbox_created_at(tenant, Utc::now()).await
+        }
+
+        /// A sandbox created at a stated instant.
+        ///
+        /// `created_at` is what the sandbox page orders by, so a test that
+        /// asserts the order has to control it: several sandboxes created in the
+        /// same wall-clock microsecond sort by something the test does not get
+        /// to choose, and an ordering assertion that depends on that passes
+        /// about half the time either way.
+        async fn sandbox_created_at(&self, tenant: Uuid, created_at: DateTime<Utc>) -> Sandbox {
             let sandbox = Sandbox {
                 id: new_id(),
                 tenant_id: tenant,
@@ -5830,8 +5889,8 @@ mod tests {
                 timeout_seconds: 60,
                 network: NetworkPolicy::Disabled,
                 environment: Default::default(),
-                created_at: now,
-                updated_at: now,
+                created_at,
+                updated_at: created_at,
                 runtime_path: None,
             };
             self.repository
@@ -5886,6 +5945,204 @@ mod tests {
         }
     }
 
+    /// A tenant's sandbox list is their entire history, and it only grows:
+    /// destroying a sandbox transitions its row rather than deleting it, and
+    /// nothing reclaims it. So this route used to read the whole history into
+    /// one response, which let any tenant decide how much the control plane
+    /// holds in memory.
+    ///
+    /// Capping it without a successor would be worse than the original defect:
+    /// a truncated list is indistinguishable from a complete one, and the older
+    /// rows would be unreachable rather than merely slow. So the page carries
+    /// its own successor, and this walks the whole history through it and checks
+    /// that every sandbox appears exactly once, in the expected order. That
+    /// equality is what pins the subtle part: the cursor has to name the last
+    /// sandbox *returned*, not the row held back to prove another page exists.
+    /// Pointing it at the held-back row pages past it, and this walk would end
+    /// with that sandbox silently missing.
+    #[tokio::test]
+    async fn a_sandbox_list_pages_through_the_whole_history_and_says_where_it_continues() {
+        let fixture = RecoveryFixture::new(b"{}".to_vec());
+        let tenant = new_id();
+        // Timestamps a second apart and oldest-first, so the expected order is
+        // known exactly. Relying on wall-clock ordering here would pass about
+        // half the time even with no ordering at all, which is not a test.
+        let base = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("the current time is representable");
+        let total = aiec_core::storage::MAX_SANDBOX_PAGE as usize + 5;
+        let mut ids = Vec::with_capacity(total);
+        for index in 0..total {
+            let record = fixture
+                .sandbox_created_at(tenant, base + chrono::Duration::seconds(index as i64))
+                .await;
+            ids.push(record.id);
+        }
+        let newest_first: Vec<Uuid> = ids.iter().rev().copied().collect();
+
+        let caller = Principal {
+            tenant_id: tenant,
+            key_id: new_id(),
+            scopes: vec![Scope::SandboxesRead],
+        };
+        let page = |limit: Option<u32>, after: Option<SandboxCursor>| {
+            let state = fixture.state.clone();
+            let caller = caller.clone();
+            async move {
+                list_sandboxes(
+                    State(state),
+                    Extension(caller),
+                    Query(ListSandboxesQuery {
+                        limit,
+                        after_created_at: after.map(|cursor| cursor.created_at),
+                        after_id: after.map(|cursor| cursor.id),
+                    }),
+                )
+                .await
+                .map(|Json(page)| page)
+                .unwrap_or_else(|error| panic!("list sandboxes: {error:?}"))
+            }
+        };
+
+        // Walk the whole history a few at a time. Seven divides neither the
+        // total nor its remainder evenly: a page size that divides evenly would
+        // let a cursor that skipped exactly one row still produce the right
+        // count.
+        let per_page = 7;
+        let mut walked: Vec<Uuid> = Vec::with_capacity(total);
+        let mut cursor: Option<SandboxCursor> = None;
+        let mut pages = 0usize;
+        loop {
+            let response = page(Some(per_page), cursor).await;
+            assert!(
+                response.sandboxes.len() <= per_page as usize,
+                "a page returned more than was asked for"
+            );
+            assert!(!response.sandboxes.is_empty(), "a page came back empty");
+            let more = response.next.is_some();
+            if let Some(next) = response.next {
+                let last = response.sandboxes.last().expect("the page is not empty");
+                assert_eq!(
+                    (next.created_at, next.id),
+                    (last.created_at, last.id),
+                    "the cursor must name the last sandbox returned, or the walk skips one"
+                );
+                cursor = Some(next);
+            }
+            walked.extend(response.sandboxes.into_iter().map(|sandbox| sandbox.id));
+            pages += 1;
+            if !more {
+                break;
+            }
+            assert!(
+                pages < total,
+                "the cursor named a next page but the history had already run out"
+            );
+        }
+        assert_eq!(
+            walked, newest_first,
+            "paging must reproduce the whole history exactly once, newest first"
+        );
+
+        // The ceiling, the default and a zero, through the route because each
+        // passes on a store that happens to be small.
+        assert_eq!(
+            page(Some(100_000), None).await.sandboxes.len(),
+            aiec_core::storage::MAX_SANDBOX_PAGE as usize,
+            "an oversized limit must be capped at the ceiling, not honoured"
+        );
+        assert_eq!(
+            page(None, None).await.sandboxes.len(),
+            DEFAULT_SANDBOX_PAGE as usize,
+            "a caller that states no limit gets the default page, not everything"
+        );
+        assert_eq!(
+            page(Some(0), None).await.sandboxes.len(),
+            1,
+            "a zero limit must be raised to one rather than returning nothing"
+        );
+    }
+
+    /// Two sandboxes created in the same instant have no ordering by time
+    /// alone, so the tie is broken by id. That is exactly where comparing the
+    /// cursor's two halves independently goes wrong: `created_at <` alone
+    /// lets the walk re-visit everything sharing that timestamp, and `id <`
+    /// alone lets it jump over rows. The tuple comparison is what makes a
+    /// shared timestamp survivable, so it is checked here rather than assumed.
+    #[tokio::test]
+    async fn a_sandbox_page_cursor_survives_a_shared_creation_timestamp() {
+        let fixture = RecoveryFixture::new(b"{}".to_vec());
+        let tenant = new_id();
+        let shared = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("the current time is representable");
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let record = fixture.sandbox_created_at(tenant, shared).await;
+            ids.push(record.id);
+        }
+        ids.sort_unstable();
+        let expected: Vec<Uuid> = ids.iter().rev().copied().collect();
+
+        // One at a time, so the cursor is re-read between every pair.
+        let mut walked = Vec::new();
+        let mut cursor: Option<SandboxCursor> = None;
+        loop {
+            let response = fixture
+                .repository
+                .list_sandboxes(tenant, 1, cursor)
+                .await
+                .expect("read a page");
+            walked.extend(response.sandboxes.iter().map(|sandbox| sandbox.id));
+            match response.next {
+                Some(next) => {
+                    cursor = Some(next);
+                    assert!(walked.len() < 3, "the cursor never ran out");
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, expected,
+            "sandboxes sharing a creation timestamp must still page exactly once"
+        );
+    }
+
+    /// Half a cursor cannot name a position: a timestamp alone has no sandbox
+    /// to start after, and an id alone cannot order a page that has not been
+    /// read. Guessing either would return a page the caller cannot tell apart
+    /// from the one they asked for.
+    #[tokio::test]
+    async fn a_sandbox_cursor_given_one_half_is_refused() {
+        let fixture = RecoveryFixture::new(b"{}".to_vec());
+        let caller = Principal {
+            tenant_id: new_id(),
+            key_id: new_id(),
+            scopes: vec![Scope::SandboxesRead],
+        };
+        let half = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("the current time is representable");
+        for query in [
+            ListSandboxesQuery {
+                limit: None,
+                after_created_at: Some(half),
+                after_id: None,
+            },
+            ListSandboxesQuery {
+                limit: None,
+                after_created_at: None,
+                after_id: Some(new_id()),
+            },
+        ] {
+            let failure = list_sandboxes(
+                State(fixture.state.clone()),
+                Extension(caller.clone()),
+                Query(query),
+            )
+            .await
+            .expect_err("half a cursor must not resolve to a page");
+            assert_eq!(failure.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
     #[tokio::test]
     async fn corrupt_workspace_restore_reclaims_the_new_computer() {
         let archive = b"{\"version\":1,\"entries\":[]}".to_vec();
@@ -5915,9 +6172,14 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
-        let sandboxes = fixture.repository.list_sandboxes(tenant).await.unwrap();
+        let sandboxes = fixture
+            .repository
+            .list_sandboxes(tenant, aiec_core::storage::MAX_SANDBOX_PAGE, None)
+            .await
+            .unwrap();
         assert_eq!(
             sandboxes
+                .sandboxes
                 .iter()
                 .filter(|value| value.state != SandboxState::Destroyed)
                 .map(|value| value.id)
@@ -5968,9 +6230,10 @@ mod tests {
         assert_eq!(
             fixture
                 .repository
-                .list_sandboxes(tenant)
+                .list_sandboxes(tenant, aiec_core::storage::MAX_SANDBOX_PAGE, None)
                 .await
                 .unwrap()
+                .sandboxes
                 .iter()
                 .map(|sandbox| sandbox.id)
                 .collect::<Vec<_>>(),
@@ -6020,9 +6283,10 @@ mod tests {
         assert_eq!(
             fixture
                 .repository
-                .list_sandboxes(tenant)
+                .list_sandboxes(tenant, aiec_core::storage::MAX_SANDBOX_PAGE, None)
                 .await
                 .unwrap()
+                .sandboxes
                 .iter()
                 .map(|sandbox| sandbox.id)
                 .collect::<Vec<_>>(),
@@ -8327,14 +8591,18 @@ mod tests {
             run.results.task.is_none(),
             "the task must not run after setup failed"
         );
-        let sandboxes = fixture.store.list_sandboxes(fixture.tenant).await.unwrap();
+        let sandboxes = fixture
+            .store
+            .list_sandboxes(fixture.tenant, aiec_core::storage::MAX_SANDBOX_PAGE, None)
+            .await
+            .unwrap();
         assert_eq!(
-            sandboxes.len(),
+            sandboxes.sandboxes.len(),
             1,
             "a failed setup is permanent, not a fresh-machine retry"
         );
-        assert_eq!(run.retained_sandbox_id, Some(sandboxes[0].id));
-        assert_eq!(sandboxes[0].state, SandboxState::Running);
+        assert_eq!(run.retained_sandbox_id, Some(sandboxes.sandboxes[0].id));
+        assert_eq!(sandboxes.sandboxes[0].state, SandboxState::Running);
     }
 
     /// A storage refusal must cost one machine, not one per remaining attempt.

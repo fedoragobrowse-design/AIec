@@ -457,6 +457,40 @@ pub struct MatrixCellPage {
     pub next: Option<MatrixCursor>,
 }
 
+/// Ceiling on one page of a tenant's sandboxes.
+///
+/// Declared once, here, because the route clamps to it and the store clamps to
+/// it: two copies of this number would drift, and the drift would show up as a
+/// caller inside the process asking the database for more rows than the route
+/// would ever have returned.
+pub const MAX_SANDBOX_PAGE: u32 = 200;
+
+/// Where the next page of a tenant's sandboxes starts.
+///
+/// The two fields together are the sandbox's own position in the ordering, so a
+/// page boundary is a value that already exists rather than an offset a reader
+/// would have to keep consistent against rows created or destroyed meanwhile.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxCursor {
+    /// `created_at` of the last sandbox of the previous page.
+    pub created_at: DateTime<Utc>,
+    /// Identifier of that sandbox, which breaks a `created_at` tie.
+    pub id: Uuid,
+}
+
+/// One bounded page of a tenant's sandboxes.
+///
+/// The page carries its successor because a bounded read that does not say
+/// whether it truncated is indistinguishable from a complete one. A caller
+/// that stops here has stopped where the page ended and can say so.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SandboxPage {
+    /// Sandboxes newest first, at most the requested limit.
+    pub sandboxes: Vec<Sandbox>,
+    /// Where the next page starts, or `None` when this page is the last.
+    pub next: Option<SandboxCursor>,
+}
+
 /// What one pass of the orphaned-lease reclaim did.
 ///
 /// Two counts rather than one, because "released a lease" and "found a lease
@@ -678,8 +712,20 @@ pub trait MetadataStore: Send + Sync {
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), CoreError>;
     /// Gets a tenant-owned sandbox.
     async fn get_sandbox(&self, tenant: TenantId, id: SandboxId) -> Result<Sandbox, CoreError>;
-    /// Lists all sandboxes owned by a tenant.
-    async fn list_sandboxes(&self, tenant: TenantId) -> Result<Vec<Sandbox>, CoreError>;
+    /// Reads one bounded page of a tenant's sandboxes, newest first.
+    ///
+    /// The page is bounded because sandbox rows are never deleted: destroying a
+    /// sandbox is a state transition, not a removal, and nothing reclaims them.
+    /// A tenant's list is therefore their whole history and only grows.
+    /// Implementations must apply the bound in the query rather than
+    /// materializing the tenant's history and truncating it.
+    async fn list_sandboxes(
+        &self,
+        tenant: TenantId,
+        limit: u32,
+        after: Option<SandboxCursor>,
+    ) -> Result<SandboxPage, CoreError>;
+
     /// Performs a compare-and-set state transition.
     async fn update_state(
         &self,

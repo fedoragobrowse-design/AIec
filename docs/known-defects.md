@@ -1067,6 +1067,92 @@ gateway did not stop cleanly but nothing is stranded. Not covered by a
 regression: reaching this arm needs a live Guard gateway and root-level `ip` and
 `nft`, so there is no deterministic seam to drive it from a test.
 
+## Fixed in the 2026-10-03 audit: unbounded list reads
+
+### `GET /v1/sandboxes` returned the tenant's entire history in one response
+
+Destroying a sandbox transitions its row rather than deleting it, and nothing
+reclaims it, so a tenant's sandbox list is their whole history and only grows.
+The route called `list_sandboxes(tenant)`, the store ran `SELECT * FROM sandboxes
+WHERE tenant_id = $1` with no `LIMIT`, and the whole thing was serialised into one
+response. Any tenant could therefore decide how much the control plane held in
+memory and on the wire, and the cost rose with tenure rather than with anything
+the caller asked for.
+
+Capping the list without a successor would have been worse than the original
+defect rather than better: a truncated list is indistinguishable from a complete
+one, so the older rows would be unreachable rather than merely slow, and no
+caller could get past the cap. The route now mirrors the matrix listing that
+already exists in this codebase:
+
+- `limit` plus paired `after_created_at` / `after_id`. Both halves or neither: a
+  cursor with only a timestamp has no sandbox to start after, and one with only
+  an id cannot order a page that has not been read.
+- The response is `{ "sandboxes": [...], "next": {...} }` rather than a bare
+  array, so a page says whether it truncated. `next` is `null` exactly on the
+  last page.
+- Newest first, `ORDER BY created_at DESC, id DESC`, with the keyset predicate
+  `(created_at, id) < ($cursor_ts, $cursor_id)` so the boundary is a value that
+  already exists rather than an offset a reader has to keep consistent against
+  rows created or destroyed meanwhile.
+- The ceiling is `aiec_core::storage::MAX_SANDBOX_PAGE` (200), declared once in
+  core because the route and both stores clamp to it; two copies would drift and
+  the drift would show up as an in-process caller asking the database for more
+  rows than the route would have returned.
+
+The cursor names the last sandbox the page **returned**, not the row held back
+to prove another page exists. That is the one detail this could easily have got
+wrong, and a cursor pointing at the held-back row pages past it: the walk ends
+with that sandbox silently missing.
+
+`limit + 1` is fetched and the extra row trimmed, so `next` reflects the real
+answer rather than being inferred from a page that happened to come back full.
+
+Migration: the Rust client gained `list_sandboxes_page`, `list_sandboxes_after`
+and `list_all_sandboxes`; `aiec sandbox list` follows the cursor by default and
+prints one page with `--page`; the Python SDK returns a `SandboxPage` and gained
+`list_after` / `list_all`, and refuses a `limit` the control plane would clamp.
+One defect was introduced by the migration and caught by its own regression,
+which is worth recording because it is invisible in review: the Rust client
+first built the cursor query with `format!`, and `DateTime<Utc>::to_rfc3339()`
+ends in `+00:00`. A bare `+` in a query string decodes as a space, so the route
+received `2026-10-03T12:00:00 00:00` and refused every page after the first — for
+a cursor the caller had never got wrong, and only when the tenant's history
+exceeded one page. The client now uses the same `.query(&[...])` the matrix
+cursor above it uses, and the regression reads the raw query off the wire and
+decodes it the way a server does rather than trusting the client to have encoded
+it.
+
+The MCP server no longer reads this route at all — it fetched the tenant's list
+and intersected it with its own ownership set, which under paging would have
+hidden any owned sandbox older than the first page, so it now fetches each owned
+sandbox by id.
+
+Evidence. Three Rust regressions and one DB-backed SQL regression. Every one of
+these mutations was applied and confirmed to fail:
+
+| mutation | caught by |
+|---|---|
+| cursor names the held-back row (in-memory and SQL) | both the API walk and the SQL walk |
+| no sort: hash order decides the page | both |
+| cursor compares `created_at` alone, dropping the id tiebreak | the shared-timestamp tests only |
+| no page-size clamp | the ceiling assertions only |
+| no cursor predicate: every page is the first page | the SQL walk |
+| `ORDER BY` loses the id tiebreak | the SQL walk |
+
+The tie is placed where the walk rests on it — with a page of four, the first
+page ends on the tied pair's higher id — because a tie at either end of the
+history passes under a timestamp-only comparison by luck.
+
+### Not proven: the statement-level `LIMIT` is not observable from a test
+
+The rows are trimmed in Rust as well as in SQL, so deleting `LIMIT` from the
+query leaves the page-length assertions green while the database goes on
+transferring and parsing every row the tenant owns. The SQL bound is there to
+keep the transfer small; the page bound itself is what the tests pin, and it
+holds either way. Asserting the statement-level bound would need a row count the
+store does not expose, so it is recorded here rather than tested.
+
 ## Open
 
 ### Accepted, not fixed: placement holds a worker row lock while it waits

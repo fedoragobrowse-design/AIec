@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub use aiec_core::run::{
     BatchOptions, CommandOutcome, Placement, RepoSpec, RunResults, RunSandbox,
 };
-pub use aiec_core::storage::{MatrixCell, MatrixCursor};
+pub use aiec_core::storage::{MatrixCell, MatrixCursor, SandboxCursor, SandboxPage};
 
 /// The ceiling on a client-side batch, matching the control plane's own limit
 /// so a client cannot be the thing that makes a batch unbounded.
@@ -424,9 +424,62 @@ impl AIecClient {
         )
         .await
     }
-    pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, ClientError> {
-        self.send(self.request(reqwest::Method::GET, "/v1/sandboxes"))
-            .await
+    /// Reads one page of the caller's sandboxes, newest first.
+    ///
+    /// The response is a page rather than the tenant's whole list, so the
+    /// result carries the cursor its successor starts at. A caller that wants
+    /// every sandbox follows `next` until it is `None`; a caller that ignores
+    /// it has stopped at a page boundary it chose, not had its list silently
+    /// truncated.
+    pub async fn list_sandboxes_page(&self, limit: u32) -> Result<SandboxPage, ClientError> {
+        self.send(
+            self.request(reqwest::Method::GET, "/v1/sandboxes")
+                .query(&[("limit", limit.to_string())]),
+        )
+        .await
+    }
+
+    /// Reads the page that starts where `after` says.
+    ///
+    /// The cursor goes through `.query` rather than into a formatted path: an
+    /// RFC 3339 instant ends in `+00:00`, and an unencoded `+` in a query
+    /// string decodes as a space. Built by hand the timestamp arrives as
+    /// `2026-10-03T12:00:00 00:00`, which the route cannot parse, so every
+    /// page past the first would be refused for a cursor the caller never got
+    /// wrong.
+    pub async fn list_sandboxes_after(
+        &self,
+        limit: u32,
+        after: &SandboxCursor,
+    ) -> Result<SandboxPage, ClientError> {
+        self.send(self.request(reqwest::Method::GET, "/v1/sandboxes").query(&[
+            ("limit", limit.to_string()),
+            ("after_created_at", after.created_at.to_rfc3339()),
+            ("after_id", after.id.to_string()),
+        ]))
+        .await
+    }
+
+    /// Reads every page of the caller's sandboxes, newest first.
+    ///
+    /// This is the call that wants the whole list and is prepared to hold it.
+    /// Each request is bounded, so the cost is the history the caller asked for
+    /// rather than one response the control plane had to build in full.
+    pub async fn list_all_sandboxes(&self, limit: u32) -> Result<Vec<Sandbox>, ClientError> {
+        let mut all = Vec::new();
+        let mut after: Option<SandboxCursor> = None;
+        loop {
+            let page = match &after {
+                Some(cursor) => self.list_sandboxes_after(limit, cursor).await?,
+                None => self.list_sandboxes_page(limit).await?,
+            };
+            let cursor = page.next;
+            all.extend(page.sandboxes);
+            match cursor {
+                Some(next) => after = Some(next),
+                None => return Ok(all),
+            }
+        }
     }
     pub async fn get_sandbox(&self, id: Uuid) -> Result<Sandbox, ClientError> {
         self.send(self.request(reqwest::Method::GET, &format!("/v1/sandboxes/{id}")))
@@ -1087,6 +1140,41 @@ mod tests {
         serde_json::to_value(settled_run(state)).expect("a run serialises")
     }
 
+    /// One sandbox page: `page` is 1-based, and only the first names a
+    /// successor.
+    fn sandbox_page(page: usize) -> Value {
+        let ids = [
+            "0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b31",
+            "0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b32",
+        ];
+        let sandbox = |id: &str, created_at: &str| {
+            serde_json::json!({
+                "id": id,
+                "tenant_id": "0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b33",
+                "image_id": "alpine:3.21",
+                "state": "destroyed",
+                "runtime": "docker",
+                "cpu": 1,
+                "memory_mb": 128,
+                "disk_mb": 512,
+                "timeout_seconds": 60,
+                "network": { "enabled": false },
+                "created_at": created_at,
+                "updated_at": created_at,
+            })
+        };
+        match page {
+            1 => serde_json::json!({
+                "sandboxes": [sandbox(ids[0], "2026-10-03T12:00:00Z")],
+                "next": { "created_at": "2026-10-03T12:00:00Z", "id": ids[0] },
+            }),
+            _ => serde_json::json!({
+                "sandboxes": [sandbox(ids[1], "2026-10-02T12:00:00Z")],
+                "next": null,
+            }),
+        }
+    }
+
     /// A control plane that records what it was asked and answers with the
     /// document the API would answer with.
     async fn stub_control_plane(stub: Stub) -> (String, tokio::task::JoinHandle<()>) {
@@ -1192,6 +1280,21 @@ mod tests {
                     }),
                 )
             }
+            // Two pages, newest first, the second carrying no successor. A
+            // fixed sequence rather than one page repeated: a client that
+            // trusted its own count instead of the page's `next` would then be
+            // visible, and so would one that returns only the first page.
+            "/v1/sandboxes" => {
+                let served = stub
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|entry| entry.path == "/v1/sandboxes")
+                    .count();
+                let page = sandbox_page(served);
+                (AxumStatus::OK, page)
+            }
             other if other.ends_with("/events") => (AxumStatus::OK, serde_json::json!([])),
             other if other.ends_with("/artifacts") => (
                 AxumStatus::OK,
@@ -1219,6 +1322,126 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(payload.to_string()))
             .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+
+    /// A cursor's timestamp carries a `+`, and `+` in a query string decodes as
+    /// a space. A client that interpolates the instant into the path therefore
+    /// asks for a timestamp the route cannot parse, and every page after the
+    /// first fails for a cursor the caller never got wrong.
+    ///
+    /// This reads the raw query the way a server does rather than trusting the
+    /// client meant to encode it: `+` and `:` are decoded back and the instant is
+    /// parsed. A hand-built path fails here; `.query` passes.
+    #[tokio::test]
+    async fn a_sandbox_cursor_put_on_the_wire_survives_the_round_trip() {
+        let stub = Stub::new();
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+
+        let cursor = SandboxCursor {
+            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("a valid instant")
+                .with_timezone(&Utc),
+            id: Uuid::from_u128(0x0192_f2c1_6f0a_7b1e_8a1c_2f9a_4d0e_5b31),
+        };
+        client
+            .list_sandboxes_after(25, &cursor)
+            .await
+            .expect("a page");
+
+        let seen = stub.seen.lock().await;
+        let query = seen.last().expect("a request was recorded").query.clone();
+        drop(seen);
+        assert!(
+            !query.contains('+'),
+            "a bare + in a query string decodes as a space: {query}"
+        );
+        let decoded: Vec<(String, String)> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| {
+                (
+                    key.to_owned(),
+                    value
+                        .replace("%3A", ":")
+                        .replace("%2B", "+")
+                        .replace("%3D", "="),
+                )
+            })
+            .collect();
+        let value_of = |key: &str| {
+            decoded
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("{key} is missing from {query}"))
+        };
+        assert_eq!(value_of("limit"), "25");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&value_of("after_created_at"))
+                .expect("the cursor instant survives the wire")
+                .timestamp(),
+            cursor.created_at.timestamp(),
+            "the instant the server decodes must be the instant the client meant"
+        );
+        assert_eq!(value_of("after_id"), cursor.id.to_string());
+        drop(serving);
+    }
+
+    /// Walking the whole history has to actually walk: one page at a time, each
+    /// one starting where the last stopped, until the page says there is no
+    /// next. A client that returns the first page regardless would look
+    /// identical to one that works whenever the tenant's history fits in a
+    /// single page.
+    #[tokio::test]
+    async fn reading_every_sandbox_follows_the_cursor_until_the_page_says_it_is_the_last() {
+        let stub = Stub::new();
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+
+        // Two pages are on offer and the second says it is the last, so a
+        // client that asks a third time has not believed the page.
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.list_all_sandboxes(50),
+        )
+        .await
+        .expect("the walk terminates")
+        .expect("a page");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|sandbox| sandbox.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b31".to_owned(),
+                "0192f2c1-6f0a-7b1e-8a1c-2f9a4d0e5b32".to_owned(),
+            ],
+            "the whole history, newest first"
+        );
+
+        let seen = stub.seen.lock().await;
+        let pages: Vec<String> = seen
+            .iter()
+            .filter(|entry| entry.path == "/v1/sandboxes")
+            .map(|entry| entry.query.clone())
+            .collect();
+        drop(seen);
+        assert_eq!(
+            pages.len(),
+            2,
+            "one request per page, and it stops at the last"
+        );
+        assert!(
+            !pages[0].contains("after_created_at"),
+            "the first page has no cursor to follow"
+        );
+        assert!(
+            pages[1].contains("after_created_at") && pages[1].contains("after_id"),
+            "the second page must carry the cursor the first one named: {}",
+            pages[1]
+        );
+        drop(serving);
     }
 
     fn request(command: &[&str]) -> CreateRunRequest {

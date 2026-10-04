@@ -18,7 +18,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-from .runs import Runs
+from .runs import MAX_LIST_LIMIT, Runs, _listed
 from .evals import Evals
 
 #: What the control plane gives a command that states no timeout of its own
@@ -245,6 +245,33 @@ class AIec:
         return self.sandboxes.create(image=image, **kwargs)
 
 
+@dataclass
+class SandboxPage:
+    """One bounded page of sandboxes, and where the next one starts.
+
+    ``next`` is ``None`` exactly when this is the last page. A caller that
+    stops reading has stopped where the page ended and can say so; there is no
+    silent truncation to discover later.
+    """
+
+    client: "AIec"
+    data: dict
+
+    @property
+    def sandboxes(self) -> list:
+        return self.data["sandboxes"]
+
+    @property
+    def next(self) -> dict | None:
+        return self.data.get("next")
+
+    def __len__(self) -> int:
+        return len(self.sandboxes)
+
+    def __iter__(self):
+        return iter(self.sandboxes)
+
+
 class _Sandboxes:
     def __init__(self, client: AIec):
         self.client = client
@@ -260,9 +287,58 @@ class _Sandboxes:
             ),
         )
 
-    def list(self) -> Any:
-        return self.client._request(
-            "GET", "/v1/sandboxes", timeout=LIST_TIMEOUT_SECONDS
+    def list(self, limit: int = MAX_LIST_LIMIT) -> "SandboxPage":
+        """One page of the caller's sandboxes, newest first.
+
+        The control plane answers a bounded page and names the cursor its
+        successor starts at, so this hands both back: ``sandboxes`` is what the
+        page held and ``next`` is where the rest begins. A ``limit`` the control
+        plane would clamp is refused rather than quietly reduced -- a page
+        smaller than asked for, with no error, is indistinguishable from a
+        short history.
+        """
+        page = _listed(limit)
+        return SandboxPage(
+            self.client,
+            self.client._request(
+                "GET", f"/v1/sandboxes?limit={page}", timeout=LIST_TIMEOUT_SECONDS
+            ),
+        )
+
+    def list_all(self, limit: int = MAX_LIST_LIMIT) -> list:
+        """Every sandbox, following the cursor until the history is exhausted.
+
+        Each request is bounded. The caller has asked for the whole list and is
+        prepared to hold it, so the cost is their history rather than one
+        response the control plane had to build in full.
+        """
+        collected: list = []
+        cursor = None
+        while True:
+            page = (
+                self.list(limit)
+                if cursor is None
+                else self.list_after(cursor, limit)
+            )
+            collected.extend(page.sandboxes)
+            cursor = page.next
+            if cursor is None:
+                return collected
+
+    def list_after(self, cursor: dict, limit: int = MAX_LIST_LIMIT) -> "SandboxPage":
+        """The page starting where ``cursor`` says."""
+        page = _listed(limit)
+        if not isinstance(cursor, dict) or "created_at" not in cursor or "id" not in cursor:
+            raise ValueError("cursor is a page's next value, with created_at and id")
+        return SandboxPage(
+            self.client,
+            self.client._request(
+                "GET",
+                f"/v1/sandboxes?limit={page}"
+                f"&after_created_at={quote(str(cursor['created_at']), safe='')}"
+                f"&after_id={quote(str(cursor['id']), safe='')}",
+                timeout=LIST_TIMEOUT_SECONDS,
+            ),
         )
 
 

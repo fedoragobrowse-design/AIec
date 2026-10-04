@@ -170,16 +170,49 @@ impl MemoryRepository {
         owned(&data, tenant, id)
     }
 
-    async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, StoreError> {
-        Ok(self
-            .data
-            .read()
-            .await
+    async fn list_sandboxes(
+        &self,
+        tenant: Uuid,
+        limit: u32,
+        after: Option<aiec_core::storage::SandboxCursor>,
+    ) -> Result<aiec_core::storage::SandboxPage, StoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_SANDBOX_PAGE);
+        // Sorted rather than taken from the map: the map iterates in an
+        // arbitrary order, so bounding an unsorted iterator would silently
+        // decide the page by hash layout instead of by recency. This is the
+        // same order the SQL store returns, so swapping between the two does
+        // not hand a caller a different page.
+        let data = self.data.read().await;
+        let mut page: Vec<Sandbox> = data
             .sandboxes
             .values()
             .filter(|value| value.tenant_id == tenant)
+            .filter(|value| match after {
+                // The same keyset comparison the SQL store applies, against
+                // the same ordering, so a page boundary means one thing here
+                // and one there.
+                Some(cursor) => (value.created_at, value.id) < (cursor.created_at, cursor.id),
+                None => true,
+            })
             .cloned()
-            .collect())
+            .collect();
+        page.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        let more = page.len() > limit as usize;
+        page.truncate(limit as usize);
+        // The cursor names the last sandbox this page returned, not the row
+        // held back to prove another page exists: pointing at that row would
+        // skip it, and a caller paging to the end would never be shown it.
+        let next = match (more, page.last()) {
+            (true, Some(last)) => Some(aiec_core::storage::SandboxCursor {
+                created_at: last.created_at,
+                id: last.id,
+            }),
+            _ => None,
+        };
+        Ok(aiec_core::storage::SandboxPage {
+            sandboxes: page,
+            next,
+        })
     }
 
     async fn update_state(
@@ -814,8 +847,15 @@ impl MetadataStore for MemoryRepository {
             .map_err(core_error)
     }
 
-    async fn list_sandboxes(&self, tenant: Uuid) -> Result<Vec<Sandbox>, CoreError> {
-        Self::list_sandboxes(self, tenant).await.map_err(core_error)
+    async fn list_sandboxes(
+        &self,
+        tenant: Uuid,
+        limit: u32,
+        after: Option<aiec_core::storage::SandboxCursor>,
+    ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
+        Self::list_sandboxes(self, tenant, limit, after)
+            .await
+            .map_err(core_error)
     }
 
     async fn update_state(

@@ -182,7 +182,20 @@ enum SandboxCommand {
         #[arg(long)]
         network: bool,
     },
-    List,
+    /// Lists sandboxes, newest first.
+    ///
+    /// The control plane answers one bounded page, so this follows the page
+    /// cursor until the history is exhausted by default: a truncated history
+    /// printed as though it were the whole thing is worse than a few more
+    /// requests. `--page` prints one page and stops where that page ended.
+    List {
+        /// Print exactly one page, and say where the next one starts.
+        #[arg(long)]
+        page: bool,
+        /// Sandboxes to ask for per page request.
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
     Show {
         id: Uuid,
     },
@@ -1782,10 +1795,28 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
             };
             println!("{}", serde_json::to_string_pretty(&sandbox)?)
         }
-        SandboxCommand::List => println!(
-            "{}",
-            serde_json::to_string_pretty(&c.list_sandboxes().await?)?
-        ),
+        SandboxCommand::List { page, limit } => {
+            if page {
+                // One page, with the cursor printed alongside it. Stopping
+                // here is the caller's choice, so the response has to carry
+                // enough to resume: the cursor is the last sandbox shown, not
+                // an offset a reader would have to keep in step with the data.
+                let response = c.list_sandboxes_page(limit).await?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                if let Some(next) = &response.next {
+                    eprintln!(
+                        "more sandboxes remain; resume after {} {}",
+                        next.created_at.to_rfc3339(),
+                        next.id
+                    );
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&c.list_all_sandboxes(limit).await?)?
+                );
+            }
+        }
         SandboxCommand::Show { id } => println!(
             "{}",
             serde_json::to_string_pretty(&c.get_sandbox(id).await?)?

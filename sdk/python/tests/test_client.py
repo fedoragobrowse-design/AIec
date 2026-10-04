@@ -56,6 +56,76 @@ class RecordingTransport:
         return self.timeouts[-1]
 
 
+class SandboxPageTest(unittest.TestCase):
+    """`GET /v1/sandboxes` answers a bounded page and names its successor.
+
+    The SDK hands both back. A caller that stops reading has to be able to tell
+    that it stopped at a page boundary it chose, rather than discovering later
+    that a list it believed complete was not.
+    """
+
+    def paged(self, bodies):
+        """A transport answering the given pages in order."""
+        client = a_client()
+        seen = []
+
+        def request(method, path, payload=None, *, timeout=120):
+            seen.append(path)
+            return bodies[min(len(seen) - 1, len(bodies) - 1)]
+
+        client._request = request
+        return client, seen
+
+    def test_the_page_carries_its_items_and_its_successor(self):
+        client, _ = self.paged([
+            {"sandboxes": [{"id": "a"}, {"id": "b"}],
+             "next": {"created_at": "2024-01-01T00:00:00Z", "id": "b"}}
+        ])
+        page = client.sandboxes.list()
+        self.assertEqual([s["id"] for s in page.sandboxes], ["a", "b"])
+        self.assertEqual(page.next["id"], "b")
+        self.assertEqual(len(page), 2)
+
+    def test_the_last_page_says_there_is_no_next(self):
+        client, _ = self.paged([{"sandboxes": [{"id": "a"}], "next": None}])
+        self.assertIsNone(client.sandboxes.list().next)
+
+    def test_a_page_beyond_what_the_control_plane_will_give_is_refused(self):
+        # The route clamps to 200. Asking for a thousand and receiving two
+        # hundred with no error is an answer that looks complete and is not.
+        client, _ = self.paged([{"sandboxes": [], "next": None}])
+        with self.assertRaises(ValueError):
+            client.sandboxes.list(limit=1000)
+        with self.assertRaises(ValueError):
+            client.sandboxes.list(limit=0)
+
+    def test_the_page_the_control_plane_will_still_give_is_accepted(self):
+        client, seen = self.paged([{"sandboxes": [], "next": None}])
+        client.sandboxes.list(limit=200)
+        self.assertIn("limit=200", seen[0])
+
+    def test_listing_the_whole_history_follows_the_cursor_until_it_runs_out(self):
+        client, seen = self.paged([
+            {"sandboxes": [{"id": "a"}],
+             "next": {"created_at": "2024-01-01T00:00:00Z", "id": "a"}},
+            {"sandboxes": [{"id": "b"}],
+             "next": {"created_at": "2023-01-01T00:00:00Z", "id": "b"}},
+            {"sandboxes": [{"id": "c"}], "next": None},
+        ])
+        self.assertEqual([s["id"] for s in client.sandboxes.list_all()], ["a", "b", "c"])
+        self.assertEqual(len(seen), 3, "it must stop where the last page ends")
+        self.assertIn("after_created_at=2024-01-01T00%3A00%3A00Z", seen[1])
+        self.assertIn("after_id=a", seen[1])
+        self.assertIn("after_created_at=2023-01-01T00%3A00%3A00Z", seen[2])
+
+    def test_a_cursor_without_both_halves_is_refused_before_the_request(self):
+        client, seen = self.paged([{"sandboxes": [], "next": None}])
+        for cursor in ({"created_at": "2024-01-01T00:00:00Z"}, {"id": "a"}, {}):
+            with self.assertRaises(ValueError):
+                client.sandboxes.list_after(cursor)
+        self.assertEqual(seen, [], "a half cursor must not become a request")
+
+
 class ClientContractTest(unittest.TestCase):
     def test_context_manager_and_file_operations_use_api_contract(self):
         client = AIec(api_key="af_live_" + "0" * 48, base_url="http://example")

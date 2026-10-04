@@ -532,8 +532,13 @@ mod tests {
         async fn get_sandbox(&self, tenant: TenantId, id: SandboxId) -> Result<Sandbox, CoreError> {
             self.inner.get_sandbox(tenant, id).await
         }
-        async fn list_sandboxes(&self, tenant: TenantId) -> Result<Vec<Sandbox>, CoreError> {
-            self.inner.list_sandboxes(tenant).await
+        async fn list_sandboxes(
+            &self,
+            tenant: TenantId,
+            limit: u32,
+            after: Option<aiec_core::storage::SandboxCursor>,
+        ) -> Result<aiec_core::storage::SandboxPage, CoreError> {
+            self.inner.list_sandboxes(tenant, limit, after).await
         }
         async fn update_state(
             &self,

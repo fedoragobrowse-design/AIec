@@ -283,24 +283,35 @@ impl LocalAiec {
     }
 
     /// Lists sandboxes this server is responsible for.
+    ///
+    /// Each owned sandbox is fetched by id rather than by scanning the
+    /// tenant's sandbox list. That route answers one bounded page ordered by
+    /// recency, so an owned sandbox older than the page would simply not
+    /// appear in it — this server would report a sandbox it still holds and
+    /// still owns as gone. The set is this server's own bookkeeping, so its size
+    /// is bounded by what this server created.
     pub async fn list_owned_sandboxes(&self) -> ToolResult<Vec<SandboxView>> {
-        let all = self
-            .client
-            .list_sandboxes()
-            .await
-            .map_err(|error| map_client_error(&error))?;
-        let owned: Vec<Uuid> = self
-            .owned
-            .lock()
-            .expect("ownership lock is not poisoned")
-            .iter()
-            .map(|record| record.sandbox_id)
-            .collect();
-        Ok(all
-            .iter()
-            .filter(|sandbox| owned.contains(&sandbox.id))
-            .map(view_of)
-            .collect())
+        let owned: Vec<Uuid> = {
+            let guard = self.owned.lock().expect("ownership lock is not poisoned");
+            guard.iter().map(|record| record.sandbox_id).collect()
+        };
+        let mut views = Vec::with_capacity(owned.len());
+        for id in owned {
+            let sandbox = self
+                .client
+                .get_sandbox(id)
+                .await
+                .map_err(|error| map_client_error(&error))?;
+            views.push(view_of(&sandbox));
+        }
+        // Newest first, the order the list route returns, so the two ways of
+        // seeing a sandbox's history agree.
+        views.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.sandbox_id.cmp(&a.sandbox_id))
+        });
+        Ok(views)
     }
 
     /// Fetches one sandbox, mapping a missing sandbox onto a typed error.
