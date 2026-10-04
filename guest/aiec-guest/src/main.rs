@@ -400,14 +400,26 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
         command.env(key, value);
     }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    if let Some(mut pipe) = child.stdin.take() {
-        pipe.write_all(&stdin).map_err(|error| error.to_string())?;
-    }
+    // Standard input is delivered by its own thread rather than written here.
+    // Writing inline blocks until the command either reads or exits, so a
+    // command that closes its input without reading it fails the whole exec
+    // with `EPIPE` instead of reporting the status it exited with, and a
+    // command that never reads it at all can run past its own deadline.
+    let stdin_writer = child.stdin.take().map(|mut pipe| {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(pipe.write_all(&stdin).and_then(|()| pipe.flush()));
+            // Closing the pipe here is what tells a reader that has consumed
+            // everything to see EOF.
+            drop(pipe);
+        });
+        receiver
+    });
     let pid = child.id() as i32;
     let stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("stderr unavailable")?;
-    let out_rx = bounded_reader(stdout, limit);
-    let err_rx = bounded_reader(stderr, limit);
+    let out_rx = bounded_reader(stdout);
+    let err_rx = bounded_reader(stderr);
     let started = Instant::now();
     let deadline = Duration::from_millis(timeout_ms.clamp(1, 3_600_000));
     let mut timed_out = false;
@@ -419,18 +431,42 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
-            let _ = child.wait();
             timed_out = true;
             break child.wait().map_err(|error| error.to_string())?;
         }
         thread::sleep(Duration::from_millis(5));
     };
-    let stdout = out_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|error| error.to_string())??;
-    let stderr = err_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|error| error.to_string())??;
+    // A command that never read its input is still reported as it exited. A
+    // pipe the reader has already closed is not an exec failure: the command
+    // chose not to read stdin, and `EPIPE`/`ECONNRESET` says only that the
+    // reader went away. That verdict does not depend on `timed_out`, because
+    // the writer usually fails before the wait loop notices the exit. Every
+    // other write failure is real and is reported.
+    if let Some(receiver) = stdin_writer {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) {
+                    return Err(error.to_string());
+                }
+            }
+            // A writer still blocked on a process group that has already been
+            // killed cannot report anything, and its pipe is dropped with the
+            // thread.
+            Err(_) => {}
+        }
+    }
+    // A pipe held open by a backgrounded grandchild is not an exec failure:
+    // the command exited, and its exit status is the answer. Output arrives in
+    // chunks, so whatever was produced within the wait is still reported. Both
+    // pipes share one bound, so a command that leaves both open costs one
+    // wait rather than two.
+    let output_deadline = Instant::now() + Duration::from_secs(2);
+    let stdout = collect_output(out_rx, limit, output_deadline)?;
+    let stderr = collect_output(err_rx, limit, output_deadline)?;
     Ok(ResponsePayload::Exec {
         exit_code: status.code().unwrap_or(if timed_out { -124 } else { -1 }),
         stdout,
@@ -449,32 +485,60 @@ fn valid_env(key: &str, value: &str) -> bool {
         && !value.as_bytes().contains(&0)
 }
 
+/// Reads one pipe in bounded chunks, sending each chunk as it arrives so a
+/// collector can stop without discarding what the command already wrote.
 fn bounded_reader<R: Read + Send + 'static>(
     mut reader: R,
-    limit: usize,
-) -> mpsc::Receiver<Result<Vec<u8>, String>> {
+) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let mut output = Vec::new();
         let mut buffer = [0; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    if output.len() < limit {
-                        let take = count.min(limit - output.len());
-                        output.extend_from_slice(&buffer[..take]);
+                    // Once the collector is gone the exec has its answer, and
+                    // dropping this reader closes our end of the pipe instead
+                    // of leaving the command blocked on a full one.
+                    if sender.send(Ok(buffer[..count].to_vec())).is_err() {
+                        return;
                     }
                 }
                 Err(error) => {
-                    let _ = sender.send(Err(error.to_string()));
+                    let _ = sender.send(Err(error));
                     return;
                 }
             }
         }
-        let _ = sender.send(Ok(output));
     });
     receiver
+}
+
+/// Drains one pipe up to `limit` bytes, until the command closes it, the reader
+/// fails, or `deadline` passes. The bound is what the caller asked for, so
+/// output past it is truncated rather than buffered whole.
+fn collect_output(
+    receiver: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    limit: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(chunk)) => {
+                if output.len() < limit {
+                    let take = chunk.len().min(limit - output.len());
+                    output.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Ok(Err(error)) => return Err(error.to_string()),
+            // The command closed its output, or it outlived the wait with the
+            // pipe still open. What was collected is the answer either way.
+            Err(_) => break,
+        }
+    }
+    Ok(output)
 }
 
 fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
@@ -761,6 +825,128 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A command that exits without reading its standard input has not failed
+    /// the exec. It reported a status, and that status is what the caller gets:
+    /// a delivery that dies with `EPIPE` is the command declining to read, not
+    /// the guest failing. This also covers the deadline, because the delivery
+    /// thread is the only thing that used to be able to outlive it.
+    #[test]
+    fn stdin_the_command_never_reads_is_not_an_exec_failure() {
+        for stdin in [Vec::new(), vec![b'x'; 512 * 1024]] {
+            let ResponsePayload::Exec {
+                timed_out,
+                exit_code,
+                ..
+            } = run_command(RequestPayload::Exec {
+                argv: vec!["/bin/true".into()],
+                cwd: None,
+                env: Default::default(),
+                timeout_ms: 30_000,
+                output_limit: 1024,
+                stdin,
+            })
+            .expect("a command that ignores stdin still reports its status")
+            else {
+                panic!("exec must answer with its exit status");
+            };
+            assert!(!timed_out, "a command that exited was not killed");
+            assert_eq!(exit_code, 0);
+        }
+    }
+
+    /// The deadline is enforced by the process group, not by delivery
+    /// finishing. A command that ignores stdin and outlives its deadline has
+    /// to be killed and reported as timed out.
+    #[test]
+    fn the_deadline_kills_a_command_that_never_reads_its_stdin() {
+        let started = Instant::now();
+        let ResponsePayload::Exec {
+            timed_out,
+            exit_code,
+            ..
+        } = run_command(RequestPayload::Exec {
+            argv: vec!["/bin/sleep".into(), "30".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 50,
+            output_limit: 1024,
+            stdin: vec![b'x'; 512 * 1024],
+        })
+        .expect("the group kill reaps the command")
+        else {
+            panic!("exec must answer with its exit status");
+        };
+        assert!(timed_out, "the command outlived its deadline");
+        assert_eq!(exit_code, -124);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the deadline is the exec's bound, not the command's"
+        );
+    }
+
+    /// Moving stdin delivery to a thread must not lose or truncate it, or the
+    /// read would silently be short. This is larger than a pipe buffer, so it
+    /// only completes if delivery is really concurrent with the child.
+    #[test]
+    fn stdin_larger_than_a_pipe_buffer_is_delivered_whole() {
+        let stdin = vec![b'q'; 256 * 1024];
+        let expected = stdin.clone();
+        let ResponsePayload::Exec {
+            exit_code, stdout, ..
+        } = run_command(RequestPayload::Exec {
+            argv: vec!["/bin/cat".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            // The reader is what bounds the response, so ask for enough to
+            // hold every byte being checked.
+            output_limit: stdin.len() + 1024,
+            stdin,
+        })
+        .expect("a reader that consumes its input succeeds")
+        else {
+            panic!("exec must answer with its exit status");
+        };
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            stdout, expected,
+            "stdin must arrive whole, and a reader must see EOF"
+        );
+    }
+
+    /// A command that exits while a backgrounded grandchild still holds its
+    /// output pipes has finished. Its exit status and the output it produced
+    /// are the answer; the open pipe is not an error and must not cost more
+    /// than the one bound both pipes share.
+    #[test]
+    fn a_backgrounded_grandchild_does_not_fail_or_stall_the_exec() {
+        let started = Instant::now();
+        let ResponsePayload::Exec {
+            timed_out,
+            exit_code,
+            stdout,
+            ..
+        } = run_command(RequestPayload::Exec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30 & echo done".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            output_limit: 1024,
+            stdin: Vec::new(),
+        })
+        .expect("a command that exited reports its status, not its descendants")
+        else {
+            panic!("exec must answer with its exit status");
+        };
+        assert!(!timed_out, "the command exited inside its deadline");
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, b"done\n", "output written before the wait is kept");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "an open pipe costs one bounded wait, not two unbounded ones"
+        );
     }
     use super::*;
 

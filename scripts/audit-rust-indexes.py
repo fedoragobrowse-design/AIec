@@ -13,6 +13,7 @@ import tree_sitter
 import tree_sitter_rust
 
 ROOT = Path(__file__).resolve().parents[1]
+SOURCE_GLOBS = ("crates/**/src/**/*.rs", "guest/aiec-guest/src/**/*.rs")
 TEST_ATTRIBUTES = {"#[cfg(test)]", "#[cfg(all(test,unix))]", "#[test]"}
 
 
@@ -64,7 +65,7 @@ def main():
     parser = tree_sitter.Parser(tree_sitter.Language(tree_sitter_rust.language()))
     sites, macro_candidates, errors = [], [], []
     files = 0
-    for path in sorted(ROOT.glob("crates/**/src/**/*.rs")):
+    for path in sorted(path for pattern in SOURCE_GLOBS for path in ROOT.glob(pattern)):
         if "tests" in path.relative_to(ROOT).parts or path.name == "tests.rs" or path.stem.endswith("_tests"):
             continue
         files += 1
@@ -75,6 +76,7 @@ def main():
         collect(tree.root_node, source, path, sites, macro_candidates)
     print(json.dumps({
         "parser_versions": {name: version(name) for name in ("tree-sitter", "tree-sitter-rust")},
+        "source_globs": list(SOURCE_GLOBS),
         "files": files,
         "errors": errors,
         "index_nodes": len(sites),

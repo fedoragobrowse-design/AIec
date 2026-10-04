@@ -4,8 +4,8 @@ use guard::{GuardCommand, guard_command};
 use image::{ImageCommand, image_command};
 
 use aiec_api::{
-    HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerRegistration, WorkerService,
-    WorkerStatus, serve_worker_tls_until,
+    HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerListener, WorkerRegistration,
+    WorkerService, WorkerStatus,
 };
 use aiec_client::{
     AIecClient, BatchOptions, CreateRunRequest, EvalBatchRequest, EvalMatrixSpec,
@@ -890,7 +890,7 @@ async fn client(url: &str, api_key: Option<String>) -> Result<AIecClient> {
         .context("set --api-key, --api-key-file or AIEC_API_KEY")?;
     AIecClient::new(url, key).context("create API client")
 }
-async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
+async fn worker(control_url: &str, mut args: WorkerArgs) -> Result<()> {
     // The worker emits structured logs all over - rejected operations, lease
     // renewals, capacity decisions, sandbox teardown - and without a subscriber
     // every one of them was discarded, so a worker that refused an operation or
@@ -909,6 +909,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         .ok();
     let token = args
         .token
+        .take()
         .or_else(|| std::env::var("AIEC_WORKER_TOKEN").ok())
         .context("set --token or AIEC_WORKER_TOKEN")?;
     if args.capacity == 0 {
@@ -943,10 +944,116 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     if args.runtime != "bwrap-dev" && advertised.scheme() != "https" {
         anyhow::bail!("non-development workers must advertise HTTPS");
     }
+    let bind = args.bind.parse().context("invalid worker bind address")?;
     // Handler installation is fallible. Do it before registration, local
     // reconciliation or lease claims, not inside the spawned shutdown future:
     // a panic there is otherwise mistaken for a clean server shutdown.
-    let shutdown = termination_signal()?;
+    let mut shutdown = termination_signal()?;
+    let listener = tokio::select! {
+        biased;
+        _ = &mut shutdown => {
+            tracing::info!("worker shutdown requested during startup");
+            return Ok(());
+        }
+        listener = WorkerListener::bind(
+            bind,
+            tls_config.as_ref().map(|(cert, key)| (Path::new(cert), Path::new(key))),
+        ) => listener.context("prepare worker listener")?,
+    };
+    // Keep the runtime outside the cancellable startup future so termination
+    // or a startup error can still reclaim anything this process owns.
+    let mut startup_runtime = None;
+    let started = tokio::select! {
+        // If both become ready together, do not publish a listener after the
+        // user has already requested termination.
+        biased;
+        _ = &mut shutdown => {
+            tracing::info!("worker shutdown requested during startup");
+            Ok(None)
+        }
+        started = start_worker(
+            control_url, args, token, advertise_url, &mut startup_runtime
+        ) => started.map(Some),
+    };
+    if !matches!(&started, Ok(Some(_)))
+        && let Some(runtime) = startup_runtime.as_ref()
+    {
+        let reclaimed = runtime.shutdown().await;
+        tracing::info!(
+            reclaimed = reclaimed.len(),
+            "reclaimed worker startup runtime"
+        );
+    }
+    let Some(WorkerStartup {
+        service,
+        runtime: shutdown_runtime,
+        mut maintenance,
+    }) = started?
+    else {
+        return Ok(());
+    };
+    drop(startup_runtime);
+    let (drain, drained) = tokio::sync::oneshot::channel();
+    let listener_shutdown = async move {
+        let _ = drained.await;
+    };
+    let serving_context = if tls_config.is_some() {
+        "serve TLS worker"
+    } else {
+        "serve worker"
+    };
+    let serving = async move {
+        listener
+            .serve_until(service, listener_shutdown)
+            .await
+            .context(serving_context)
+    };
+    tokio::pin!(serving);
+    let mut serving_started = false;
+    let serving = tokio::select! {
+        biased;
+        _ = &mut shutdown => {
+            // Stop claims and renewals before beginning the listener drain.
+            // Keep serving in-flight operations until the drain completes.
+            maintenance.shutdown().await;
+            let _ = drain.send(());
+            if serving_started {
+                serving.await
+            } else {
+                Ok(())
+            }
+        }
+        result = std::future::poll_fn(|cx| {
+            serving_started = true;
+            serving.as_mut().poll(cx)
+        }) => {
+            maintenance.shutdown().await;
+            drop(drain);
+            result
+        }
+    };
+    // Reclaim after the listener drains, even if serving returned an error.
+    let reclaimed = shutdown_runtime.shutdown().await;
+    tracing::info!(
+        reclaimed = reclaimed.len(),
+        "reclaimed the machines this worker was still running"
+    );
+    serving
+}
+
+struct WorkerStartup {
+    service: WorkerService,
+    runtime: Arc<dyn SandboxRuntime>,
+    maintenance: JoinSet<()>,
+}
+
+async fn start_worker(
+    control_url: &str,
+    args: WorkerArgs,
+    token: String,
+    advertise_url: String,
+    startup_runtime: &mut Option<Arc<dyn SandboxRuntime>>,
+) -> Result<WorkerStartup> {
     let control = control_url.trim_end_matches('/').to_owned();
     let node_id = match args.node_id {
         Some(id) => id,
@@ -1006,6 +1113,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             "unsupported worker runtime {other}; use bwrap-dev, docker, or firecracker"
         ),
     };
+    *startup_runtime = Some(runtime.clone());
     let capabilities = runtime.capabilities();
     let mut client_builder =
         reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
@@ -1231,7 +1339,8 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // Moved into the liveness task, which republishes it with a fresh reading
     // on every beat rather than sending a partial object.
     let liveness_metadata = registration_metadata;
-    tokio::spawn(async move {
+    let mut maintenance = JoinSet::new();
+    maintenance.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         // Carried across beats because a failed probe does not tell the worker
         // how many sandboxes it holds, and guessing zero would have the control
@@ -1330,7 +1439,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     let loop_state_dir = args.state_dir.clone();
     let loop_reserves = reserves;
     let loop_production = production;
-    tokio::spawn(async move {
+    maintenance.spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
@@ -1404,32 +1513,11 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
             }
         }
     });
-    let bind = args.bind.parse().context("invalid worker bind address")?;
-    // The signal ends the listener and the server reports itself drained; the
-    // machines are reclaimed after that, not in parallel with it. A request
-    // still in flight holds its sandbox's lifecycle gate, and a reclaim that
-    // waited on the same gate would be reclaiming under a create that is still
-    // copying.
-    let serving = if let Some((cert, key)) = tls_config {
-        serve_worker_tls_until(service, bind, cert, key, shutdown)
-            .await
-            .context("serve worker operations over TLS")
-    } else {
-        aiec_api::serve_worker_until(service, bind, shutdown)
-            .await
-            .context("serve worker operations")
-    };
-    // A worker's machines are process-local: no other process adopts a VM
-    // directory this one stops tracking, so anything still running now would
-    // be a guest nobody owns, holding a rootfs on the host for as long as the
-    // disk lasts. Reclaiming them is the last thing this process owes the host
-    // it ran on, and it happens whether the server stopped cleanly or not.
-    let reclaimed = shutdown_runtime.shutdown().await;
-    tracing::info!(
-        reclaimed = reclaimed.len(),
-        "reclaimed the machines this worker was still running"
-    );
-    serving
+    Ok(WorkerStartup {
+        service,
+        runtime: shutdown_runtime,
+        maintenance,
+    })
 }
 
 /// Installs both handlers immediately, then resolves on `SIGTERM` or `SIGINT`.
@@ -1437,16 +1525,20 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
 /// Installation errors must fail worker startup before it registers or takes
 /// ownership of machines. The default signal disposition skips destructors;
 /// the returned future gives the running worker a chance to reclaim them.
-fn termination_signal() -> Result<impl Future<Output = ()>> {
+fn termination_signal() -> Result<impl Future<Output = ()> + Unpin> {
+    use std::{future::poll_fn, task::Poll};
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-    Ok(async move {
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
+    // Signal streams are Unpin. An allocation-free poll_fn keeps the waiter
+    // movable from startup's select into the server's owned shutdown task.
+    Ok(poll_fn(move |cx| {
+        if terminate.poll_recv(cx).is_ready() || interrupt.poll_recv(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-    })
+    }))
 }
 
 /// Lease lifetime requested when this worker claims assignments.

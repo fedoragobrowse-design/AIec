@@ -2388,7 +2388,7 @@ Mutation evidence: restoring the unconditional `?` on the ancestor loop fails
 with `Permission denied (os error 13)`, reproduced through the real publication
 path. Restored.
 
-### Audited: enumerated panic candidates in shipping Rust code
+### Audited: scoped Rust panic candidates and indexing
 
 Two candidate sets were reviewed with different enumeration methods. These
 are scoped source-review results, not a repository-wide panic-free guarantee.
@@ -2408,17 +2408,20 @@ it included embedded-language/string text and omitted constant indices,
 method-call receivers and multiline expressions. Masking literals reduced that
 scan to 96 candidates but did not make its coverage complete.
 
-A Rust syntax-tree scan now covers **105 source files**, with **zero parse
-errors**, yielding **211 non-test `index_expression` nodes**. A supplementary
+A Rust syntax-tree scan now covers **106 source files**, with **zero parse
+errors**, yielding **216 non-test `index_expression` nodes**. A supplementary
 macro-token scan found **17 additional indexing candidates**, all confirmed as
-index expressions by reading their context. All **228 enumerated expressions**
+index expressions by reading their context. All **233 enumerated expressions**
 were reviewed for receiver type, bounds, mutation between guard and use, and
 UTF-8 boundaries where applicable. No actionable indexing defect was confirmed.
-Counts include separate read/write occurrences on the same line.
+Counts include separate read/write occurrences on the same line. The earlier
+crates-only inventory was 105 files, 211 AST nodes and 17 macro candidates;
+the shipping guest adds one file and five AST nodes, with no macro candidates.
 
 The scan used Python `tree-sitter` 0.25.2 and `tree-sitter-rust` 0.24.2 on
-`crates/**/src/**/*.rs`. It excludes `tests/`, `tests.rs` and `*_tests.rs`;
-unlike the previous truncation rule, it continues after inline test modules.
+`crates/**/src/**/*.rs` and `guest/aiec-guest/src/**/*.rs`. It excludes `tests/`,
+`tests.rs` and `*_tests.rs`; unlike the previous truncation rule, it continues
+after inline test modules.
 It skips structurally test-only items with `cfg(test)`, `cfg(all(test, unix))`,
 `test` or `tokio::test` attributes and modules named `tests`, inheriting that
 exclusion into descendants. The compound predicate excludes the
@@ -2432,7 +2435,7 @@ these source files and more complex macro syntax remain outside this claim.
 The reproducible candidate generator is `scripts/audit-rust-indexes.py`:
 install `tree-sitter==0.25.2` and `tree-sitter-rust==0.24.2` in an isolated Python
 environment, then run `python scripts/audit-rust-indexes.py`. It emits counts,
-parser versions, parse errors and every source location as JSON, and exits
+parser versions, source globs, parse errors and every source location as JSON, and exits
 nonzero on a parse error. The retained script produced the counts above with
 exit 0. A synthetic smoke probe confirmed constant and macro indices are
 included, embedded raw-string text is excluded, compound/argument-bearing test
@@ -2450,7 +2453,14 @@ items are excluded, and shipping code after a test module is retained.
 | `aiec-network-linux` | 7 | 1 |
 | `aiec-runtime` | 28 | 0 |
 | `aiec-storage` | 10 | 0 |
-| **Total** | **211** | **17** |
+| `aiec-guest` | 5 | 0 |
+| **Total** | **216** | **17** |
+
+The five guest expressions are independently bounded: `argv[0]` and `argv[1..]`
+follow the empty-argv refusal in `run_command`; `buffer[..take]` uses a take no
+larger than the read count into the 8192-byte buffer; the two `pair` indices in
+`hex_decode` follow an even-byte-length check and `chunks(2)`. These bounds do
+not establish guest process-lifetime correctness or compiler-expanded coverage.
 
 Three `expect("cidr suffix")` calls in `aiec-network-linux/src/lib.rs`
 were classified as tests by reading them, not counted as production defects.
@@ -2542,7 +2552,8 @@ removal would be caught.
 
 Set A's listed candidates and all enumerated Set B candidates are individually
 justified. Neither enumeration proves that no panic is reachable anywhere in
-the tree; notably Set A still uses the older file-truncation method.
+the tree. The original Set A scan used truncation; its structural follow-through
+below covers the 105 crates source files, not the added guest source.
 
 ### Correction: "60s is ample" was not supported by what was checked
 
@@ -2635,9 +2646,9 @@ which is unreachable for the reason recorded.
 
 The earlier indexing count was not supported: regex matches included embedded
 Python/SQL/string text and omitted literal indices and other Rust expressions.
-The replacement Set B inventory above reviews 211 syntax-tree index nodes plus
-17 macro-token candidates across 105 source files, with explicit exclusions and
-remaining limits. Its per-site bounds review supersedes the earlier incomplete
+The replacement Set B inventory above reviews 216 syntax-tree index nodes plus
+17 macro-token candidates across 106 source files, including the guest. Its
+per-site bounds review supersedes the earlier incomplete
 triage; it does not turn the macro heuristic into exhaustive compiler coverage.
 
 Current-tree verification after restoring the mutation: fmt exit **0**, clippy
@@ -2685,8 +2696,9 @@ bypasses reclaim; no skipped-reclaim claim is made.
 **Repair:** `termination_signal()` now installs both handlers synchronously and
 returns `Result<impl Future<Output = ()>>`. The worker calls it before durable
 identity publication, local reconciliation, registration or lease claims.
-Installation errors propagate with the failed signal's context. The plain and
-TLS server branches receive that same already-installed shutdown future.
+Installation errors propagate with the failed signal's context. Initially,
+the plain and TLS server branches received that installed shutdown future;
+the subsequent startup/lifecycle repair below also polls it before serving.
 No HTTP, SDK or CLI argument contract changed.
 
 **Actual-binary verification:** under either injected failure the rebuilt CLI
@@ -2705,3 +2717,130 @@ Post-repair gates, with subprocess return values captured directly: fmt **0**,
 clippy **0**, workspace tests **0**, **1104 passed / 0 failed / 42 suites**.
 SDK, benchmark and launcher files were unchanged by this repair; their earlier
 same-turn gates remain the verification for those surfaces.
+
+### Fixed: installed termination signals were not polled during worker startup
+
+Installing handlers removed the default SIGTERM/SIGINT action, but the worker
+did not poll their receivers until the listener started. A pending registration,
+response body, reconciliation or initial claim could therefore prevent
+termination indefinitely.
+
+**Before repair:** with the actual `0d74611` CLI and an owned loopback control
+fixture holding registration, both signals left the process running after
+0.75 seconds. Releasing the response then allowed exit 0. The retained
+`worker_startup` integration tests failed before repair with
+`worker ignored termination while startup I/O was pending` (Cargo exit 101).
+The fourth fixture phase was subsequently corrected to strip the claim URL's
+query before matching its path; the final tests exercise all four phases.
+
+The ownership review also confirmed late listener acquisition: with its bind
+address already occupied, the CLI contacted the control plane before reporting
+the bind failure. `occupied_worker_listener_refuses_before_control_requests`
+failed against that ordering (Cargo exit 101). Invalid TLS configuration was
+likewise loaded only when serving began, after startup side effects.
+
+**Repair:** install the signal handlers, then acquire `WorkerListener` and load
+TLS configuration before identity publication, registration or lease claims.
+Poll the installed, movable signal waiter during listener preparation and
+asynchronous worker startup. Retain an independent runtime handle across
+startup cancellation and errors so cleanup remains reachable. Local
+Firecracker reconciliation is report-only, not adoption of orphaned VMs.
+
+Heartbeat and reconciliation/claim tasks now belong to a `JoinSet`; there is
+no fallible setup or yielding operation after those tasks are spawned. On a
+serving signal, cancel and await maintenance before beginning the listener
+drain, then reclaim the runtime after in-flight operations finish. Serving
+errors also stop maintenance before reclaim. If serving was never polled,
+termination drops the acquired listener without starting the server. The TLS
+server owns and joins its shutdown task on return. Existing address-based
+serving APIs, CLI arguments and wire contracts remain available and unchanged.
+
+**Current behavior evidence:** five actual-CLI integration tests passed:
+SIGTERM and SIGINT each terminate all four held startup-I/O phases; both also
+cancel a held maintenance HTTP request while an authenticated worker operation
+is still draining its incomplete JSON body; an occupied listener refuses before
+any control connection or durable state directory. No operation is dispatched
+by the incomplete-body fixture and no sandbox is assigned.
+
+Removing maintenance cancellation from the signal arm made both drain tests
+fail with `maintenance I/O survived shutdown during the listener drain`
+(Cargo exit 101). Cancellation was restored immediately; all five tests then
+passed (exit 0). This checks task lifetime, not merely shutdown return status.
+
+An owned throwaway TLS harness generated a local certificate and trusted it
+for real `/health` requests. SIGTERM and SIGINT each reached HTTPS 200 and
+exited 0 with reclaim logging; each also exited 0 without releasing a held
+registration response. An invalid TLS key exited 1 with zero control requests
+and no identity directory. All processes, sockets and scratch were harness
+owned and removed. No Docker daemon, guest or remote/KVM service was used.
+
+**Limits:** cancelling HTTP does not roll back a registration or claim already
+committed by the control plane. Such records retain the existing lease
+expiry/generation fencing and recovery semantics; this repair does not promise
+immediate server-side release. Signal polling does not preempt synchronous
+filesystem work or runtime constructors. Zero-machine fixtures do not prove
+live Firecracker reclaim or orphan recovery; those checks remain blocked by
+the untrusted remote route.
+
+### Fixed: guest exec reported failures that were not the command's
+
+Two defects in `guest/aiec-guest/src/main.rs::run_command` turned ordinary
+commands into guest errors, and a third turned ordinary output into one. All
+three were found by executing the shipping guest source directly, not by reading
+it.
+
+**Standard input was written inline, before any deadline check.** The old code
+wrote the whole of `stdin` and only then started waiting. A command that exited
+without reading it failed the exec with `Broken pipe (os error 32)` instead of
+the status it exited with, and a command that never read it at all ran past its
+own deadline because nothing was polling the clock while the write blocked.
+Delivery now happens on its own thread. A pipe the reader has already closed is
+the command declining to read, so `BrokenPipe`/`ConnectionReset` is not an exec
+failure; every other write failure is still reported, and the writer's own
+thread is dropped with the process group when the deadline kills it.
+
+**Output was only sent at EOF.** `bounded_reader` accumulated into a buffer and
+sent nothing until the command closed its pipe, so a command that exited while a
+backgrounded grandchild still held it failed with `timed out waiting on channel`
+after two seconds — and the output it had already produced was lost. Readers
+now send bounded 8 KiB chunks as they arrive, and collection drains up to the
+caller's `output_limit` until the pipe closes, the reader fails, or one deadline
+shared by both pipes passes. Dropping the receiver closes this end of the pipe
+rather than leaving the command blocked on a full one.
+
+**Reproduction and evidence.** An owned harness compiled the guest source into
+its own temporary crate. Before repair, `/bin/true` with 512 KiB of stdin
+reported `error=Broken pipe (os error 32)`; `sh -c 'sleep 20 & echo done'`
+reported `error=timed out waiting on channel`. After repair the same cases report
+`timed_out=false exit=0`, and the second reports `stdout="done\n"` with its
+partial output intact. `/bin/sleep 30` with 512 KiB of unread stdin still reports
+`timed_out=true exit=-124`. Refusals that are genuinely refusals are unchanged:
+empty argv, a missing cwd, a missing binary, and stdin over the documented
+maximum each still answer `Err` before or at spawn.
+
+Four permanent regressions in the guest cover the unread-stdin status, the
+deadline kill, delivery of 256 KiB whole with EOF observed, and the held-pipe
+grandchild. Reverting stdin delivery to an inline write fails
+`stdin_the_command_never_reads_is_not_an_exec_failure` and
+`the_deadline_kills_a_command_that_never_reads_its_stdin` with the reproduced
+`Broken pipe` (Cargo exit 101). Propagating every delivery error, rather than
+excluding a closed pipe, fails the first with `Broken pipe` (exit 101). Both
+mutations were reverted immediately and all 16 guest tests pass (exit 0,
+repeated three times, about 2.3 s each).
+
+**Also fixed: the TLS worker server detached its shutdown task.**
+`serve_worker_tls_until` spawned the shutdown waiter and only aborted it after
+the server future returned. Cancelling that future — which is what a dropped
+worker startup or a panicking caller does — left the task alive forever, holding
+the listener handle and everything the caller's shutdown future owned. The task
+is now owned by a guard that aborts it on drop. An owned probe with a real local
+certificate printed `shutdown_resource_dropped=false` before the repair and
+`true` after.
+
+**Limits:** a command killed by a signal still reports `exit_code: -1`, matching
+the Docker runtime's existing convention rather than the signal number; that is
+unchanged and untested here. Output collection still waits up to two seconds
+after a command that leaves its pipes open, so a backgrounded grandchild adds
+that much latency to that one exec. Guest behavior was exercised on the host,
+not inside a booted Firecracker guest; the guest binary's own I/O and process
+group handling are what these probes cover, not the host-side transport.

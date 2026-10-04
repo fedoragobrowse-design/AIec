@@ -4548,10 +4548,9 @@ pub async fn serve_worker_until(
     addr: std::net::SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
-    // A worker holds no leases of its own, so it gets no sweeper.
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, service.router())
-        .with_graceful_shutdown(shutdown)
+    WorkerListener::bind(addr, None)
+        .await?
+        .serve_until(service, shutdown)
         .await
 }
 
@@ -4573,25 +4572,75 @@ pub async fn serve_worker_tls_until(
     key_path: impl AsRef<std::path::Path>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
-    let handle = axum_server::Handle::new();
-    let trigger = handle.clone();
-    // Bounded, because the exit path that follows this one has to finish too:
-    // a drain with no end would let one long request keep a worker's machines
-    // on the host indefinitely, which is the leak this ordering exists to
-    // close.
-    tokio::spawn(async move {
-        shutdown.await;
-        trigger.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-    });
-    axum_server::bind_rustls(addr, config)
-        .handle(handle)
-        .serve(
-            service
-                .router()
-                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+    WorkerListener::bind(addr, Some((cert_path.as_ref(), key_path.as_ref())))
+        .await?
+        .serve_until(service, shutdown)
         .await
+}
+
+/// An acquired worker socket and validated TLS configuration. Startup can
+/// reserve the listener before registration or lease claims without accepting
+/// operations until the worker is ready.
+pub struct WorkerListener {
+    listener: tokio::net::TcpListener,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+}
+
+impl WorkerListener {
+    pub async fn bind(
+        addr: std::net::SocketAddr,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Result<Self, std::io::Error> {
+        let tls = match tls {
+            Some((cert, key)) => {
+                Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?)
+            }
+            None => None,
+        };
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Ok(Self { listener, tls })
+    }
+
+    pub async fn serve_until(
+        self,
+        service: WorkerService,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), std::io::Error> {
+        if let Some(config) = self.tls {
+            let server = axum_server::from_tcp_rustls(self.listener.into_std()?, config)?;
+            let handle = axum_server::Handle::new();
+            let trigger = handle.clone();
+            let shutdown_task = ShutdownTask(tokio::spawn(async move {
+                shutdown.await;
+                trigger.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            }));
+            let outcome = server
+                .handle(handle)
+                .serve(
+                    service
+                        .router()
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await;
+            drop(shutdown_task);
+            outcome
+        } else {
+            axum::serve(self.listener, service.router())
+                .with_graceful_shutdown(shutdown)
+                .await
+        }
+    }
+}
+
+/// Releases a spawned shutdown task even if the server future is cancelled,
+/// so the listener handle and the caller's shutdown resources are not left
+/// owned by a task that never finishes.
+struct ShutdownTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ShutdownTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
