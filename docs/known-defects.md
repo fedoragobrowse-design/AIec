@@ -1513,6 +1513,49 @@ number as the other two runtimes. Regression:
 entry past the bound to be a refusal, the bound itself to list whole with every
 entry described, and removing the bound check fails the refusal.
 
+### Bubblewrap's directory listing was the last one with no ceiling
+
+**Fixed.** Four runtimes serve `files.list`. Docker bounds it, e2b bounds it,
+and the guest agent now bounds it. Bubblewrap's
+`list_files` (`crates/aiec-runtime/src/lib.rs:688`) read `read_dir` into a
+`Vec<FileEntry>` with no limit at all, so a tenant decided how much of the
+worker's heap one listing allocated — the workspace is theirs to fill.
+
+The bound existed three times over in that file's neighbourhood, as a private
+constant in each backend, and that is how the fourth went missing: it was not a
+decision that Bubblewrap lacked, it was a decision Bubblewrap never got to
+make. `MAX_LIST_ENTRIES` is now one `pub(crate)` constant in `aiec-runtime`,
+used by docker and e2b as well, so the next backend cannot pick a different
+number by omission. The guest agent keeps its own copy because it is a separate
+crate that does not link the runtime.
+
+Regression: `a_directory_too_large_to_list_is_refused_rather_than_shortened`
+requires 10,000 to list whole and 10,001 to be a `LimitExceeded` refusal.
+Removing the bound makes it return `Ok` with a short listing.
+
+### Candidates audited and deliberately not changed
+
+- **`restore_owner_access`** (`crates/aiec-runtime/src/docker.rs:1119`) walks a
+  guest-created tree into an explicit stack with no entry ceiling. Bounding it
+  would leave the tree half-restored and the files owned by the wrong user, so
+  a slow walk is the correct trade on a cleanup path. The comment already
+  records that depth is the guest's to choose.
+- **Firecracker's `list_files`** carries no local check because its source is
+  the guest agent, which now refuses. The transport is bounded independently:
+  `read_frame_async_bounded` rejects any frame over `MAX_FRAME = 2 MiB` before
+  allocating it, and the frame is HMAC-authenticated with the per-sandbox guest
+  secret, so a guest process cannot forge a larger response.
+- **SDK and client `list_all` walks** accumulate into the caller's own heap
+  with a repeat-cursor guard but no total ceiling. That is a large tenant
+  listing to their own process, not a shared server; bounding it would make
+  the walk return an incomplete answer, which is the failure mode pagination
+  was introduced to avoid.
+- **Daemon loops** in the worker claim, heartbeat, lease-renewal and
+  `aiec-guard-watcher` incident polling run forever by design, are driven by
+  fixed operator intervals, and propagate errors rather than spinning.
+- **e2b's `bindings` map** grows one entry per created sandbox and is only
+  removed on `destroy`. Worker-lifetime and a few hundred bytes per entry.
+
 ## Verification notes
 
 Two things about this cluster that cost time and will again.

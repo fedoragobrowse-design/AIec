@@ -81,6 +81,15 @@ fn into_core(error: RuntimeError) -> CoreError {
 /// grow a map keyed by a request-supplied id.
 pub const MAX_CONCURRENT_LIFECYCLES: usize = 4_096;
 
+/// Most entries one directory listing will describe, for every runtime.
+///
+/// This lives here rather than per backend because that is how it went wrong:
+/// docker, e2b and the guest agent each carried their own copy of the same
+/// number, and Bubblewrap's listing, which had none, was missed rather than
+/// being a fourth decision. The number is only a defence if it is the same
+/// number everywhere.
+pub(crate) const MAX_LIST_ENTRIES: usize = 10_000;
+
 /// Largest Firecracker API response header this runtime will read, in bytes.
 const HEADER_LIMIT: usize = 64 * 1024;
 
@@ -682,6 +691,17 @@ impl BubblewrapRuntime {
         let mut out = vec![];
         while let Some(v) = rd.next_entry().await? {
             let m = v.metadata().await?;
+            // Refused rather than shortened, and for the reason the other
+            // runtimes give: a caller that walks a workspace treats a listing
+            // as complete, so a truncated one archives a directory that is
+            // missing files and reports it as whole. The guest chooses this
+            // directory's size - the workspace is the tenant's to fill.
+            if out.len() == MAX_LIST_ENTRIES {
+                return Err(CoreError::LimitExceeded(format!(
+                    "directory holds more than {MAX_LIST_ENTRIES} entries"
+                ))
+                .into());
+            }
             out.push(FileEntry {
                 name: v.file_name().to_string_lossy().into_owned(),
                 path: format!(
@@ -5152,6 +5172,44 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    /// A directory the guest made enormous is refused, not shortened.
+    ///
+    /// Docker, e2b and the guest agent all bound this and all refuse rather
+    /// than truncate, because a caller walking a workspace treats a listing as
+    /// complete. Bubblewrap's listing had no ceiling at all, so one tenant
+    /// could decide how much of the worker's heap a single `files.list` call
+    /// allocates - and the workspace directory is theirs to fill.
+    #[tokio::test]
+    async fn a_directory_too_large_to_list_is_refused_rather_than_shortened() {
+        let root = std::env::temp_dir().join(format!("af-listing-{}", Uuid::now_v7()));
+        let runtime = BubblewrapRuntime::new(&root);
+        let target = sandbox(Uuid::now_v7(), 60);
+        runtime.create(&target).await.unwrap();
+
+        let workspace = root.join(target.id.to_string()).join("workspace");
+        for index in 0..=MAX_LIST_ENTRIES {
+            std::fs::write(workspace.join(format!("entry-{index}")), b"").unwrap();
+        }
+
+        let refused = runtime.list_files(&target, "/workspace").await;
+        assert!(
+            matches!(&refused, Err(RuntimeError::Core(CoreError::LimitExceeded(message))) if message.contains(&MAX_LIST_ENTRIES.to_string())),
+            "one entry past the bound must be a refusal, not a short listing: {refused:?}"
+        );
+
+        // One below the bound still lists whole: the bound is where the walk
+        // stops being able to describe everything, not a number callers have
+        // to stay under.
+        std::fs::remove_file(workspace.join(format!("entry-{MAX_LIST_ENTRIES}"))).unwrap();
+        let listed = runtime
+            .list_files(&target, "/workspace")
+            .await
+            .expect("a directory at the bound lists");
+        assert_eq!(listed.len(), MAX_LIST_ENTRIES);
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     /// A publish that cannot complete leaves the key with the snapshot it

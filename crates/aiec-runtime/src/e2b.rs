@@ -67,7 +67,6 @@ const MAX_PROVIDER_TIMEOUT_SECONDS: u64 = 3_600;
 const DEFAULT_SANDBOX_TIMEOUT_SECONDS: u64 = 900;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const WORKSPACE_ROOT: &str = "/workspace";
-const MAX_LIST_ENTRIES: usize = 10_000;
 
 /// Connect protocol endpoints exposed by `envd`.
 ///
@@ -1561,7 +1560,7 @@ fn file_entries(listing: &Value, root: &Path) -> Result<Vec<FileEntry>, CoreErro
         .get("entries")
         .and_then(Value::as_array)
         .ok_or_else(|| CoreError::Backend("envd listing carried no entries".into()))?;
-    if entries.len() > MAX_LIST_ENTRIES {
+    if entries.len() > crate::MAX_LIST_ENTRIES {
         return Err(CoreError::LimitExceeded(
             "workspace listing has too many members".into(),
         ));

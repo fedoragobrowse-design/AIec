@@ -43,8 +43,6 @@ fn workspace_path(raw: &str) -> Result<String, aiec_core::CoreError> {
         .map_err(|_| aiec_core::CoreError::Forbidden("outside workspace".into()))
 }
 
-const MAX_LIST_ENTRIES: usize = 10_000;
-
 /// Whether a nameserver is one a container can actually reach.
 ///
 /// Loopback is the trap. A host running systemd-resolved lists only
@@ -932,7 +930,9 @@ impl SandboxRuntime for DockerRuntime {
         let path = workspace_path(path)?;
         let directory = self.open_workspace_directory(sandbox, &path)?;
         let mut files = Vec::new();
-        for name in directory_entry_names(&directory, MAX_LIST_ENTRIES).map_err(crate::into_core)? {
+        for name in
+            directory_entry_names(&directory, crate::MAX_LIST_ENTRIES).map_err(crate::into_core)?
+        {
             let entry = entry_stat(&directory, &name).map_err(aiec_core::CoreError::Io)?;
             let file_name = name.to_string_lossy().into_owned();
             files.push(FileEntry {
