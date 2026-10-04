@@ -360,6 +360,22 @@ impl FilesystemObjectStore {
     }
 }
 
+/// Most objects one `list` call will describe.
+///
+/// This is not a page size and there is no successor cursor: the route that
+/// calls this lists one sandbox's artifacts, and the point is to bound work
+/// rather than serve a page. It matters because on this backend `list` returns
+/// a checksum and a size for every object it finds, and computes them by reading
+/// each file end to end. Listing metadata therefore costs the bytes of the whole
+/// prefix, not just its directory entries — so without a bound, an ordinary
+/// tenant that can upload artifacts by name decides how much of the object store
+/// a single `GET` reads.
+///
+/// Past the bound the call is refused rather than truncated. A short list is
+/// indistinguishable from a complete one, which is the failure this exists to
+/// prevent; the refusal says there is more here than one call will describe.
+pub const MAX_LISTED_OBJECTS: usize = 1000;
+
 impl FilesystemObjectStore {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, StoreError> {
         let prefix = prefix.trim_end_matches('/');
@@ -408,6 +424,16 @@ impl FilesystemObjectStore {
                     .map_err(|_| StoreError::InvalidObjectKey("object path escaped root".into()))?
                     .to_string_lossy()
                     .replace('\\', "/");
+                // Checked before the read, not after: hashing is the expensive
+                // part, and a prefix just over the bound must cost no more
+                // than the bound allows rather than discovering the overflow
+                // one whole file too late.
+                if objects.len() >= MAX_LISTED_OBJECTS {
+                    return Err(StoreError::ListingLimitExceeded(format!(
+                        "more than {MAX_LISTED_OBJECTS} objects under the prefix; \
+                         listing them all is refused rather than truncated"
+                    )));
+                }
                 let mut file = tokio::fs::File::open(&path).await?;
                 let (size_bytes, digest) = hash_reader(&mut file, None, u64::MAX).await?;
                 objects.push(ObjectMetadata {
@@ -1332,6 +1358,59 @@ mod tests {
                 .is_err()
         );
         drop(download);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    /// `list` describes every object under a prefix, and on this backend it
+    /// computes a size and a checksum for each by reading the file end to end,
+    /// so an unbounded walk costs the bytes of the whole prefix. A tenant can
+    /// add objects to a sandbox by name with nothing stopping it from adding
+    /// many, which made one `GET` cost whatever the tenant had chosen to store.
+    #[tokio::test]
+    async fn a_listing_too_large_to_describe_is_refused_rather_than_truncated() {
+        let root = std::env::temp_dir().join(format!("aiec-list-{}", Uuid::new_v4()));
+        let store = FilesystemObjectStore::new(&root);
+
+        for index in 0..MAX_LISTED_OBJECTS {
+            store
+                .put(
+                    &format!("tenants/t/sandboxes/s/artifacts/artifact-{index:06}"),
+                    Bytes::from(vec![b'a'; 8]),
+                )
+                .await
+                .unwrap();
+        }
+        // Exactly at the bound is a complete listing, not a refusal: the bound
+        // is where the walk stops being able to describe everything, not a
+        // number the caller has to stay under.
+        let at_bound = store
+            .list("tenants/t/sandboxes/s/artifacts/")
+            .await
+            .unwrap();
+        assert_eq!(at_bound.len(), MAX_LISTED_OBJECTS);
+
+        store
+            .put(
+                "tenants/t/sandboxes/s/artifacts/artifact-overflow",
+                Bytes::from(vec![b'a'; 8]),
+            )
+            .await
+            .unwrap();
+        // One over is refused, and the refusal must not look like a short
+        // listing: a caller given fewer objects than exist would read it as a
+        // complete answer, which is the failure the bound exists to prevent.
+        assert!(matches!(
+            store.list("tenants/t/sandboxes/s/artifacts/").await,
+            Err(StoreError::ListingLimitExceeded(_))
+        ));
+        // The bound is on the walk, not on the prefix: a listing small enough
+        // to describe still answers normally while the store holds more.
+        let other = store
+            .list("tenants/t/sandboxes/other/artifacts/")
+            .await
+            .unwrap();
+        assert!(other.is_empty());
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

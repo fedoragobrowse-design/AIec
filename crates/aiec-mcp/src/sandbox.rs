@@ -21,12 +21,26 @@ use aiec_core::{
     SandboxState, WorkspaceSpec,
 };
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::{ErrorCode, McpError, ToolResult};
 use crate::guard::LocalEndpoint;
 
+/// How many sandboxes one listing will describe.
+///
+/// The control plane's own sandbox list is paged for exactly this reason. This
+/// server tracks its own machines and fetches each one by id, so the cost of
+/// listing is one request per machine and grows with everything this process
+/// has ever created. Refused rather than truncated: a shorter list would be
+/// indistinguishable from a complete one, and a caller acting on "these are my
+/// machines" would leave the rest running and never learn about them.
+const MAX_OWNED_SANDBOXES: usize = 200;
+
+/// How many of those requests are in flight at once. Bounded so that a listing
+/// with a few hundred machines does not open a few hundred sockets.
+const OWNED_FETCH_CONCURRENCY: usize = 8;
 /// The marker recorded on every sandbox this server creates.
 pub const CREATED_BY: &str = "aiec-mcp";
 
@@ -295,14 +309,43 @@ impl LocalAiec {
             let guard = self.owned.lock().expect("ownership lock is not poisoned");
             guard.iter().map(|record| record.sandbox_id).collect()
         };
+        if owned.len() > MAX_OWNED_SANDBOXES {
+            return Err(McpError::invalid(format!(
+                "this server owns {} sandboxes; destroy the ones you no longer \
+                 need before asking it to describe all of them",
+                owned.len()
+            )));
+        }
+        // Concurrently, and bounded. This is one request per machine, so a
+        // serial walk made a health poll cost the length of this server's whole
+        // history, on a path a client reaches repeatedly.
+        let fetched = futures::stream::iter(owned.iter().copied())
+            .map(|id| async move {
+                let sandbox = self.client.get_sandbox(id).await;
+                (id, sandbox)
+            })
+            .buffer_unordered(OWNED_FETCH_CONCURRENCY);
+        futures::pin_mut!(fetched);
         let mut views = Vec::with_capacity(owned.len());
-        for id in owned {
-            let sandbox = self
-                .client
-                .get_sandbox(id)
-                .await
-                .map_err(|error| map_client_error(&error))?;
-            views.push(view_of(&sandbox));
+        let mut dead: Vec<Uuid> = Vec::new();
+        while let Some((id, sandbox)) = fetched.next().await {
+            match sandbox {
+                Ok(sandbox) if is_terminal(sandbox.state) => dead.push(id),
+                Ok(sandbox) => views.push(view_of(&sandbox)),
+                Err(error) if map_client_error(&error).code == ErrorCode::SandboxNotFound => {
+                    dead.push(id)
+                }
+                Err(error) => return Err(map_client_error(&error).with_sandbox(id)),
+            }
+        }
+        // A machine that is gone, or that finished on its own, is not something
+        // this server can clean up or hand back. It was kept here only because
+        // `forget` runs on an explicit destroy, so a sandbox that timed out or
+        // failed by itself stayed in the map for the life of the process — and
+        // this map is exactly what the listing walks, so a long-lived server
+        // made every poll cost one request per sandbox it had ever made.
+        for id in dead {
+            self.forget(id);
         }
         // Newest first, the order the list route returns, so the two ways of
         // seeing a sandbox's history agree.
@@ -821,5 +864,140 @@ mod tests {
     fn an_empty_command_is_rejected_before_any_request() {
         let error = McpError::invalid("the command is empty");
         assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+
+    #[derive(Clone, Default)]
+    struct Stub {
+        requested: Arc<Mutex<Vec<String>>>,
+        gone: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn stub_handle(
+        axum::extract::State(stub): axum::extract::State<Stub>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        let id = request
+            .uri()
+            .path()
+            .strip_prefix("/v1/sandboxes/")
+            .unwrap_or_default()
+            .to_owned();
+        stub.requested
+            .lock()
+            .expect("not poisoned")
+            .push(id.clone());
+        let gone = stub.gone.lock().expect("not poisoned").clone();
+        // Retention-expired: the control plane no longer has this one at all,
+        // so it answers 404 rather than a document.
+        let (status, body) = if gone.contains(&id) {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                serde_json::json!({"error": {
+                    "code": "not_found",
+                    "message": "gone",
+                    "request_id": "00000000-0000-0000-0000-000000000003",
+                }}),
+            )
+        } else if id.ends_with('1') {
+            (
+                axum::http::StatusCode::OK,
+                sandbox_document(&id, "destroyed"),
+            )
+        } else {
+            (axum::http::StatusCode::OK, sandbox_document(&id, "running"))
+        };
+        (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response()
+    }
+
+    /// A sandbox document the way the control plane returns one.
+    fn sandbox_document(id: &str, state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "tenant_id": "00000000-0000-0000-0000-000000000001",
+            "node_id": serde_json::Value::Null,
+            "image_id": "image",
+            "state": state,
+            "runtime": "docker",
+            "cpu": 1,
+            "memory_mb": 128,
+            "disk_mb": 128,
+            "timeout_seconds": 900,
+            "network": {"enabled": false},
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "runtime_path": serde_json::Value::Null,
+        })
+    }
+
+    /// A long-lived server reads its sandbox list on a health poll, and that
+    /// list is one request per machine this process ever created. Two things
+    /// follow, and both are checked here: a machine that finished on its own
+    /// stops being carried, and a server holding more than one listing will
+    /// describe refuses rather than describing part of it.
+    #[tokio::test]
+    async fn the_owned_listing_forgets_finished_machines_and_refuses_past_its_bound() {
+        let stub = Stub {
+            gone: std::sync::Arc::new(std::sync::Mutex::new(vec![
+                "00000000-0000-0000-0000-000000000003".to_owned(),
+            ])),
+            ..Stub::default()
+        };
+        let app = axum::Router::new()
+            .fallback(any(stub_handle))
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let url = format!("http://{}", listener.local_addr().expect("a bound address"));
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = LocalEndpoint::parse(&url, false).expect("a loopback endpoint");
+        let aiec = LocalAiec::new(endpoint, String::new(), 900, 1 << 20, 4).expect("a facade");
+        let live = "00000000-0000-0000-0000-000000000002";
+        // Ends in 1, so the stub reports it as having finished on its own.
+        let finished = "00000000-0000-0000-0000-000000000001";
+        let vanished = "00000000-0000-0000-0000-000000000003";
+        aiec.mark_tool_owned(Uuid::parse_str(live).expect("a uuid"));
+        aiec.mark_tool_owned(Uuid::parse_str(finished).expect("a uuid"));
+        // Retention-expired: the control plane no longer has this one at all.
+        aiec.mark_tool_owned(Uuid::parse_str(vanished).expect("a uuid"));
+
+        let views = aiec.list_owned_sandboxes().await.expect("a listing");
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| view.sandbox_id.to_string())
+                .collect::<Vec<_>>(),
+            vec![live.to_owned()],
+            "a machine that finished on its own is not one to hand back"
+        );
+        assert_eq!(
+            aiec.owned_sandbox_ids(),
+            vec![Uuid::parse_str(live).expect("a uuid")],
+            "and it must leave the map, or every later poll fetches it again"
+        );
+
+        // More machines than one listing will describe. Refused rather than
+        // truncated, so a caller is never handed a partial "these are my
+        // machines" answer and left the rest running.
+        for _ in 0..MAX_OWNED_SANDBOXES {
+            aiec.mark_tool_owned(Uuid::new_v4());
+        }
+        assert!(
+            aiec.list_owned_sandboxes().await.is_err(),
+            "a listing past the bound must be refused, not truncated"
+        );
+
+        serving.abort();
     }
 }

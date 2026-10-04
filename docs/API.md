@@ -25,6 +25,8 @@ Base path `/v1`. Except health/metrics, send `Authorization: Bearer af_live_...`
 - `DELETE /v1/snapshots/{id}`.
 - `POST|GET|DELETE /v1/sandboxes/{id}/artifacts/{name}` provides tenant-scoped upload/download/delete with a 64 MiB decoded-size limit. `GET /v1/sandboxes/{id}/artifacts` lists sorted object metadata for the development filesystem backend. The production S3 backend returns a typed `501` for listing until ListObjectsV2 support is implemented and verified.
 
+  The listing is bounded by `MAX_LISTED_OBJECTS` (1000) objects under the sandbox's prefix, and is **refused with `413 limit_exceeded`** past that rather than truncated — a shorter list would be indistinguishable from a complete one. The bound is on the walk rather than on uploads: `PUT` of distinct names is uncapped, so a sandbox can hold more than one listing will describe. On the filesystem backend the listing also computes each object's size and SHA-256 by reading it, so its cost is the bytes of the prefix, not just its directory entries; the bound exists to keep that proportional to the platform rather than to tenant storage.
+
 - `GET /v1/usage` — metric totals for current tenant.
 
 The Python SDK exposes the same size-guarded partial path as `Sandbox.upload_artifact`, `download_artifact`, and `delete_artifact`; listing remains unsupported, and the production S3 path remains unverified.

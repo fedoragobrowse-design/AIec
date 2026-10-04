@@ -1328,6 +1328,191 @@ supports. It was reverted rather than left in, because it would have made
 A `2026-07-28` client talks to this server over per-request metadata instead of
 the legacy handshake; that path is the SDK's, not ours.
 
+### `GET /v1/sandboxes/{id}/artifacts` read the whole prefix and hashed it
+
+**Fixed.** The route lists one sandbox's artifacts under
+`tenants/{tenant}/sandboxes/{id}/artifacts/`, and `FilesystemObjectStore::list`
+walked that tree with no bound — and it returned a size and a SHA-256 for every
+object it found, which it computes by reading each file end to end. So the cost
+of asking for a listing of object *metadata* was the bytes of every object in
+the prefix.
+
+What made it reachable is that `MAX_ARTIFACTS = 64` does not cover it. That
+constant bounds `WorkloadSpec.artifacts` — the paths a *run* collects. The
+direct upload route `PUT /v1/sandboxes/{id}/artifacts/{name}` is separately
+tenant-callable, accepts any distinct `name` (up to 128 characters from a fixed
+alphabet), and has no cap on how many. An ordinary tenant could therefore store
+as many objects as it liked under one sandbox and make each subsequent listing
+read all of them.
+
+`MAX_LISTED_OBJECTS = 1000` now bounds the walk, checked *before* each file is
+opened rather than after, so a prefix just over the bound does not cost one
+whole file more than the bound allows. Past the bound the call is refused with
+`StoreError::ListingLimitExceeded` → `CoreError::LimitExceeded`, which the API
+already maps to `413 limit_exceeded`. Refused rather than truncated on purpose:
+a short listing is indistinguishable from a complete one, and a caller that
+cannot distinguish them will treat a partial answer as the truth.
+
+The S3 backend is unaffected — its `list` is `Unsupported` and returns
+`501`. This bound is on the filesystem backend, which is what a self-hosted or
+development deployment actually runs.
+
+Regression: `a_listing_too_large_to_describe_is_refused_rather_than_truncated`,
+which puts exactly `MAX_LISTED_OBJECTS` objects under a prefix and requires a
+complete listing, adds one more and requires a refusal, and requires a small
+listing to still answer while the store holds more. Removing the bound check
+fails it at the refusal assertion.
+
+### Checked and not defects: the three unbounded run-history reads
+
+`list_run_events`, `list_run_attempts` and `list_run_artifacts` are complete
+per-Run reads with no `LIMIT`, which looks like the same defect as the sandbox
+list. They are not: each is bounded by a constant enforced on the write path,
+so the response size cannot grow with tenant tenure the way `GET /v1/sandboxes`
+did.
+
+- **`run_attempts` ≤ `MAX_RUN_ATTEMPTS` = 10.** `validate` refuses anything
+  outside `1..=MAX_RUN_ATTEMPTS` (`crates/aiec-api/src/runs.rs:186`), the loop
+  is `for number in 1..=request.max_attempts` (`runs.rs:225`), and the table
+  adds `UNIQUE (run_id, attempt_number)` with `CHECK (attempt_number > 0)`.
+- **`run_artifacts` ≤ `MAX_ARTIFACTS` = 64.** Enforced in
+  `WorkloadSpec::validate` (`crates/aiec-core/src/run.rs:237`), and
+  `put_run_artifacts` replaces the run's artifact set rather than appending to
+  it.
+- **`run_events`** is the only one that is not capped by a single constant, and
+  it is still bounded: the events a run accumulates are a function of its
+  attempts. Roughly 700 rows in the worst case, from one `run.created`, per
+  attempt one `sandbox.assigned`, at most `MAX_SETUP_COMMANDS` (32)
+  `task.started`, 32 validation `task.started`, one `task.finished`, one settled
+  event, and at most one `sandbox.destroyed`.
+
+The part worth stating because it looked like the opposite: the cleanup loop at
+`runs.rs:1965` emits one `sandbox.destroyed` per sandbox, so events scale with
+sandboxes per run. There is no named cap on sandboxes per run, but
+`run_sandboxes` is written only by `link_attempt_sandbox`
+(`crates/aiec-storage/src/postgres.rs:516`), which is one row per attempt and
+is guarded by `sandbox_id IS NULL` on a `running` attempt. So the bound is
+`MAX_RUN_ATTEMPTS`, transitively. `link_run_sandbox` — the public trait method
+that would write a row not tied to an attempt — has no production caller.
+
+Eval matrix and repetitions do not change this: they create many *runs*, each
+with one sandbox, not many sandboxes in one run.
+
+### Checked and not defects: source-address spoofing on every guest path
+
+`c839bab` fixed the legacy TAP path, and the open question was whether it also
+covered Firecracker. It does. There are exactly two nftables builders in the
+tree and both refuse a forged source:
+
+| Guest path | Verdict | Decisive rule |
+|---|---|---|
+| Firecracker with a Guard policy | covered | `crates/aiec-guard/src/enforcement/render.rs:391` — `input iifname "{iface}" ip saddr != {guest} counter … drop` |
+| Firecracker without one (`AIEC_ALLOW_LEGACY_NETWORK=1`) | covered | `crates/aiec-network-linux/src/lib.rs:445` and `:453` — `input`/`forward iifname "{tap}" ip saddr != {guest} drop` |
+| Docker | not applicable | it never builds a host-side policy at all; policy becomes a Docker network-mode string (`crates/aiec-runtime/src/docker.rs:131-139`) |
+| `NetworkPolicy::Disabled` | not applicable | no interface is created, so there is no link to source from |
+| host-network mode | does not exist | `NetworkPolicy` has three variants and none maps to `"host"` |
+
+`FirecrackerRuntime::new` builds a `GuardNetworkManager`
+(`crates/aiec-runtime/src/lib.rs:2069`), which dispatches on whether the sandbox
+carries a policy (`crates/aiec-network-linux/src/guard.rs:1196`) — so the
+shipped worker takes one of the two covered branches, never a third.
+
+Two details that make the legacy rules hold rather than merely exist. The only
+`ct state` accept is keyed `oifname "{tap}" ip daddr {guest}` (`lib.rs:460`) —
+inbound *to* the guest, so a guest cannot reach it with a forged source. And the
+masquerade (`:462`) is keyed `ip saddr {guest}`, so a forged source is not even
+NATed. Guard renders no masquerade and no `ct state` at all: its egress
+terminates at an in-host gateway (`forward iifname "{iface}" … drop`,
+`render.rs:405`).
+
+Each builder has its own anti-spoof regression rather than one shared test:
+`a_forged_source_from_the_guest_is_dropped_before_any_accept_runs`
+(`crates/aiec-network-linux/src/lib.rs:1032`) and
+`the_generated_ruleset_enforces_the_model_it_was_built_from`
+(`crates/aiec-guard/src/enforcement.rs:1598`). Both assert *ordering* — that the
+drop precedes every `accept` — which is the property that matters. There is no
+single test asserting both, and no unit-level Firecracker end-to-end check: that
+proof needs real nft and KVM and lives in the acceptance harness.
+
+One adjacent fact, recorded so it is not re-audited as a new finding: the
+`bwrap-dev` runtime gives the guest the host network namespace whenever network
+is enabled — no `--unshare-net`, no nft (`crates/aiec-runtime/src/lib.rs:623`).
+That is the one place a guest shares the host's stack outright. It is outside
+the production boundary and is documented as such in `docs/SECURITY.md:3`.
+
+### The MCP server's sandbox list never shrank, and cost one request each
+
+**Fixed.** `LocalAiec` keeps its own `owned` map of the sandboxes the MCP server
+created, and `list_owned_sandboxes` walked it with one `get_sandbox` request per
+machine, in series. Two separate problems:
+
+- **It grew without bound.** `forget` runs only from an explicit
+  `destroy_sandbox` (`crates/aiec-mcp/src/sandbox.rs:636`). A machine that
+  timed out, failed, or aged past retention stayed in the map for the life of
+  the process, so a long-running MCP server accumulated every sandbox it had
+  ever made and fetched all of them on every listing.
+- **A health poll paid for it.** `health_report` calls the same listing
+  (`crates/aiec-mcp/src/server.rs:784`), so the cost of asking the server if it
+  was alive was one round trip per sandbox it had ever created — on the path a
+  client reaches repeatedly, and grows without limit. `aiec://sandboxes` and the
+  `list_sandboxes` tool had the same exposure.
+
+The listing now fetches concurrently with `OWNED_FETCH_CONCURRENCY = 8` so a few
+hundred machines do not open a few hundred sockets, drops any machine that is
+terminal or that the control plane no longer has — neither is something this
+server can clean up or hand back — and refuses past `MAX_OWNED_SANDBOXES = 200`.
+Refused rather than truncated, for the same reason as everywhere else in this
+file: a shorter list is indistinguishable from a complete one, and a caller
+acting on "these are my machines" would leave the rest running without ever
+learning of them.
+
+Regression: `the_owned_listing_forgets_finished_machines_and_refuses_past_its_bound`
+checks all three properties — a destroyed machine is not handed back, it leaves
+the map, and a 404 for a retention-expired one prunes it too, and a server past
+the bound is refused. Removing the prune fails on the ownership-map assertion;
+removing the bound fails on the refusal.
+
+### The Python SDK's `list_all` had no way to stop
+
+**Fixed.** The Rust client gained two guards when the sandbox list was
+paged — a cursor already followed stops the walk, and an empty page carrying a
+cursor is refused. The Python SDK's `list_all`, which walks the same route, had
+neither: it ended only when the server said there was no next page, so a
+control plane that kept offering a cursor made it request forever.
+
+Both guards are now in `sdk/python/agentforge/client.py`, raising `ValueError`.
+Regressions: `test_a_control_plane_that_repeats_a_cursor_cannot_walk_forever`
+and `test_an_empty_page_with_a_cursor_is_refused_not_repeated`.
+
+Both stubs refuse past five requests, so a walk that does not stop fails in
+about a second rather than spinning until the suite is killed — the first
+version of these tests hung, which proved the defect and made for a worse
+regression.
+
+### The guest agent's directory listing was the one unbounded one
+
+**Fixed.** Three runtimes serve a directory listing and two of them already
+bounded it. Docker refuses a directory holding more than `MAX_LIST_ENTRIES =
+10_000` entries, and says why in the code: a silent truncation there would
+archive a workspace that is missing files (`crates/aiec-runtime/src/docker.rs:382`).
+e2b bounds the same way. The Firecracker path went through the guest agent, and
+`guest/aiec-guest/src/main.rs` read the whole directory into a `Vec` with no
+ceiling at all.
+
+The host's bound did not cover it. Both Firecracker workspace walks cap
+`total` against `MAX_WORKSPACE_ARCHIVE_BYTES` (`crates/aiec-runtime/src/lib.rs:3711`
+and `:3842`) — total *bytes*. A directory of a million empty files is a few
+megabytes and never approaches it, while still costing a million-entry vector
+in the guest, a million-entry response frame over vsock, and a million-entry
+`Vec<FileEntry>` on the host.
+
+The listing is now `list_directory`, extracted from the request match and
+bounded at the same 10,000, refusing rather than shortening — same reason, same
+number as the other two runtimes. Regression:
+`a_directory_too_large_to_list_is_refused_rather_than_shortened` requires one
+entry past the bound to be a refusal, the bound itself to list whole with every
+entry described, and removing the bound check fails the refusal.
+
 ## Verification notes
 
 Two things about this cluster that cost time and will again.

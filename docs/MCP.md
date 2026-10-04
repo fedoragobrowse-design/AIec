@@ -68,6 +68,27 @@ left open so a supervisor can probe it without holding a credential.
 | `aiec_run_cancel` | Stop a run and reclaim its machines |
 | `aiec_health` | Local control-plane and capacity status |
 
+
+### What "sandboxes this server created" means
+
+`aiec_list_sandboxes`, the `aiec://sandboxes` resource and `aiec_health` all read
+the same list: the machines this MCP server process created, fetched by id
+rather than by scanning the tenant's list. Two properties of that list are worth
+knowing before relying on it.
+
+It **forgets**. A machine that has finished — destroyed, failed, or aged past
+retention so the control plane no longer has it — is dropped from the list the
+first time it is seen. So the list is "machines I still hold", not "machines I
+have ever made", and a long-running server does not accumulate every sandbox it
+has ever created. An explicitly destroyed sandbox was always removed.
+
+It is **bounded**, and past the bound it is refused rather than shortened. A
+partial list would be indistinguishable from a complete one, and a caller
+treating "these are my machines" as complete would leave the rest running
+without ever learning of them. Keep fewer than 200 live at once and destroy what
+you no longer need. The bound is on this list only — the control plane's own
+`GET /v1/sandboxes` is separately paged.
+
 A typical loop from an agent:
 
 ```json

@@ -142,6 +142,59 @@ class SandboxPageTest(unittest.TestCase):
             "a raw plus in the query is a space by the time the server decodes it",
         )
 
+    def test_a_control_plane_that_repeats_a_cursor_cannot_walk_forever(self):
+        """A cursor the walk has already followed stops the walk.
+
+        ``list_all`` ends when the server says there is no next page, so on its
+        own it has no way to end. A control plane that keeps handing back the
+        same cursor makes it fetch forever -- the same defect the paging was
+        added to stop, one layer down. The stub refuses past a few requests so
+        that a walk which does not stop fails here in a second instead of
+        spinning until the suite is killed.
+        """
+        client = a_client()
+        seen = []
+
+        def request(method, path, payload=None, *, timeout=120):
+            seen.append(path)
+            if len(seen) > 5:
+                raise AssertionError(
+                    f"the walk made {len(seen)} requests without stopping"
+                )
+            return {"sandboxes": [{"id": "a"}],
+                    "next": {"created_at": "2024-01-01T00:00:00Z", "id": "a"}}
+
+        client._request = request
+        with self.assertRaises(ValueError):
+            client.sandboxes.list_all()
+        self.assertEqual(len(seen), 2, "it must stop, not keep re-fetching")
+
+    def test_an_empty_page_with_a_cursor_is_refused_not_repeated(self):
+        """An empty page names nothing to advance past.
+
+        A cursor describes where the next page begins. With nothing in this
+        one, following it can only return the same nothing, so the walk would
+        issue requests without ever making progress. As above, the stub refuses
+        past a few requests so an unbounded walk fails here rather than
+        spinning until the suite is killed.
+        """
+        client = a_client()
+        seen = []
+
+        def request(method, path, payload=None, *, timeout=120):
+            seen.append(path)
+            if len(seen) > 5:
+                raise AssertionError(
+                    f"the walk made {len(seen)} requests without stopping"
+                )
+            return {"sandboxes": [],
+                    "next": {"created_at": "2024-01-01T00:00:00Z", "id": "a"}}
+
+        client._request = request
+        with self.assertRaises(ValueError):
+            client.sandboxes.list_all()
+        self.assertEqual(len(seen), 1, "the contradiction is the first page's")
+
     def test_a_cursor_without_both_halves_is_refused_before_the_request(self):
         client, seen = self.paged([{"sandboxes": [], "next": None}])
         for cursor in ({"created_at": "2024-01-01T00:00:00Z"}, {"id": "a"}, {}):

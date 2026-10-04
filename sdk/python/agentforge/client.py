@@ -314,16 +314,36 @@ class _Sandboxes:
         """
         collected: list = []
         cursor = None
+        seen: list = []
         while True:
             page = (
                 self.list(limit)
                 if cursor is None
                 else self.list_after(cursor, limit)
             )
+            # The walk is bounded by the server saying it is done, so it needs
+            # its own termination guarantee. A control plane that keeps offering
+            # a cursor without advancing past it turns this into an unbounded
+            # request loop -- the same defect the paging was added to stop, one
+            # layer down, and it never ends on its own.
+            nxt = page.next
+            if nxt is not None:
+                position = (nxt["created_at"], nxt["id"])
+                if position in seen:
+                    raise ValueError(
+                        f"GET /v1/sandboxes returned the cursor {nxt['id']} twice; "
+                        "the page walk was stopped rather than repeated"
+                    )
+                if not page.sandboxes:
+                    raise ValueError(
+                        "GET /v1/sandboxes returned an empty page and a cursor "
+                        f"({nxt['id']}); there is nothing to advance past"
+                    )
+                seen.append(position)
             collected.extend(page.sandboxes)
-            cursor = page.next
-            if cursor is None:
+            if nxt is None:
                 return collected
+            cursor = nxt
 
     def list_after(self, cursor: dict, limit: int = MAX_LIST_LIMIT) -> "SandboxPage":
         """The page starting where ``cursor`` says."""

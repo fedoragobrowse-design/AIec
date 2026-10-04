@@ -64,6 +64,11 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("invalid object key: {0}")]
     InvalidObjectKey(String),
+    /// The listing is over the platform's bound rather than open-ended.
+    /// Surfaced as `CoreError::LimitExceeded`, so a caller can tell "there is
+    /// nothing here" from "there is more than one call will describe".
+    #[error("listing limit exceeded: {0}")]
+    ListingLimitExceeded(String),
     #[error("object store: {0}")]
     ObjectStore(String),
     #[error("unsupported repository operation: {0}")]
@@ -91,6 +96,7 @@ pub(crate) fn core_error(error: StoreError) -> CoreError {
         StoreError::Io(error) => CoreError::Io(error),
         StoreError::Json(error) => CoreError::Backend(error.to_string()),
         StoreError::InvalidObjectKey(message) => CoreError::InvalidRequest(message),
+        StoreError::ListingLimitExceeded(message) => CoreError::LimitExceeded(message),
         StoreError::ObjectStore(message) => CoreError::Backend(message),
         StoreError::Unsupported(operation) => {
             CoreError::Unsupported(format!("metadata operation `{operation}`"))

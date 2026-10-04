@@ -15,6 +15,15 @@ const AF_VSOCK: i32 = 40;
 const SOCK_STREAM: i32 = 1;
 const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
 
+/// Most entries one directory listing will describe.
+///
+/// The other runtimes bound this at the same number and refuse rather than
+/// shorten. Refusing is the point: the caller walking a workspace treats a
+/// listing as complete, so a truncated one archives a directory that is
+/// missing files and reports it as whole. The host's own walk bounds total
+/// bytes, which a directory of a million empty files never approaches.
+const MAX_LIST_ENTRIES: usize = 10_000;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SockAddrVm {
@@ -23,6 +32,49 @@ struct SockAddrVm {
     svm_port: u32,
     svm_cid: u32,
     svm_zero: [u8; 16],
+}
+
+/// Lists one directory, refusing a directory too large to describe whole.
+fn list_directory(path: &Path) -> Result<Vec<DirectoryEntry>, String> {
+    let mut entries = Vec::new();
+    for item in fs::read_dir(path).map_err(|error| error.to_string())? {
+        let item = item.map_err(|error| error.to_string())?;
+        // `symlink_metadata` rather than `metadata`: a link is described by
+        // what it is, not by what it points at, so a link out of the tree is
+        // not reported as the directory it targets and a walker does not
+        // descend through it.
+        let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+        let kind = if metadata.is_dir() {
+            FileKind::Directory
+        } else {
+            FileKind::File
+        };
+        // The path reported is the one the caller asked about plus this
+        // entry's name, which is inside the workspace by construction.
+        // Resolving it is left to the operation that uses it: a link whose
+        // target escapes is still listed, so the caller can see that it is
+        // there, and still cannot read through it, because every read resolves
+        // the path again and refuses. Resolving here instead aborted the whole
+        // listing on the first escaping link, which is how a repository
+        // containing one lost its entire file list.
+        let child = item.path();
+        // Checked before the push, so the listing costs no more than the bound
+        // allows and the caller is told the directory is too large rather than
+        // handed the first MAX_LIST_ENTRIES entries as though they were all of
+        // them.
+        if entries.len() == MAX_LIST_ENTRIES {
+            return Err(format!(
+                "directory holds more than {MAX_LIST_ENTRIES} entries"
+            ));
+        }
+        entries.push(DirectoryEntry {
+            name: item.file_name().to_string_lossy().into_owned(),
+            path: child.to_string_lossy().into_owned(),
+            kind,
+            size: metadata.len(),
+        });
+    }
+    Ok(entries)
 }
 
 fn vsock_listener() -> std::io::Result<OwnedFd> {
@@ -525,43 +577,8 @@ fn serve_connection(stream: OwnedFd, secret: &[u8]) -> Result<bool, String> {
                     _ => Err("write chunk payload required".into()),
                 },
                 Operation::ListDirectory => match request.payload {
-                    RequestPayload::Path { path } => {
-                        let path = safe_path(&path)?;
-                        let mut entries = Vec::new();
-                        for item in fs::read_dir(path).map_err(|error| error.to_string())? {
-                            let item = item.map_err(|error| error.to_string())?;
-                            // `symlink_metadata` rather than `metadata`: a link is
-                            // described by what it is, not by what it points at, so
-                            // a link out of the tree is not reported as the
-                            // directory it targets and a walker does not descend
-                            // through it.
-                            let metadata = fs::symlink_metadata(item.path())
-                                .map_err(|error| error.to_string())?;
-                            let kind = if metadata.is_dir() {
-                                FileKind::Directory
-                            } else {
-                                FileKind::File
-                            };
-                            // The path reported is the one the caller asked about
-                            // plus this entry's name, which is inside the workspace
-                            // by construction. Resolving it is left to the
-                            // operation that uses it: a link whose target escapes
-                            // is still listed, so the caller can see that it is
-                            // there, and still cannot read through it, because
-                            // every read resolves the path again and refuses.
-                            // Resolving here instead aborted the whole listing on
-                            // the first escaping link, which is how a repository
-                            // containing one lost its entire file list.
-                            let child = item.path();
-                            entries.push(DirectoryEntry {
-                                name: item.file_name().to_string_lossy().into_owned(),
-                                path: child.to_string_lossy().into_owned(),
-                                kind,
-                                size: metadata.len(),
-                            });
-                        }
-                        Ok(ResponsePayload::ListDirectory { entries })
-                    }
+                    RequestPayload::Path { path } => list_directory(&safe_path(&path)?)
+                        .map(|entries| ResponsePayload::ListDirectory { entries }),
                     _ => Err("path payload required".into()),
                 },
                 Operation::CreateDirectory => match request.payload {
@@ -708,6 +725,43 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    /// A directory too large to describe is refused, not shortened. The host's
+    /// workspace walk treats a listing as complete, so a truncated one archives
+    /// a directory that is missing files and reports it as whole. The host's
+    /// byte bound does not cover this: a directory of empty files is small.
+    #[test]
+    fn a_directory_too_large_to_list_is_refused_rather_than_shortened() {
+        let root = std::env::temp_dir().join(format!("aiec-guest-listing-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        for index in 0..=MAX_LIST_ENTRIES {
+            std::fs::write(root.join(format!("entry-{index}")), b"").unwrap();
+        }
+
+        let refused = list_directory(&root);
+        assert!(
+            refused.is_err(),
+            "one entry past the bound must be a refusal, not a short listing"
+        );
+        assert!(
+            refused.unwrap_err().contains(&MAX_LIST_ENTRIES.to_string()),
+            "and the refusal should say what the bound was"
+        );
+
+        // One below the bound still lists whole: the bound is where the walk
+        // stops being able to describe everything, not a number the caller has
+        // to stay under.
+        std::fs::remove_file(root.join(format!("entry-{MAX_LIST_ENTRIES}"))).unwrap();
+        let listed = list_directory(&root).expect("a directory at the bound lists");
+        assert_eq!(listed.len(), MAX_LIST_ENTRIES);
+        assert!(
+            listed.iter().all(|entry| entry.kind == FileKind::File),
+            "and what it does list is described, not defaulted"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use super::*;
 
     #[test]
