@@ -695,10 +695,16 @@ impl AIecClient {
     }
 
     /// Lists this tenant's runs, newest first.
+    ///
+    /// One page. `after` is the last run of the previous page and pages
+    /// strictly past it on `(requested_at, id)`, so a caller that stops at a
+    /// page limit can say which run it stopped after rather than discovering
+    /// the ceiling by counting. `None` is the first page.
     pub async fn list_runs(
         &self,
         state: Option<RunState>,
         limit: Option<u32>,
+        after: Option<MatrixCursor>,
     ) -> Result<Vec<Run>, ClientError> {
         let mut query = Vec::new();
         if let Some(state) = state {
@@ -706,6 +712,13 @@ impl AIecClient {
         }
         if let Some(limit) = limit {
             query.push(format!("limit={limit}"));
+        }
+        if let Some(after) = after {
+            query.push(format!(
+                "after_requested_at={}",
+                urlencode(&after.requested_at.to_rfc3339())
+            ));
+            query.push(format!("after_id={}", urlencode(&after.id.to_string())));
         }
         let path = if query.is_empty() {
             "/v1/runs".to_owned()
@@ -1747,26 +1760,6 @@ mod tests {
                 "workload",
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn a_run_page_carries_the_state_and_limit_filters() {
-        let stub = Stub::new();
-        let (url, serving) = stub_control_plane(stub.clone()).await;
-        let client = AIecClient::new(&url, "af_live_key").expect("a client");
-
-        let runs = client
-            .list_runs(Some(RunState::Running), Some(5))
-            .await
-            .expect("a run page");
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].state, RunState::Running);
-
-        let seen = stub.requests().await;
-        assert_eq!(seen[0].path, "/v1/runs");
-        assert_eq!(seen[0].query, "state=running&limit=5");
-        assert_eq!(seen[0].method, "GET");
-        serving.abort();
     }
 
     #[tokio::test]

@@ -666,6 +666,27 @@ async fn the_public_probe_routes_report_the_fleet_without_listing_it() {
         last_heartbeat: chrono::Utc::now(),
     }))
     .unwrap();
+    for (name, healthy, age) in [
+        ("unhealthy-node", false, 0),
+        (
+            "stale-node",
+            true,
+            aiec_storage::NODE_HEARTBEAT_TTL_SECONDS + 60,
+        ),
+    ] {
+        repo.register_node(Node {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            available_vcpus: 40,
+            available_memory_bytes: 100,
+            available_disk_bytes: 0,
+            sandbox_count: 0,
+            healthy,
+            last_heartbeat: chrono::Utc::now() - chrono::Duration::seconds(age),
+        })
+        .await
+        .unwrap();
+    }
 
     let runtime = Arc::new(MockRuntime);
     let registry = Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
@@ -696,11 +717,11 @@ async fn the_public_probe_routes_report_the_fleet_without_listing_it() {
     )
     .unwrap();
     assert!(
-        text.contains("aiec_node_available_vcpus 4"),
+        text.contains("aiec_node_available_vcpus 4\n"),
         "the vcpu gauge did not report the registered node: {text}"
     );
     assert!(
-        text.contains("aiec_node_available_memory_bytes 8589934592"),
+        text.contains("aiec_node_available_memory_bytes 8589934592\n"),
         "the memory gauge did not report the registered node: {text}"
     );
 
@@ -3152,6 +3173,80 @@ async fn a_release_note_may_contain_spaces() {
     );
 }
 
+/// `aiec guard release` sends exactly this body, so the field name is a contract
+/// between the shipped operator surface and the route. The body is
+/// `deny_unknown_fields`, which makes a spelling disagreement a hard 400 rather
+/// than a silently ignored reviewer label: the operator's release is refused
+/// and nothing says why. Asserting the conflict - and not the bad request -
+/// shows the request reached the policy-hash check, which only a body this
+/// route recognises can do.
+#[tokio::test]
+async fn the_guard_cli_release_body_is_accepted_by_the_release_route() {
+    let repo = Arc::new(MemoryRepository::new());
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::GuardRelease],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let runtime = Arc::new(MockRuntime);
+    let platform = Platform::builder()
+        .runtime(runtime.clone())
+        .metadata_store(repo.as_ref().clone())
+        .scheduler(Arc::new(DevelopmentScheduler))
+        .policy(Arc::new(DefaultPolicy))
+        .build()
+        .unwrap();
+    let router = app(AppState::development(platform).with_runtime_kind(RuntimeKind::Docker));
+
+    let sandbox = Uuid::now_v7();
+    let now = chrono::Utc::now();
+    futures::executor::block_on(repo.create_sandbox(Sandbox {
+        id: sandbox,
+        tenant_id: tenant,
+        node_id: Some(Uuid::now_v7()),
+        image_id: "python:3.13".into(),
+        state: aiec_core::SandboxState::Quarantined,
+        runtime: RuntimeKind::Docker,
+        cpu: 1,
+        memory_mb: 512,
+        disk_mb: 2048,
+        timeout_seconds: 600,
+        network: Default::default(),
+        environment: Default::default(),
+        created_at: now,
+        updated_at: now,
+        runtime_path: None,
+    }))
+    .expect("the quarantined sandbox exists");
+
+    let (status, body) = call(
+        &router,
+        &key,
+        axum::http::Method::POST,
+        &format!("/v1/sandboxes/{sandbox}/guard/release"),
+        serde_json::json!({ "operator_label": "oncall-a" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the CLI's own release body must be recognised by the route: {body}"
+    );
+    assert!(
+        !body.to_string().contains("unknown field"),
+        "a field-name disagreement between the CLI and the route is a 400 the operator cannot act on: {body}"
+    );
+}
+
 /// An image resolver that admits a named allow-list and records what it saw.
 ///
 /// The recording is the point: a path that boots a machine from a stored
@@ -3641,9 +3736,9 @@ async fn the_default_scopes_are_granted_only_to_a_key_that_holds_them() {
 ///
 /// `DELETE /v1/keys/{id}` checked one thing: that the target was not the key
 /// making the request. That rule exists to stop self-lockout, and it is a
-/// different rule from the one that governs minting. So a key issued for a
-/// single purpose - and the platform issues sandbox keys into every sandbox -
-/// could revoke any other credential in the tenant, including its `admin` key.
+/// different rule from the one that governs minting. A key issued for a single
+/// purpose could revoke any other credential in the tenant, including its
+/// `admin` key.
 ///
 /// Revocation cannot be undone and the way back into a tenant is an invite, so
 /// this is a permanent denial of service available to the least privileged

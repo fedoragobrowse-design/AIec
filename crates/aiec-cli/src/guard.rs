@@ -272,7 +272,7 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
                 url,
                 reqwest::Method::POST,
                 &format!("/v1/sandboxes/{sandbox_id}/guard/release"),
-                Some(json!({ "operator": operator })),
+                Some(json!({ "operator_label": operator })),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&released)?);

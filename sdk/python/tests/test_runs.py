@@ -1,13 +1,13 @@
-"""Contract tests for the run surface, against a fake transport.
+"""Run contract tests with isolated transports and a local HTTP paging fixture."""
 
-No live control plane: the client's `_request` is replaced, so these assert on
-the bytes the SDK would put on the wire -- which is the part that silently
-drifts from the API.
-"""
-
+import http.server
+import json
 import threading
 import time
 import unittest
+
+from datetime import datetime
+from urllib.parse import parse_qs, urlsplit
 
 from agentforge import AIec, AIecError, Runs
 from agentforge import runs as runs_module
@@ -211,33 +211,28 @@ class RunReadTest(unittest.TestCase):
         self.transport = FakeTransport()
         self.runs = Runs(client_with(self.transport))
 
-    def test_a_run_page_carries_the_state_filter_and_the_limit(self):
-        self.runs.list(state="running", limit=5)
-        method, path, payload = self.transport.calls[0]
-        self.assertEqual((method, payload), ("GET", None))
-        self.assertEqual(path, "/v1/runs?limit=5&state=running")
-
     def test_a_page_beyond_what_the_control_plane_will_give_is_refused(self):
         # `GET /v1/runs` clamps `limit` to MAX_RUN_PAGE (200, crates/aiec-api/
-        # src/lib.rs) and answers with a bare `Vec<Run>`: no cursor, no total,
-        # nothing that distinguishes a capped page from a complete one. Asking
-        # for a thousand used to answer with two hundred runs and no error, so
-        # `list` claimed to be "the caller's runs" while returning the newest
-        # two hundred of them - a wrong answer indistinguishable from a right
-        # one, with no way to ask for the rest.
-        with self.assertRaises(ValueError):
-            self.runs.list(limit=1000)
+        # src/lib.rs) and answers with a bare `Vec<Run>`: the body carries no
+        # cursor or total. Asking for a thousand used to answer with two
+        # hundred runs and no error, so `list` claimed to be "the caller's runs"
+        # while returning the newest two hundred of them. The rest is reachable
+        # by resuming with after_requested_at/after_id, but one call still
+        # cannot return a thousand rows, so the impossible page is refused.
+        for limit in (runs_module.MAX_LIST_LIMIT + 1, 1000):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                self.runs.list(limit=limit)
         self.assertEqual(self.transport.calls, [])
 
-    def test_the_page_the_control_plane_will_still_give_is_accepted(self):
-        # The guard refuses only what cannot be honoured. A caller asking for
-        # the ceiling gets it, and a caller asking for one more than the
-        # server clamps to is told so rather than quietly answered.
-        self.runs.list(limit=runs_module.MAX_LIST_LIMIT)
-        path = self.transport.calls[-1][1]
-        self.assertEqual(path, f"/v1/runs?limit={runs_module.MAX_LIST_LIMIT}")
+    def test_half_a_cursor_is_refused_before_a_request_is_made(self):
+        # A timestamp alone orders nothing without an identity, and an id alone
+        # cannot order a page that has not been read, so either half pages from
+        # a query the caller did not ask for. Refused here rather than sent.
         with self.assertRaises(ValueError):
-            self.runs.list(limit=runs_module.MAX_LIST_LIMIT + 1)
+            self.runs.list(after_requested_at="2024-01-02T03:04:05+00:00")
+        with self.assertRaises(ValueError):
+            self.runs.list(after_id="run-9")
+        self.assertEqual(self.transport.calls, [])
 
     def test_each_read_uses_its_own_documented_route(self):
         self.runs.get("run-1")
@@ -253,6 +248,88 @@ class RunReadTest(unittest.TestCase):
                 ("POST", "/v1/runs/run-1/cancel"),
             ],
         )
+
+
+class RunHttpPagingTest(unittest.TestCase):
+    def test_offset_cursors_preserve_filtered_exclusive_pages_over_http(self):
+        def identity(number):
+            return f"00000000-0000-0000-0000-{number:012d}"
+
+        def instant(stamp):
+            return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+        rows = [
+            {"id": identity(5), "requested_at": "2024-01-02T03:04:06Z", "state": "queued"},
+            {"id": identity(4), "requested_at": "2024-01-02T03:04:05Z", "state": "succeeded"},
+            {"id": identity(3), "requested_at": "2024-01-02T03:04:05Z", "state": "succeeded"},
+            {"id": identity(2), "requested_at": "2024-01-02T03:04:04Z", "state": "succeeded"},
+        ]
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                target = urlsplit(self.path)
+                if target.path != "/v1/runs":
+                    self.send_error(404)
+                    return
+                query = parse_qs(target.query)
+                try:
+                    state = query.get("state", [None])[0]
+                    limit = int(query.get("limit", ["50"])[0])
+                    stamp = query.get("after_requested_at", [None])[0]
+                    run_id = query.get("after_id", [None])[0]
+                    if (stamp is None) != (run_id is None):
+                        raise ValueError("half cursor")
+                    after = None if stamp is None else (instant(stamp), run_id)
+                    page = [
+                        row for row in rows
+                        if (state is None or row["state"] == state)
+                        and (after is None or (instant(row["requested_at"]), row["id"]) < after)
+                    ][:limit]
+                    status, payload = 200, page
+                except ValueError:
+                    status = 400
+                    payload = {"error": {"code": "invalid_request", "message": "invalid cursor"}}
+                body = json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        try:
+            runs = AIec(
+                api_key="af_live_" + "0" * 48,
+                base_url=f"http://127.0.0.1:{server.server_port}",
+            ).runs
+            first = runs.list("succeeded", 1)
+            self.assertEqual([row["id"] for row in first], [identity(4)])
+            second = runs.list(
+                "succeeded", 1,
+                after_requested_at="2024-01-02T05:04:05+02:00",
+                after_id=first[-1]["id"],
+            )
+            self.assertEqual([row["id"] for row in second], [identity(3)])
+            third = runs.list(
+                "succeeded", 1,
+                after_requested_at="2024-01-02T03:04:05+00:00",
+                after_id=second[-1]["id"],
+            )
+            self.assertEqual([row["id"] for row in third], [identity(2)])
+            self.assertEqual(
+                runs.list(
+                    "succeeded", 1,
+                    after_requested_at=third[-1]["requested_at"],
+                    after_id=third[-1]["id"],
+                ),
+                [],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            serving.join()
 
 
 class RunWorkflowTest(unittest.TestCase):

@@ -661,6 +661,113 @@ async fn handled_guard_budgets_cannot_fill_the_reapers_window() {
     );
 }
 
+/// A released sandbox is paused, not running, and its budget row stays spent -
+/// that is the point of a release: the operator wants the network back, not a
+/// fresh allowance. The reaper used to select it on the very next tick, because
+/// "not destroyed" was the only state condition, and immediately quarantine the
+/// machine the operator had just released. That is the release loop: release,
+/// wait one tick, discover it is quarantined again, release again.
+///
+/// The allowance is not restored by this. The moment the sandbox starts it is a
+/// consuming machine with a spent budget, and the same query selects it.
+#[tokio::test]
+async fn a_released_budget_is_not_reaped_until_the_sandbox_runs_again() {
+    let repository = MemoryRepository::new();
+    let tenant = Uuid::new_v4();
+    let now = Utc::now();
+
+    let (released, _fence) = budgeted_sandbox(&repository, tenant, true, now).await;
+    let (running, _fence) = budgeted_sandbox(&repository, tenant, false, now).await;
+
+    // The production release: the quarantine is cleared and the sandbox becomes
+    // paused, but nothing about the spent budget is rewritten.
+    repository
+        .release_guard_quarantine(tenant, released, "key:test/operator")
+        .await
+        .unwrap();
+
+    let tick = repository
+        .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
+        .await
+        .unwrap();
+    assert_eq!(
+        tick.iter()
+            .map(|b| b.identity.sandbox_id)
+            .collect::<Vec<_>>(),
+        vec![running],
+        "a paused machine is not consuming its budget, so it is not reaped; the \
+         running one with the same spent budget is"
+    );
+
+    // Starting it again puts it straight back in the window.
+    repository
+        .data
+        .write()
+        .await
+        .sandboxes
+        .get_mut(&released)
+        .unwrap()
+        .state = SandboxState::Running;
+    let resumed = repository
+        .list_expired_guard_budgets(Utc::now(), aiec_core::storage::REAPER_GUARD_WINDOW)
+        .await
+        .unwrap();
+    assert!(
+        resumed.iter().any(|b| b.identity.sandbox_id == released),
+        "a released sandbox that is started again is still over budget and must \
+         be enforced, not silently granted a fresh allowance"
+    );
+}
+
+/// The reaper fences every quarantine through the sandbox's current lease. A
+/// budget whose sandbox has no active owner therefore cannot be quarantined at
+/// all, yet it was selected on every tick - so a backlog of unowned rows kept a
+/// full window of permanent no-ops ahead of the rows the reaper could act on,
+/// and lease reconciliation had to finish first for any enforcement to happen.
+#[tokio::test]
+async fn an_unowned_budget_does_not_consume_the_reapers_window() {
+    let repository = MemoryRepository::new();
+    let tenant = Uuid::new_v4();
+    let now = Utc::now();
+    let window = aiec_core::storage::REAPER_GUARD_WINDOW;
+
+    let (actionable, _fence) = budgeted_sandbox(&repository, tenant, false, now).await;
+    let mut unowned = Vec::new();
+    for _ in 0..window {
+        let (id, fence) = budgeted_sandbox(&repository, tenant, false, now).await;
+        // The owner is gone: the lease is no longer current, so no dispatch can
+        // fence a quarantine of this sandbox.
+        repository
+            .data
+            .write()
+            .await
+            .leases
+            .get_mut(&fence.lease_id)
+            .unwrap()
+            .expires_at = now - Duration::hours(1);
+        unowned.push(id);
+    }
+
+    let tick = repository
+        .list_expired_guard_budgets(Utc::now(), window)
+        .await
+        .unwrap();
+    assert_eq!(
+        tick.iter()
+            .map(|b| b.identity.sandbox_id)
+            .collect::<Vec<_>>(),
+        vec![actionable],
+        "budgets the reaper cannot fence must not fill its window; they are left \
+         to lease reconciliation"
+    );
+    assert!(
+        !tick
+            .iter()
+            .any(|b| unowned.contains(&b.identity.sandbox_id)),
+        "an unowned sandbox is not work"
+    );
+}
+
 /// The window bounds a tick's work; it does not discard the backlog. Budgets
 /// past the window come back once the ones in front of them are handled, which
 /// is the same path the reaper drives.

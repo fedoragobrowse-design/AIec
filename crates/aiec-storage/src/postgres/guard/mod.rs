@@ -16,16 +16,24 @@ use uuid::Uuid;
 
 /// The reaper's work list, bounded and ordered.
 ///
-/// Already-quarantined budgets are excluded rather than returned: the reaper
-/// has no work for them, and because they are the oldest sandboxes they sort
-/// to the front of the window. Returning them is how a long-lived tenant kept
-/// the reaper from ever reaching a budget that still needed enforcing. `LIMIT`
-/// is pushed into the query so the bound is on the read, not on a `take` after
-/// it.
+/// The query selects rows the reaper can *act* on, not rows it would have to
+/// skip: budgets already quarantined, sandboxes that are not consuming, and
+/// sandboxes with no current owner are all excluded. Anything else is a row the
+/// reaper reads and abandons on every tick, which is how a bounded window gets
+/// filled with permanent no-ops and a budget that still needed enforcing is
+/// never reached. `LIMIT` is pushed into the query so the bound is on the read,
+/// not on a `take` after it.
+///
+/// A sandbox the operator stopped - released, paused or stopped - is not
+/// re-quarantined over a budget it was not spending. Its budget row is still
+/// spent, so the moment it starts again it is selected again: the allowance is
+/// not restored, only the enforcement waits until there is something to stop.
 pub(crate) const EXPIRED_GUARD_BUDGETS_SQL: &str = "SELECT b.payload FROM guard_budgets b \
 JOIN sandboxes s ON s.id=b.sandbox_id AND s.tenant_id=b.tenant_id \
-WHERE s.state NOT IN ('destroyed','destroying') \
+WHERE s.state IN ('creating','starting','running','stopping','snapshotting','restoring') \
 AND NOT COALESCE((b.payload->>'quarantined')::boolean, false) \
+AND EXISTS (SELECT 1 FROM sandbox_leases l WHERE l.sandbox_id=s.id \
+  AND l.tenant_id=s.tenant_id AND l.status='active' AND l.expires_at > $1) \
 AND (b.expires_at <= $1 \
   OR (b.payload->>'model_requests')::numeric >= (b.payload->>'max_model_requests')::numeric \
   OR (b.payload->>'bytes_in')::numeric >= (b.payload->>'max_bytes_in')::numeric \

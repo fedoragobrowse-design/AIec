@@ -476,20 +476,22 @@ impl GenerationLedger {
     }
 
     /// Reloads the durable ledger, keeping only records for this node.
-    fn load(dir: &Path, node_id: Uuid) -> Self {
+    fn load(dir: &Path, node_id: Uuid) -> std::io::Result<Self> {
         let path = dir.join(Self::FILE_NAME);
-        let records = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<LearnedGeneration>>(&bytes).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| record.node_id == node_id)
-            .map(|record| (record.sandbox_id, record))
-            .collect();
-        Self {
+        let records: Vec<LearnedGeneration> = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
             path: Some(path),
-            records,
-        }
+            records: records
+                .into_iter()
+                .filter(|record| record.node_id == node_id)
+                .map(|record| (record.sandbox_id, record))
+                .collect(),
+        })
     }
 
     fn generation(&self, sandbox_id: Uuid) -> Option<i64> {
@@ -532,7 +534,7 @@ impl GenerationLedger {
                 return Ok(());
             }
         }
-        self.records.insert(
+        let previous = self.records.insert(
             sandbox_id,
             LearnedGeneration {
                 sandbox_id,
@@ -541,12 +543,26 @@ impl GenerationLedger {
                 lease_id: Some(lease_id),
             },
         );
-        self.persist()
+        if let Err(error) = self.persist() {
+            match previous {
+                Some(previous) => {
+                    self.records.insert(sandbox_id, previous);
+                }
+                None => {
+                    self.records.remove(&sandbox_id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn forget(&mut self, sandbox_id: Uuid) -> Result<(), std::io::Error> {
-        if self.records.remove(&sandbox_id).is_some() {
-            self.persist()?;
+        if let Some(previous) = self.records.remove(&sandbox_id)
+            && let Err(error) = self.persist()
+        {
+            self.records.insert(sandbox_id, previous);
+            return Err(error);
         }
         Ok(())
     }
@@ -560,9 +576,32 @@ impl GenerationLedger {
         records.sort_by_key(|record| record.sandbox_id);
         let encoded = serde_json::to_vec(&records)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, encoded)?;
-        std::fs::rename(&temporary, path)
+        let temporary = path.with_file_name(format!(".lease-generations-{}.tmp", Uuid::now_v7()));
+        let mut created = false;
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&temporary)?;
+            created = true;
+            std::io::Write::write_all(&mut file, &encoded)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            #[cfg(unix)]
+            {
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if result.is_err() && created {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
     }
 }
 
@@ -1487,9 +1526,9 @@ impl WorkerService {
     /// Persists learned lease generations under the worker state directory and
     /// reloads the previous ones, so a restart cannot forget a newer
     /// generation that a superseded request would otherwise slip past.
-    pub fn with_state_dir(mut self, dir: &Path) -> Self {
-        self.generations = Arc::new(Mutex::new(GenerationLedger::load(dir, self.node_id)));
-        self
+    pub fn with_state_dir(mut self, dir: &Path) -> std::io::Result<Self> {
+        self.generations = Arc::new(Mutex::new(GenerationLedger::load(dir, self.node_id)?));
+        Ok(self)
     }
 
     /// Sets the authoritative ownership source consulted before every
@@ -1556,20 +1595,21 @@ impl WorkerService {
 
     /// Persists the generation the control plane just confirmed, keeping the
     /// in-memory map as a cache of the durable ledger.
-    async fn learn_generation(&self, sandbox_id: Uuid, generation: i64, lease_id: Uuid) {
-        if let Err(error) =
-            self.generations
-                .lock()
-                .await
-                .record(sandbox_id, self.node_id, generation, lease_id)
-        {
-            tracing::warn!(
-                %sandbox_id,
-                %generation,
-                %error,
-                "failed to persist learned lease generation"
-            );
-        }
+    async fn learn_generation(
+        &self,
+        sandbox_id: Uuid,
+        generation: i64,
+        lease_id: Uuid,
+    ) -> Result<(), CoreError> {
+        self.generations
+            .lock()
+            .await
+            .record(sandbox_id, self.node_id, generation, lease_id)
+            .map_err(|error| {
+                CoreError::Unavailable(format!(
+                    "cannot persist worker lease generation floor: {error}"
+                ))
+            })
     }
 
     async fn forget_generation(&self, sandbox_id: Uuid) {
@@ -1899,7 +1939,11 @@ async fn authorize(state: &WorkerService, request: &WorkerRequest) -> Result<(),
             );
             state
                 .learn_generation(sandbox_id, generation, lease_id)
-                .await;
+                .await
+                .map_err(|error| {
+                    let error = WorkerError::from_runtime(error);
+                    Box::new(rejected(request_id, &error.code, error.message))
+                })?;
             Ok(())
         }
     }
@@ -3491,6 +3535,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_service_refuses_generation_ledger_publication_failure_until_persisted() {
+        let state_dir = std::env::temp_dir().join(format!("aiec-worker-fence-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let owner = Uuid::now_v7();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let target = sandbox(Some(owner));
+        let service = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_state_dir(&state_dir)
+        .unwrap()
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(7),
+        }));
+        let path = state_dir.join(GenerationLedger::FILE_NAME);
+        std::fs::create_dir(&path).unwrap();
+        let first = post_operation(service.clone(), exec_request(7, &target)).await;
+        let retry = post_operation(service.clone(), exec_request(7, &target)).await;
+        let refused_execs = execs.load(Ordering::Relaxed);
+        assert!(path.is_dir());
+        std::fs::remove_dir(path).unwrap();
+        let recovered = post_operation(service, exec_request(7, &target)).await;
+        let recovered_execs = execs.load(Ordering::Relaxed);
+        let restarted = WorkerService::new(
+            Arc::new(CountingRuntime {
+                execs: execs.clone(),
+            }),
+            RuntimeKind::Firecracker,
+            RuntimeCapabilities::default(),
+            None,
+            "token",
+            owner,
+            1,
+        )
+        .with_state_dir(&state_dir)
+        .unwrap()
+        .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
+            answer: FakeOwnership::Owned(6),
+        }));
+        let stale = post_operation(restarted, exec_request(6, &target)).await;
+        let final_execs = execs.load(Ordering::Relaxed);
+        std::fs::remove_dir_all(state_dir).unwrap();
+        assert_eq!(first["result"]["Err"]["code"], "runtime_unavailable");
+        assert_eq!(retry["result"]["Err"]["code"], "runtime_unavailable");
+        assert_eq!(
+            refused_execs, 0,
+            "failed durable publication must not execute"
+        );
+        assert!(recovered["result"]["Ok"].is_object());
+        assert_eq!(recovered_execs, 1, "retry succeeds only after publication");
+        assert_eq!(stale["result"]["Err"]["code"], "conflict");
+        assert_eq!(final_execs, 1, "restart must preserve the recovered floor");
+    }
+
+    #[test]
+    fn worker_service_refuses_a_corrupt_or_unreadable_generation_ledger() {
+        for content in [
+            Some(b"".as_slice()),
+            Some(b"{".as_slice()),
+            Some(b"\xff".as_slice()),
+            None,
+        ] {
+            let state_dir =
+                std::env::temp_dir().join(format!("aiec-worker-fence-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&state_dir).unwrap();
+            let path = state_dir.join(GenerationLedger::FILE_NAME);
+            let expected_kind = if let Some(content) = content {
+                std::fs::write(&path, content).unwrap();
+                std::io::ErrorKind::InvalidData
+            } else {
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("marker"), b"preserve directory").unwrap();
+                std::fs::read(&path).unwrap_err().kind()
+            };
+            let result = WorkerService::new(
+                Arc::new(ForbiddenRuntime),
+                RuntimeKind::Firecracker,
+                RuntimeCapabilities::default(),
+                None,
+                "token",
+                Uuid::now_v7(),
+                1,
+            )
+            .with_state_dir(&state_dir);
+            let kind = result.err().map(|error| error.kind());
+            let preserved = if let Some(content) = content {
+                std::fs::read(path).unwrap() == content
+            } else {
+                std::fs::read(path.join("marker")).unwrap() == b"preserve directory"
+            };
+            std::fs::remove_dir_all(state_dir).unwrap();
+            assert_eq!(
+                kind,
+                Some(expected_kind),
+                "corrupt state must refuse startup"
+            );
+            assert!(preserved, "startup must preserve the original ledger state");
+        }
+    }
+
+    #[tokio::test]
     async fn worker_service_keeps_learned_generation_across_restart() {
         let state_dir = std::env::temp_dir().join(format!("aiec-worker-fence-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -3509,6 +3662,7 @@ mod tests {
             1,
         )
         .with_state_dir(&state_dir)
+        .unwrap()
         .with_ownership_verifier(Arc::new(FakeOwnershipVerifier {
             answer: FakeOwnership::Owned(7),
         }));
@@ -3532,6 +3686,7 @@ mod tests {
             1,
         )
         .with_state_dir(&state_dir)
+        .unwrap()
         // `Reassigned`, not `Owned`: the comment above says the sandbox moved to
         // another worker, and that is a *different lease*, not the same lease at
         // a higher generation. A renewal keeps its lease id and is legitimate;
@@ -3577,7 +3732,7 @@ mod tests {
         )
         .expect("write legacy ledger");
 
-        let mut ledger = GenerationLedger::load(&dir, node_id);
+        let mut ledger = GenerationLedger::load(&dir, node_id).unwrap();
         assert_eq!(ledger.generation(sandbox_id), Some(4), "legacy entry loads");
         assert_eq!(
             ledger.lease(sandbox_id),

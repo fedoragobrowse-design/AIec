@@ -178,6 +178,24 @@ impl SandboxState {
             Self::Destroyed => "destroyed",
         }
     }
+
+    /// Whether a sandbox in this state can still consume its durable budget.
+    ///
+    /// Quarantine enforcement targets consuming machines. A machine an
+    /// operator stopped is stopped for the reason they stopped it, and the
+    /// spent budget row survives the stop, so enforcement resumes unchanged if
+    /// it is ever started again.
+    pub fn consumes(self) -> bool {
+        matches!(
+            self,
+            Self::Creating
+                | Self::Starting
+                | Self::Running
+                | Self::Stopping
+                | Self::Snapshotting
+                | Self::Restoring
+        )
+    }
     pub fn can_transition_to(self, next: Self) -> bool {
         use SandboxState::*;
         matches!(

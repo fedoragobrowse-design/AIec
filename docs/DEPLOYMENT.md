@@ -114,6 +114,8 @@ export AIEC_S3_REGION=us-east-1
 export AIEC_S3_BUCKET=aiec
 export AIEC_S3_ACCESS_KEY_ID='...'
 export AIEC_S3_SECRET_ACCESS_KEY='...'
+export AIEC_TLS_CERT_FILE=/etc/aiec/tls/api.crt
+export AIEC_TLS_KEY_FILE=/etc/aiec/tls/api.key
 aiec-server
 ```
 
@@ -144,8 +146,8 @@ resolved commit, and only ever used for anonymous HTTPS repositories with no
 run secrets, so a private repository or a credentialed run always takes the
 ordinary clone path. Each run still gets its own working tree, index and
 `.git`. See
-[EFFICIENCY-AUDIT.md](../benchmarks/EFFICIENCY-AUDIT.md#repository-object-cache-opt-in-implemented-unmeasured)
-for the measured-versus-unmeasured state of it.
+[EFFICIENCY-AUDIT.md](../benchmarks/EFFICIENCY-AUDIT.md#repository-object-cache-opt-in-measured-and-not-shippable-as-written)
+for the measured cost and why it should remain disabled.
 
 The systemd API unit starts `aiec-server`. The shorter `aiec server` command supports explicit `bwrap-dev` and `docker` single-process development distributions.
 
@@ -157,13 +159,65 @@ export AIEC_KERNEL=/var/lib/aiec/images/vmlinux
 export AIEC_ROOTFS=/var/lib/aiec/images/aiec-rootfs.ext4
 export AIEC_GUEST_SECRET='<same protected secret used to build the rootfs>'
 export AIEC_STATE_DIR=/var/lib/aiec/firecracker
-aiec --url http://aiec-api:8080 worker --runtime firecracker --name worker-a \
-  --bind 0.0.0.0:9000 --capacity 8
+export AIEC_WORKER_TOKEN='<same protected worker token used by the API>'
+export AIEC_TLS_CERT_FILE=/etc/aiec/tls/worker.crt
+export AIEC_TLS_KEY_FILE=/etc/aiec/tls/worker.key
+# For a private CA, also set AIEC_TLS_CA_CERT to its PEM trust anchor.
+aiec --url https://aiec-api.internal:8080 worker --runtime firecracker --name worker-a \
+  --advertise-url https://worker-a.internal:9000 \
+  --bind 0.0.0.0:9000 --capacity 8 --state-dir /var/lib/aiec/worker
 ```
 
 The worker endpoint must be reachable only from the API/control network and protected by `AIEC_WORKER_TOKEN`. Run at least two workers for a multi-node deployment. Worker registration, versioned heartbeats, assignment claims, and lease renewal are persisted in PostgreSQL.
 
 The example units are starting points. A Firecracker worker needs narrowly scoped `/dev/kvm`, network administration, writable VM/snapshot storage, and `NoNewPrivileges=false` or an equivalent reviewed jailer arrangement. API and worker storage should be separate encrypted volumes.
+
+The packaged worker unit creates an `aiec`-owned `/var/lib/aiec` with
+`StateDirectory=aiec`, sets that working directory, and passes an absolute
+`--state-dir /var/lib/aiec/worker`. This is the durable worker identity and
+the filesystem used for host disk-pressure measurement. `AIEC_STATE_DIR`
+separately configures Firecracker VM/snapshot storage; it does not override
+the worker's `--state-dir`. Put both on the intended writable data volume.
+
+Keep `node-id` with the worker's durable state. Automatic identity generation
+is permitted only when that file is missing; malformed, unreadable or
+non-file state refuses startup without replacing it. Restore the original
+identity from a trusted backup rather than deleting the file while that node
+owns work. An explicit `--node-id UUID` remains an operator-controlled
+override; registration persists the assigned identity. On Unix, new identity
+files are mode `0600`, newly created state directories are mode `0700`, and
+publication syncs the complete file and directory ancestry. Concurrent first
+starts adopt one published identity; assigned replacements use atomic rename.
+
+For systemd, set `AIEC_RUNTIME=firecracker`, `AIEC_URL` to the HTTPS API
+origin, `AIEC_WORKER_ADVERTISE_URL`, the token and TLS variables in
+`/etc/aiec/aiec.env`; its `EnvironmentFile` does not inherit shell exports.
+An advertised HTTPS worker origin must match the certificate and be reachable
+from the API.
+
+Neither packaged unit imposes `MemoryMax`, `CPUQuota` or `LimitNOFILE`; process
+and task limits otherwise inherit systemd/OS defaults. Capacity and pressure
+checks are admission gates, not a cgroup resource ceiling. Set service/slice
+budgets for the host allocation and runtime in an operator-managed drop-in,
+including child microVM processes and descriptor/process headroom. A small
+generic cap can kill active sandboxes and invalidate the declared capacity,
+so no guessed fixed value is shipped. `/dev/kvm` access still requires the
+service account's device permissions; `ReadWritePaths` is not a device ACL.
+
+### Long-running HTTP requests
+
+The production API and non-development worker listeners require TLS. Keep
+`/ready` and `/metrics` on the trusted management network; the public probes
+are intentionally unauthenticated. If a reverse proxy fronts the API, its
+response timeout and the client's timeout must cover synchronous
+`POST /v1/runs`: queue wait (default 300 seconds), workload execution
+(`timeout_seconds` plus the 120-second placement/teardown grace), and the bounded
+30-second settlement wait, plus transport headroom. A default 60-second
+proxy/client timeout is insufficient for a
+900-second workload. Configure the supported upper bound for your deployment,
+not just the probe timeout. Disconnecting the caller stops its wait, not the
+durable run: use the idempotency key and the run detail/list routes to recover
+the outcome rather than submitting duplicate work.
 
 ## Host pressure and reserves
 

@@ -21,6 +21,8 @@ pub mod omp;
 mod provision_ownership_tests;
 pub mod ratelimit;
 pub(crate) mod repo_cache;
+#[cfg(test)]
+mod run_paging_tests;
 mod run_queue;
 pub mod run_secrets;
 pub mod runs;
@@ -3613,6 +3615,25 @@ pub(crate) fn page_cursor(
     }
 }
 
+/// The run listing's cursor. Same pair-or-nothing rule as [`page_cursor`], and
+/// the same reason: a half-supplied cursor would otherwise silently page from
+/// an instant with no identity, which is a different query rather than an
+/// error the caller can see.
+fn run_cursor(
+    requested_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<aiec_core::storage::MatrixCursor>, ApiFailure> {
+    match (requested_at, id) {
+        (None, None) => Ok(None),
+        (Some(requested_at), Some(id)) => {
+            Ok(Some(aiec_core::storage::MatrixCursor { requested_at, id }))
+        }
+        _ => Err(ApiFailure::from(CoreError::InvalidRequest(
+            "after_requested_at and after_id must be given together".into(),
+        ))),
+    }
+}
+
 async fn list_snapshots(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -3817,6 +3838,10 @@ const MAX_RUN_PAGE: u32 = 200;
 struct ListRunsQuery {
     state: Option<String>,
     limit: Option<u32>,
+    /// `requested_at` of the last run of the previous page.
+    after_requested_at: Option<DateTime<Utc>>,
+    /// Identifier of that run, which breaks a `requested_at` tie.
+    after_id: Option<Uuid>,
 }
 
 /// A run's artifact plus where its bytes are.
@@ -3865,6 +3890,12 @@ async fn create_run(
 }
 
 /// Lists the caller's runs, newest first.
+///
+/// The response stays a bare array, so a client that never pages is unaffected.
+/// It is paged anyway: `after_requested_at` with `after_id` continues past the
+/// last run of the previous page, and a caller that stops at `MAX_RUN_PAGE` can
+/// say which run it stopped after rather than discovering the ceiling by
+/// counting.
 async fn list_runs(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -3886,9 +3917,10 @@ async fn list_runs(
         .limit
         .unwrap_or(DEFAULT_RUN_PAGE)
         .clamp(1, MAX_RUN_PAGE);
+    let after = run_cursor(query.after_requested_at, query.after_id)?;
     Ok(Json(
         s.repository()
-            .list_runs(p.tenant_id, state, limit)
+            .list_runs(p.tenant_id, state, limit, after)
             .await
             .map_err(ApiFailure::from)?,
     ))
@@ -5343,6 +5375,7 @@ mod tests {
             tenant: TenantId,
             state: Option<RunState>,
             limit: u32,
+            after: Option<aiec_core::storage::MatrixCursor>,
         ) -> Result<Vec<Run>, CoreError> {
             let mut page: Vec<Run> = self
                 .runs
@@ -5350,7 +5383,11 @@ mod tests {
                 .await
                 .values()
                 .filter(|run| {
-                    run.tenant_id == tenant && state.is_none_or(|state| run.state == state)
+                    run.tenant_id == tenant
+                        && state.is_none_or(|state| run.state == state)
+                        && after.is_none_or(|cursor| {
+                            (run.requested_at, run.id) < (cursor.requested_at, cursor.id)
+                        })
                 })
                 .cloned()
                 .collect();

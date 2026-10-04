@@ -29,14 +29,11 @@ from urllib.parse import urlencode
 #: deadline is written as `now() + queue_timeout_seconds`.
 MAX_RUN_QUEUE_WAIT_SECONDS = 86_400
 
-#: What the wait adds on top of the queue deadline and the stated execution
-#: timeout: the control plane's own placement-and-teardown grace, plus room for
-#: the answer to cross the network. The API drives a run to a terminal state
-#: before it answers, so this wait *is* the run; a client that drops first
-#: cancels the server's future mid-flight and leaves the row non-terminal with
-#: no terminal event, and the machine leaks. Those are the runs that hold a
-#: machine longest, so this is what the failure costs most. It must therefore
-#: exceed the server's grace (`PLACEMENT_GRACE_SECONDS`).
+#: What the wait adds on top of the queue deadline and stated execution timeout:
+#: placement/teardown grace, the bounded settlement wait and transport headroom.
+#: Admitted work is durable: timing out hides its outcome rather than cancelling
+#: it. The caller should recover the result instead of submitting duplicate work.
+#: This budget must exceed the server's grace (`PLACEMENT_GRACE_SECONDS`).
 RUN_RESPONSE_SLACK_SECONDS = 300
 
 #: How long a cancel may take. It is not the general request budget: the
@@ -84,10 +81,11 @@ RETENTIONS = ("destroy", "keep_on_failure", "keep_always")
 #: The page size the control plane uses when a caller states none.
 DEFAULT_LIST_LIMIT = 50
 
-#: The control plane clamps a run page to this and answers with a bare list:
-#: no cursor, no total, nothing that says a page was cut short. A caller who
-#: asked for more than this therefore cannot tell a full answer from a capped
-#: one, so the clamp is refused here rather than discovered later.
+#: The control plane clamps a run page to this and answers with a bare list: no
+#: total, nothing in the body that says a page was cut short. A caller who asked
+#: for more than this gets a page they must resume themselves with
+#: ``after_requested_at``/``after_id``; the clamp is still refused here rather
+#: than discovered later, because one page cannot hold what was asked for.
 MAX_LIST_LIMIT = 200
 
 #: The same bound the control plane puts on a client-side batch.
@@ -202,11 +200,12 @@ def _listed(limit: int) -> int:
     """Checks the caller's page size against what the control plane will give.
 
     ``GET /v1/runs`` clamps ``limit`` to 200 and returns a bare list, so asking
-    for a thousand answers with two hundred runs and no indication that the page
-    was cut. ``list`` returning "the caller's runs" when it is actually the
-    newest two hundred of them is a wrong answer that looks like a right one,
-    and the caller has no cursor to ask for the rest. Refusing the impossible
-    request keeps the answer honest; there is no wire change here.
+    for a thousand answers with two hundred runs. ``list`` returning "the
+    caller's runs" when it is actually the newest two hundred of them is a
+    wrong answer that looks like a right one. The rest is reachable by
+    resuming with ``after_requested_at``/``after_id``, but one call cannot
+    return more than one page, so the impossible request is refused rather than
+    quietly truncated; there is no wire change here.
     """
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("limit is an integer")
@@ -382,18 +381,31 @@ class Runs:
 
     # -- reading runs ---------------------------------------------------
 
-    def list(self, state: str | None = None, limit: int = DEFAULT_LIST_LIMIT) -> list:
+    def list(
+        self,
+        state: str | None = None,
+        limit: int = DEFAULT_LIST_LIMIT,
+        *,
+        after_requested_at: str | None = None,
+        after_id: str | None = None,
+    ) -> list:
         """The caller's runs, newest first.
 
-        One page, capped at ``MAX_LIST_LIMIT``: the control plane clamps a run
-        page and sends no cursor, so this returns the newest ``limit`` runs and
-        cannot tell a short history from a capped page. A larger ``limit`` is
-        refused rather than silently clamped.
+        One page, capped at ``MAX_LIST_LIMIT``. ``after_requested_at`` with
+        ``after_id`` continues strictly past the last run of the previous page,
+        so a caller whose history is longer than one page can walk it instead of
+        seeing the newest ``limit`` runs and no way to ask for the rest. A
+        larger ``limit`` is refused rather than silently clamped.
         """
         page = _listed(limit)
         query: dict[str, Any] = {"limit": page}
         if state is not None:
             query["state"] = state
+        if (after_requested_at is None) != (after_id is None):
+            raise ValueError("after_requested_at and after_id must be given together")
+        if after_requested_at is not None:
+            query["after_requested_at"] = after_requested_at
+            query["after_id"] = after_id
         return self.client._request("GET", f"/v1/runs?{urlencode(query)}")
 
     def get(self, run_id: str) -> dict:

@@ -34,6 +34,7 @@ dependencies = [
 name = "aiec-api"
 version = "0.1.0"
 dependencies = [
+ "aiec-client",
  "aiec-core",
  "aiec-guard",
  "aiec-network-linux",
@@ -265,6 +266,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "crc",
  "futures-util",
  "hex",
  "hmac",

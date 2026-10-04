@@ -484,7 +484,7 @@ impl MemoryRepository {
     }
 
     async fn node_capacity_totals(&self) -> Result<aiec_core::NodeCapacity, StoreError> {
-        let cutoff = Utc::now() - chrono::Duration::seconds(30);
+        let cutoff = Utc::now() - chrono::Duration::seconds(NODE_HEARTBEAT_TTL_SECONDS);
         let data = self.data.read().await;
         let mut totals = aiec_core::NodeCapacity::default();
         for node in data.nodes.values() {
@@ -500,15 +500,14 @@ impl MemoryRepository {
     }
 
     async fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(NODE_HEARTBEAT_TTL_SECONDS);
         Ok(self
             .data
             .read()
             .await
             .nodes
             .values()
-            .filter(|node| {
-                node.healthy && node.last_heartbeat > Utc::now() - chrono::Duration::seconds(30)
-            })
+            .filter(|node| node.healthy && node.last_heartbeat > cutoff)
             .cloned()
             .collect())
     }
@@ -1389,7 +1388,35 @@ impl PostgresRepository {
     }
 
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        sqlx::migrate!("../../migrations").run(&self.pool).await?;
+        let mut connection = self.pool.acquire().await.map_err(database_error)?;
+        // A cancelled migrator must not return a session-held lock to the pool.
+        connection.close_on_drop();
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(database_error)?;
+        // Match SQLx 0.8's lock key so all migration entrypoints serialize.
+        const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+        let lock_id = 0x3d32ad9e * i64::from(CRC.checksum(database.as_bytes()));
+        loop {
+            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(database_error)?;
+            if acquired {
+                break;
+            }
+            // A blocking pg_advisory_lock query retains a transaction/snapshot
+            // that CREATE INDEX CONCURRENTLY can wait on: a startup deadlock.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut migrator = sqlx::migrate!("../../migrations");
+        migrator.set_locking(false); // Our session already holds the same lock.
+        let result = migrator.run_direct(&mut *connection).await;
+        let closed = connection.close().await;
+        result?;
+        closed.map_err(database_error)?;
         Ok(())
     }
 }

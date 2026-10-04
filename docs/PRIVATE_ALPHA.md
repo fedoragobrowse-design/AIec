@@ -76,32 +76,75 @@ Firecracker `create()` writes an owner marker when `sandbox.node_id` is set; uno
 
 ## Reproducing the acceptance runs
 
-Both acceptance harnesses need a toolchain image and, for the Firecracker path, a privileged container (TAP devices and `/dev/kvm` are unavailable to an unprivileged shell). Build the image once and run the harnesses from it:
+Both acceptance harnesses run beside a live deployment, so each one owns exactly
+three things and refuses everything else: a per-run identifier, a scratch
+directory that must not already exist, and a database it owns alone. Before
+running either harness, decide those three.
+
+**The database.** `DATABASE_URL` is no longer used and is refused if set. Name
+a disposable database this run owns alone with `AIEC_ACCEPTANCE_DATABASE_URL`
+— its name must match `aiec_guard_*`, so the deployment's own `aiec` is
+refused — or, for the recovery harness only, set
+`AIEC_RECOVERY_PROVISION_DATABASE=1` with `AIEC_RECOVERY_DB` naming a server you
+control so a run-tagged database can be created and dropped. With none of those
+set the harness builds and stops a private cluster of its own, which is the
+safest option on a shared host.
+
+**The network namespace.** The Firecracker path creates TAP devices, nftables
+tables and masquerade rules. In the host network namespace those land on the
+machine the deployment is serving, so the harness refuses to start without a
+private namespace; there is no `--network host` fallback. Capture the host
+namespace before entering one and pass it in:
 
 ```bash
-# Firecracker coding-agent dogfood (real /dev/kvm and TAP, network host).
+HOST_NETNS=$(readlink /proc/self/ns/net)
+```
+
+Then enter a private namespace, which needs its own loopback brought up (the
+helpers do this) and, for Firecracker, real TAP and `/dev/kvm` access.
+
+**The scratch directory.** `--out`/`AIEC_DOGFOOD_OUT` and
+`AIEC_RECOVERY_OUT` must name a path that does not exist. A run that finds one
+refuses instead of clearing it, so a leftover directory from an interrupted run
+is evidence: read it, then remove it yourself.
+
+Both harnesses also need `AIEC_S3_ENDPOINT`, `AIEC_S3_BUCKET`,
+`AIEC_S3_ACCESS_KEY_ID` and `AIEC_S3_SECRET_ACCESS_KEY`.
+`AIEC_RECOVERY_BIN` and `AIEC_DOGFOOD_BIN` each name a *directory* that must
+hold an executable `aiec-server` and `aiec`. They exist so a caller staging a
+specific build tests that build: the harnesses deliberately do not rebuild,
+because rebuilding would silently substitute whatever this checkout happens to
+contain.
+
+```bash
+# Firecracker coding-agent dogfood, inside a private network namespace.
 sg docker -c 'docker build -t aiec-acceptance scripts/acceptance-container.Dockerfile'
-sg docker -c 'docker run --rm --privileged --network host \
-  -v /dev/kvm:/dev/kvm -v "$PWD:$PWD" -w "$PWD" \
-  -e DATABASE_URL=postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec \
+sg docker -c "docker run --rm --privileged \
+  --network none -v /dev/kvm:/dev/kvm -v \"\$PWD:\$PWD\" -w \"\$PWD\" \
+  -e AIEC_ACCEPTANCE_HOST_NETNS=\"$HOST_NETNS\" \
   -e AIEC_S3_ENDPOINT=http://127.0.0.1:9000 -e AIEC_S3_REGION=us-east-1 \
   -e AIEC_S3_BUCKET=aiec -e AIEC_S3_ACCESS_KEY_ID=aiec \
   -e AIEC_S3_SECRET_ACCESS_KEY=aiec-dev-only \
-  -e AIEC_GUEST_SECRET=0123456789abcdef0123456789abcdef \
-  aiec-acceptance bash scripts/firecracker-coding-dogfood.sh'
+  aiec-acceptance unshare --net bash scripts/firecracker-coding-dogfood.sh"
 
-# Live recovery and fencing, three iterations.
-sg docker -c 'docker run --rm --privileged --network host \
-  -v /var/run/docker.sock:/var/run/docker.sock -v /dev/kvm:/dev/kvm \
+# Live recovery and fencing, three iterations, docker runtime: no namespace of
+# its own is required, because the docker runtime creates none of these.
+sg docker -c 'docker run --rm --privileged \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD:$PWD" -w "$PWD" -e AIEC_RECOVERY_ITERATIONS=3 \
-  -e DATABASE_URL=postgresql://aiec:aiec-dev-only@127.0.0.1:5432/aiec \
   -e AIEC_S3_ENDPOINT=http://127.0.0.1:9000 -e AIEC_S3_REGION=us-east-1 \
   -e AIEC_S3_BUCKET=aiec -e AIEC_S3_ACCESS_KEY_ID=aiec \
   -e AIEC_S3_SECRET_ACCESS_KEY=aiec-dev-only \
   aiec-acceptance bash scripts/worker-recovery-validation.sh'
 ```
 
-The recovery harness provisions and drops its own database, so run at most one instance at a time: the control plane binds fixed ports and concurrent runs collide.
+Run at most one instance of a harness at a time: the control plane binds fixed
+ports and concurrent runs collide. `AIEC_RECOVERY_RUNTIME=firecracker` moves the
+recovery harness onto the private-namespace requirement above.
+
+The recovery harness's SIGKILL-orphan and graceful-reclaim assertions are the
+part of this matrix that has not been re-executed against the current
+launchers; they need staged binaries, an isolated database and KVM.
 
 Pause/resume now has explicit Core state, runtime trait, worker operation, and API routes. The development mock path tests `running → paused → running` and invalid resume returns `409`; Bubblewrap's explicit `501` response is covered by a focused API test. Firecracker pause issues the Firecracker `PATCH /vm` pause transition and is explicitly advertised as non-reclaiming; real Firecracker boot, pause and resume are covered by the opt-in `real_firecracker_exec_file_snapshot_restore` integration test and by the coding-agent dogfood.
 

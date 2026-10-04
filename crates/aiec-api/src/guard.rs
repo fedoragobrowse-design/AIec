@@ -402,6 +402,35 @@ pub(crate) async fn guard_quarantine(
     Ok(Json(incident))
 }
 
+/// The authoritative event that records a quarantine.
+///
+/// Its reason is the rule that triggered the cut, not the subsystem the request
+/// arrived through. A durable-budget or lifetime reaper and an operator API
+/// call both reach this one path, and an incident that always said "watchdog"
+/// sent every reader to a subsystem that had not triggered it.
+fn quarantine_event(
+    id: Uuid,
+    tenant: Uuid,
+    policy_hash: String,
+    rules: &[aiec_guard::control::RuleTrigger],
+) -> aiec_guard::events::EventInput {
+    let triggered_by = rules
+        .first()
+        .map_or_else(|| "quarantine".to_string(), |rule| rule.rule.clone());
+    aiec_guard::events::EventInput {
+        sandbox_id: id,
+        tenant_id: tenant,
+        policy_hash,
+        category: aiec_guard::events::Category::Quarantine,
+        decision: aiec_guard::events::Decision::Quarantine,
+        reason: triggered_by.clone(),
+        destination: rules.first().map(|rule| rule.rule.clone()),
+        request_bytes: 0,
+        response_bytes: 0,
+        duration_ms: 0,
+    }
+}
+
 /// One authoritative quarantine path, in the order the threat model requires.
 ///
 /// The cut comes first and is never gated on the audit succeeding: an unrecorded
@@ -626,18 +655,7 @@ async fn advance_quarantine(
     if already_recorded {
         tracing::warn!("quarantine event already recorded for {id}; not appending a duplicate");
     } else {
-        let event = aiec_guard::events::EventInput {
-            sandbox_id: id,
-            tenant_id: tenant,
-            policy_hash: policy_hash.clone(),
-            category: aiec_guard::events::Category::Quarantine,
-            decision: aiec_guard::events::Decision::Quarantine,
-            reason: "watchdog quarantine".into(),
-            destination: request.rules.first().map(|rule| rule.rule.clone()),
-            request_bytes: 0,
-            response_bytes: 0,
-            duration_ms: 0,
-        };
+        let event = quarantine_event(id, tenant, policy_hash.clone(), &request.rules);
         if let Err(error) = runtime
             .guard_control(
                 &sandbox,
@@ -891,4 +909,60 @@ pub fn routes() -> axum::Router<crate::AppState> {
         .route("/sandboxes/{id}/guard/heartbeat", post(guard_heartbeat))
         .route("/sandboxes/{id}/guard/quarantine", post(guard_quarantine))
         .route("/sandboxes/{id}/guard/incident", get(guard_incident))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quarantine_event;
+
+    fn rules(names: &[&str]) -> Vec<aiec_guard::control::RuleTrigger> {
+        names
+            .iter()
+            .map(|rule| aiec_guard::control::RuleTrigger {
+                rule: (*rule).to_string(),
+                first_event_sequence: None,
+                evidence_references: vec!["durable-control-plane-budget".into()],
+            })
+            .collect()
+    }
+
+    /// A reaped budget and an operator call reach the same path, and the record
+    /// of which rule cut the machine is the only thing telling them apart. A
+    /// constant here sent every incident reader to the watchdog subsystem.
+    #[test]
+    fn a_quarantine_event_is_attributed_to_the_rule_that_triggered_it() {
+        let id = aiec_core::new_id();
+        let tenant = aiec_core::new_id();
+
+        let reaped = quarantine_event(
+            id,
+            tenant,
+            "policy-hash".into(),
+            &rules(&["durable_budget_exhausted"]),
+        );
+        assert_eq!(reaped.reason, "durable_budget_exhausted");
+        assert_eq!(
+            reaped.destination.as_deref(),
+            Some("durable_budget_exhausted")
+        );
+        assert_eq!(reaped.category, aiec_guard::events::Category::Quarantine);
+        assert_eq!(reaped.decision, aiec_guard::events::Decision::Quarantine);
+        assert_eq!(reaped.sandbox_id, id);
+        assert_eq!(reaped.tenant_id, tenant);
+
+        let expired = quarantine_event(
+            id,
+            tenant,
+            "policy-hash".into(),
+            &rules(&["sandbox_lifetime_expired"]),
+        );
+        assert_ne!(reaped.reason, expired.reason);
+        assert_eq!(expired.reason, "sandbox_lifetime_expired");
+
+        // A request that names no rule still records that a quarantine happened,
+        // rather than inventing an attribution.
+        let unattributed = quarantine_event(id, tenant, "policy-hash".into(), &[]);
+        assert_eq!(unattributed.reason, "quarantine");
+        assert_eq!(unattributed.destination, None);
+    }
 }

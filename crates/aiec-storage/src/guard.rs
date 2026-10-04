@@ -360,13 +360,29 @@ impl MemoryRepository {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<GuardBudgetState>, StoreError> {
-        let mut matching: Vec<GuardBudgetState> = self
-            .data
-            .read()
-            .await
+        let data = self.data.read().await;
+        let mut matching: Vec<GuardBudgetState> = data
             .guard_budgets
             .values()
             .filter(|state| expired(state, now))
+            .filter(|state| {
+                // The reaper can only quarantine a sandbox it can fence, and
+                // only a consuming sandbox is work. Same two conditions the
+                // database applies, so the window means the same thing in both
+                // stores.
+                let Some(sandbox) = data.sandboxes.get(&state.identity.sandbox_id) else {
+                    return false;
+                };
+                if !sandbox.state.consumes() {
+                    return false;
+                }
+                data.leases.values().any(|lease| {
+                    lease.tenant_id == state.identity.tenant_id
+                        && lease.sandbox_id == state.identity.sandbox_id
+                        && lease.status == "active"
+                        && lease.expires_at > now
+                })
+            })
             .cloned()
             .collect();
         // Ordered so the window the reaper takes is the same one the database

@@ -902,17 +902,15 @@ Restoring the silent truncation makes it fail.
 
 ### The Python SDK returned a capped run page as if it were the whole answer
 
-`GET /v1/runs` clamps `limit` to `MAX_RUN_PAGE` (200) and answers with a bare
-`Vec<Run>` — no cursor, no total, nothing that distinguishes a capped page from
-a complete one. `Runs.list(limit=1000)` sent 1000, got 200, raised nothing, and
-returned a list its docstring called "the caller's runs".
+`GET /v1/runs` previously clamped `limit` to `MAX_RUN_PAGE` (200) and answered
+with a bare `Vec<Run>` and no cursor. `Runs.list(limit=1000)` sent 1000, got
+200, and returned a list its docstring called "the caller's runs".
 
-The wire shape is not changed here; adding a cursor is an API decision with
-its own compatibility cost. What is fixed is the SDK's part of it: it now
-refuses a `limit` the control plane cannot honour (`MAX_LIST_LIMIT = 200`,
-validated by `_listed`, matching the existing `_bounded` idiom) instead of
-quietly answering with two hundred runs. The docstring now says it is one page
-and cannot tell a short history from a capped one.
+The SDK now refuses a page size the control plane cannot honour
+(`MAX_LIST_LIMIT = 200`, validated by `_listed`) and documents a one-page read.
+The subsequent API fix adds an exclusive `after_requested_at` + `after_id`
+keyset cursor without changing the array response shape; older callers remain
+valid. Histories beyond 200 are now reachable. See the run keyset evidence below.
 
 Regressions: `test_a_page_beyond_what_the_control_plane_will_give_is_refused`
 and `test_the_page_the_control_plane_will_still_give_is_accepted`; both fail
@@ -1674,8 +1672,8 @@ the threat: not the key you are authenticating with. That prevents
 self-lockout. It says nothing about authority, so any key could revoke any
 other key in the tenant, including the tenant's `admin` key. Revocation has no
 inverse and a tenant gets back in with an invite, so this was a permanent
-denial of service available to the least privileged credential in the tenant -
-and the platform issues sandbox keys into every sandbox it creates.
+denial of service available to the least privileged credential in the tenant,
+including a scoped credential a caller supplies to a sandbox.
 
 Both now answer to the same rule as each other, and as the mint check was
 always meant to: **a key may not grant or destroy a privilege it does not hold.**
@@ -1880,3 +1878,279 @@ The snapshots are seeded through `MetadataStore::put_snapshot` rather than
 capture route is rate limited per tenant, so the listing would have been
 refused before it was ever asked. What is under test is the listing route, and
 it reads the same rows either way.
+
+## Fixed in the 2026-10-04 audit: run histories beyond the page ceiling
+
+`GET /v1/runs` returned at most 200 rows with no continuation parameter. Older
+rows were unreachable through that listing. It now accepts the paired
+`after_requested_at` + `after_id` cursor, ordered and filtered exclusively by
+`(requested_at DESC, id DESC)`. Tenant and state filters remain in the same SQL
+statement. Both cursor fields are required; a half cursor is HTTP 400. Default
+50 and clamped 1–200 limits, and the bare array response, remain compatible.
+The last returned run supplies the next cursor; continue until a short or empty
+page. An exactly full final page needs an extra request because there is no
+`next` envelope.
+
+Migration `0029_run_list_keyset_index.sql` replaces the existing tenant/time
+index with `(tenant_id, requested_at DESC, id DESC)` without modifying published
+migrations. An index ending at the timestamp required PostgreSQL to sort tied
+groups before applying the limit. The production `LIST_RUNS_SQL` plan regression
+now checks the actual `plan[0]["Plan"]` root is `Limit` and recursively rejects
+both `Sort` and `Incremental Sort`; a substring check for `"Sort"` alone missed
+the latter. Restoring the old index failed with
+`["Limit", "Incremental Sort", "Index Scan"]`. The full ordering index passed.
+
+Evidence:
+
+- `a_tenant_can_page_past_the_run_page_ceiling` traverses timestamp ties across
+  page boundaries and checks exact descending order, exhaustion, state-filtered
+  continuation and tenant isolation.
+- PostgreSQL-backed API regressions cover a 210-run history, default 50,
+  continuation past 200, a true 200-row clamp, exhaustion, both half cursors and
+  another tenant's newer run. Replacing `<` with `<=` failed traversal; making
+  the half-cursor guard guess values failed the HTTP 400 regression. Both
+  mutations were restored.
+- A throwaway live loopback HTTP smoke served the production router over
+  PostgreSQL, walked 210 tied-timestamp runs exactly once in 14 requests,
+  observed the 200-row clamp and both half-cursor HTTP 400 responses, then
+  removed its scratch schema.
+- The Rust client regression traverses all 210 rows over a real TCP listener,
+  production router and PostgreSQL, comparing exact seeded order and checking
+  the state filter. Removing timestamp URL encoding failed continuation;
+  restoring it passed. Mock query-string echoes were replaced by this
+  consumer-visible regression.
+- A second throwaway live smoke used the actual Python SDK to traverse all 210
+  rows exactly once in 14 HTTP requests, then exercised CLI exclusive
+  continuation and both CLI/Python half-cursor guards. The smoke script and
+  temporary fixture entry point were removed after verification.
+- Python's retained HTTP behavioral regression uses isolated rows with a
+  filtered-out newer run and tied timestamps. It checks exact exclusive pages,
+  exhaustion and equivalent `+02:00`/`+00:00` cursor instants through the real
+  SDK transport. This fixture models the listing boundary; production SQL is
+  exercised separately above. Replacing encoded `%2B` with a raw `+` failed
+  continuation with HTTP 400. The mutation was restored.
+
+The memory repository deliberately does not implement run storage; no memory
+run-pagination parity is claimed. This is a keyset traversal, not a transaction
+snapshot: concurrent writes or state changes can change later filtered pages.
+
+### Probe capacity follow-up
+
+The memory capacity aggregate and `list_nodes` now use the shared
+`NODE_HEARTBEAT_TTL_SECONDS` rather than literal 30-second durations.
+`the_public_probe_routes_report_the_fleet_without_listing_it` includes both
+an unhealthy fresh node and a healthy stale node, and checks complete gauge
+lines rather than numeric prefixes. Removing either aggregate filter failed
+with 44 available vCPUs instead of 4, and 8,589,934,692 memory bytes instead of
+8,589,934,592. Both guards were restored.
+
+## Fixed in the 2026-10-04 audit: packaged worker state placement
+
+The packaged worker unit supplied neither `WorkingDirectory` nor `--state-dir`.
+The CLI defaults its identity and disk-pressure directory to relative `.aiec`,
+which resolves under `/` for a system service and lies outside the unit's
+`ProtectSystem=strict` writable paths. `AIEC_STATE_DIR` configures Firecracker
+VM/snapshot storage, not the worker identity directory; the documented export
+did not repair this startup path.
+
+The unit now declares `StateDirectory=aiec`, `WorkingDirectory=/var/lib/aiec`
+and `--state-dir /var/lib/aiec/worker`. Deployment guidance distinguishes the
+two state directories, specifies systemd's environment file and HTTPS/token
+configuration, and states the absence of explicit cgroup/resource ceilings.
+Admission pressure checks are not `MemoryMax`/`CPUQuota` enforcement. KVM access
+still requires actual device permissions; `ReadWritePaths` is not a device ACL.
+Proxy timeouts must cover queue wait, execution and settlement; a disconnected
+synchronous request does not cancel durable work.
+
+Evidence: after rebuilding the current CLI, starting it from `/` with the
+default relative directory failed with permission denied before registration.
+An explicit writable scratch state directory reached registration, published
+disk pressure from that filesystem and retained the same node-ID SHA-256
+across two starts. Registration deliberately targeted a refused local port;
+no full worker registration or Firecracker execution is claimed.
+`systemd-analyze verify` passed for a temporary worker-unit copy using the
+built executable (only executable path changed; comments omitted). Verification
+of the packaged paths cannot pass locally because `/usr/local/bin/aiec` and
+`/usr/local/bin/aiec-server` are not installed. No installed privileged systemd
+service, KVM/device confinement, proxy, or whole-deployment recovery run was
+exercised by this follow-up.
+
+Only the local development database's checksum for unpublished migration 0029
+was reconciled after its comments were shortened. Fresh schema migrations are
+exercised by the run regressions. Published migration bytes and production
+migration metadata were not changed.
+
+## Fixed in the 2026-10-04 audit: durable worker identity refuses corruption
+
+The worker previously treated every identity read/parse failure as a first
+start. A corrupted `node-id` was silently replaced with a new UUID, and the
+worker proceeded to registration under that identity. A direct pre-fix CLI
+reproduction observed that replacement and registration attempt.
+
+`durable_node_id` now mints automatically only on `NotFound`; corruption and
+other read errors propagate without changing the stored state. Initial
+publication writes and syncs an exclusive same-directory temporary file,
+publishes it without clobbering a concurrent winner, and adopts that winner.
+Control-plane-assigned replacements use atomic rename rather than truncating
+the old identity. Unix publication syncs the state directory and its ancestry,
+including entries introduced by recursive directory creation. New identity
+files use `0600`; newly created directories use `0700`.
+
+Evidence:
+
+- Eight filesystem regressions passed: restart stability, independent state
+  directories, empty/malformed/invalid-UTF-8 refusal, unreadable-file refusal,
+  deterministic directory-at-identity-path refusal, eight simultaneous first
+  starts, assigned-ID persistence/permissions, and complete visibility during
+  200 concurrent replacements.
+- Restoring the old fallback-mint behavior failed both corruption and
+  unreadable-file regressions. The mutation was restored; the expanded
+  eight-test suite passed.
+- The rebuilt CLI refused empty, malformed, invalid-UTF-8 and directory
+  identity states before registration. Each original file or directory marker
+  remained unchanged.
+
+The concurrency checks prove atomic visibility and restart behavior, not
+simulated power-loss recovery or every filesystem's durability semantics.
+An explicit `--node-id` is still an intentional operator override; recovery
+guidance says to restore the original identity rather than delete it while
+the node owns work.
+
+## Fixed in the 2026-10-04 audit: the worker generation ledger is fail-closed
+
+The durable generation floor was advisory. `GenerationLedger::load` treated any
+read or parse failure as a first start, so a truncated or unreadable ledger was
+silently replaced by empty state and the worker would learn generations again
+from zero, losing the fencing floor exactly when the file was damaged. Record
+and forget also mutated the in-memory map before persistence, so a failed write
+left memory ahead of durable evidence.
+
+`GenerationLedger::load` now accepts only a genuine `NotFound` as empty state
+and returns `InvalidData` for malformed UTF-8 or JSON, propagating other I/O
+errors. `WorkerService::with_state_dir` is fallible, and startup refuses a
+corrupt, unreadable or directory-shaped ledger without touching it. `record`
+rolls the map back when persistence fails and `forget` restores a removed
+record. Publication uses an exclusive same-directory temporary file with
+`0600`, file and parent-directory sync, atomic rename, and cleanup limited to
+the caller's own temporary. `learn_generation` returns
+`CoreError::Unavailable` when the floor cannot be published, and authorized
+dispatch propagates that as a rejected worker error instead of running the
+runtime on memory-only state.
+
+Evidence: `worker::tests` passed 33 tests, including
+`worker_service_refuses_a_corrupt_or_unreadable_generation_ledger` and
+`worker_service_refuses_generation_ledger_publication_failure_until_persisted`.
+Before the repair both failed, the publication case reporting a null error field
+where a `runtime_unavailable` rejection was required, which is direct evidence
+that dispatch proceeded on unpersisted state. The rebuilt CLI refused empty,
+malformed, invalid-UTF-8 and directory ledger states before registration, with
+the original bytes or directory marker preserved. These checks cover
+visibility, refusal and rollback; they do not simulate power loss or every
+filesystem's durability semantics.
+
+## Fixed in the 2026-10-04 audit: migration 0029/0030 and the migration lock
+
+The run-list keyset cutover shipped as two `-- no-transaction` files. SQLx 0.8.6
+executes a whole migration file as one simple-query message, so a file
+containing more than one statement is wrapped in an implicit transaction and
+`CREATE/DROP INDEX CONCURRENTLY` fails. Each file now contains exactly one
+statement, and 0029 builds `runs_tenant_created_keyset_idx` on
+`(tenant_id, requested_at DESC, id DESC)` before 0030 concurrently drops
+`runs_tenant_created_idx`. 0029 deliberately has no `IF NOT EXISTS`: an
+interrupted concurrent build can leave an invalid index, and a retry that
+silently accepted it would publish an unvalidated index. Published migrations
+0001-0028 are unchanged.
+
+SQLx's own migration lock then deadlocked the concurrent DDL. The migrator takes
+a blocking `pg_advisory_lock` on a pooled session and holds a transaction
+snapshot; `CREATE INDEX CONCURRENTLY` then waits for a snapshot that cannot be
+granted, while the lock wait blocks every other migrator. Three of four
+concurrent fresh-schema fixtures failed this way. Migrations now run on one
+dedicated connection that is closed on drop, keyed by
+`0x3d32ad9e * crc32(current_database())` to reproduce SQLx 0.8's derivation, and
+the lock is acquired by polling `pg_try_advisory_lock` every 100 ms. This keeps
+migration serialization without holding a blocking-lock snapshot across
+concurrent DDL. The compatibility constant duplicates SQLx internals and must be
+re-audited if SQLx is upgraded.
+
+Evidence: all four concurrent run-route fixtures pass on fresh schemas.
+`the_run_page_bound_is_pushed_down_to_the_database` asserts the exact production
+statement with a root `Limit` and rejects every Sort variant; restoring the
+legacy timestamp-only index produced `["Limit", "Incremental Sort", "Index
+Scan"]`. On the local development database the current 0029 and 0030 both apply
+successfully, leaving `runs_tenant_created_keyset_idx` with `indisvalid` and
+`indisready` true and `runs_tenant_created_idx` absent. Only the local
+development database's record for unpublished migration 0029 was deleted to
+let the current chain reapply; published migration bytes and production
+migration metadata were not changed. No production database was migrated.
+
+## Fixed in the 2026-10-04 audit: the Guard reaper window holds only actable work
+
+`list_expired_guard_budgets` took a bounded window of expired or quarantined
+budgets ordered by ID. Released and stopped machines, and rows whose sandbox no
+longer has a live lease, permanently occupied that window. A tenant that had
+quarantined a machine and then released it could evict every actionable
+quarantine ahead of it, and unowned rows were retried forever without ever
+being fenced.
+
+`SandboxState::consumes()` names the states that are actually running
+(`creating`, `starting`, `running`, `stopping`, `snapshotting`, `restoring`).
+Both stores now return a row only when its sandbox is in one of those states and
+holds an active, unexpired lease for the same tenant and sandbox. Spent budgets
+are still retained, so restarting a released machine makes it immediately
+eligible again rather than refilling it. The deterministic ordering and the
+pushed-down `LIMIT` are unchanged, and the consumer keeps its defensive
+quarantine guard.
+
+Evidence: the memory and PostgreSQL suites agree, 15 tests including
+`a_released_budget_is_not_reaped_until_the_sandbox_runs_again`,
+`an_unowned_budget_does_not_consume_the_reapers_window` and
+`only_actable_guard_budgets_reach_the_reaper_window`. Three mutations each
+failed with the released or unowned sandbox appearing in the window: adding
+`'paused'` to the SQL state list, dropping the lease expiry predicate, and
+relaxing the memory store's state filter. All were restored.
+
+The quarantine event previously recorded `"watchdog quarantine"` as its reason
+on every path, including durable-budget and lifetime reaping. An incident reader
+was sent to a subsystem that had not triggered it. The event now names the rule
+that triggered the cut. The literal had no other consumer in the API, its tests
+or the Python SDK.
+
+## Hardened in the 2026-10-04 audit: acceptance launchers cannot touch a deployment
+
+`scripts/acceptance-db.sh`, `scripts/firecracker-coding-dogfood.sh` and
+`scripts/worker-recovery-validation.sh` run next to a live deployment and
+previously inherited patterns suited to a dedicated machine: a fixed output
+directory that was cleared on entry, process sweeps by command-line substring,
+a database chosen from `DATABASE_URL`, and a Firecracker path that assumed its
+own TAP devices, nftables tables and masquerade rules were harmless in the host
+network namespace.
+
+A run now owns exactly three things and refuses everything else: a per-run
+identifier minted before any process starts, a scratch directory that must not
+already exist, and either a private cluster it builds and stops or a database
+the caller confirms it owns alone. `DATABASE_URL` is no longer consulted, and
+the deployment's own `aiec` database is refused by name. A run-tagged database
+may be created and dropped only where the operator names the server and
+consents, and a name carrying a quote, a semicolon or more than 63 characters is
+refused before it reaches `CREATE` or `DROP` DDL. Process sweeps require the
+exact inherited identifier in `/proc/<pid>/environ` and exclude the sweeping
+shell's own ancestry; without an identifier the scan refuses rather than
+degrading to a command-line match. Firecracker runs refuse to start unless the
+caller supplies the network namespace to have left behind, with no host-network
+fallback. TAP censuses are now reported as this run's namespace rather than
+claimed as a host-wide census.
+
+Evidence, exercised directly against the sourced helpers on this host:
+a fresh scratch path is claimed; an existing directory, a symlink to another
+run's directory with its target preserved, the checkout root, an empty path and
+`/` are all refused; a process started by this run is found while a process
+carrying an identical command line with a stripped environment is not; the scan
+refuses when no identifier is present; the host network namespace is refused; a
+percent-encodable socket URL yields the database name rather than the socket
+path's last component; a name carrying `"` and `;` is refused; and `aiec` is
+refused as an isolated database. `bash -n` passes on all three scripts.
+
+No launcher was executed end to end: each requires a staged deployment, an
+isolated database and, for Firecracker, KVM. The recovery scenario's SIGKILL
+orphan and graceful-reclaim assertions therefore remain unexercised.

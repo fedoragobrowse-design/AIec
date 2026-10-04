@@ -8,7 +8,9 @@ Type=simple
 User=aiec
 Group=aiec
 EnvironmentFile=/etc/aiec/aiec.env
-ExecStart=/usr/local/bin/aiec worker
+StateDirectory=aiec
+WorkingDirectory=/var/lib/aiec
+ExecStart=/usr/local/bin/aiec worker --state-dir /var/lib/aiec/worker
 Restart=on-failure
 NoNewPrivileges=false
 # Guard installs nftables tables and TAP devices of its own, so the worker needs

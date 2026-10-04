@@ -1136,11 +1136,16 @@ pub trait MetadataStore: Send + Sync {
         Err(CoreError::Unsupported("run storage".into()))
     }
     /// Lists a tenant's runs newest first, optionally filtered by state.
+    ///
+    /// `after` names the last returned row; the next page is strictly older in
+    /// `(requested_at DESC, id DESC)` order. `MatrixCursor` carries this key.
+    /// PostgreSQL supports run storage; the memory repository does not.
     async fn list_runs(
         &self,
         _tenant: TenantId,
         _state: Option<RunState>,
         _limit: u32,
+        _after: Option<MatrixCursor>,
     ) -> Result<Vec<Run>, CoreError> {
         Err(CoreError::Unsupported("run storage".into()))
     }

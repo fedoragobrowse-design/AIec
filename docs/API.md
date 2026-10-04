@@ -70,7 +70,14 @@ tie either re-reads or skips the rows sharing a timestamp.
   this document; the guest receives a `placeholder://<binding>` instead. See
   `GUARD_POLICY.md`.
 
-- `GET /v1/runs`, `GET /v1/runs/{id}` — tenant-scoped list (filterable by `state`, paginated by `limit`) and detail.
+- `GET /v1/runs` — a tenant-scoped bare array, filtered by optional `state`, ordered by `(requested_at DESC, id DESC)`. `limit` defaults to 50 and is clamped to 1–200. For the next page, pass the last returned run's `requested_at` and `id` as `after_requested_at` + `after_id`; both must be given together or the route returns HTTP 400. The cursor is exclusive. Keep the same state filter and continue until a short or empty page; an exactly full final page requires one additional empty request because this compatible array shape has no `next` field.
+  Consumers expose the same one-page cursor: Rust
+  `AIecClient::list_runs(state, limit, Option<MatrixCursor>)`; Python
+  `client.runs.list(state, limit, after_requested_at=..., after_id=...)`;
+  CLI `aiec run list --after-requested-at TIMESTAMP --after-id RUN_ID`.
+  Python's cursor fields are keyword-only; existing positional state/limit
+  calls remain valid. Python and CLI refuse half cursors before sending.
+- `GET /v1/runs/{id}` — tenant-scoped detail.
 - `GET /v1/runs/{id}/events`, `GET /v1/runs/{id}/attempts` — the run's history and its attempts.
 - `POST /v1/runs/{id}/cancel` — stop a run and reclaim its machine. Cancelling a finished run returns it unchanged.
 - `POST /v1/eval/batch`, `POST /v1/eval/repetitions`, `POST /v1/eval/matrix` — bounded parallel evaluation. `batch` takes `{requests, options}` and returns `Vec<Run>`; `repetitions` takes `{request, repetitions, options}` and returns `Vec<Run>`; `matrix` takes `{cells: [{axis, request}], options}` and returns `{matrix_id, requested_at, max_parallel, results: [{axis, run?, error?}]}`. Every submitted cell appears in `results`: a cell that was refused before it ran comes back with its `axis` and an `error` and no `run`, beside the cells that did run, so a partial failure never hides the runs that were executed and billed — and never costs the caller the `matrix_id` that is the only way to find them. A matrix must also be keyed throughout or not at all; a partly-keyed matrix is `400` before anything is admitted, because keyed cells keep their keys across a retry and unkeyed cells do not, and the clash between those two is only visible after the batch has been spent. `repetitions` must be at least 1 and `max_parallel` is bounded; every evaluation route needs the sandbox write scope. The Python SDK exposes these as `af.evals.batch(...)`, `.repetitions(...)` and `.matrix(...)`, and expands a suite document into the `matrix` request with `af.evals.run_suite(...)` and `.compare(...)`; `af.evals.compare` reports both revisions' outcomes and picks no winner.

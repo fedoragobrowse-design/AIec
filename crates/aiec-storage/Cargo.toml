@@ -11,6 +11,7 @@ async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+crc.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true

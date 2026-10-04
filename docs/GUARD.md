@@ -100,7 +100,8 @@ governed placement - visibly, and correctly. This is worth checking before a
 deployment is declared protected:
 
 ```bash
-aiec doctor --json | grep network_policy
+# `nft list tables` shows whether Guard's rules are installed on this host.
+# `aiec doctor` reports runtime prerequisites, not Guard state.
 nft list tables | grep aiec_guard
 ```
 

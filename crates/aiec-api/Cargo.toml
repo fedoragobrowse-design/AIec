@@ -47,4 +47,5 @@ futures.workspace = true
 parking_lot = "0.12"
 
 [dev-dependencies]
+aiec-client.workspace = true
 tower = { version = "0.5", features = ["util"] }

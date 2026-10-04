@@ -18,13 +18,14 @@ use aiec_core::{
     run::{RepoSpec, RetentionPolicy, RunState},
     runtime::SandboxRuntime,
     snapshots::SnapshotProvider,
-    storage::{MetadataStore, WorkerAssignment},
+    storage::{MatrixCursor, MetadataStore, WorkerAssignment},
 };
 use aiec_guard::budget_client::HttpBudgetAuthority;
 use aiec_guard::policy::PolicyTemplate;
 use aiec_runtime::DockerRuntime;
 use aiec_runtime::{BubblewrapRuntime, FirecrackerConfig, FirecrackerRuntime};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -263,11 +264,21 @@ enum RunCommand {
     /// One run, in full.
     Show { run_id: Uuid },
     /// This tenant's runs, newest first.
+    ///
+    /// One page. `--after-requested-at` with `--after-id` resumes past the last
+    /// run of the previous page; both are required together, because half a
+    /// cursor names no row to start after.
     List {
         #[arg(long)]
         state: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// `requested_at` of the last run of the previous page.
+        #[arg(long, value_name = "TIMESTAMP")]
+        after_requested_at: Option<String>,
+        /// Id of that run, which breaks a `requested_at` tie.
+        #[arg(long, value_name = "RUN_ID")]
+        after_id: Option<Uuid>,
     },
     /// Stops a run and reclaims the machine it was holding.
     Cancel { run_id: Uuid },
@@ -841,6 +852,36 @@ mod tests {
         assert!(latencies.withheld.is_none());
         assert!(!latencies.fields("create").contains("withheld"));
     }
+
+    /// A half-stated cursor is refused before a request is made. Sending it
+    /// would page from a query the caller did not ask for - an instant with no
+    /// identity orders nothing, and an id alone cannot order a page that has
+    /// not been read - and the control plane's own rejection would arrive only
+    /// after the credentials were spent on a request that was always wrong.
+    #[test]
+    fn a_run_page_cursor_is_either_the_pair_or_neither() {
+        assert!(
+            run_page_cursor(None, None)
+                .expect("the first page")
+                .is_none()
+        );
+
+        let id = Uuid::now_v7();
+        let cursor = run_page_cursor(Some("2024-01-02T03:04:05Z"), Some(id))
+            .expect("a paired cursor")
+            .expect("a cursor");
+        assert_eq!(cursor.id, id);
+        assert_eq!(
+            cursor.requested_at.to_rfc3339(),
+            "2024-01-02T03:04:05+00:00"
+        );
+
+        assert!(run_page_cursor(Some("2024-01-02T03:04:05Z"), None).is_err());
+        assert!(run_page_cursor(None, Some(id)).is_err());
+        // A timestamp that is not one is a message, not a page that comes
+        // back wrong.
+        assert!(run_page_cursor(Some("yesterday"), Some(id)).is_err());
+    }
 }
 
 async fn client(url: &str, api_key: Option<String>) -> Result<AIecClient> {
@@ -1118,6 +1159,7 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
         args.capacity,
     )
     .with_state_dir(&args.state_dir)
+    .context("load durable worker generation ledger")?
     .with_ownership_verifier(Arc::new(verifier));
     match &guard_budget_authority {
         Ok(authority) => {
@@ -2037,6 +2079,25 @@ fn run_request_from(args: &RunSubmitArgs) -> Result<CreateRunRequest> {
     Ok(request)
 }
 
+/// The run listing's page cursor, or the first page when neither flag was given.
+///
+/// A half-stated cursor names no row to start after: the timestamp alone orders
+/// nothing without an identity, and the id alone cannot order a page that has
+/// not been read. Passing one through would page from a different query than
+/// the caller asked for, so the halves are refused here rather than sent.
+fn run_page_cursor(requested_at: Option<&str>, id: Option<Uuid>) -> Result<Option<MatrixCursor>> {
+    match (requested_at, id) {
+        (None, None) => Ok(None),
+        (Some(raw), Some(id)) => {
+            let requested_at = DateTime::parse_from_rfc3339(raw.trim())
+                .with_context(|| format!("not an RFC 3339 timestamp: {raw}"))?
+                .with_timezone(&Utc);
+            Ok(Some(MatrixCursor { requested_at, id }))
+        }
+        _ => anyhow::bail!("--after-requested-at and --after-id must be given together"),
+    }
+}
+
 async fn run_command(url: &str, key: Option<String>, command: RunCommand) -> Result<()> {
     // The request is built before the client so a `--dry-run` review needs no
     // credentials: being able to read what you are about to submit without
@@ -2061,7 +2122,15 @@ async fn run_command(url: &str, key: Option<String>, command: RunCommand) -> Res
             let run = c.get_run(run_id).await?;
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
-        (RunCommand::List { state, limit }, _) => {
+        (
+            RunCommand::List {
+                state,
+                limit,
+                after_requested_at,
+                after_id,
+            },
+            _,
+        ) => {
             // Parsed here so a typo is a message rather than a query the
             // control plane answers with an empty page.
             let state = state
@@ -2070,7 +2139,8 @@ async fn run_command(url: &str, key: Option<String>, command: RunCommand) -> Res
                         .ok_or_else(|| anyhow::anyhow!("unknown run state `{raw}`"))
                 })
                 .transpose()?;
-            let runs = c.list_runs(state, Some(limit)).await?;
+            let after = run_page_cursor(after_requested_at.as_deref(), after_id)?;
+            let runs = c.list_runs(state, Some(limit), after).await?;
             println!("{}", serde_json::to_string_pretty(&runs)?);
         }
         (RunCommand::Cancel { run_id }, _) => {
@@ -2508,33 +2578,106 @@ fn base64_decode(value: &str) -> Result<Vec<u8>> {
 
 /// Records the node id the control plane assigned to this worker.
 fn persist_node_id(state_dir: &std::path::Path, node_id: Uuid) -> anyhow::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
-    std::fs::write(state_dir.join("node-id"), format!("{node_id}\n"))?;
+    publish_node_id(state_dir, node_id, true)
+}
+
+/// Publishes a complete, synced identity without truncating the previous one.
+fn publish_node_id(
+    state_dir: &std::path::Path,
+    node_id: Uuid,
+    replace: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    directory.mode(0o700);
+    directory.create(state_dir)?;
+    let path = state_dir.join("node-id");
+    let temporary = state_dir.join(format!(".node-id-{}.tmp", Uuid::now_v7()));
+    let mut temporary_created = false;
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        temporary_created = true;
+        let mut bytes = [0u8; 37];
+        node_id.hyphenated().encode_lower(&mut bytes[..36]);
+        bytes[36] = b'\n';
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if replace {
+            std::fs::rename(&temporary, &path)?;
+        } else {
+            // A simultaneous first start must adopt the winning identity.
+            std::fs::hard_link(&temporary, &path)?;
+            std::fs::remove_file(&temporary)?;
+        }
+        #[cfg(unix)]
+        sync_node_id_directory(state_dir)?;
+        Ok(())
+    })();
+    if result.is_err() && temporary_created {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.context("persist worker node identity")
+}
+
+/// Sync every directory entry that recursive creation may have introduced.
+#[cfg(unix)]
+fn sync_node_id_directory(state_dir: &std::path::Path) -> std::io::Result<()> {
+    for ancestor in state_dir.ancestors() {
+        let path = if ancestor.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            ancestor
+        };
+        std::fs::File::open(path)?.sync_all()?;
+    }
     Ok(())
 }
 
-/// Returns this worker's node id, minting and persisting one on first start.
-///
-/// A worker's name is unique in the control plane, so a restart that invented a
-/// fresh id would collide on that name. Persisting the id keeps the sandboxes
-/// this worker placed attached to its node record instead of orphaning them.
+fn read_node_id(path: &std::path::Path) -> anyhow::Result<Uuid> {
+    let text = std::fs::read_to_string(path).context("read stored worker node identity")?;
+    Uuid::parse_str(text.trim()).context("stored worker node identity is malformed")
+}
+
+/// Only a genuinely missing identity permits automatic first-start minting.
 fn durable_node_id(state_dir: &std::path::Path) -> anyhow::Result<Uuid> {
     let path = state_dir.join("node-id");
-    if let Some(existing) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| Uuid::parse_str(text.trim()).ok())
-    {
-        return Ok(existing);
+    match read_node_id(&path) {
+        Ok(existing) => return Ok(existing),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
     }
-
     let minted = Uuid::now_v7();
-    persist_node_id(state_dir, minted)?;
-    Ok(minted)
+    match publish_node_id(state_dir, minted, false) {
+        Ok(()) => Ok(minted),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            #[cfg(unix)]
+            sync_node_id_directory(state_dir)?;
+            read_node_id(&path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
 mod node_identity_tests {
-    use super::durable_node_id;
+    use super::{durable_node_id, persist_node_id};
 
     /// A worker that invents a fresh id on every start collides with the
     /// control plane's unique name and can never re-register, so the id has to
@@ -2551,8 +2694,148 @@ mod node_identity_tests {
     #[test]
     fn separate_state_dirs_get_separate_identities() {
         let suffix = uuid::Uuid::now_v7();
-        let a = durable_node_id(&std::env::temp_dir().join(format!("aiec-a-{suffix}"))).unwrap();
-        let b = durable_node_id(&std::env::temp_dir().join(format!("aiec-b-{suffix}"))).unwrap();
+        let a_dir = std::env::temp_dir().join(format!("aiec-a-{suffix}"));
+        let b_dir = std::env::temp_dir().join(format!("aiec-b-{suffix}"));
+        let a = durable_node_id(&a_dir).unwrap();
+        let b = durable_node_id(&b_dir).unwrap();
         assert_ne!(a, b, "two workers must not share an identity");
+        std::fs::remove_dir_all(a_dir).unwrap();
+        std::fs::remove_dir_all(b_dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_identity_is_refused_and_preserved() {
+        for content in [b"".as_slice(), b"interrupted-node-id", b"\xff"] {
+            let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&dir).unwrap();
+            let path = dir.join("node-id");
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                durable_node_id(&dir).is_err(),
+                "corruption must not mint a new identity"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_directory_at_the_identity_path_is_refused_and_preserved() {
+        let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+        let path = dir.join("node-id");
+        std::fs::create_dir_all(&path).unwrap();
+        let marker = path.join("preserve");
+        std::fs::write(&marker, b"existing directory").unwrap();
+        assert!(durable_node_id(&dir).is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read(marker).unwrap(), b"existing directory");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_identity_is_not_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+        let original = durable_node_id(&dir).unwrap();
+        let path = dir.join("node-id");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::read_to_string(&path).is_ok() {
+            eprintln!(
+                "this process bypasses file read permissions; unreadable-file case not exercised"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        assert!(durable_node_id(&dir).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(durable_node_id(&dir).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_first_starts_adopt_one_identity() {
+        let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    durable_node_id(&dir).unwrap()
+                })
+            })
+            .collect();
+        let identities: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(identities.iter().all(|id| *id == identities[0]));
+        assert_eq!(durable_node_id(&dir).unwrap(), identities[0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_assigned_identity_survives_the_next_start() {
+        let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+        let first = durable_node_id(&dir).unwrap();
+        let assigned = uuid::Uuid::now_v7();
+        assert_ne!(assigned, first);
+        persist_node_id(&dir, assigned).unwrap();
+        assert_eq!(durable_node_id(&dir).unwrap(), assigned);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("node-id"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_an_identity_never_exposes_partial_or_missing_content() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = std::env::temp_dir().join(format!("aiec-node-id-{}", uuid::Uuid::now_v7()));
+        let first = durable_node_id(&dir).unwrap();
+        let assigned = uuid::Uuid::now_v7();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_dir = dir.clone();
+        let writer_done = done.clone();
+        let writer = std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                for index in 0..200 {
+                    persist_node_id(&writer_dir, if index % 2 == 0 { first } else { assigned })?;
+                }
+                Ok(())
+            })();
+            writer_done.store(true, Ordering::Release);
+            result
+        });
+        let mut failure = None;
+        loop {
+            match durable_node_id(&dir) {
+                Ok(id) if id == first || id == assigned => {}
+                other => {
+                    failure = Some(other);
+                }
+            }
+            if failure.is_some() || done.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        writer.join().unwrap().unwrap();
+        assert!(
+            failure.is_none(),
+            "a replacement exposed invalid identity: {failure:?}"
+        );
+        assert_eq!(durable_node_id(&dir).unwrap(), assigned);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

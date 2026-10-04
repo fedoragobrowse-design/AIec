@@ -1005,6 +1005,73 @@ async fn handled_guard_budgets_cannot_fill_the_reapers_window() {
     drop_test_schema(&repository, admin, schema).await;
 }
 
+/// The memory store's reaper eligibility is the database's eligibility.
+///
+/// A released sandbox is `paused` with a budget that is still spent, and a
+/// sandbox whose lease has expired cannot be fenced at all. Selecting either
+/// spends the bounded window on work the reaper cannot perform - re-quarantining
+/// a machine an operator just released, or a permanent no-op - so neither may
+/// occupy the window while a sandbox that is genuinely over budget waits behind
+/// them. The budget itself is untouched: start the sandbox again and the same
+/// query returns it.
+#[tokio::test]
+async fn only_actable_guard_budgets_reach_the_reaper_window() {
+    let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let window = aiec_core::storage::REAPER_GUARD_WINDOW;
+    // One worker per sandbox: the test worker offers two vCPUs and placement is
+    // capacity-admission checked, so three sandboxes on one worker is refused
+    // before the eligibility this test is about is ever reached.
+    let released_worker = register_test_worker(&repository, tenant).await;
+    let unowned_worker = register_test_worker(&repository, tenant).await;
+    let actionable_worker = register_test_worker(&repository, tenant).await;
+
+    let (released_state, fence) = place(&repository, tenant, released_worker).await;
+    let (unowned_state, _) = place(&repository, tenant, unowned_worker).await;
+    let (actionable_state, _) = place(&repository, tenant, actionable_worker).await;
+    let released = released_state.identity.sandbox_id;
+    let unowned = unowned_state.identity.sandbox_id;
+    let actionable = actionable_state.identity.sandbox_id;
+    for state in [released_state, unowned_state, actionable_state] {
+        let mut state = state;
+        state.expires_at = Utc::now() - chrono::Duration::hours(1);
+        repository.put_guard_budget(state).await.unwrap();
+    }
+    repository
+        .mark_guard_quarantined(tenant, released, fence)
+        .await
+        .unwrap();
+    repository
+        .release_guard_quarantine(tenant, released, "key:test/operator")
+        .await
+        .unwrap();
+    // The owner goes away: the lease is no longer current, so no dispatch can
+    // fence a quarantine of this sandbox.
+    sqlx::query(
+        "UPDATE sandbox_leases SET expires_at = now() - interval '1 hour' WHERE sandbox_id = $1",
+    )
+    .bind(unowned)
+    .execute(&repository.pool)
+    .await
+    .unwrap();
+
+    let tick = repository
+        .list_expired_guard_budgets(Utc::now(), window)
+        .await
+        .unwrap();
+    assert_eq!(
+        tick.iter()
+            .map(|b| b.identity.sandbox_id)
+            .collect::<Vec<_>>(),
+        vec![actionable],
+        "a released machine and an unowned one must not spend the window; only \
+         the running, owned, over-budget sandbox is work"
+    );
+    repository.pool.close().await;
+    drop_test_schema(&repository, admin, schema).await;
+}
+
 /// The window reaches the database. Without this the query materialises every
 /// expired budget in the deployment and the bound only exists afterwards.
 #[tokio::test]

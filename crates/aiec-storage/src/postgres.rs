@@ -1653,6 +1653,16 @@ pub(crate) const LIST_SNAPSHOTS_SQL: &str = "\
      AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4)) \
      ORDER BY created_at DESC, id DESC LIMIT $5";
 
+/// The run listing, for the same reason as [`LIST_SNAPSHOTS_SQL`]. The cursor
+/// predicate and the `ORDER BY` are one shape: both name
+/// `(requested_at DESC, id DESC)`, so the statement stays a keyset page and
+/// not an offset one dressed up as a keyset.
+pub(crate) const LIST_RUNS_SQL: &str = "\
+     SELECT * FROM runs WHERE tenant_id = $1 \
+     AND ($2::text IS NULL OR state = $2) \
+     AND ($4::timestamptz IS NULL OR (requested_at, id) < ($4, $5)) \
+     ORDER BY requested_at DESC, id DESC LIMIT $3";
+
 /// Re-exported for the same reason as [`LIST_SNAPSHOTS_SQL`]: the plan
 /// assertion has to run against the statement that actually executes.
 #[cfg(test)]
@@ -3698,23 +3708,27 @@ impl PostgresRepository {
         tenant: Uuid,
         state: Option<RunState>,
         limit: u32,
+        after: Option<aiec_core::storage::MatrixCursor>,
     ) -> Result<Vec<Run>, StoreError> {
-        // The tenant leads so `runs_tenant_created_idx` drives the page, which
-        // is the index that answers "this tenant's runs, newest first". The
+        // The tenant leads so `runs_tenant_created_keyset_idx` drives the page,
+        // which is the index that answers "this tenant's runs, newest first"
+        // and now carries the id tie-breaker the cursor compares. The
         // state stays an `OR` on a nullable parameter so one statement serves
         // both the filtered and the unfiltered page, and a filter that matches
         // few rows of a tenant's own page costs less than a second scan shape.
-        let rows = sqlx::query(
-            "SELECT * FROM runs \
-             WHERE tenant_id = $1 AND ($2::text IS NULL OR state = $2) \
-             ORDER BY requested_at DESC, id DESC LIMIT $3",
-        )
-        .bind(tenant)
-        .bind(state.map(RunState::as_str))
-        .bind(i64::from(limit.clamp(1, 1_000)))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?;
+        // The cursor is the same nullable trick: `($4::timestamptz IS NULL OR
+        // (requested_at, id) < ($4, $5))` is the row-comparison form of the
+        // keyset, and it keeps the index the driving scan instead of turning
+        // the continuation into an offset the planner has to cost.
+        let rows = sqlx::query(LIST_RUNS_SQL)
+            .bind(tenant)
+            .bind(state.map(RunState::as_str))
+            .bind(i64::from(limit.clamp(1, 1_000)))
+            .bind(after.map(|cursor| cursor.requested_at))
+            .bind(after.map(|cursor| cursor.id))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
         rows.iter().map(run_from_row).collect()
     }
 
@@ -4957,8 +4971,9 @@ impl MetadataStore for PostgresRepository {
         tenant: Uuid,
         state: Option<RunState>,
         limit: u32,
+        after: Option<aiec_core::storage::MatrixCursor>,
     ) -> Result<Vec<Run>, CoreError> {
-        Self::list_runs(self, tenant, state, limit)
+        Self::list_runs(self, tenant, state, limit, after)
             .await
             .map_err(core_error)
     }
@@ -8277,10 +8292,10 @@ pub(crate) mod tests {
         );
         assert_eq!(repository.get_run(tenant, value.id).await.unwrap(), value);
 
-        let listed = repository.list_runs(tenant, None, 50).await.unwrap();
+        let listed = repository.list_runs(tenant, None, 50, None).await.unwrap();
         assert!(listed.contains(&value));
         let queued = repository
-            .list_runs(tenant, Some(RunState::Queued), 50)
+            .list_runs(tenant, Some(RunState::Queued), 50, None)
             .await
             .unwrap();
         assert!(queued.contains(&parent));
@@ -8310,7 +8325,11 @@ pub(crate) mod tests {
             "a retried request is handed the run it already created, not a second one"
         );
         assert_eq!(
-            repository.list_runs(tenant, None, 50).await.unwrap().len(),
+            repository
+                .list_runs(tenant, None, 50, None)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -8322,11 +8341,174 @@ pub(crate) mod tests {
         assert_ne!(theirs.id, created.id);
         assert_eq!(
             repository
-                .list_runs(outsider, None, 50)
+                .list_runs(outsider, None, 50, None)
                 .await
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// The page bound is a page, not a ceiling: a tenant with more runs than
+    /// `limit` holds can reach the older ones. Before the cursor existed the
+    /// `LIMIT` truncated silently and the rows past it were unreachable through
+    /// the API at all, which is worse than an unbounded read - it looked like
+    /// the tenant's whole history.
+    ///
+    /// The real PostgreSQL route is covered in `aiec-api/src/run_paging_tests.rs`;
+    /// the memory repository intentionally does not implement run storage.
+    #[tokio::test]
+    async fn a_tenant_can_page_past_the_run_page_ceiling() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+
+        // Tied groups cross page boundaries: both cursor fields are required
+        // to avoid skipping or repeating runs with the same timestamp.
+        let total = 25usize;
+        let mut written = Vec::with_capacity(total);
+        let requested_at = whole_microsecond_ago(0);
+        for index in 0..total {
+            let mut value = run(tenant);
+            value.requested_at = requested_at - chrono::Duration::seconds((index / 6) as i64 * 60);
+            if index % 2 == 0 {
+                value.state = RunState::Succeeded;
+            }
+            written.push(repository.create_run(value).await.unwrap());
+        }
+
+        let mut seen: Vec<Uuid> = Vec::new();
+        let mut after: Option<aiec_core::storage::MatrixCursor> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= total, "the walk did not terminate: {pages} pages");
+            let page = repository.list_runs(tenant, None, 10, after).await.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|run| run.id));
+            let last = page.last().expect("a non-empty page has a last row");
+            after = Some(aiec_core::storage::MatrixCursor {
+                requested_at: last.requested_at,
+                id: last.id,
+            });
+        }
+
+        assert_eq!(pages, 4, "25 runs at 10 per page is three pages and a stop");
+        written.sort_by_key(|run| std::cmp::Reverse((run.requested_at, run.id)));
+        let expected: Vec<Uuid> = written.iter().map(|run| run.id).collect();
+        assert_eq!(
+            seen, expected,
+            "every run exactly once, in descending key order"
+        );
+
+        // Newest first, and a continuation is strictly past its cursor: the
+        // first run of the second page may not be the last run of the first.
+        let first = repository.list_runs(tenant, None, 10, None).await.unwrap();
+        let boundary = first.last().unwrap();
+        let second = repository
+            .list_runs(
+                tenant,
+                None,
+                10,
+                Some(aiec_core::storage::MatrixCursor {
+                    requested_at: boundary.requested_at,
+                    id: boundary.id,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !second.iter().any(|run| run.id == boundary.id),
+            "a continuation must not re-serve the row the cursor names"
+        );
+
+        // Another tenant's runs stay out of the walk, at any cursor position.
+        let outsider = other_tenant(&repository).await;
+        assert!(
+            repository
+                .list_runs(outsider, None, 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A state filter carries the same cursor: paging a filtered listing
+        // must not leak the runs the filter excluded.
+        let mut queued_ids = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = repository
+                .list_runs(tenant, Some(RunState::Queued), 5, cursor)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            queued_ids.extend(page.iter().map(|run| run.id));
+            assert!(queued_ids.len() <= total, "filtered cursor did not advance");
+            let last = page.last().unwrap();
+            cursor = Some(aiec_core::storage::MatrixCursor {
+                requested_at: last.requested_at,
+                id: last.id,
+            });
+        }
+        let expected_queued: Vec<Uuid> = written
+            .iter()
+            .filter(|run| run.state == RunState::Queued)
+            .map(|run| run.id)
+            .collect();
+        assert_eq!(queued_ids, expected_queued);
+    }
+
+    /// Explain the production statement, not a copied query. A `Limit` root
+    /// alone is insufficient: a `Sort` or `Incremental Sort` below it can
+    /// consume an unbounded tenant history or tied timestamp group first.
+    #[tokio::test]
+    async fn the_run_page_bound_is_pushed_down_to_the_database() {
+        let Some((repository, _tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let plan: Value = sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIST_RUNS_SQL}"))
+            .bind(Uuid::now_v7())
+            .bind(Option::<String>::None)
+            .bind(10_i64)
+            .bind(Option::<DateTime<Utc>>::None)
+            .bind(Option::<Uuid>::None)
+            .fetch_one(&repository.pool)
+            .await
+            .expect("the plan is available without seeded rows");
+        // `EXPLAIN (FORMAT JSON)` answers with a one-element array, so the plan
+        // node is under the array, not at its root.
+        let root = plan[0]["Plan"]["Node Type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            root, "Limit",
+            "the run listing must bound in the database, not in the caller: {plan}"
+        );
+        // Every node type in the plan, at any depth. Matching the node type by
+        // substring does not work: an index that stops at `requested_at` makes
+        // PostgreSQL emit `Incremental Sort`, which sorts every tied group and
+        // so is exactly the unbounded sort this asserts the absence of.
+        fn node_types(node: &Value, into: &mut Vec<String>) {
+            if let Some(kind) = node["Node Type"].as_str() {
+                into.push(kind.to_owned());
+            }
+            if let Some(children) = node["Plans"].as_array() {
+                for child in children {
+                    node_types(child, into);
+                }
+            }
+        }
+        let mut kinds = Vec::new();
+        node_types(&plan[0]["Plan"], &mut kinds);
+        assert!(
+            !kinds.iter().any(|kind| kind.contains("Sort")),
+            "the page must be read in index order, not sorted before the limit, \
+             found {kinds:?} in {plan}"
         );
     }
 
@@ -8405,7 +8587,7 @@ pub(crate) mod tests {
         );
         assert!(
             repository
-                .list_runs(outsider, None, 50)
+                .list_runs(outsider, None, 50, None)
                 .await
                 .unwrap()
                 .is_empty()
