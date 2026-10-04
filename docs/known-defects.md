@@ -2213,8 +2213,10 @@ The multiplier is a bare literal in SQLx's own source, not a named constant —
 `sqlx-postgres-0.8.6/src/migrate.rs::generate_lock_id` reads
 `0x3d32ad9e * CRC_32_ISO_HDLC(database_name)` under the comment "chosen by fair
 dice roll". It was checked against the vendored crate rather than recalled, so
-there is no `MIGRATION_LOCK_ID` symbol to grep for; `MIGRATION_LOCK_TIMEOUT` is
-the only lock-related constant in this tree.
+there is no `MIGRATION_LOCK_ID` symbol to grep for. `MIGRATION_LOCK_TIMEOUT` is
+the only *migration*-lock constant in this tree; `HOST_LOCK_ATTEMPTS` and
+`HOST_LOCK_BACKOFF` (`postgres.rs:1012-1013`) are the unrelated advisory lock
+that `pg_advisory_lock` around host state uses.
 
 The concurrency fixtures continue to prove that four processes migrating at once
 serialize safely; neither test replaces them.
@@ -2389,10 +2391,23 @@ path. Restored.
 ### Audited and found clean: reachable panics in shipping code
 
 Every `.unwrap()`, `.expect()`, `panic!`, `unreachable!` and literal index in
-`crates/*/src/**` was enumerated, with each file truncated at its first
-`#[cfg(test)]` or `mod tests` so test code was excluded, and integration-test
-directories excluded separately. Each surviving production site was read in
-context rather than pattern-matched. The result is no reachable panic.
+`crates/*/src/**` was enumerated. The scan truncates each file at its first
+`#[cfg(test)]` or `mod tests`, and skips `tests/` directories — those two rules
+and nothing more. It does not exclude test-shaped modules that live in `src/`
+behind neither marker, and several exist: `aiec-api/src/provision_ownership_tests.rs`,
+`aiec-api/src/run_paging_tests.rs`, `aiec-guard/src/events/tests.rs` and
+`aiec-storage/src/guard/tests.rs` were all enumerated and then classified as
+test code by reading them. Three `expect("cidr suffix")` calls in
+`aiec-network-linux/src/lib.rs` are likewise inside `#[test]` functions the
+truncation did not catch, and were only identified because they were read.
+Every surviving site was read in context rather than pattern-matched. The
+result is no reachable panic in production code.
+
+Two classes of match are false positives worth naming, because a future scan
+will rediscover them: the six `self.expect(b'x')?` calls in
+`aiec-guard/src/l7.rs` are an inherent method on the parser that returns a
+`Result`, not `Option::expect`, and the `unwrap`s in `events/tests.rs` and
+`guard/tests.rs` are the test files above.
 
 - `aiec-mcp/src/eval.rs:1282` indexes `command[0]`; `validate_command` rejects an
   empty command first, and `explicit_shell_script` — which also indexes `[0]` —
@@ -2413,6 +2428,10 @@ context rather than pattern-matched. The result is no reachable panic.
   response from a constant status and header.
 - `aiec-runtime/src/e2b.rs:1279-1284` indexes a 5-byte frame header under
   `buffer.len() < ENVELOPE_HEADER` returning early.
+- `aiec-network-linux/src/guard.rs:988`'s `gateway.as_ref().expect("new
+  gateway")` reads a `Mutex<Option<_>>` nine lines after the same function
+  built it as `Mutex::new(Some(gateway))` in a fresh `Arc` it has not yet
+  handed to anyone.
 - The remaining `expect`s are HMAC key construction (`new_from_slice` accepts any
   length), a constant-path `parent()`, and MCP ownership locks whose critical
   sections are a `Vec::push` and an `iter().map().collect()`, so no user code
@@ -2479,3 +2498,32 @@ the bytes as they are received and refuses past `max_bytes`, and the object is
 spooled before the vector is built. Both call sites pass
 `LEGACY_DOWNLOAD_LIMIT`. The capacity is therefore proportional to bytes already
 read and bounded, not to a claim.
+
+## Round 4: three claims checked because they had not been evidenced
+
+**Clippy's exit status was never actually captured.** Every clippy invocation in
+rounds 2 and 3 ended `| grep -E '^error' | head -5; echo "CLIPPY_DONE"`. The
+pipeline's status is grep's, so a clippy failure with no line starting `error`
+in the filtered head would have printed `CLIPPY_DONE` and been recorded as clean.
+Re-run writing to a file and reading `$?` directly:
+`cargo clippy --workspace --all-features --all-targets -- -D warnings` exits 0
+with zero `error`/`warning` lines. The conclusion was right; the evidence for it
+was not, and the ledger is only worth anything if it distinguishes the two.
+
+**`repetitions` as a capacity hint is bounded.** `eval_matrix.rs:578` and
+`eval.rs:821-861` size vectors from a request-supplied `repetitions` before the
+loop that consumes it, which is the shape of a request-controlled allocation.
+Both are guarded ahead of the hint: `eval_matrix.rs:573` refuses above
+`MAX_EVAL_REPETITIONS`, and `eval.rs:818` calls `resolve_repetitions`, which
+refuses `0` and the same ceiling at `eval.rs:1381`. The ceiling is 1000, so the
+widest hint is 2000 elements.
+
+**The panic scan's method did not match its own description.** The entry claimed
+integration-test directories were "excluded separately", implying a rule the
+script does not apply. Re-running with the rules the text now describes — drop
+`tests/` directories, truncate at the first `#[cfg(test)]` or `mod tests`, and
+nothing else — reproduces the enumeration and leaves four test-shaped modules
+that live in `src/` behind neither marker. They are named in the entry, so the
+result is reproducible rather than asserted. Doing it properly also found one
+production site the entry had missed, `aiec-network-linux/src/guard.rs:988`,
+which is unreachable for the reason recorded.
