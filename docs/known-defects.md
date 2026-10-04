@@ -2439,3 +2439,43 @@ about a large one, since `CREATE INDEX CONCURRENTLY` scans twice and is
 `O(n log n)`. The bound is documented as a tunable whose correct response to a
 larger table is to raise it, with the caller naming the database in the
 `StoreError::Transient` it raises.
+
+## Audited and found clean in the 2026-10-04 round 3 sweep
+
+Three whole-tree sweeps, all over non-test code (each file truncated at its test
+module, integration-test directories excluded). All three came back with no
+defect. They are recorded because coverage that was not performed is
+indistinguishable from coverage that found nothing, and the next round should
+not repeat them.
+
+**Dynamic SQL.** Every query built with `format!`, `push_str` or an inline
+interpolation. Only three sites build SQL text at all, and all three are test
+fixtures: `CREATE SCHEMA`/`DROP SCHEMA` in `run_paging_tests.rs:43,204` and
+`provision_ownership_tests.rs:147,332`, all named from `new_id().simple()` —
+an internally generated hex string, never caller input. Production code
+interpolates no SQL text at all; every value is a bind parameter. The one
+production command-line interpolation, `nft delete table inet aiec_{suffix}` at
+`aiec-network-linux/src/lib.rs:293`, takes `suffix` from the first 12 characters
+of a sandbox UUID and passes it as a single argv element, so neither the
+characters nor a second argument can be injected.
+
+**Integer overflow and underflow.** 24 sites where a length, offset or size
+participates in arithmetic. The two that looked live were both already guarded:
+`aiec-runtime/src/e2b.rs:883` computes `request.length * 4 + 4096`, but
+`request.validate()?` runs at line 818 of the same function and rejects anything
+above `FILE_CHUNK_BYTES` (64 KiB), so the product cannot wrap; and
+`object_store.rs:73` subtracts only inside `while bytes.len() < length`.
+`crates/aiec-core/src/protocol.rs:284` allocates `vec![0; length]` from a
+wire-supplied u32, refused first by `length > MAX_FRAME`.
+
+**Allocation from untrusted sizes.** 78 allocation sites. The only one sized by
+something outside the process is
+`object_store.rs:collect_download`'s `Vec::with_capacity(size_bytes)`, where
+`size_bytes` is object-store metadata — worth checking, because a remote
+`Content-Length` driving an allocation is the classic no-bytes-sent OOM. It is
+not reachable as one: `size_bytes` is never taken from a response header, it is
+produced by `hash_reader(&mut file, Some(&mut spool), max_bytes)`, which measures
+the bytes as they are received and refuses past `max_bytes`, and the object is
+spooled before the vector is built. Both call sites pass
+`LEGACY_DOWNLOAD_LIMIT`. The capacity is therefore proportional to bytes already
+read and bounded, not to a claim.
