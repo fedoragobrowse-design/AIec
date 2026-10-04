@@ -495,19 +495,39 @@ impl BubblewrapRuntime {
         timeout: u64,
         stdin: Option<String>,
     ) -> Result<ExecResult, RuntimeError> {
-        if let Some(data) = stdin {
-            use tokio::io::AsyncWriteExt;
-            child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| RuntimeError::Unavailable("stdin unavailable".into()))?
-                .write_all(data.as_bytes())
-                .await?;
-        }
-        drop(child.stdin.take());
         let started = Instant::now();
-        let mut out = Vec::new();
-        let mut err = Vec::new();
+        // Standard input is delivered by its own task rather than written
+        // here. Writing inline blocks until the command either reads or exits,
+        // so a command that closes its input without reading it failed the
+        // whole exec with `EPIPE` instead of reporting the status it exited
+        // with, and a command that never read it at all ran past its own
+        // deadline because the wait below never started.
+        let stdin_task = match stdin {
+            Some(data) => {
+                use tokio::io::AsyncWriteExt;
+                let mut pipe = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| RuntimeError::Unavailable("stdin unavailable".into()))?;
+                Some(tokio::spawn(async move {
+                    // Closing here is what tells a reader that has consumed
+                    // everything to see EOF.
+                    pipe.write_all(data.as_bytes()).await?;
+                    pipe.shutdown().await
+                }))
+            }
+            None => None,
+        };
+        // The channels are unbounded so a reader is never blocked on a send
+        // while its consumer is still waiting for the command to exit. What
+        // bounds them is `stream_pipe`: at most one stream limit is ever
+        // forwarded, so a bounded channel capacity is not the memory bound,
+        // and a full one is not a way to deadlock a writer the caller is still
+        // waiting on.
+        let (out_tx, mut out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<std::io::Result<Vec<u8>>>();
+        let (err_tx, mut err_rx) =
+            tokio::sync::mpsc::unbounded_channel::<std::io::Result<Vec<u8>>>();
         let stdout = child
             .stdout
             .take()
@@ -516,50 +536,69 @@ impl BubblewrapRuntime {
             .stderr
             .take()
             .ok_or_else(|| RuntimeError::Unavailable("stderr unavailable".into()))?;
-        let out_task = tokio::spawn(async move {
-            let mut pipe = stdout;
-            let mut buf = vec![0; 8192];
-            while let Ok(n) = pipe.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                if out.len() < MAX_STDOUT {
-                    let take = n.min(MAX_STDOUT - out.len());
-                    out.extend_from_slice(&buf[..take]);
-                }
-            }
-            Ok::<_, std::io::Error>(out)
-        });
-        let err_task = tokio::spawn(async move {
-            let mut pipe = stderr;
-            let mut buf = vec![0; 8192];
-            while let Ok(n) = pipe.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                if err.len() < MAX_STDERR {
-                    let take = n.min(MAX_STDERR - err.len());
-                    err.extend_from_slice(&buf[..take]);
-                }
-            }
-            Ok::<_, std::io::Error>(err)
-        });
+        // Chunks are sent as they arrive rather than accumulated and returned
+        // at EOF. A command that exits while a backgrounded descendant still
+        // holds its output pipes has finished, and the output it produced
+        // before that is real output, not something to withhold until a pipe
+        // this exec no longer owns finally closes.
+        let out_task = tokio::spawn(stream_pipe(stdout, out_tx, MAX_STDOUT));
+        let err_task = tokio::spawn(stream_pipe(stderr, err_tx, MAX_STDERR));
         let status = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
         let timed_out = status.is_err();
-        if timed_out {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let status = match status {
+            Ok(status) => status?,
+            Err(_) => {
+                let _ = child.start_kill();
+                // The post-kill wait is where a killed command's status comes
+                // from. Reading it from the elapsed timeout instead made every
+                // deadline produce `process ended without status`, so a
+                // timed-out exec was reported as an error and never as a
+                // timeout.
+                child
+                    .wait()
+                    .await
+                    .map_err(|_| RuntimeError::Unavailable("killed process has no status".into()))?
+            }
+        };
+        // A pipe the command has already closed is not an exec failure: the
+        // command chose not to read stdin, and `EPIPE` says only that the
+        // reader went away. Any other write failure is real and reported.
+        if let Some(task) = stdin_task {
+            match tokio::time::timeout(DRAIN, task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    if !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        return Err(error.into());
+                    }
+                }
+                // A writer still blocked on a command we just killed cannot
+                // report anything, and its pipe is dropped with the task.
+                Ok(Err(_)) | Err(_) => {}
+            }
         }
-        let status = status
-            .ok()
-            .transpose()?
-            .ok_or_else(|| RuntimeError::Unavailable("process ended without status".into()))?;
-        let out = out_task
-            .await
-            .map_err(|_| RuntimeError::Unavailable("stdout task failed".into()))??;
-        let err = err_task
-            .await
-            .map_err(|_| RuntimeError::Unavailable("stderr task failed".into()))??;
+        // One shared bound for both pipes, measured from here: a descendant
+        // holding a pipe costs this exec one wait, not one per stream, and
+        // whatever arrived before it is kept.
+        let drains = Instant::now() + DRAIN;
+        let out = drain_output(&mut out_rx, MAX_STDOUT, drains).await;
+        let err = drain_output(&mut err_rx, MAX_STDERR, drains).await;
+        // A stream that ends because its bound ran out is a truncated read of
+        // output the caller asked for, not a failed exec. The command's own
+        // status and timeout flag are what describe the run.
+        if let Some(error) = out.1.or(err.1) {
+            tracing::debug!(reason = %error, "exec output collection stopped early");
+        }
+        let out = out.0;
+        let err = err.0;
+        // The command has exited or been killed, so anything still holding a
+        // pipe is a process this exec has already stopped waiting for. The
+        // reader is released rather than awaited, which is what keeps one such
+        // descendant from holding the caller's lifecycle gate.
+        out_task.abort();
+        err_task.abort();
         let code = status.code().unwrap_or(if timed_out { -124 } else { -1 });
         Ok(ExecResult {
             exit_code: code,
@@ -568,6 +607,90 @@ impl BubblewrapRuntime {
             duration_ms: started.elapsed().as_millis() as u64,
             timed_out,
         })
+    }
+}
+
+/// How long an exec may spend collecting output after its command has ended.
+/// A process this exec no longer owns may still hold an output pipe open, and
+/// the caller's own deadline has already been spent; this is a second, much
+/// smaller bound so one dead descendant cannot hold a sandbox's lifecycle gate.
+const DRAIN: Duration = Duration::from_secs(2);
+
+/// Sends each chunk of a pipe as it arrives, forwarding at most `limit` bytes
+/// and discarding the rest while still reading to EOF.
+///
+/// Sending per chunk rather than accumulating and returning at EOF is what lets
+/// a caller keep the output a command produced before its pipes stayed open.
+/// Discarding is not stopping: a reader that stopped at the limit would close
+/// the pipe under a command that is still writing and hand it a `SIGPIPE` for
+/// output this side has already decided not to keep.
+async fn stream_pipe<R>(
+    mut pipe: R,
+    sender: tokio::sync::mpsc::UnboundedSender<std::io::Result<Vec<u8>>>,
+    limit: usize,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = vec![0; 8192];
+    let mut forwarded = 0usize;
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => {
+                if forwarded >= limit {
+                    continue;
+                }
+                let take = n.min(limit - forwarded);
+                forwarded += take;
+                if sender.send(Ok(buf[..take].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        }
+    }
+}
+
+/// Collects up to `limit` bytes that arrived before `deadline`. The second
+/// element is the reason collection stopped early, if it did: a read failure,
+/// or the bound running out with the pipe still open.
+async fn drain_output(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Vec<u8>>>,
+    limit: usize,
+    deadline: Instant,
+) -> (Vec<u8>, Option<String>) {
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        if collected.len() >= limit {
+            return (collected, Some("output limit reached".into()));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return (
+                collected,
+                Some("output pipe still open at its bound".into()),
+            );
+        }
+        match tokio::time::timeout(remaining, receiver.recv()).await {
+            Ok(Some(Ok(chunk))) => {
+                let take = chunk.len().min(limit - collected.len());
+                collected.extend_from_slice(&chunk[..take]);
+            }
+            Ok(Some(Err(error))) => {
+                return (collected, Some(format!("output stream failed: {error}")));
+            }
+            // Every sender is gone, so this pipe reached EOF.
+            Ok(None) => return (collected, None),
+            Err(_) => {
+                return (
+                    collected,
+                    Some("output pipe still open at its bound".into()),
+                );
+            }
+        }
     }
 }
 impl BubblewrapRuntime {
@@ -4821,6 +4944,121 @@ mod tests {
         assert!(!bwrap_caps.virtual_machine && !bwrap_caps.memory);
         assert!(firecracker_caps.workspace && firecracker_caps.cross_instance_restore);
         assert!(firecracker_caps.virtual_machine && firecracker_caps.memory);
+    }
+
+    /// A command that exits without reading its standard input has reported a
+    /// status. `bounded` used to write stdin inline before any deadline poll,
+    /// so a pipe the command never read failed the whole exec with the write's
+    /// own `EPIPE` instead of the status it exited with.
+    #[tokio::test]
+    async fn unread_stdin_reports_the_status_rather_than_the_write() {
+        let mut command = tokio::process::Command::new("/bin/true");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result =
+            BubblewrapRuntime::bounded(command.spawn().unwrap(), 30, Some("x".repeat(512 * 1024)))
+                .await
+                .expect("a command that ignores stdin still reports its status");
+        assert!(!result.timed_out, "a command that exited was not killed");
+        assert_eq!(result.exit_code, 0);
+    }
+
+    /// The deadline bounds the whole exec, including delivery that a command
+    /// never reads. A command that outlives it while its stdin sits unread
+    /// must still be killed and reported as timed out rather than running to
+    /// its own completion.
+    #[tokio::test]
+    async fn the_deadline_bounds_a_command_that_never_reads_its_stdin() {
+        let mut command = tokio::process::Command::new("/bin/sleep");
+        command.arg("30");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            BubblewrapRuntime::bounded(command.spawn().unwrap(), 1, Some("x".repeat(512 * 1024))),
+        )
+        .await
+        .expect("the deadline is the exec's bound, not the command's")
+        .expect("the group kill reaps the command");
+        assert!(result.timed_out, "the command outlived its deadline");
+        assert_eq!(result.exit_code, -124);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A command that exits while a backgrounded grandchild still holds its
+    /// output pipes has finished. Awaiting those readers with no bound left
+    /// the exec waiting for a process it no longer owns, indefinitely, holding
+    /// the sandbox's lifecycle gate.
+    #[tokio::test]
+    async fn a_backgrounded_grandchild_does_not_hold_the_exec_open() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30 2>/dev/null & echo done");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            BubblewrapRuntime::bounded(command.spawn().unwrap(), 30, None),
+        )
+        .await
+        .expect("an open output pipe costs one bounded wait, not an unbounded one")
+        .expect("a command that exited reports its status");
+        assert!(!result.timed_out, "the command exited inside its deadline");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            result.stdout, "done\n",
+            "output written before the wait is kept"
+        );
+    }
+
+    /// Output past the limit is dropped, and the writer that produced it is
+    /// not killed for producing it.
+    ///
+    /// The property is the writer's own status, not the shell's: a shell whose
+    /// last command is `echo` exits 0 whether or not `dd` was killed, so
+    /// asserting the shell's status would pass against a reader that closes
+    /// the pipe early. `dd` reports `141` when its stdout is closed under it.
+    #[tokio::test]
+    async fn output_past_the_limit_is_dropped_without_failing_the_writer() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        // Four megabytes, well past the one-megabyte stream bound. The writer's
+        // own status goes to stderr, which is below its own limit, and the
+        // shell exits with it so the result carries it.
+        command.arg("-c").arg(
+            "dd if=/dev/zero bs=1024 count=4096 2>/dev/null; \
+             status=$?; echo writer_status=$status >&2; exit $status",
+        );
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = BubblewrapRuntime::bounded(command.spawn().unwrap(), 30, None)
+            .await
+            .expect("a command whose output exceeds the limit still reports its status");
+        assert!(
+            !result.timed_out,
+            "the command finished inside its deadline"
+        );
+        assert_eq!(
+            result.stdout.len(),
+            MAX_STDOUT,
+            "output is truncated at the limit"
+        );
+        assert!(
+            result.stderr.contains("writer_status=0"),
+            "a writer past the limit is not killed for it, stderr was {:?}",
+            result.stderr
+        );
+        assert_eq!(
+            result.exit_code, 0,
+            "the writer's own status reaches the caller"
+        );
     }
 
     #[tokio::test]

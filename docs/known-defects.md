@@ -2844,3 +2844,75 @@ after a command that leaves its pipes open, so a backgrounded grandchild adds
 that much latency to that one exec. Guest behavior was exercised on the host,
 not inside a booted Firecracker guest; the guest binary's own I/O and process
 group handling are what these probes cover, not the host-side transport.
+
+### Fixed: the bubblewrap runtime inherited both guest exec defects, and one more
+
+The advisory that the guest class was closed was wrong for
+`crates/aiec-runtime/src/lib.rs::BubblewrapRuntime::bounded`, which is the
+Docker/bubblewrap exec path. Four defects, all reproduced by executing the real
+function.
+
+**Standard input was written inline, before the deadline was polled.** The same
+defect as the guest: `stdin.write_all(...).await?` ran before `child.wait()`, so a
+command that exited without reading its input failed the exec with
+`Io(Os { code: 32, kind: BrokenPipe })` instead of the status it exited with, and
+a command that never read it at all ran past its own deadline. Delivery now runs
+on its own task; a pipe the reader closed is not a failure, and every other
+write error still is.
+
+**The output readers were awaited with no bound at all.** `out_task.await` and
+`err_task.await` had no timeout, so a command that exited while a backgrounded
+descendant still held its pipes left the exec waiting for a process it no longer
+owned, indefinitely. This is worse than the guest's bounded two-second failure
+and it runs while the caller holds the sandbox's lifecycle gate, so it also
+blocks that sandbox's destroy. Collection is now bounded by a shared two-second
+`DRAIN` for both streams, so one held pipe costs one wait rather than one per
+stream, and whatever arrived before it is kept.
+
+**A timed-out exec could not report a timeout.** On the deadline path the code
+read the status out of the elapsed timeout rather than out of the post-kill wait,
+so every timeout produced `Unavailable("process ended without status")`. The
+`-124` convention and the `timed_out` flag were unreachable: `crates/aiec-api`
+checks `result.timed_out` at `repo_cache.rs:327`, `repo_cache.rs:567` and
+`lib.rs:2405`, and none of those could ever see it from this runtime. The status
+now comes from the wait after the kill.
+
+**Output past the limit now drains rather than stops.** Repaired, the reader
+forwards at most one stream limit and keeps reading to EOF, discarding the rest.
+An earlier version of this repair returned at the limit instead, which closes the
+read end under a writer that is still going and hands it `SIGPIPE` — turning a
+command that merely produced a lot of output into a failed one. Measured: `dd` of
+4 MiB through an early-closed pipe exits `141`. The reader's limit is also the
+only memory bound, so the chunk channels are unbounded — a bounded channel that
+filled up while the caller was still waiting for the command to exit deadlocked
+the writer outright, which the 4 MiB regression reproduced.
+
+**Reproduction and evidence.** Before repair, against the real function:
+`/bin/true` with 512 KiB of stdin reported `Io(Os { code: 32, kind: BrokenPipe })`;
+`/bin/sleep 30` with 512 KiB of unread stdin exceeded a 10-second outer guard;
+`sh -c 'sleep 30 2>/dev/null & echo done'` with a 30-second exec timeout exceeded
+a 10-second outer guard. All three now complete, and the third keeps
+`stdout="done\n"`.
+
+Four permanent regressions in `aiec-runtime` cover the unread-stdin status, the
+deadline kill, the held-pipe grandchild, and the limit truncation. Mutation
+evidence, each mutant required to compile and the named test required to run:
+
+| Mutation | Result |
+|---|---|
+| stdin written inline again | `unread_stdin_reports_the_status_rather_than_the_write` and `the_deadline_bounds_a_command_that_never_reads_its_stdin` FAILED (exit 101) |
+| `drain_output` bound removed | `a_backgrounded_grandchild_does_not_hold_the_exec_open` FAILED (exit 101) |
+| status read from the elapsed timeout | `the_deadline_bounds_a_command_that_never_reads_its_stdin` FAILED (exit 101) |
+| reader returns at the limit | `output_past_the_limit_is_dropped_without_failing_the_writer` FAILED with `writer_status=141` (exit 101) |
+
+Every mutation was reverted immediately. `cargo test -p aiec-runtime --lib`:
+140 passed, 0 failed.
+
+**Limits:** a backgrounded descendant is still not killed on normal exit; it
+keeps running until the sandbox or guest tears down, and its output past the
+drain bound is discarded rather than collected. The two-second `DRAIN` is a
+constant, not a measured value, and is charged to an exec whose command has
+already finished. Output collection is bounded but not truncated-reported: the
+caller cannot distinguish a complete stream from one that was cut at its bound
+except through `stdout` length. This path was exercised by spawning `/bin/sh`
+directly against `bounded`, not through a booted sandbox under bubblewrap.
