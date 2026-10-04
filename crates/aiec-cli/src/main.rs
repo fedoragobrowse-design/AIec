@@ -943,6 +943,10 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     if args.runtime != "bwrap-dev" && advertised.scheme() != "https" {
         anyhow::bail!("non-development workers must advertise HTTPS");
     }
+    // Handler installation is fallible. Do it before registration, local
+    // reconciliation or lease claims, not inside the spawned shutdown future:
+    // a panic there is otherwise mistaken for a clean server shutdown.
+    let shutdown = termination_signal()?;
     let control = control_url.trim_end_matches('/').to_owned();
     let node_id = match args.node_id {
         Some(id) => id,
@@ -1407,11 +1411,11 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     // waited on the same gate would be reclaiming under a create that is still
     // copying.
     let serving = if let Some((cert, key)) = tls_config {
-        serve_worker_tls_until(service, bind, cert, key, termination_signal())
+        serve_worker_tls_until(service, bind, cert, key, shutdown)
             .await
             .context("serve worker operations over TLS")
     } else {
-        aiec_api::serve_worker_until(service, bind, termination_signal())
+        aiec_api::serve_worker_until(service, bind, shutdown)
             .await
             .context("serve worker operations")
     };
@@ -1428,20 +1432,21 @@ async fn worker(control_url: &str, args: WorkerArgs) -> Result<()> {
     serving
 }
 
-/// Resolves on the first `SIGTERM` or `SIGINT`.
+/// Installs both handlers immediately, then resolves on `SIGTERM` or `SIGINT`.
 ///
-/// The default disposition of either signal ends the process without running a
-/// single destructor, so a worker that only waited on its listener would leave
-/// every machine it was running on the host. Waiting for the signal is what
-/// gives the runtime the chance to destroy them.
-async fn termination_signal() {
+/// Installation errors must fail worker startup before it registers or takes
+/// ownership of machines. The default signal disposition skips destructors;
+/// the returned future gives the running worker a chance to reclaim them.
+fn termination_signal() -> Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
-    }
+    let mut terminate = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
 /// Lease lifetime requested when this worker claims assignments.

@@ -2393,15 +2393,15 @@ path. Restored.
 Two candidate sets were reviewed with different enumeration methods. These
 are scoped source-review results, not a repository-wide panic-free guarantee.
 
-**Set A — `unwrap`/`expect`/`panic!`/`unreachable!`.** The scan drops `tests/`
-directories, drops a basename of `tests.rs` or `*_tests.rs`, and truncates every
-remaining file at its first `#[cfg(test)]` or `mod tests`. Those three rules and
-nothing more; they exclude nine files. Anything a rule misses is classified by
-reading it. **22 sites survive in production code and all 22 were read.** Six
-are a false positive — `aiec-guard/src/l7.rs`'s six `self.expect(b'x')?` calls
-are an inherent method on the parser returning a `Result`, not
-`Option::expect`. The remaining **16** are justified below, with line numbers
-so the count can be reconciled against the list.
+**Set A — `unwrap`/`expect`/`panic!`/`unreachable!`.** The earlier regex scan
+dropped `tests/`, `tests.rs` and `*_tests.rs` and truncated each remaining file
+at its first `#[cfg(test)]` or `mod tests`, excluding nine files altogether.
+It enumerated **22 textual matches**, all reviewed. Six were L7 parser methods
+named `expect` returning `Result`, leaving **16 genuine `unwrap`/`expect` sites**
+justified below. This was not complete shipping-code coverage: truncation
+omitted later production code. The structural follow-through below found ten
+additional panic-family sites, including the two worker signal-installation
+panics subsequently repaired.
 
 **Set B — indexing.** The earlier **142** regex-candidate count is withdrawn:
 it included embedded-language/string text and omitted constant indices,
@@ -2647,3 +2647,61 @@ Statuses were captured from the subprocess return values, not filtered output.
 The SDK import contract passed, Python SDK tests reported **69 passed** plus
 two subtests, benchmark tests reported **21 passed**, and syntax checks passed
 for all three acceptance/recovery launcher scripts.
+
+### Fixed: signal-handler installation failure looked like clean worker shutdown
+
+The indexing scan's structural test exclusion exposed an additional problem
+with Set A's older truncation method: shipping code after an inline test module
+was absent from its inventory. A follow-through AST scan (same 105-file scope
+and test exclusions) found **32 panic-family candidates before this repair**:
+six were the already-classified L7 parser methods named `expect`, 25 were
+actual `unwrap`/`expect` calls, and one was `unreachable!`. This is still not a
+macro-expanded or repository-wide panic inventory.
+
+The ten additional sites were reviewed:
+
+- API `lib.rs:2199` constructs the valid Unix epoch from constant `(0, 0)`.
+  API `worker.rs:2095` calls `last()` only after the chunk-group nonempty check.
+- Core `lib.rs:1030` constructs another HMAC-SHA256 with arbitrary-length keys.
+- Runtime `lib.rs:239` reads and mutably retrieves the same gate-map entry while
+  holding the same lock, with no removal between them.
+- Storage `guard.rs:459` checks the same sandbox under one write lock before
+  retrieving it mutably. Storage `lib.rs:645,731` selects approval IDs from the
+  same unchanged map under its write lock; insertion keys are the row IDs.
+- API `lib.rs:3701`'s `unreachable!` is inside a branch that explicitly excludes
+  `SnapshotKind::Workspace`, on an unchanged local enum value.
+- CLI `main.rs` installed SIGTERM/SIGINT handlers inside the asynchronously
+  polled shutdown future with `expect`. These two sites were actionable.
+
+**Reproduction:** built the actual CLI, ran a local development worker against
+an isolated loopback control fixture, and used a throwaway `LD_PRELOAD`
+`sigaction` shim returning `EPERM` separately for SIGTERM and SIGINT handler
+installation. In both cases the worker registered, panicked in the spawned
+shutdown task, logged reclaim, and exited **0**. Axum treated that task ending
+as shutdown, so the process reported success for a failed startup mechanism.
+The reclaim log disproves the initial hypothesis that this panic necessarily
+bypasses reclaim; no skipped-reclaim claim is made.
+
+**Repair:** `termination_signal()` now installs both handlers synchronously and
+returns `Result<impl Future<Output = ()>>`. The worker calls it before durable
+identity publication, local reconciliation, registration or lease claims.
+Installation errors propagate with the failed signal's context. The plain and
+TLS server branches receive that same already-installed shutdown future.
+No HTTP, SDK or CLI argument contract changed.
+
+**Actual-binary verification:** under either injected failure the rebuilt CLI
+exited **1**, reported the corresponding handler error without panic, made
+**zero** control requests and did not create its state directory. Without
+injection, separate SIGTERM and SIGINT control runs reached the actual worker
+`/health` endpoint (HTTP 200), then exited **0** without panic and logged reclaim.
+All child processes, loopback services and scratch directories were owned by
+the smoke harness. No guest, Docker daemon, KVM host or remote service was used.
+These checks prove startup/error and graceful-signal behavior, not live-machine
+reclaim under either runtime. The fault-injection harness is throwaway rather
+than a permanent test requiring a C compiler and Unix dynamic-loader hooks;
+no production-only injection abstraction was added.
+
+Post-repair gates, with subprocess return values captured directly: fmt **0**,
+clippy **0**, workspace tests **0**, **1104 passed / 0 failed / 42 suites**.
+SDK, benchmark and launcher files were unchanged by this repair; their earlier
+same-turn gates remain the verification for those surfaces.
