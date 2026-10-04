@@ -821,3 +821,108 @@ async fn guard_budgets_beyond_the_window_come_back_on_the_next_tick() {
         "ticking through the backlog should reach every budget exactly once"
     );
 }
+
+/// Moves the fixture's sandbox to a state without going through the compare-
+/// and-set transition API, which would refuse paths the test is not exercising
+/// (a paused machine cannot be stopped).
+async fn set_sandbox_state(repository: &MemoryRepository, sandbox: Uuid, state: SandboxState) {
+    repository
+        .data
+        .write()
+        .await
+        .sandboxes
+        .get_mut(&sandbox)
+        .expect("the fixture's sandbox")
+        .state = state;
+}
+
+/// The reaper's window is filtered by `SandboxState::consumes`, so a machine it
+/// has stopped watching must also stop being charged. The two used to be
+/// separate hand-written lists and `paused` was in neither the reaper's
+/// eligibility nor the reserve refusal: an operator could pause a machine and
+/// it could still debit a budget nothing was enforcing.
+#[tokio::test]
+async fn only_a_consuming_machine_can_debit_its_durable_budget() {
+    let (repository, budget, fence) = fixture().await;
+    let tenant = budget.identity.tenant_id;
+    let sandbox = budget.identity.sandbox_id;
+    let debit = BudgetDebit {
+        model_requests: 1,
+        bytes_in: 2,
+        bytes_out: 3,
+    };
+
+    repository
+        .reserve_guard_budget(budget.identity.clone(), fence, debit)
+        .await
+        .expect("a running machine may debit");
+
+    // Every state the machine can reach without consuming must refuse, driven
+    // through the repository rather than the shared helper so the fence, the
+    // state rule and the durable latch are all on the path the worker uses.
+    // `stopping` is absent deliberately: the machine is still running while it
+    // stops, and it keeps spending until `stopped` is committed.
+    for inert in [
+        SandboxState::Paused,
+        SandboxState::Stopped,
+        SandboxState::Quarantined,
+        SandboxState::Destroying,
+        SandboxState::Destroyed,
+        SandboxState::Failed,
+    ] {
+        assert!(
+            !inert.consumes(),
+            "{inert:?} must not be treated as consuming"
+        );
+        set_sandbox_state(&repository, sandbox, inert).await;
+        assert!(
+            matches!(
+                repository
+                    .reserve_guard_budget(budget.identity.clone(), fence, debit)
+                    .await,
+                Err(StoreError::Conflict(_))
+            ),
+            "{inert:?} accepted a debit against a budget nothing enforces"
+        );
+        let unchanged = repository.get_guard_budget(tenant, sandbox).await.unwrap();
+        assert_eq!(
+            (
+                unchanged.model_requests,
+                unchanged.bytes_in,
+                unchanged.bytes_out
+            ),
+            (1, 2, 3),
+            "{inert:?} refused the debit but still wrote to the counters"
+        );
+    }
+
+    // The durable latch is a property of the budget row, not of the sandbox:
+    // it stays set while the machine is still `running`, and only an
+    // authorized release clears it. `consumes` cannot express it, so this case
+    // is the only thing pinning the latch against being folded away.
+    set_sandbox_state(&repository, sandbox, SandboxState::Running).await;
+    repository
+        .data
+        .write()
+        .await
+        .guard_budgets
+        .get_mut(&sandbox)
+        .expect("the fixture's budget")
+        .quarantined = true;
+    assert!(
+        matches!(
+            repository
+                .reserve_guard_budget(budget.identity.clone(), fence, debit)
+                .await,
+            Err(StoreError::Conflict(_))
+        ),
+        "a latched budget accepted a debit from a running machine"
+    );
+
+    // And the refusal is total: the counters are untouched by it.
+    let after = repository.get_guard_budget(tenant, sandbox).await.unwrap();
+    assert_eq!(
+        (after.model_requests, after.bytes_in, after.bytes_out),
+        (1, 2, 3)
+    );
+}

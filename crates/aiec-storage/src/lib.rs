@@ -1372,6 +1372,30 @@ pub struct PostgresRepository {
     pub pool: PgPool,
 }
 
+/// SQLx 0.8's migration lock key for a database, so every migration entrypoint
+/// — ours and the `sqlx` CLI's — serializes on the same advisory lock.
+pub(crate) fn migration_lock_id(database: &str) -> i64 {
+    const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    0x3d32ad9e * i64::from(CRC.checksum(database.as_bytes()))
+}
+
+/// How long `migrate` waits for a peer to finish migrating before reporting it
+/// as a transient failure.
+///
+/// The bound is on waiting for a *peer*, not on this migration's own runtime —
+/// a peer legitimately holds the lock through a `CREATE INDEX CONCURRENTLY` on
+/// a large `runs` table — so this has to exceed the slowest expected peer
+/// migration, or a concurrent deploy fails at startup instead of queueing
+/// behind it.
+///
+/// Nothing bounds it from above: no unit in `deploy/` sets a
+/// `TimeoutStartSec`, so a caller waiting here is not racing an external kill
+/// and the constant only has to clear real migration time. Every statement in
+/// `migrations/` is DDL — 28 `CREATE TABLE`, 71 `ALTER TABLE` and one `CREATE
+/// INDEX CONCURRENTLY` — so 60s is ample, and it is the value to revisit if a
+/// data-heavy migration is ever added.
+const MIGRATION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl PostgresRepository {
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         Ok(Self {
@@ -1388,6 +1412,12 @@ impl PostgresRepository {
     }
 
     pub async fn migrate(&self) -> Result<(), StoreError> {
+        self.migrate_within(MIGRATION_LOCK_TIMEOUT).await
+    }
+
+    /// `acquire_timeout` is a parameter so the timeout path is testable without
+    /// a test that waits a real minute. Production callers use `migrate`.
+    async fn migrate_within(&self, acquire_timeout: std::time::Duration) -> Result<(), StoreError> {
         let mut connection = self.pool.acquire().await.map_err(database_error)?;
         // A cancelled migrator must not return a session-held lock to the pool.
         connection.close_on_drop();
@@ -1395,9 +1425,9 @@ impl PostgresRepository {
             .fetch_one(&mut *connection)
             .await
             .map_err(database_error)?;
-        // Match SQLx 0.8's lock key so all migration entrypoints serialize.
-        const CRC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
-        let lock_id = 0x3d32ad9e * i64::from(CRC.checksum(database.as_bytes()));
+        let lock_id = migration_lock_id(&database);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        let deadline = tokio::time::Instant::now() + acquire_timeout;
         loop {
             let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_id)
@@ -1407,9 +1437,28 @@ impl PostgresRepository {
             if acquired {
                 break;
             }
+            if tokio::time::Instant::now() >= deadline {
+                let message = format!(
+                    "timed out after {:?} waiting for the migration lock on database {database}",
+                    acquire_timeout
+                );
+                // `Transient`, not `Migration`. No migration failed and no
+                // database is broken: a peer is mid-migration and this process
+                // lost a bounded race for the lock. Reporting that as a
+                // migration failure misnames the condition to whoever reads it.
+                //
+                // At today's two call sites this changes nothing observable —
+                // `aiec-api/src/main.rs` and `aiec-cli/src/main.rs` both
+                // propagate with `?` at startup. It matters wherever the class
+                // is actually read: `CoreError::Transient` is answered 409
+                // `transient` where `CoreError::Backend` is answered 500, and
+                // `is_transient_destroy_error` retries a `Transient` but treats
+                // a `Backend` as permanent.
+                return Err(StoreError::Transient(message));
+            }
             // A blocking pg_advisory_lock query retains a transaction/snapshot
             // that CREATE INDEX CONCURRENTLY can wait on: a startup deadlock.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
         let mut migrator = sqlx::migrate!("../../migrations");
         migrator.set_locking(false); // Our session already holds the same lock.

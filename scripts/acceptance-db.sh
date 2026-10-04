@@ -153,10 +153,24 @@ acceptance_netns_loopback_up() {
 # Query first, then path: a socket directory is a query parameter containing
 # slashes (`?host=/run/postgresql`), so stripping the path first would read the
 # last component of the socket path as the database name.
+#
+# A URL that names no database at all is refused rather than parsed. Its last
+# path component is then the authority — `user:password@host:port` — so
+# `${url##*/}` would hand back credentials, and the caller that prints this name
+# for a diagnostic would print a password. A component carrying `@` or `:` is
+# therefore refused: neither can appear unescaped in a URL path component that
+# names a database, and both are how an authority looks after this stripping.
+# Callers must not rely on an isolation check running first to make that
+# unreachable; this function's contract is "a database name and nothing else",
+# so a credential is not a database name.
 acceptance_database_url_name() {
   local url=$1
   url=${url%%\?*}
-  printf '%s\n' "${url##*/}"
+  local name=${url##*/}
+  case $name in
+    '' | /* | *@* | *:*) return 1 ;;
+  esac
+  printf '%s\n' "$name"
 }
 
 # True when the URL reaches PostgreSQL through a Unix socket: a `host` query
@@ -374,7 +388,7 @@ PY
 acceptance_database_is_isolated() {
   # $1 URL, $2 disposable-name pattern (optional)
   local name pattern=${2:-aiec_guard_*}
-  name=$(acceptance_database_url_name "$1")
+  name=$(acceptance_database_url_name "$1") || return 1
   [[ -n $name && $name != /* ]] && [[ $name == $pattern ]]
 }
 
@@ -434,7 +448,7 @@ acceptance_prepare_database() {
     if acceptance_database_is_socket_url "$AIEC_ACCEPTANCE_DATABASE_URL"; then
       export DATABASE_URL="$AIEC_ACCEPTANCE_DATABASE_URL"
       printf 'acceptance database: %s via the unix socket it already names\n' \
-        "$(acceptance_database_url_name "$AIEC_ACCEPTANCE_DATABASE_URL")" >&2
+        "$(acceptance_database_url_name "$AIEC_ACCEPTANCE_DATABASE_URL")" >&2 || exit 2
       ACCEPTANCE_DB_CLUSTER=0
       return
     fi

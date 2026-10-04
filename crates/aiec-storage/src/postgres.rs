@@ -5396,7 +5396,9 @@ async fn release_capacity(
 pub(crate) mod tests {
     mod capacity;
     mod guard_durable;
-    use sqlx::postgres::PgPoolOptions;
+    use crate::migration_lock_id;
+    use sqlx::Connection;
+    use sqlx::postgres::{PgConnection, PgPoolOptions};
 
     use super::*;
     use std::collections::BTreeMap;
@@ -5437,6 +5439,108 @@ pub(crate) mod tests {
             serde_json::from_value(value).unwrap();
         assert_eq!(parsed, capabilities);
     }
+    /// The migration lock is polled with a deadline so a peer holding it cannot
+    /// hang startup forever. Nothing else reaches that branch — the concurrent
+    /// fixture tests all acquire well inside it — so it is exercised here by
+    /// holding the real advisory lock on a separate session and asking the
+    /// migrator to give up. The deadline is a parameter, so this runs in
+    /// milliseconds rather than the production minute.
+    #[tokio::test]
+    async fn the_migration_lock_gives_up_on_a_peer_that_keeps_it() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let repository = PostgresRepository::from_pool(pool);
+        repository.migrate().await.unwrap();
+        let database: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&repository.pool)
+            .await
+            .unwrap();
+
+        // The same key `migrate` computes, held by a session that never gives
+        // it back: the "stuck old binary" case the bound exists for. The
+        // connection stays alive for the whole test, because a session-level
+        // advisory lock is released the moment its session ends.
+        let mut holder = PgConnection::connect(&url).await.unwrap();
+        // Other tests in this binary migrate against the same database at the
+        // same time and hold this exact key for a moment, so the fixture waits
+        // for it to become free rather than assuming it already is. Without
+        // this the test fails whenever it runs beside the concurrency fixtures.
+        let mut held = false;
+        for _ in 0..200 {
+            held = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(migration_lock_id(&database))
+                .fetch_one(&mut holder)
+                .await
+                .unwrap();
+            if held {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            held,
+            "the fixture must hold the lock it is testing contention for"
+        );
+
+        let contended = repository.migrate_within(Duration::from_millis(300)).await;
+        match contended {
+            Err(StoreError::Transient(message)) => {
+                assert!(
+                    message.contains("waiting for the migration lock"),
+                    "the operator cannot tell a lock wait from anything else: {message}"
+                );
+                assert!(
+                    message.contains(&database),
+                    "the timeout does not name the database it was waiting on: {message}"
+                );
+            }
+            Err(other) => panic!("a held lock must report as Transient, got {other:?}"),
+            Ok(()) => panic!("migration ran while a peer held the migration lock"),
+        }
+
+        // And it is genuinely a retryable classification, not a hard failure a
+        // supervisor would act on by giving up.
+        assert!(matches!(
+            core_error(StoreError::Transient("busy".into())),
+            CoreError::Transient(_)
+        ));
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(migration_lock_id(&database))
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        // With the lock released the same call succeeds, so the timeout did not
+        // leave the connection or the pool in a state a retry cannot recover.
+        repository
+            .migrate_within(Duration::from_secs(30))
+            .await
+            .expect("a retry after the peer released the lock must succeed");
+    }
+
+    /// The whole point of computing the key here rather than picking any
+    /// advisory lock is that it must equal the one SQLx 0.8 takes, so the CLI
+    /// and this binary serialize against each other. Divergence is silent: both
+    /// would "work" and two processes would migrate the same database at once,
+    /// which is the startup deadlock the lock was introduced to remove. Pinned
+    /// so changing it takes a deliberate edit.
+    #[test]
+    fn the_migration_lock_key_matches_sqlx() {
+        // SQLx 0.8's migrator takes MIGRATION_LOCK_ID * crc32_iso_hdlc(database)
+        // with MIGRATION_LOCK_ID = 0x3d32ad9e. CRC-32/ISO-HDLC("aiec") is
+        // 0x29e910d5.
+        assert_eq!(migration_lock_id("aiec"), 0x3d32ad9e * 0x29e910d5u32 as i64);
+        // Distinct databases must not collide, or unrelated deployments on one
+        // server would serialize against each other's migrations.
+        assert_ne!(migration_lock_id("aiec"), migration_lock_id("aiec2"));
+    }
+
     pub(crate) fn sandbox_record(tenant: Uuid) -> Sandbox {
         sandbox(tenant)
     }

@@ -97,13 +97,10 @@ pub(crate) async fn reserve_guard_budget(
             "sandbox is not owned by this worker",
         ));
     }
-    if sandbox.state == SandboxState::Quarantined {
-        return Err(ApiFailure::new(
-            StatusCode::CONFLICT,
-            "conflict",
-            "sandbox is quarantined",
-        ));
-    }
+    // Whether this machine may still charge its durable budget is decided by
+    // the store, against the same `SandboxState::consumes` predicate the
+    // reaper filters its window with. It is not re-decided here, because a
+    // second copy of the rule is a second thing that can drift from the first.
     state
         .repository()
         .reserve_guard_budget(body.identity.clone(), body.fence, body.debit)

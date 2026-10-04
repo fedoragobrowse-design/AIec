@@ -1975,10 +1975,11 @@ of the packaged paths cannot pass locally because `/usr/local/bin/aiec` and
 service, KVM/device confinement, proxy, or whole-deployment recovery run was
 exercised by this follow-up.
 
-Only the local development database's checksum for unpublished migration 0029
-was reconciled after its comments were shortened. Fresh schema migrations are
-exercised by the run regressions. Published migration bytes and production
-migration metadata were not changed.
+The local development database had recorded a stale row for unpublished migration
+0029, so that row was deleted and both 0029 and 0030 were applied fresh: the
+keyset index was built concurrently and the legacy index was dropped. Fresh
+schema migrations are exercised by the run regressions. Published migration
+bytes and production migration metadata were not changed.
 
 ## Fixed in the 2026-10-04 audit: durable worker identity refuses corruption
 
@@ -2154,3 +2155,225 @@ refused as an isolated database. `bash -n` passes on all three scripts.
 No launcher was executed end to end: each requires a staged deployment, an
 isolated database and, for Firecracker, KVM. The recovery scenario's SIGKILL
 orphan and graceful-reclaim assertions therefore remain unexercised.
+
+## Fixed in the 2026-10-04 audit: migration lock acquisition is bounded
+
+The non-blocking migration lock polled `pg_try_advisory_lock` with no deadline.
+That trades SQLx's blocking lock, which deadlocks startup against itself, for a
+poller that never returns: a session holding the lock — a stuck old binary, a
+`sqlx-cli`, or a peer wedged in its own concurrent index build — turned every
+subsequent startup into an indefinite hang with no log line and no error. That
+is the same availability failure with strictly worse diagnostics.
+
+Acquisition is now bounded at 60 seconds and the timeout names the database it
+was waiting on. The bound is on waiting for a *peer*, not on this migration's
+own runtime, so the constant has to exceed the slowest migration a peer might
+be running. Nothing bounds it from above: no unit in `deploy/` sets a
+`TimeoutStartSec`, so a caller waiting here is not racing an external kill.
+Every statement in `migrations/` is DDL — 28 `CREATE TABLE`, 71 `ALTER TABLE`,
+one `CREATE INDEX CONCURRENTLY` — so 60s is ample, and it is the value to
+revisit if a data-heavy migration is added.
+
+The timeout is reported as `StoreError::Transient`, which maps to
+`CoreError::Transient`. It is not a migration failure: no broken database is
+involved, a peer is mid-migration and this process lost the race for a bounded
+window. `StoreError::Migration` maps to `CoreError::Backend`, which names the
+wrong condition.
+
+This changes no current behaviour, and the ledger should say so rather than
+imply otherwise. Both production call sites — `crates/aiec-api/src/main.rs:135`
+and `crates/aiec-cli/src/main.rs:1773` — are startup paths that propagate with
+`?`, so the class is never read. It is a correctness fix to the reported error,
+not a behaviour fix today. It would matter wherever the class is observed:
+`crates/aiec-api/src/lib.rs:537` answers `CoreError::Transient` with 409
+`transient` where `CoreError::Backend` becomes 500, and
+`is_transient_destroy_error` in `crates/aiec-api/src/runs.rs` retries a
+`Transient` but treats a `Backend` as permanent. Note that the other retry
+policy in the same file, `is_retryable`, does accept `Backend`, so "permanent"
+is specific to the destroy path.
+
+The deadline is exercised directly. `the_migration_lock_gives_up_on_a_peer_that_keeps_it`
+opens a second session, takes the same advisory lock on the real key and leaves
+it held, then calls the migrator with an injected 300 ms budget: the call fails,
+the error is `StoreError::Transient`, and the message carries both the phrase
+`waiting for the migration lock` and the database name. The test then unlocks and
+calls the migrator again, so the timeout is also shown to leave the pool in a
+state a retry recovers from — the bound is a wait, not a wedge. The 60-second
+production value is never waited out; only the branch is.
+
+The lock key itself is pinned by `the_migration_lock_key_matches_sqlx`. Nothing
+in the timeout test could catch a change to it, because the test takes the lock
+through the same helper the migrator uses — a mutated key still contends with
+itself and the test passes. That is verified: changing `MIGRATION_LOCK_ID` to
+`0x3d32ad9f` left the contention test green and failed the pinned-key test. The
+pinned value is `0x3d32ad9e * 0x29e910d5`, where `0x29e910d5` is
+CRC-32/ISO-HDLC of `"aiec"`.
+
+The concurrency fixtures continue to prove that four processes migrating at once
+serialize safely; neither test replaces them.
+
+The fixture polls for the lock instead of taking it once. The first version
+called `pg_try_advisory_lock` a single time and passed in isolation, then failed
+in the full suite with `the fixture must hold the lock it is testing contention
+for` — the concurrency fixtures migrate against the same database at the same
+time and hold this exact key for a moment. The fix waits for the lock to be
+free, which is what the test actually needs; the failure was in the fixture, not
+in the behavior under test.
+
+## Fixed in the 2026-10-04 audit: the CLI's Guard bodies are tested as bodies
+
+`aiec guard release` sent `operator` to a route that requires
+`operator_label`, so the command always answered 400. The regression added for
+it asserted against a body hardcoded in the test, which proved the server
+accepts a body the CLI does not send and could not catch the defect it was
+written for. The same held for the proposal and quarantine bodies, whose field
+names had no client-side coverage at all.
+
+The three request bodies are now built by named functions that are the only
+construction path, and two tests run their output through the server's real
+deserializers — `ReleaseBody`, `ReviewProposalBody` and
+`QuarantineRequest`, which are re-exported from `aiec-api` for that purpose — and
+assert the exact key sets. Renaming a field on either side now fails here rather
+than in production.
+
+While verifying this I checked a claim that the CLI's quarantine body always
+failed to deserialize because `RuleTrigger::first_event_sequence` is an
+`Option` without `#[serde(default)]`. It does not: serde treats a missing
+`Option` field as `None`, confirmed by deserializing that exact struct shape.
+The test now proves it in-tree instead of leaving it as an assumption.
+
+Note that `serde_json::Value` objects are key-sorted without the
+`preserve_order` feature, so the key-set assertions sort rather than depend on
+serializer order: the wire contract is the set of names, not their sequence.
+
+Mutation evidence: reverting the release builder to the `operator` spelling that
+shipped fails both tests, the deserialization one with
+`unknown field 'operator', expected 'operator_label' or 'note'` — the exact
+error an operator received — and the key-set one with `["operator"]` against
+`["operator_label"]`. Restored.
+
+## Clarified in the 2026-10-04 audit: a lapsed lease was never a reaper case
+
+Narrowing the window to sandboxes holding an active, unexpired lease raises the
+question of whether it removes enforcement for a machine whose lease lapsed
+while the workload kept running — the runaway-spend case Guard exists for. It
+does not, because that enforcement was never in this path. The reaper resolves
+the fence before doing anything, `current_fence` calls `dispatch_target`, and
+that requires `status = 'active' AND expires_at > now()`; a sandbox whose lease
+lapsed yields `NotFound` and the loop logs "no current owner; leaving it to
+lease reconciliation" and continues without quarantining. The new SQL predicate
+matches that decision exactly.
+
+So a lapsed lease was never a budget-enforcement case in the reaper. It spent a
+slot in the bounded window, was fetched, failed the fence check, and was
+discarded — a no-op that could evict every actionable quarantine ahead of it.
+Reclaiming a machine whose lease lapsed is the lease reconciler's job, which is
+why that log line names it.
+
+## Fixed in the 2026-10-04 audit: a paused machine could still spend budget
+
+Restricting the reaper window to consuming sandboxes is only half a rule. The
+other half is the debit path, and it did not agree with it.
+
+`crates/aiec-storage/src/guard.rs::reserve` enumerated the states it would
+refuse by hand:
+
+```rust
+if matches!(
+    sandbox.state,
+    SandboxState::Destroying
+        | SandboxState::Destroyed
+        | SandboxState::Failed
+        | SandboxState::Stopped
+        | SandboxState::Stopping
+) {
+    return Err(StoreError::Conflict("Guard sandbox is not active".into()));
+}
+```
+
+`Paused` is not in that list. `SandboxState::consumes()` — the predicate the
+reaper's window is filtered by — does not include it either, so the two were
+already divergent before the window was narrowed. An operator who paused a
+machine stopped the reaper from watching it *and* left the worker free to debit
+against it. The spent budget row survives the pause, so the next reaper tick
+would pick the sandbox up again; but the debit has already been admitted, and
+the reserve route commits the debit before the gateway forwards the traffic it
+was taken for.
+
+The fix is not a second enumeration but the same predicate the reaper uses:
+
+```rust
+if !sandbox.state.consumes() {
+    return Err(StoreError::Conflict("Guard sandbox is not active".into()));
+}
+```
+
+`reserve` is the single shared helper both stores go through — `MemoryRepository`
+and `PostgresRepository::reserve_guard_budget` each call it — so one predicate
+now governs the memory path, the PostgreSQL path and the reaper window, and a
+state added to `consumes` later cannot silently be missed by one of them.
+
+`Stopping` is deliberately still consuming, which is a behaviour change in the
+other direction: `reserve` previously refused a stopping machine and now
+permits it. A machine being stopped is still running until `stopped` is
+committed and keeps spending until then, and the reaper window has always
+included `stopping` — so the two now agree instead of the debit path being
+stricter than the reaper it answers to. `Paused` was the state actually missing
+from the debit path; `stopping` was missing from nothing.
+
+The route in `aiec-api` keeps only the ownership check it owns and deliberately
+does not repeat either the state rule or the latch. Two copies of one predicate
+is two things that can drift from each other, which is how this defect existed.
+
+Regression `only_a_consuming_machine_can_debit_its_durable_budget` drives every
+case through `MemoryRepository::reserve_guard_budget` — the path the worker's
+reserve request actually takes, including the fence — rather than calling the
+shared helper directly. It admits a real debit on a running machine, asserts
+each non-consuming state is refused, asserts the counters are untouched after
+each refusal, and then latches the stored budget against a `running` sandbox.
+
+Mutation evidence, both arms:
+
+- restoring the previous hand-written list fails with `Paused accepted a debit
+  against a budget nothing enforces`;
+- removing the `state.quarantined` arm fails with `a latched budget accepted a
+  debit from a running machine`.
+
+Both mutations were reverted and the test passes again. The latch arm was
+dropped by the first cut of this fix while replacing the enumerated list, which
+is why it has its own case: the sandbox-state loop would still have passed
+without it, because `Quarantined` is refused by `consumes()` either way. The
+latch cannot be folded into `consumes()` — it stays set while the sandbox is
+`running`, and only an authorized release clears it, so it is a property of the
+budget row rather than of the machine.
+## Fixed in the 2026-10-04 audit: an ancestor's permissions could stop a worker starting
+
+`sync_node_id_directory` opened and `fsync`ed every ancestor of the state
+directory, up to `/`, and propagated any failure. Ancestors are synced for a
+real reason — `create_dir_all` may have just created the state directory, and a
+new directory's own entry lives in its parent — but they are pre-existing system
+directories that belong to someone else, and their failure mode does not belong
+to this write.
+
+A directory can be entirely usable for its purpose while refusing to be opened
+for reading. Mode `0300` is write-and-traverse with no read: files can be created
+inside it, and the identity file can be written and read back through a path
+traversal, but `File::open` on the directory itself fails with `EACCES`. Any
+worker whose state directory sat below such a directory refused to start at all,
+reporting `persist worker node identity: Permission denied (os error 13)` — a
+failure caused by a directory the worker never needed to touch. `fsync` on a
+directory is also not universally supported and can report `EINVAL`, with the
+same consequence.
+
+The directory that actually received the entry is still synced strictly: it is
+the one whose durability matters and the one this code creates. Ancestors are now
+synced on a best-effort basis with a warning naming the directory and the error,
+so a lost parent entry is diagnosable instead of silently skipped.
+
+Regression `an_unreadable_ancestor_does_not_block_identity_publication` builds
+the fixture, asserts up front that the ancestor really cannot be opened, then
+mints and re-reads an identity underneath it.
+
+Mutation evidence: restoring the unconditional `?` on the ancestor loop fails
+with `Permission denied (os error 13)`, reproduced through the real publication
+path. Restored.

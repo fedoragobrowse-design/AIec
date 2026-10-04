@@ -77,17 +77,18 @@ pub(crate) fn reserve(
             "Guard policy identity mismatch".into(),
         ));
     }
-    if state.quarantined || sandbox.state == SandboxState::Quarantined {
+    // The durable latch is separate from the sandbox's state: a quarantined
+    // budget stays latched whatever the machine is doing, and releasing it is
+    // the operator's call, not a state transition's.
+    if state.quarantined {
         return Err(StoreError::Conflict("Guard sandbox is quarantined".into()));
     }
-    if matches!(
-        sandbox.state,
-        SandboxState::Destroying
-            | SandboxState::Destroyed
-            | SandboxState::Failed
-            | SandboxState::Stopped
-            | SandboxState::Stopping
-    ) {
+    // `consumes` is the same predicate the durable reaper filters its window
+    // with, so a machine that has stopped being watched also stops being
+    // charged. Enumerating states here instead would drift from it: `paused`
+    // was missing from an earlier hand-written list, leaving an operator-paused
+    // machine able to charge a budget no reaper would ever enforce.
+    if !sandbox.state.consumes() {
         return Err(StoreError::Conflict("Guard sandbox is not active".into()));
     }
     if state.expires_at <= now {

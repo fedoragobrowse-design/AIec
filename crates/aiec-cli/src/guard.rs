@@ -5,6 +5,35 @@
 //! the credential the control plane checks; nothing here decides anything the
 //! control plane and the worker do not re-check.
 
+/// The bodies this CLI sends to the Guard routes.
+///
+/// The route tests assert the server half of this contract against a body they
+/// hardcode, which cannot catch the client half: a renamed field here reaches a
+/// route that rejects it as an unknown field and the command simply 400s. These
+/// builders are the client's half, so both are checked against the same key
+/// sets rather than against each other's assumptions.
+pub fn release_body(operator: &str) -> Value {
+    json!({ "operator_label": operator })
+}
+
+pub fn proposal_body(operator: &str, note: Option<&str>) -> Value {
+    match note {
+        Some(note) => json!({"operator_label": operator, "note": note}),
+        None => json!({"operator_label": operator}),
+    }
+}
+
+/// The fence is the authoritative object telemetry returned, forwarded whole:
+/// the server checks it against its own record, so inventing a shape here would
+/// only produce a fence mismatch.
+pub fn quarantine_body(fence: &Value, policy_hash: &str, reason: &str) -> Value {
+    json!({
+        "fence": fence,
+        "policy_hash": policy_hash,
+        "rules": [{"rule": "operator.quarantine", "evidence_references": [reason]}],
+    })
+}
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -253,11 +282,7 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
                 url,
                 reqwest::Method::POST,
                 &format!("/v1/sandboxes/{sandbox_id}/guard/quarantine"),
-                Some(json!({
-                    "fence": fence,
-                    "policy_hash": policy_hash,
-                    "rules": [{"rule": "operator.quarantine", "evidence_references": [reason]}],
-                })),
+                Some(quarantine_body(&fence, &policy_hash, &reason)),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&incident)?);
@@ -272,7 +297,7 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
                 url,
                 reqwest::Method::POST,
                 &format!("/v1/sandboxes/{sandbox_id}/guard/release"),
-                Some(json!({ "operator_label": operator })),
+                Some(release_body(&operator)),
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&released)?);
@@ -304,7 +329,7 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
                     sandbox_id,
                     proposal_id,
                     "approve",
-                    json!({"operator_label": operator}),
+                    proposal_body(&operator, None),
                 ),
                 ProposalCommand::Deny {
                     sandbox_id,
@@ -315,7 +340,7 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
                     sandbox_id,
                     proposal_id,
                     "deny",
-                    json!({"operator_label": operator, "note": note}),
+                    proposal_body(&operator, note.as_deref()),
                 ),
             };
             println!(
@@ -355,4 +380,83 @@ async fn authenticated(_url: &str, key: Option<String>) -> Result<reqwest::Clien
             headers
         })
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{proposal_body, quarantine_body, release_body};
+    use aiec_api::{ReleaseBody, ReviewProposalBody};
+    use aiec_guard::control::QuarantineRequest;
+    use serde_json::json;
+
+    /// The bodies this CLI sends must deserialize into the server's own types.
+    ///
+    /// A route test that hardcodes the expected body only proves the server
+    /// accepts a body the client does not send, which is how `operator` versus
+    /// `operator_label` reached production as a command that always 400s. These
+    /// assertions run the client's real output through the server's real
+    /// deserializers, so renaming a field on either side fails here.
+    #[test]
+    fn the_guard_cli_bodies_deserialize_into_the_servers_own_types() {
+        let release: ReleaseBody =
+            serde_json::from_value(release_body("ops@example")).expect("release body");
+        assert_eq!(release.operator_label.as_deref(), Some("ops@example"));
+        assert_eq!(release.note, None);
+
+        let approve: ReviewProposalBody =
+            serde_json::from_value(proposal_body("ops@example", None)).expect("approve body");
+        assert_eq!(approve.operator_label.as_deref(), Some("ops@example"));
+        assert_eq!(approve.note, None);
+
+        let deny: ReviewProposalBody =
+            serde_json::from_value(proposal_body("ops@example", Some("denied: cost")))
+                .expect("deny body");
+        assert_eq!(deny.note.as_deref(), Some("denied: cost"));
+
+        let fence = json!({
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 7,
+        });
+        let quarantine: QuarantineRequest =
+            serde_json::from_value(quarantine_body(&fence, "policy-hash", "operator asked"))
+                .expect("quarantine body");
+        assert_eq!(quarantine.policy_hash, "policy-hash");
+        assert_eq!(quarantine.rules[0].rule, "operator.quarantine");
+        assert_eq!(
+            quarantine.rules[0].evidence_references,
+            vec!["operator asked".to_string()]
+        );
+        assert_eq!(quarantine.fence.generation, 7);
+    }
+
+    /// The keys are the contract: a renamed or extra field is exactly what
+    /// `deny_unknown_fields` rejects, so the key set is asserted rather than
+    /// looked up, which would pass as long as the value existed somewhere.
+    #[test]
+    fn the_guard_cli_bodies_carry_exactly_the_fields_the_routes_deserialize() {
+        /// Sorted: a `Value` object's key order is an implementation detail of the
+        /// serializer, and the wire contract is the set of names, not their
+        /// sequence.
+        fn keys(value: &serde_json::Value) -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+        assert_eq!(keys(&release_body("ops@example")), vec!["operator_label"]);
+        assert_eq!(keys(&proposal_body("ops", None)), vec!["operator_label"]);
+        assert_eq!(
+            keys(&proposal_body("ops", Some("why"))),
+            vec!["note", "operator_label"]
+        );
+        let fence = json!({
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+        });
+        let quarantine = quarantine_body(&fence, "h", "r");
+        assert_eq!(keys(&quarantine), vec!["fence", "policy_hash", "rules"]);
+        assert_eq!(
+            keys(&quarantine["rules"][0]),
+            vec!["evidence_references", "rule"]
+        );
+    }
 }

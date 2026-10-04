@@ -2629,16 +2629,42 @@ fn publish_node_id(
     result.context("persist worker node identity")
 }
 
-/// Sync every directory entry that recursive creation may have introduced.
+/// Sync the directory that received the identity entry, then the directories
+/// above it on a best-effort basis.
+///
+/// The entry just written lives in `state_dir`, so syncing that directory is
+/// what makes the identity durable, and it is the one directory this code
+/// creates and owns. Ancestors are synced because `create_dir_all` may have
+/// just created `state_dir` — a new directory's own entry lives in its parent,
+/// so the parent's directory needs syncing too — but those ancestors are
+/// pre-existing system directories (`/var`, `/home`, `/`) that belong to
+/// someone else.
+///
+/// Their failures are therefore logged rather than propagated. Two reasons:
+/// `fsync` on a directory is not universally supported and can report
+/// `EINVAL`, and a directory can be perfectly usable for its purpose while
+/// refusing to be opened for reading — mode `0300` permits creating files
+/// inside it but not opening it. Either case would otherwise turn node
+/// identity publication, and with it worker startup, into a failure caused by
+/// a directory this process never needed to touch.
 #[cfg(unix)]
 fn sync_node_id_directory(state_dir: &std::path::Path) -> std::io::Result<()> {
-    for ancestor in state_dir.ancestors() {
+    std::fs::File::open(state_dir)?.sync_all()?;
+    for ancestor in state_dir.ancestors().skip(1) {
         let path = if ancestor.as_os_str().is_empty() {
             std::path::Path::new(".")
         } else {
             ancestor
         };
-        std::fs::File::open(path)?.sync_all()?;
+        let synced = std::fs::File::open(path).and_then(|directory| directory.sync_all());
+        if let Err(error) = synced {
+            tracing::warn!(
+                directory = %path.display(),
+                error = %error,
+                "could not sync a parent of the node identity directory; the \
+                 identity itself is durable, only the parent entry may not survive a crash"
+            );
+        }
     }
     Ok(())
 }
@@ -2717,6 +2743,38 @@ mod node_identity_tests {
             assert_eq!(std::fs::read(&path).unwrap(), content);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// An ancestor directory can be fully usable for creating and writing the
+    /// identity while refusing to be opened for reading — mode `0300` is
+    /// write-and-traverse, no read. Sync hardening that walks past the
+    /// directory it actually wrote into would refuse to mint an identity
+    /// because of a directory the worker never needed to touch, and worker
+    /// startup fails with it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_ancestor_does_not_block_identity_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("aiec-ancestor-{}", uuid::Uuid::now_v7()));
+        let outer = root.join("outer");
+        std::fs::create_dir_all(&outer).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let state_dir = outer.join("inner");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // The precondition: usable for its purpose, not openable for reading.
+        assert!(
+            std::fs::File::open(&outer).is_err(),
+            "the fixture must be an ancestor that cannot be opened"
+        );
+
+        let minted = durable_node_id(&state_dir)
+            .expect("an unreadable ancestor must not stop the worker minting an identity");
+        assert_eq!(durable_node_id(&state_dir).unwrap(), minted);
+
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

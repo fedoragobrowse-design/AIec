@@ -16,6 +16,8 @@ pub mod evaluations;
 pub mod guard;
 mod guard_proposals;
 mod guard_release;
+pub use guard_proposals::ReviewProposalBody;
+pub use guard_release::ReleaseBody;
 pub mod omp;
 #[cfg(test)]
 mod provision_ownership_tests;
