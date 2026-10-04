@@ -425,9 +425,16 @@ mod tests {
         MetadataStore::put_stored_snapshot(&*repository, stored.clone())
             .await
             .unwrap();
-        let listed = MetadataStore::list_snapshots(&*repository, owner, sandbox)
-            .await
-            .unwrap();
+        let listed = MetadataStore::list_snapshots(
+            &*repository,
+            owner,
+            sandbox,
+            aiec_core::storage::MAX_SNAPSHOT_PAGE,
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshots;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, value.id);
         assert_eq!(listed[0].object_key, "primary");
@@ -439,10 +446,17 @@ mod tests {
             4
         );
         assert!(
-            MetadataStore::list_snapshots(&*repository, stranger, sandbox)
-                .await
-                .unwrap()
-                .is_empty()
+            MetadataStore::list_snapshots(
+                &*repository,
+                stranger,
+                sandbox,
+                aiec_core::storage::MAX_SNAPSHOT_PAGE,
+                None
+            )
+            .await
+            .unwrap()
+            .snapshots
+            .is_empty()
         );
         assert!(
             MetadataStore::get_snapshot(&*repository, stranger, value.id)

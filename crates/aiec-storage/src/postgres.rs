@@ -1639,6 +1639,20 @@ async fn fetch_lease_for_sandbox(
     lease_from_row(&row)
 }
 
+/// The snapshot listing, as the database sees it.
+///
+/// Hoisted so the query plan can be asserted against the statement that
+/// actually runs. A test carrying its own copy of this SQL proves that the copy
+/// has a `LIMIT` in it, which is not the question: deleting the `LIMIT` from
+/// the store leaves the copy untouched and the plan assertion still passes,
+/// while the database goes on materialising every snapshot the sandbox ever
+/// had. The paging tests cannot catch it either - the rows are trimmed in Rust
+/// after the fetch.
+pub(crate) const LIST_SNAPSHOTS_SQL: &str = "\
+     SELECT * FROM snapshots WHERE tenant_id = $1 AND sandbox_id = $2 \
+     AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4)) \
+     ORDER BY created_at DESC, id DESC LIMIT $5";
+
 impl PostgresRepository {
     /// Creates a run, or returns the run this idempotency key already produced.
     async fn set_run_failure(
@@ -2063,17 +2077,40 @@ impl PostgresRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<Snapshot>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM snapshots WHERE tenant_id = $1 AND sandbox_id = $2 \
-             ORDER BY created_at DESC, id",
-        )
-        .bind(tenant)
-        .bind(sandbox)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?;
-        rows.iter().map(snapshot_from_row).collect()
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::SnapshotPage, StoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_SNAPSHOT_PAGE);
+        let (after_created_at, after_id) = after
+            .map(|cursor| (Some(cursor.created_at), Some(cursor.id)))
+            .unwrap_or((None, None));
+        let rows = sqlx::query(LIST_SNAPSHOTS_SQL)
+            .bind(tenant)
+            .bind(sandbox)
+            .bind(after_created_at)
+            .bind(after_id)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?;
+        let mut snapshots: Vec<Snapshot> = rows
+            .iter()
+            .map(snapshot_from_row)
+            .collect::<Result<_, _>>()?;
+        // The extra row exists only to prove another page follows, so the
+        // cursor names the last row *returned*: paging from the held-back row
+        // would skip exactly one snapshot per page.
+        let next = if snapshots.len() > limit as usize {
+            let last = &snapshots[limit as usize - 1];
+            Some(aiec_core::storage::PageCursor {
+                created_at: last.created_at,
+                id: last.id,
+            })
+        } else {
+            None
+        };
+        snapshots.truncate(limit as usize);
+        Ok(aiec_core::storage::SnapshotPage { snapshots, next })
     }
 
     async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
@@ -2397,21 +2434,28 @@ impl PostgresRepository {
         stored_snapshot_from_row(&row)
     }
 
-    async fn list_stored_snapshots(
+    async fn latest_stored_snapshot(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<StoredSnapshot>, StoreError> {
-        let rows = sqlx::query(
+        kind: &str,
+    ) -> Result<Option<StoredSnapshot>, StoreError> {
+        // One row, newest first, chosen in the database. `complete` and the
+        // checksum are both required because `stored_snapshot_from_row`
+        // refuses a snapshot without one, and a partial capture that passed
+        // here would fail the mapping rather than being skipped.
+        let row = sqlx::query(
             "SELECT * FROM snapshots WHERE tenant_id=$1 AND sandbox_id=$2 \
-             AND checksum_sha256 IS NOT NULL ORDER BY created_at DESC, id",
+             AND kind=$3 AND complete AND checksum_sha256 IS NOT NULL \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(tenant)
         .bind(sandbox)
-        .fetch_all(&self.pool)
+        .bind(kind)
+        .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
-        rows.iter().map(stored_snapshot_from_row).collect()
+        row.as_ref().map(stored_snapshot_from_row).transpose()
     }
 
     async fn create_sandbox_idempotent(
@@ -4545,8 +4589,10 @@ impl MetadataStore for PostgresRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<Snapshot>, CoreError> {
-        Self::list_snapshots(self, tenant, sandbox)
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::SnapshotPage, CoreError> {
+        Self::list_snapshots(self, tenant, sandbox, limit, after)
             .await
             .map_err(core_error)
     }
@@ -4612,12 +4658,13 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
-    async fn list_stored_snapshots(
+    async fn latest_stored_snapshot(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<StoredSnapshot>, CoreError> {
-        Self::list_stored_snapshots(self, tenant, sandbox)
+        kind: &str,
+    ) -> Result<Option<StoredSnapshot>, CoreError> {
+        Self::latest_stored_snapshot(self, tenant, sandbox, kind)
             .await
             .map_err(core_error)
     }
@@ -5518,6 +5565,37 @@ pub(crate) mod tests {
                  timestamp is sorted before LIMIT applies. Found: {definition}"
             );
         }
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// The snapshot listing is the third table that had the same missing
+    /// tie-breaker, after the sandbox list and the two Guard histories. Its
+    /// index stopped at `created_at`, and the query ordered `created_at DESC,
+    /// id` - descending by one column and ascending by the other, which is a
+    /// stable order but not the order a descending keyset walks.
+    #[tokio::test]
+    async fn the_snapshot_list_index_carries_the_keyset_tie_breaker() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        if database_url.is_empty() {
+            return;
+        }
+        let repository = Arc::new(PostgresRepository::connect(&database_url).await.unwrap());
+        repository.migrate().await.unwrap();
+
+        let definition: Option<String> =
+            sqlx::query_scalar("SELECT pg_get_indexdef(to_regclass($1))")
+                .bind("snapshots_tenant_sandbox_idx")
+                .fetch_one(&repository.pool)
+                .await
+                .expect("the index lookup must run");
+        let definition = definition.expect("the snapshot list index must exist in the search path");
+        assert!(
+            definition.ends_with("(tenant_id, sandbox_id, created_at DESC, id DESC)"),
+            "the snapshot page keys on (created_at, id) in descending order, so \
+             the index needs both columns in that order. Found: {definition}"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
@@ -6873,11 +6951,12 @@ pub(crate) mod tests {
         assert!(stored.complete);
         assert_eq!(stored.workspace_object_key.as_deref(), Some(&*object_key));
         let recoverable = repository
-            .list_stored_snapshots(tenant, scheduled.sandbox.id)
+            .latest_stored_snapshot(tenant, scheduled.sandbox.id, "workspace")
             .await
             .unwrap();
-        assert!(
-            recoverable.iter().any(|entry| entry.id == snapshot_id),
+        assert_eq!(
+            recoverable.map(|entry| entry.id),
+            Some(snapshot_id),
             "recovery would not find the workspace archive"
         );
     }

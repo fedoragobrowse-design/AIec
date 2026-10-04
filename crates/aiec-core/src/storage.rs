@@ -471,6 +471,9 @@ pub const MAX_SANDBOX_PAGE: u32 = MAX_HISTORY_PAGE;
 /// Ceiling on one page of a sandbox's Guard history.
 pub const MAX_GUARD_PAGE: u32 = MAX_HISTORY_PAGE;
 
+/// Ceiling on one page of a sandbox's snapshots.
+pub const MAX_SNAPSHOT_PAGE: u32 = MAX_HISTORY_PAGE;
+
 /// Where the next page of a tenant-scoped history listing starts.
 ///
 /// The two fields together are the row's own position in the ordering, so a
@@ -523,6 +526,20 @@ pub struct GuardProposalPage {
 pub struct GuardToolApprovalPage {
     /// Approvals newest first, at most the requested limit.
     pub approvals: Vec<GuardToolApproval>,
+    /// Where the next page starts, or `None` when this page is the last.
+    pub next: Option<PageCursor>,
+}
+
+/// One bounded page of a sandbox's snapshots, newest first.
+///
+/// A snapshot is retained until somebody deletes it and nothing prunes them
+/// automatically, so a sandbox that is snapshotted repeatedly grows this table
+/// for as long as it lives. Paged rather than read whole for the same reason
+/// the Guard histories are.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotPage {
+    /// Snapshots newest first, at most the requested limit.
+    pub snapshots: Vec<Snapshot>,
     /// Where the next page starts, or `None` when this page is the last.
     pub next: Option<PageCursor>,
 }
@@ -831,12 +848,16 @@ pub trait MetadataStore: Send + Sync {
     async fn put_snapshot(&self, value: Snapshot) -> Result<(), CoreError>;
     /// Gets tenant-owned snapshot metadata.
     async fn get_snapshot(&self, tenant: TenantId, id: SnapshotId) -> Result<Snapshot, CoreError>;
-    /// Lists snapshots for a tenant-owned sandbox.
+    /// Lists one bounded, newest-first page of a tenant-owned sandbox's
+    /// snapshots. Snapshots are retained until they are deleted and nothing
+    /// prunes them, so this is one page rather than the whole history.
     async fn list_snapshots(
         &self,
         tenant: TenantId,
         sandbox: SandboxId,
-    ) -> Result<Vec<Snapshot>, CoreError>;
+        limit: u32,
+        after: Option<PageCursor>,
+    ) -> Result<SnapshotPage, CoreError>;
     /// Deletes tenant-owned snapshot metadata.
     async fn delete_snapshot(&self, tenant: TenantId, id: SnapshotId) -> Result<(), CoreError>;
     /// Appends a usage event.
@@ -871,12 +892,20 @@ pub trait MetadataStore: Send + Sync {
         tenant: TenantId,
         id: SnapshotId,
     ) -> Result<StoredSnapshot, CoreError>;
-    /// Lists detailed snapshot metadata for a sandbox.
-    async fn list_stored_snapshots(
+    /// Reads the newest complete capture of one kind for a sandbox, or `None`
+    /// when it has none.
+    ///
+    /// The only caller wants a single row - the archive to recover a workspace
+    /// from - and every snapshot the sandbox ever took is retained, so listing
+    /// the history to pick the newest one made recovery cost a function of the
+    /// sandbox's lifetime. Naming the kind also keeps the filter in the query
+    /// rather than in a scan that discards almost everything it read.
+    async fn latest_stored_snapshot(
         &self,
         tenant: TenantId,
         sandbox: SandboxId,
-    ) -> Result<Vec<StoredSnapshot>, CoreError>;
+        kind: &str,
+    ) -> Result<Option<StoredSnapshot>, CoreError>;
     /// Idempotently creates a sandbox for a request.
     async fn create_sandbox_idempotent(
         &self,

@@ -1,0 +1,33 @@
+-- `GET /v1/sandboxes/{id}/snapshots` is a keyset page, and this index is the
+-- one it pages on.
+--
+-- `snapshots_tenant_sandbox_idx` was built as
+-- `(tenant_id, sandbox_id, created_at)`. That covers the tenant and sandbox
+-- equality but stops one column short of the page boundary, which is
+-- `(created_at DESC, id DESC)`. `created_at` is not unique, so with only the
+-- timestamp the plan can read the index in `created_at DESC` order and then has
+-- to sort whatever falls out of it - every row tied on the timestamp - before
+-- the `LIMIT` is applied. A limit applied after a sort does not bound the sort.
+--
+-- The same shape was already corrected for the sandbox list in 0026 and for the
+-- two Guard histories in 0027. Three tables carrying the same mistake is the
+-- evidence that it was a convention rather than an oversight, which is why
+-- this one is replaced rather than left beside.
+--
+-- The id direction matters as much as the column. The query previously ordered
+-- `created_at DESC, id` - descending by one column and ascending by the other.
+-- That is a stable order, so nothing read out of it was wrong, but it is not
+-- the order a descending keyset walks, and the two only agree on rows that
+-- share a timestamp, which is exactly the case the key exists for.
+--
+-- Replaced rather than added: a second index on the same prefix is a write on
+-- every snapshot, and snapshots are full disk captures, so the row is the cheap
+-- part of a deliberately expensive operation. Dropping the old one inside a
+-- migration locks the index, not the table.
+--
+-- The migration table is append-only: this corrects the published 0001 and 0002
+-- rather than editing them, and a database created fresh from 0001 to 0028 ends
+-- up with exactly the indexes a database upgraded from 0001 ends up with.
+DROP INDEX IF EXISTS snapshots_tenant_sandbox_idx;
+CREATE INDEX snapshots_tenant_sandbox_idx
+  ON snapshots (tenant_id, sandbox_id, created_at DESC, id DESC)

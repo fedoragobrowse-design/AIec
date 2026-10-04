@@ -1673,3 +1673,78 @@ not change: `revoke_key` in the store scopes its update by tenant and reports
 `NotFound` when nothing matched. The handler now rejects earlier, on the
 authority check, but it does not reject differently, and a key in another
 tenant is still indistinguishable from one that does not exist.
+
+### The snapshot listing, and the index convention behind it
+
+**Fixed.** `GET /v1/sandboxes/{id}/snapshots` returned `Vec<Snapshot>`. A
+snapshot is retained until somebody deletes it, nothing prunes them
+automatically, and `POST /v1/sandboxes/{id}/snapshots` is repeatable, so the
+response was a function of how many times the sandbox had been snapshotted.
+
+It is now the same keyset page as the sandbox list and the two Guard
+histories: `limit` default 50 clamped to `MAX_SNAPSHOT_PAGE`, the paired
+`after_created_at`/`after_id` cursor refused unless both halves are present,
+`LIMIT limit + 1` in the query with the extra row trimmed in Rust, and `next`
+naming the last row returned. The paging-parameter parsing and the
+half-cursor refusal moved to one `page_cursor` helper shared by all three
+routes, because three copies of a rule is how it ends up enforced in two of
+them.
+
+Migration `0028` replaces `snapshots_tenant_sandbox_idx`, which was
+`(tenant_id, sandbox_id, created_at)`. That is the third table in this
+repository carrying the same missing tie-breaker, after the sandbox list in
+0026 and the two Guard histories in 0027. Three instances is the evidence that
+it was a convention rather than an oversight. The query also ordered
+`created_at DESC, id` - descending by one column, ascending by the other -
+which is a stable order, so nothing read out of it was wrong, but not the
+order a descending keyset walks.
+
+### Recovery read a sandbox's whole snapshot history to find one archive
+
+**Fixed.** `restore_workspace` listed every stored snapshot for the sandbox,
+filtered to complete workspace captures in Rust, and took the newest. On the
+recovery path, for every sandbox that came back on a dead worker, the cost was
+the sandbox's entire snapshot history to find one row.
+
+Replaced with `latest_stored_snapshot(tenant, sandbox, kind)`, which names the
+kind and takes `ORDER BY created_at DESC, id DESC LIMIT 1` in the database. The
+kind filter moves into the query, so the rows that were being read and then
+discarded are not read at all. `list_stored_snapshots` had no other production
+caller, so it is gone rather than left as an unused way to ask the old
+question.
+
+Regressions: `a_snapshot_history_is_paged_and_says_where_it_stopped`,
+`the_snapshot_list_index_carries_the_keyset_tie_breaker` and
+`the_snapshot_page_bound_is_pushed_down_to_the_database`. The first is caught
+by a cursor aimed at the held-back row; the third by removing `LIMIT` from the
+SQL, which the behavioural test survives. That second point is worth stating
+plainly because it was the surprise: an earlier version of the plan test
+carried its own copy of the query string, and mutating the real `LIMIT` left it
+green. It now `EXPLAIN`s `LIST_SNAPSHOTS_SQL`, the constant the store actually
+executes, for the same reason the Guard plan tests do.
+
+## Collection-read census: what was checked and deliberately left alone
+
+The unbounded-read audit did not end at the listings that were fixed. These are
+the remaining collections that are read whole, with the reason each one is
+accepted rather than overlooked. Recorded so a later reader does not have to
+re-derive them, and does not mistake an assessment for an oversight.
+
+- **Worker nodes** (`list_nodes` in `/metrics`, `list_workers` in `/ready`).
+  Both read the whole fleet on every scrape and every readiness poll. The fleet
+  is machines an operator provisions, so the row count is bounded by hardware
+  rather than by anything a tenant can do, and the `/ready` check genuinely has
+  to prove that workers are visible. Paging a sum would break it.
+- **API keys** (`GET /v1/keys`). The tenant's own credential set, read whole.
+  Creating one is now bounded by the authorization rule that was missing, so a
+  caller must already hold every scope it grants, and each key is a metadata
+  row with no per-row work behind it. Reaching the point where the response
+  mattered would take thousands of `POST /v1/keys`, which is a worse
+  amplification ratio than it looks and a real ergonomic cost to cap. If a cap
+  is wanted later, that is a product decision about how many credentials a
+  tenant may hold, not a defect in the read.
+- **Run-scoped reads** (`list_run_events`, `list_run_attempts`,
+  `list_run_artifacts`). Already checked and bounded by the write-path
+  constants: `MAX_RUN_ATTEMPTS = 10`, `MAX_ARTIFACTS = 64`, and events
+  transitively around 700 rows. They are complete per-Run reads by design and
+  are not tenant-growable, because the write paths refuse past the bound.

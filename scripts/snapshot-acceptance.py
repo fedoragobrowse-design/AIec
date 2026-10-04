@@ -461,7 +461,14 @@ def main() -> int:
 
     capture_seconds = time.time() - capture_started
     status, listed = http("GET", f"/v1/sandboxes/{original}/snapshots")
-    entries = listed if isinstance(listed, list) else (listed or {}).get("snapshots") or []
+    # A page envelope, not a bare array: the listing is bounded and carries a
+    # successor. This run creates a handful of snapshots, so one page is the
+    # whole history and asserting that is what makes "the snapshot is in here"
+    # mean "the snapshot is on this sandbox".
+    entries = (listed or {}).get("snapshots") or []
+    case("the-history-fits-one-page",
+         (listed or {}).get("next") is None,
+         {"entries": len(entries), "next": (listed or {}).get("next")})
     entry = next((e for e in entries if e.get("id") == snapshot_id), None)
     # The public listing is the thin `Snapshot` record - id, object key, size,
     # image and timestamp - and deliberately carries no completion flag; the

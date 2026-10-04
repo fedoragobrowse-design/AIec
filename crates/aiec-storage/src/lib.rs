@@ -376,16 +376,38 @@ impl MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<Snapshot>, StoreError> {
-        Ok(self
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::SnapshotPage, StoreError> {
+        let limit = limit.clamp(1, aiec_core::storage::MAX_SNAPSHOT_PAGE) as usize;
+        let mut matching: Vec<Snapshot> = self
             .data
             .read()
             .await
             .snapshots
             .values()
             .filter(|value| value.tenant_id == tenant && value.sandbox_id == sandbox)
+            .filter(|value| match after {
+                None => true,
+                Some(cursor) => (value.created_at, value.id) < (cursor.created_at, cursor.id),
+            })
             .cloned()
-            .collect())
+            .collect();
+        matching.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let next = matching.get(limit).map(|last| PageCursor {
+            created_at: last.created_at,
+            id: last.id,
+        });
+        matching.truncate(limit);
+        Ok(aiec_core::storage::SnapshotPage {
+            snapshots: matching,
+            next,
+        })
     }
 
     async fn delete_snapshot(&self, tenant: Uuid, id: Uuid) -> Result<(), StoreError> {
@@ -519,20 +541,32 @@ impl MemoryRepository {
             .ok_or(StoreError::NotFound)
     }
 
-    async fn list_stored_snapshots(
+    async fn latest_stored_snapshot(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<StoredSnapshot>, StoreError> {
+        kind: &str,
+    ) -> Result<Option<StoredSnapshot>, StoreError> {
         Ok(self
             .data
             .read()
             .await
             .stored_snapshots
             .values()
-            .filter(|value| value.tenant_id == tenant && value.sandbox_id == sandbox)
-            .cloned()
-            .collect())
+            .filter(|value| {
+                value.tenant_id == tenant
+                    && value.sandbox_id == sandbox
+                    && value.kind == kind
+                    && value.complete
+            })
+            // Newest first, breaking a tie by id so the answer is a value
+            // rather than an artefact of hash-map iteration order.
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then(left.id.cmp(&right.id))
+            })
+            .cloned())
     }
 
     /// Records a request for one high-risk call.
@@ -975,8 +1009,10 @@ impl MetadataStore for MemoryRepository {
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<Snapshot>, CoreError> {
-        Self::list_snapshots(self, tenant, sandbox)
+        limit: u32,
+        after: Option<aiec_core::storage::PageCursor>,
+    ) -> Result<aiec_core::storage::SnapshotPage, CoreError> {
+        Self::list_snapshots(self, tenant, sandbox, limit, after)
             .await
             .map_err(core_error)
     }
@@ -1042,12 +1078,13 @@ impl MetadataStore for MemoryRepository {
             .await
             .map_err(core_error)
     }
-    async fn list_stored_snapshots(
+    async fn latest_stored_snapshot(
         &self,
         tenant: Uuid,
         sandbox: Uuid,
-    ) -> Result<Vec<StoredSnapshot>, CoreError> {
-        Self::list_stored_snapshots(self, tenant, sandbox)
+        kind: &str,
+    ) -> Result<Option<StoredSnapshot>, CoreError> {
+        Self::latest_stored_snapshot(self, tenant, sandbox, kind)
             .await
             .map_err(core_error)
     }

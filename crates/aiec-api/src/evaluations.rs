@@ -598,8 +598,12 @@ mod tests {
             &self,
             tenant: TenantId,
             sandbox: SandboxId,
-        ) -> Result<Vec<Snapshot>, CoreError> {
-            self.inner.list_snapshots(tenant, sandbox).await
+            limit: u32,
+            after: Option<aiec_core::storage::PageCursor>,
+        ) -> Result<aiec_core::storage::SnapshotPage, CoreError> {
+            self.inner
+                .list_snapshots(tenant, sandbox, limit, after)
+                .await
         }
         async fn delete_snapshot(&self, tenant: TenantId, id: SnapshotId) -> Result<(), CoreError> {
             self.inner.delete_snapshot(tenant, id).await
@@ -637,12 +641,15 @@ mod tests {
         ) -> Result<StoredSnapshot, CoreError> {
             self.inner.get_stored_snapshot(tenant, id).await
         }
-        async fn list_stored_snapshots(
+        async fn latest_stored_snapshot(
             &self,
             tenant: TenantId,
             sandbox: SandboxId,
-        ) -> Result<Vec<StoredSnapshot>, CoreError> {
-            self.inner.list_stored_snapshots(tenant, sandbox).await
+            kind: &str,
+        ) -> Result<Option<StoredSnapshot>, CoreError> {
+            self.inner
+                .latest_stored_snapshot(tenant, sandbox, kind)
+                .await
         }
         async fn create_sandbox_idempotent(
             &self,

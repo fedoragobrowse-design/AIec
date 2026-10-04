@@ -1900,7 +1900,7 @@ async fn snapshot_command(url: &str, key: Option<String>, command: SnapshotComma
         ),
         SnapshotCommand::List { sandbox_id } => println!(
             "{}",
-            serde_json::to_string_pretty(&c.list_snapshots(sandbox_id).await?)?
+            serde_json::to_string_pretty(&c.list_snapshots_page(sandbox_id, 50).await?)?
         ),
         SnapshotCommand::Restore { snapshot_id } => println!(
             "{}",

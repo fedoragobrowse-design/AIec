@@ -978,17 +978,31 @@ mod tests {
         MetadataStore::put_stored_snapshot(&fixture.repository, stored.clone())
             .await
             .unwrap();
-        let listed = MetadataStore::list_snapshots(&fixture.repository, tenant, sandbox)
-            .await
-            .unwrap();
+        let listed = MetadataStore::list_snapshots(
+            &fixture.repository,
+            tenant,
+            sandbox,
+            aiec_core::storage::MAX_SNAPSHOT_PAGE,
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshots;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, stored.id);
         assert_eq!(listed[0].object_key, primary);
         assert!(
-            MetadataStore::list_snapshots(&fixture.repository, stranger, sandbox)
-                .await
-                .unwrap()
-                .is_empty()
+            MetadataStore::list_snapshots(
+                &fixture.repository,
+                stranger,
+                sandbox,
+                aiec_core::storage::MAX_SNAPSHOT_PAGE,
+                None
+            )
+            .await
+            .unwrap()
+            .snapshots
+            .is_empty()
         );
         fixture.age_objects(now).await;
         // Another tenant retires nothing and releases no object.

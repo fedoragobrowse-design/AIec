@@ -776,3 +776,133 @@ async fn a_proposal_id_from_another_tenant_cannot_be_decided_through_it() {
     assert_eq!(after.decided_by, None, "a stranger wrote the operator name");
     assert_eq!(after.decided_at, None, "a stranger wrote the decision time");
 }
+
+/// A sandbox's snapshot history is paged, and says where it stopped.
+///
+/// Snapshots are retained until somebody deletes them and nothing prunes them,
+/// so this table grows for the life of the sandbox. It was read whole.
+#[tokio::test]
+async fn a_snapshot_history_is_paged_and_says_where_it_stopped() {
+    let Some((repository, owner, _admin, _schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let worker = super::register_test_worker(&repository, owner).await;
+    let sandbox_id =
+        schedule_test_sandbox(&repository, owner, new_id(), sandbox(owner), Some(worker))
+            .await
+            .unwrap()
+            .sandbox
+            .id;
+
+    // One timestamp for all five rows, so `id` is the only thing that can order
+    // them. A keyset without it cannot say which rows a page already returned.
+    let created_at = Utc::now();
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        let id = new_id();
+        ids.push(id);
+        repository
+            .put_snapshot(aiec_core::Snapshot {
+                id,
+                tenant_id: owner,
+                sandbox_id,
+                object_key: format!("snapshots/{id}.tar"),
+                size_bytes: 1024 + index,
+                image_id: "img-test".into(),
+                created_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = repository
+        .list_snapshots(owner, sandbox_id, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(first.snapshots.len(), 2, "the bound must reach the query");
+    assert!(
+        first.next.is_some(),
+        "three more rows cannot fit in one page"
+    );
+
+    // Newest first, and the page must be internally ordered: a keyset that
+    // returns the right rows in the wrong order makes the caller walk them
+    // backwards.
+    assert!(
+        first.snapshots[0].created_at >= first.snapshots[1].created_at,
+        "a page must come back newest first"
+    );
+
+    let last = repository
+        .list_snapshots(owner, sandbox_id, 200, None)
+        .await
+        .unwrap();
+    assert!(
+        last.next.is_none(),
+        "a page that returned the last row must not claim another follows"
+    );
+
+    // Paging to the end shows every row exactly once. This is the failure a
+    // cursor aimed at the held-back row produces: that row is never returned to
+    // anybody, and a caller paging to the end believes it saw everything.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = repository
+            .list_snapshots(owner, sandbox_id, 2, cursor)
+            .await
+            .unwrap();
+        seen.extend(page.snapshots.iter().map(|row| row.id));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    seen.sort();
+    ids.sort();
+    assert_eq!(seen, ids, "every snapshot exactly once, none skipped");
+
+    // Another tenant's sandbox history is not visible, and an unknown sandbox
+    // is empty rather than an error.
+    assert!(
+        repository
+            .list_snapshots(owner, new_id(), 200, None)
+            .await
+            .unwrap()
+            .snapshots
+            .is_empty()
+    );
+}
+
+/// The page bound reaches the database, not only the trimming that follows.
+///
+/// The behavioural test above cannot see this: the rows are trimmed in Rust
+/// after the fetch, so deleting `LIMIT` from the SQL leaves it passing while the
+/// database goes on materialising every snapshot the sandbox ever had.
+#[tokio::test]
+async fn the_snapshot_page_bound_is_pushed_down_to_the_database() {
+    let Some((repository, _owner, _admin, _schema)) = isolated_repository_and_tenant().await else {
+        return;
+    };
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        crate::postgres::LIST_SNAPSHOTS_SQL
+    ))
+    .bind(Uuid::now_v7())
+    .bind(Uuid::now_v7())
+    .bind(None::<chrono::DateTime<Utc>>)
+    .bind(None::<Uuid>)
+    .bind(50_i64)
+    .fetch_one(&repository.pool)
+    .await
+    .expect("the plan must run");
+    // The document is an array whose first element holds the root under `Plan`
+    // and its children under `Plans`. A limit buried under a scan is not a
+    // limit bounding the statement.
+    assert_eq!(
+        plan[0]["Plan"]["Node Type"], "Limit",
+        "the snapshot page must be limited by the database, not only trimmed \
+         afterwards: {plan}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+}

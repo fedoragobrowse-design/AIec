@@ -86,6 +86,15 @@ tie either re-reads or skips the rows sharing a timestamp.
   twice. `attempts` is the only entry in that map that is a count rather than a
   duration.
 
+
+`GET /v1/sandboxes/{id}/snapshots` (scope `SnapshotsRead`) is paged the same way
+and returns `{snapshots, next}`. Snapshots are retained until one is deleted
+and nothing prunes them automatically, so a sandbox that is snapshotted
+repeatedly grows that list for as long as it lives. It was the third listing
+with the same missing index tie-breaker, after the sandbox list and the two
+Guard histories, which is what suggests the shape is now shared deliberately
+rather than reproduced.
+
 ### Run queue
 
 Every `POST /v1/runs` (and matrix/evaluation submission) is admitted to the durable

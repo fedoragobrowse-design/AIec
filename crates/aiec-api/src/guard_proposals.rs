@@ -9,9 +9,8 @@
 use std::collections::BTreeSet;
 
 use aiec_core::{
-    ApprovalDecisionRequest, ApprovalState, CoreError, GuardProposal, GuardToolApproval, Sandbox,
-    Scope,
-    storage::{GuardProposalPage, GuardToolApprovalPage, PageCursor},
+    ApprovalDecisionRequest, ApprovalState, GuardProposal, GuardToolApproval, Sandbox, Scope,
+    storage::{GuardProposalPage, GuardToolApprovalPage},
 };
 use aiec_guard::{
     control::{GuardControlCommand, GuardControlResponse, GuardFence},
@@ -189,20 +188,6 @@ pub(crate) struct ListGuardQuery {
     after_id: Option<Uuid>,
 }
 
-/// Reads the paired cursor, refusing half of one.
-fn guard_page_cursor(
-    created_at: Option<DateTime<Utc>>,
-    id: Option<Uuid>,
-) -> Result<Option<PageCursor>, ApiFailure> {
-    match (created_at, id) {
-        (None, None) => Ok(None),
-        (Some(created_at), Some(id)) => Ok(Some(PageCursor { created_at, id })),
-        _ => Err(ApiFailure::from(CoreError::InvalidRequest(
-            "after_created_at and after_id must be given together".into(),
-        ))),
-    }
-}
-
 pub(crate) async fn list_proposals(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -213,7 +198,7 @@ pub(crate) async fn list_proposals(
         .authorize(Scope::GuardRead)
         .map_err(ApiFailure::from)?;
     let _ = sandbox_of(&state, &principal, id).await?;
-    let after = guard_page_cursor(query.after_created_at, query.after_id)?;
+    let after = crate::page_cursor(query.after_created_at, query.after_id)?;
     let page = state
         .repository()
         .list_guard_proposals(
@@ -680,7 +665,7 @@ async fn list_tool_approvals(
         .get_sandbox(principal.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    let after = guard_page_cursor(query.after_created_at, query.after_id)?;
+    let after = crate::page_cursor(query.after_created_at, query.after_id)?;
     let page = state
         .repository()
         .list_guard_tool_approvals(

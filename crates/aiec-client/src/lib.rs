@@ -17,7 +17,7 @@ use uuid::Uuid;
 pub use aiec_core::run::{
     BatchOptions, CommandOutcome, Placement, RepoSpec, RunResults, RunSandbox,
 };
-pub use aiec_core::storage::{MatrixCell, MatrixCursor, PageCursor, SandboxPage};
+pub use aiec_core::storage::{MatrixCell, MatrixCursor, PageCursor, SandboxPage, SnapshotPage};
 
 /// The ceiling on a client-side batch, matching the control plane's own limit
 /// so a client cannot be the thing that makes a batch unbounded.
@@ -614,11 +614,45 @@ impl AIecClient {
         )
         .await
     }
-    pub async fn list_snapshots(&self, id: Uuid) -> Result<Vec<Snapshot>, ClientError> {
-        self.send(self.request(
-            reqwest::Method::GET,
-            &format!("/v1/sandboxes/{id}/snapshots"),
-        ))
+    /// Reads one bounded page of a sandbox's snapshots, newest first.
+    pub async fn list_snapshots_page(
+        &self,
+        id: Uuid,
+        limit: u32,
+    ) -> Result<SnapshotPage, ClientError> {
+        self.send(
+            self.request(
+                reqwest::Method::GET,
+                &format!("/v1/sandboxes/{id}/snapshots"),
+            )
+            .query(&[("limit", limit.to_string())]),
+        )
+        .await
+    }
+
+    /// Reads the snapshot page that starts where `after` says.
+    ///
+    /// Structured query encoding for the same reason as the sandbox cursor: an
+    /// RFC 3339 instant ends in `+00:00` and an unencoded `+` decodes as a
+    /// space, so a hand-built query string would be refused as unparseable on
+    /// every page after the first.
+    pub async fn list_snapshots_after(
+        &self,
+        id: Uuid,
+        limit: u32,
+        after: &PageCursor,
+    ) -> Result<SnapshotPage, ClientError> {
+        self.send(
+            self.request(
+                reqwest::Method::GET,
+                &format!("/v1/sandboxes/{id}/snapshots"),
+            )
+            .query(&[
+                ("limit", limit.to_string()),
+                ("after_created_at", after.created_at.to_rfc3339()),
+                ("after_id", after.id.to_string()),
+            ]),
+        )
         .await
     }
     pub async fn restore_snapshot(

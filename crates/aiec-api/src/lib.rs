@@ -1432,15 +1432,12 @@ async fn place_recovered_sandbox(
 /// a missing or damaged object fails recovery instead of quietly handing the
 /// sandbox an empty workspace.
 async fn restore_workspace(state: &AppState, sandbox: &Sandbox) -> Result<(), CoreError> {
+    // Named, not scanned: recovery wants the one archive to restore from, and a
+    // sandbox that has taken thousands of snapshots keeps all of them.
     let stored = state
         .repository()
-        .list_stored_snapshots(sandbox.tenant_id, sandbox.id)
-        .await?
-        .into_iter()
-        .filter(|snapshot| {
-            snapshot.complete && snapshot_kind(&snapshot.kind).ok() == Some(SnapshotKind::Workspace)
-        })
-        .max_by_key(|snapshot| snapshot.created_at);
+        .latest_stored_snapshot(sandbox.tenant_id, sandbox.id, "workspace")
+        .await?;
     let Some(stored) = stored else {
         tracing::warn!(
             sandbox_id = %sandbox.id,
@@ -3569,16 +3566,61 @@ async fn create_snapshot(
         }
     }
 }
+/// The paging parameters every sandbox-scoped history listing takes.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListHistoryQuery {
+    /// Rows to return. Clamped to the ceiling by the store as well as here.
+    #[serde(default)]
+    limit: Option<u32>,
+    /// The previous page's last row: when it was created, and which one. Both
+    /// halves or neither.
+    #[serde(default)]
+    after_created_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    after_id: Option<Uuid>,
+}
+
+/// Default page size for a sandbox's history listings.
+const DEFAULT_HISTORY_PAGE: u32 = 50;
+
+/// Reads the paired paging cursor, refusing half of one.
+///
+/// All three paged history routes - snapshots, Guard proposals, Guard tool
+/// approvals - take the same two query parameters and have to mean the same
+/// thing by them, so the rule lives here once. A cursor with only a timestamp
+/// names no row to start after, and one with only an id cannot order a page
+/// that has not been read; guessing either would silently return the wrong
+/// page rather than fail.
+pub(crate) fn page_cursor(
+    created_at: Option<DateTime<Utc>>,
+    id: Option<Uuid>,
+) -> Result<Option<PageCursor>, ApiFailure> {
+    match (created_at, id) {
+        (None, None) => Ok(None),
+        (Some(created_at), Some(id)) => Ok(Some(PageCursor { created_at, id })),
+        _ => Err(ApiFailure::from(CoreError::InvalidRequest(
+            "after_created_at and after_id must be given together".into(),
+        ))),
+    }
+}
+
 async fn list_snapshots(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Vec<Snapshot>> {
+    Query(query): Query<ListHistoryQuery>,
+) -> ApiResult<aiec_core::storage::SnapshotPage> {
     p.authorize(Scope::SnapshotsRead)
         .map_err(ApiFailure::from)?;
+    let after = page_cursor(query.after_created_at, query.after_id)?;
     Ok(Json(
         s.repository()
-            .list_snapshots(p.tenant_id, id)
+            .list_snapshots(
+                p.tenant_id,
+                id,
+                query.limit.unwrap_or(DEFAULT_HISTORY_PAGE),
+                after,
+            )
             .await
             .map_err(ApiFailure::from)?,
     ))
@@ -4944,8 +4986,12 @@ mod tests {
             &self,
             tenant: TenantId,
             sandbox: SandboxId,
-        ) -> Result<Vec<Snapshot>, CoreError> {
-            self.inner.list_snapshots(tenant, sandbox).await
+            limit: u32,
+            after: Option<aiec_core::storage::PageCursor>,
+        ) -> Result<aiec_core::storage::SnapshotPage, CoreError> {
+            self.inner
+                .list_snapshots(tenant, sandbox, limit, after)
+                .await
         }
         async fn delete_snapshot(&self, tenant: TenantId, id: SnapshotId) -> Result<(), CoreError> {
             self.inner.delete_snapshot(tenant, id).await
@@ -4986,12 +5032,15 @@ mod tests {
         ) -> Result<StoredSnapshot, CoreError> {
             self.inner.get_stored_snapshot(tenant, id).await
         }
-        async fn list_stored_snapshots(
+        async fn latest_stored_snapshot(
             &self,
             tenant: TenantId,
             sandbox: SandboxId,
-        ) -> Result<Vec<StoredSnapshot>, CoreError> {
-            self.inner.list_stored_snapshots(tenant, sandbox).await
+            kind: &str,
+        ) -> Result<Option<StoredSnapshot>, CoreError> {
+            self.inner
+                .latest_stored_snapshot(tenant, sandbox, kind)
+                .await
         }
         async fn create_sandbox_idempotent(
             &self,
