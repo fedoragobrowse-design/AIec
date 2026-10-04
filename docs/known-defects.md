@@ -807,20 +807,29 @@ precisely the way this defect came back; appending
 `forward iifname != tap oifname tap ip saddr 10.99.0.0/16 accept` after the drop
 makes the test fail, and so does deleting it.
 
-### The guest could send under any source address on its `/30`
+### A guest could send with any IPv4 source it liked
 
 Both legacy TAP chains carry `policy accept`, so the rules only ever described
-what was *permitted*; anything they failed to match fell out of the chain and
-was accepted by the policy. The permits keyed `ip saddr` on the whole `/30`,
-which combined with the policy into no source restriction at all.
+what was *permitted*. The `ip saddr {subnet}` accepts were one permit among
+destination-keyed drops, which means a packet from the tap carrying *any*
+source at all — not merely one inside its `/30` — matched no drop and no
+accept, fell off the end of the chain and was accepted by the policy.
 
-The address worth forging is the host's. A `/30` is four addresses — network,
-host at `.1`, guest at `.2`, broadcast — so `.1` is the only one a guest can
-source that carries traffic, and it is the host's own address on that link.
-Masquerade is a source-range rewrite, so a packet claiming `.1` was rewritten
-like any permitted source and appeared on the far side to come from the host,
-while conntrack sent the replies to the host address where the guest cannot
-see them.
+In the forward chain that was arbitrary-source IPv4 egress to any destination
+outside the blocked ranges, forwarded **without masquerade**, because the
+postrouting rule was subnet-keyed too. A guest could therefore emit traffic
+that appeared to originate from any address on the internet, with replies
+discarded by the terminal inbound drop — a reflection primitive pointed at a
+third party, not a way to impersonate the host. In the input chain the same
+fallthrough meant arbitrary-source traffic to the host itself was accepted at
+the input hook.
+
+Sourcing as `.1`, the host side of the `/30`, was the one forged case that was
+also masqueraded, and conntrack sent its replies to the host address rather
+than the guest's. That is worth noting but is *not* what distinguishes the
+abuse: masquerading to the host's egress address is what ordinary guest egress
+does too, so "looks host-originated" is not the impact. The impact is that the
+guest was its own source authority.
 
 Fix: every source match is pinned to `plan.guest`, and each chain enforces it
 with `ip saddr != {guest} drop` placed directly after the IPv6 drop, ahead of

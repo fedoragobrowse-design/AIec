@@ -412,21 +412,29 @@ async fn run_tool(program: &str, args: &[String], failure: &str) -> Result<(), C
 /// its `forward_to_guest` chain.
 ///
 /// Source matches are pinned to the guest's own address, and each chain
-/// enforces that rather than merely preferring it. Both chains carry
-/// `policy accept`, so an accept that never matched was not a restriction: a
-/// packet from the tap with a forged source missed every rule and was let
-/// through anyway. The `ip saddr !=` drop is what actually refuses it, and it
-/// sits directly after the IPv6 drop so it is reached before any destination
-/// rule could accept on the strength of where the packet was going.
+/// enforces that rather than merely preferring it.
 ///
-/// The address worth forging is the host's. A `/30` is four addresses — network,
-/// host at `.1`, guest at `.2`, broadcast — so the host's own address is the
-/// only one a guest can reach that carries traffic, and a guest sourcing as
-/// `.1` had its egress masqueraded like any other permitted source while
-/// appearing on the far side to come from the host. Destination matches stay
-/// on the subnet, because that is about which hosts are on this link rather
-/// than about who is allowed to be the sender. Guard matches the exact guest
-/// address for the same reason.
+/// The gap this closes was not "a guest could borrow another address on its
+/// link". Both chains carry `policy accept`, so they only ever described what
+/// was permitted, and the `ip saddr {subnet}` accepts were one permit among
+/// destination-keyed drops. A packet from the tap carrying *any* source at all
+/// — not just one inside its `/30` — matched no drop and no accept, fell off
+/// the end of the chain and was accepted by the policy. In the forward chain
+/// that meant arbitrary-source IPv4 egress to any destination outside the
+/// blocked ranges, forwarded with no masquerade because the postrouting rule
+/// was also subnet-keyed; in the input chain it meant arbitrary-source traffic
+/// to the host itself. Sourcing as `.1`, the host side of the link, was the
+/// one case that was also masqueraded, but masquerading to the host's egress
+/// address is what ordinary guest egress does too, so that is not what makes
+/// it distinct — replies for it land on the host address rather than the
+/// guest's. The general case is simply that the guest was its own source
+/// authority.
+///
+/// `ip saddr != {guest} drop` is what actually refuses it: it sits directly
+/// after the IPv6 drop, so it is reached before any destination rule could
+/// accept on the strength of where the packet was going. Destination matches
+/// stay on the subnet, because that is about which hosts are on this link
+/// rather than about who may be the sender. Guard refuses the same way.
 fn firewall_rules(table: &str, tap: &str, subnet: &str, guest: &str) -> String {
     format!(
         "add table inet {table}; \
@@ -1001,9 +1009,9 @@ mod tests {
         assert!(metadata_drop < outbound);
 
         // Every permit is keyed to the guest's own address, not to its `/30`.
-        // The host's own address is the one a guest can forge that carries
-        // traffic, and masquerading it attributes the guest's egress to the
-        // host while the replies never come back to the guest.
+        // `.1` is the host side of this link and `.2` the guest. Only the
+        // guest's own address may appear as a source on the tap at all, so
+        // nothing here may key a permit on the wider subnet.
         assert!(
             !rules.contains("ip saddr 172.30.8.0/30"),
             "no permit may key on the subnet as a source: {}",
