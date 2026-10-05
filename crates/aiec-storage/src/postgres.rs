@@ -2748,13 +2748,24 @@ impl PostgresRepository {
         if result.rows_affected() == 0 {
             // A worker that never registered must not be reported as merely stale: the two
             // failures mean different things to the caller and to the operator.
-            let current = match self.get_worker(heartbeat.node_id).await {
-                Ok(current) => current,
-                Err(StoreError::NotFound) => {
-                    return Err(StoreError::Conflict("worker does not exist".into()));
-                }
-                Err(error) => return Err(error),
-            };
+            // Read through the transaction already held rather than calling
+            // `get_worker`, which acquires a second connection from the pool.
+            // The pool is 20 connections with no acquire timeout, so a burst of
+            // concurrent heartbeats — a mass worker restart, which is exactly
+            // when they all arrive together — could hold every connection in
+            // an open `tx` and then each block forever waiting for the one it
+            // does not have. That is a self-deadlock with no timeout to break
+            // it, and it needs no failure of the database to happen.
+            let row = sqlx::query("SELECT * FROM nodes WHERE id = $1")
+                .bind(heartbeat.node_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::Conflict("worker does not exist".into()))?;
+            let current = worker_status_from_row(&row)?;
+            // Returning drops the transaction, which rolls back the lock the
+            // row was taken under. Nothing this branch wrote needs to survive:
+            // it exists only to say which of the two failures it was.
             if current.registration.version > heartbeat.version {
                 return Err(StoreError::Conflict(
                     "worker heartbeat version is stale".into(),
@@ -2765,6 +2776,8 @@ impl PostgresRepository {
             ));
         }
         tx.commit().await.map_err(database_error)?;
+        // Safe now that the transaction is released: this is the one call in
+        // this function that is allowed to take a fresh connection.
         self.get_worker(heartbeat.node_id).await
     }
 
@@ -6271,6 +6284,75 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    /// Replaying an idempotent create returns the sandbox the first call made.
+    ///
+    /// The second call builds a fresh `Sandbox`, so it carries a different id
+    /// and a later timestamp. Dedup therefore cannot be coming from those two
+    /// fields matching -- it has to be the `(tenant, request_id)` row and the
+    /// fingerprint, which covers the requested shape and deliberately excludes
+    /// identity and timestamps. Pinning it here is what keeps that exclusion
+    /// from being "tidied up" into something that breaks every retry.
+    #[tokio::test]
+    async fn a_replayed_idempotent_create_returns_the_first_sandbox() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let request_id = new_id();
+
+        let first = repository
+            .create_sandbox_idempotent(tenant, request_id, sandbox(tenant))
+            .await
+            .unwrap();
+        // A genuinely separate attempt: new id, new timestamps.
+        let replay = repository
+            .create_sandbox_idempotent(tenant, request_id, sandbox(tenant))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replay.id, first.id,
+            "a replay must hand back the sandbox that already exists"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sandboxes WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant)
+                .bind(first.id)
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "a replay must not provision a second sandbox");
+    }
+
+    /// The other half of the same contract: the key belongs to one shape.
+    ///
+    /// Reusing a request id for a different sandbox is a client bug that would
+    /// otherwise return the first sandbox and silently ignore what was asked
+    /// for, so it is refused by name.
+    #[tokio::test]
+    async fn an_idempotency_key_reused_for_a_different_sandbox_is_refused() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let request_id = new_id();
+        repository
+            .create_sandbox_idempotent(tenant, request_id, sandbox(tenant))
+            .await
+            .unwrap();
+
+        let mut different = sandbox(tenant);
+        different.image_id = "afimg2_other".into();
+        match repository
+            .create_sandbox_idempotent(tenant, request_id, different)
+            .await
+        {
+            Err(StoreError::Conflict(message)) => assert!(
+                message.contains("idempotency key was reused"),
+                "the refusal must name the cause: {message}"
+            ),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
     /// A worker that holds no active lease is refused *and* left unrefreshed.
     ///
     /// The refusal is the easy half. The row is the point: the heartbeat used
@@ -6287,6 +6369,7 @@ pub(crate) mod tests {
             return;
         };
         let node_id = register_test_worker(&repository, tenant).await;
+
         schedule_test_sandbox(
             &repository,
             tenant,
@@ -6296,6 +6379,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+
         let claimed = repository
             .claim_worker_assignments(node_id, 1, 60)
             .await
@@ -6340,6 +6424,67 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
 
+    /// A heartbeat that is about to be refused must not need a second
+    /// connection.
+    ///
+    /// `heartbeat_worker` opens a transaction, and the node row it reads to
+    /// explain a refusal was fetched through a fresh pool acquisition while that
+    /// transaction was still open. The pool is 20 connections with no acquire
+    /// timeout, so a burst of concurrent heartbeats could hold every connection
+    /// in an open transaction and then each wait forever for one it does not
+    /// have. That is a self-deadlock, and it needs nothing to go wrong in the
+    /// database to happen.
+    ///
+    /// The pool here is deliberately small — two connections — so the failure is
+    /// reached in a test rather than after twenty heartbeats in production.
+    /// Every heartbeat below is for a node that was never registered, which is
+    /// the branch that read the row, so the burst is entirely of the calls that
+    /// used to nest.
+    #[tokio::test]
+    async fn concurrent_heartbeat_refusals_do_not_need_a_second_connection() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let repository = Arc::new(PostgresRepository::from_pool(pool));
+        repository.migrate().await.unwrap();
+
+        // More concurrent heartbeats than the pool has connections.
+        let mut beats = Vec::new();
+        for _ in 0..8 {
+            let repository = Arc::clone(&repository);
+            beats.push(async move {
+                repository
+                    .heartbeat_worker(WorkerHeartbeat {
+                        node_id: new_id(),
+                        sandbox_count: 0,
+                        healthy: true,
+                        version: 1,
+                        metadata: json!({}),
+                        last_error: None,
+                    })
+                    .await
+            });
+        }
+        // Bounded so a regression fails loudly rather than hanging the suite,
+        // which is what it would do in production with no acquire timeout.
+        let results = tokio::time::timeout(
+            Duration::from_secs(30),
+            futures_util::future::join_all(beats),
+        )
+        .await
+        .expect("heartbeats deadlocked waiting for a second pool connection");
+        for result in results {
+            assert!(
+                matches!(result, Err(StoreError::Conflict(_))),
+                "an unregistered worker must be refused, not admitted: {result:?}"
+            );
+        }
+    }
     #[tokio::test]
     async fn lease_revocation_cannot_race_a_healthy_heartbeat() {
         let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await

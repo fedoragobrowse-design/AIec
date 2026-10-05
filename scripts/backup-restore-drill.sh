@@ -26,61 +26,33 @@ WORK=$(mktemp -d)
 # below readable to every account on the machine for as long as the process
 # lives. libpq reads the password from the environment instead, so it is taken
 # out of the URLs once here and given to it that way.
-#
-# A percent sign is refused rather than handled: libpq percent-decodes a password
-# that arrives inside a URI and does not decode `PGPASSWORD`, so an encoded
-# password would silently stop authenticating. Failing is the honest answer —
-# this is a drill, not a service, and an operator sees the message immediately.
-db_url_password() {
-  local rest=${1#*://} credentials
-  case $rest in
-    *@*) ;;
-    *) return 0 ;;
-  esac
-  credentials=${rest%%@*}
-  case $credentials in
-    *:*) printf '%s' "${credentials#*:}" ;;
-  esac
-}
+source "$REPO/scripts/acceptance-db.sh"
+acceptance_database_export_password "$DATABASE_URL" || exit 2
 
-db_url_without_password() {
-  local url=$1 rest credentials
-  rest=${url#*://}
-  case $rest in
-    *@*) ;;
-    *) printf '%s' "$url"; return ;;
-  esac
-  credentials=${rest%%@*}
-  # Only the password is dropped. Dropping the role as well would leave libpq
-  # to connect as the OS user of whoever ran the drill, which is a different
-  # database role and fails to authenticate — the redaction would trade a leak
-  # for a broken drill.
-  case $credentials in
-    *:*) printf '%s://%s@%s' "${url%%://*}" "${credentials%%:*}" "${rest#*@}" ;;
-    *) printf '%s://%s' "${url%%://*}" "$rest" ;;
-  esac
-}
-
-db_password=$(db_url_password "$DATABASE_URL")
-if [ -n "$db_password" ]; then
-  case $db_password in
-    *%*)
-      printf '%s\n' \
-        'refusing to run: the database password is percent-encoded, and moving it out of the argv would change how it is read. Set it in ~/.pgpass instead.' >&2
-      exit 1
-      ;;
-  esac
-  PGPASSWORD=$db_password
-  export PGPASSWORD
+# `PGPASSWORD` is one value for the whole process, so the admin role and the
+# source database must share it. They do by default — the admin URL is derived
+# from `DATABASE_URL` — but an override that names a different role with a
+# different password would silently authenticate as one of them and fail on the
+# other. Saying so beats a confusing authentication error mid-drill.
+if [ -n "${AIEC_DRILL_ADMIN_URL:-}" ]; then
+  admin_password=$(acceptance_database_url_password "$ADMIN_URL")
+  source_password=$(acceptance_database_url_password "$DATABASE_URL")
+  if [ "$admin_password" != "$source_password" ]; then
+    printf '%s\n' \
+      'refusing to run: AIEC_DRILL_ADMIN_URL and DATABASE_URL carry different passwords, and one PGPASSWORD cannot satisfy both. Use one role for the drill.' >&2
+    exit 1
+  fi
+  unset admin_password source_password
 fi
+
 # The full URLs stay intact: the control plane below is started with
 # `DATABASE_URL=$RESTORED_URL` in its environment, and sqlx parses the password
 # out of the URI itself rather than reading `PGPASSWORD` the way libpq does.
 # Only the copies handed to `psql`/`pg_dump`/`pg_restore` as arguments are
 # stripped, which is the only place the value was ever exposed to another
 # account.
-ADMIN_ARGV=$(db_url_without_password "$ADMIN_URL")
-DATABASE_ARGV=$(db_url_without_password "$DATABASE_URL")
+ADMIN_ARGV=$(acceptance_database_url_without_password "$ADMIN_URL")
+DATABASE_ARGV=$(acceptance_database_url_without_password "$DATABASE_URL")
 CREATED_DB=0
 SERVER_PID=""
 FAILED=0

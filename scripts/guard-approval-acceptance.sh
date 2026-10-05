@@ -31,6 +31,23 @@ bin=${P2_BIN:-$repo/target/release}
 umask 077
 mkdir -p "$root/state" "$root/tls"
 chmod 700 "$root" "$root/state" "$root/tls"
+
+# The CA private key and the API key below are minted per run, so a root this
+# script created has to go away with it. The old fixed path could only ever
+# leave one behind and was overwritten each run; an unpredictable name with no
+# removal leaves a fresh one every time, and the operator's override is the
+# case that must survive.
+approval_root_owned=0
+if [ -z "${APPROVAL_ROOT:-}" ]; then
+  approval_root_owned=1
+  cleanup() {
+    trap - EXIT INT TERM
+    rm -rf -- "$root"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
 key=$(python3 -c 'import secrets;print(secrets.token_hex(24))')
 
 cp_port=${P2_CP_PORT:-18544}

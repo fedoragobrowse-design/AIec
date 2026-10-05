@@ -421,6 +421,67 @@ class RedirectTest(unittest.TestCase):
         # The point of the test: the second server saw nothing at all.
         self.assertEqual(forwarded, [])
 
+    def test_a_2xx_that_is_not_json_arrives_as_an_aiecerror(self):
+        """A success status is not a success.
+
+        A 200 whose body is not JSON reaches the caller as a decoding error
+        rather than as `AIecError`, and `JSONDecodeError` is a `ValueError`, so
+        `except AIecError` -- the documented way to handle this API's failures
+        -- does not catch it. An intermediary answering with an HTML page is the
+        ordinary way to arrive at a 2xx with text in it, and the caller's error
+        handling then does not run at all.
+
+        The server is a real socket, because the point is what the client does
+        with a body it genuinely parsed off the wire.
+        """
+
+        class HtmlBody(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body>gateway error</body></html>")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), HtmlBody)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = a_client(base_url=f"http://127.0.0.1:{server.server_port}")
+            with self.assertRaises(AIecError) as raised:
+                client.runs.get("r1")
+            # The status is kept: the call did reach the control plane and was
+            # answered, so reporting a transport failure would be a lie.
+            self.assertEqual(raised.exception.status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_empty_2xx_body_is_still_none(self):
+        """The empty-body path is unchanged and must stay that way.
+
+        A 204 is a legitimate empty success, so guarding against unparseable
+        bodies must not turn "no content" into a failure.
+        """
+
+        class NoContent(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), NoContent)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = a_client(base_url=f"http://127.0.0.1:{server.server_port}")
+            self.assertIsNone(client.runs.get("r1"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_a_body_carrying_redirect_does_not_leak_the_token_either(self):
         forwarded = []
 

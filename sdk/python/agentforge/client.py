@@ -238,7 +238,36 @@ class AIec:
         try:
             with _no_redirect_opener().open(request, timeout=timeout) as response:
                 body = response.read()
-                return json.loads(body) if body else None
+                status = response.status
+                if not body:
+                    return None
+                try:
+                    return json.loads(body)
+                except ValueError as error:
+                    # A 2xx whose body is not JSON is not the caller's success,
+                    # and letting `JSONDecodeError` out breaks the one
+                    # guarantee the exception types exist to make: that a
+                    # failure arrives as `AIecError`. `JSONDecodeError` is a
+                    # `ValueError`, so `except AIecError` misses it entirely
+                    # and a caller handling this API's failures watches it go
+                    # past. An intermediary answering with an HTML page is the
+                    # ordinary way to get here -- a captive portal or a proxy
+                    # error page is a 200 with text in it. The body is left
+                    # out of the message so arbitrary server text is not
+                    # copied into the caller's logs.
+                    raise AIecError(
+                        status,
+                        {
+                            "error": {
+                                "code": "invalid_response",
+                                "message": (
+                                    f"{method} {path}: the control plane "
+                                    f"answered {status} with a body that is "
+                                    f"not JSON"
+                                ),
+                            }
+                        },
+                    ) from error
         except HTTPError as error:
             try:
                 error_payload = json.loads(error.read())

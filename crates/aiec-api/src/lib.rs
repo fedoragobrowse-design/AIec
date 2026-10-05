@@ -27,6 +27,7 @@ pub(crate) mod repo_cache;
 mod run_paging_tests;
 mod run_queue;
 pub mod run_secrets;
+use run_secrets::SecretRedactor;
 pub mod runs;
 mod worker;
 use axum::{
@@ -3126,7 +3127,18 @@ async fn exec_sandbox(
         "stdin_bytes": r.stdin.as_deref().map(str::len),
     });
 
-    r.environment.extend(s.secret_values(p.tenant_id, id).await);
+    // The values merged here are handed to a command the caller chose, and that
+    // command can print them -- `sh -c 'cat $TOKEN'` is a one-liner. The run
+    // path already scrubs stdout, stderr and the transport error for exactly
+    // this reason; exec did not, so the same secret that `run_command` refuses
+    // to echo came straight back through `/exec`. Same values, same redactor.
+    //
+    // The transport error is included because the runtime is handed the
+    // environment and an error can quote it, which is why the run path scrubs
+    // that too rather than only the streams.
+    let injected = s.secret_values(p.tenant_id, id).await;
+    let redactor = SecretRedactor::new(injected.values().cloned().collect());
+    r.environment.extend(injected);
     let started = std::time::Instant::now();
     let outcome = s.runtime_for(&x)?.exec(&x, r).await;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -3156,7 +3168,19 @@ async fn exec_sandbox(
             .await;
         }
     }
-    Ok(Json(outcome.map_err(ApiFailure::from)?))
+    let outcome = outcome.map_err(|error| ApiFailure::from(redactor.redact_error(&error)))?;
+    // Nothing was injected, so there is nothing to replace. Moving the streams
+    // rather than rebuilding them is the same reasoning as the run path: a
+    // megabyte copied per exec is not free.
+    if redactor.is_empty() {
+        return Ok(Json(outcome));
+    }
+    let (stdout, stderr) = redactor.redact_output_uncapped(&outcome.stdout, &outcome.stderr);
+    Ok(Json(ExecResult {
+        stdout,
+        stderr,
+        ..outcome
+    }))
 }
 
 async fn git_diff(

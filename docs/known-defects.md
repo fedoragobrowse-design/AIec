@@ -3299,3 +3299,154 @@ through unchanged, and `PGPASSWORD` is confirmed set in the parent shell after a
 command substitution. They do not prove a live PostgreSQL connection still
 authenticates — that needs the drill run against a real server, which is not
 available here.
+## A heartbeat could take a second connection while holding the first
+
+`heartbeat_worker` opens a transaction to lock the worker's lease rows before
+refreshing `nodes`. When the update matched no rows it read the node back to
+decide which of two failures to report — "never registered" versus "lost a
+concurrent update race" — and it did that with `self.get_worker`, which acquires
+a connection from `self.pool`. The transaction was still open.
+
+The pool is `max_connections(20)` with no `acquire_timeout`, so twenty
+heartbeats arriving together would each hold one connection in an open
+transaction and then each wait for a connection none of them could release. That
+is a self-deadlock: no database failure is required, nothing times out, and
+nothing logs. Mass worker restart is exactly when heartbeats arrive together,
+because every worker that comes back beats at once.
+
+**Fix.** The node row is read through the transaction already held
+(`fetch_optional(&mut *tx)`), so a heartbeat needs one connection whether it
+succeeds or is refused. The refusal branches return, which drops the
+transaction; nothing they write needs to survive, since they exist only to name
+the failure. The final `self.get_worker` after `tx.commit()` is unchanged and is
+now the only call in the function that takes a fresh connection.
+
+**Evidence.** `concurrent_heartbeat_refusals_do_not_need_a_second_connection`
+runs eight concurrent refused heartbeats against a deliberately two-connection
+pool. It passes in 0.11 s. Restoring the nested `self.get_worker` call makes it
+fail with `heartbeats deadlocked waiting for a second pool connection` after the
+full 30 s bound — the same hang, reproduced on demand.
+
+A sweep of every transaction-holding method in `postgres.rs` for a pool
+acquisition reachable from inside its open transaction found this one site and
+no other. The safe patterns nearby are the ones worth naming, because the bug
+was the absence of one: quota is locked before it is read (`:1249` before
+`:1361`), idempotency is locked before the existing row is read (`:2521`,
+`:3590`), and lease updates carry a generation fence (`:5329`).
+
+**What this does not prove.** The deadlock is demonstrated against a local
+PostgreSQL with a deliberately undersized pool. Production presents 20
+connections, so triggering it there needs a burst of twenty rather than eight;
+the mechanism is identical and the test is a faithful reduction of it, but no
+production-scale burst was run.
+
+## A 2xx that was not JSON arrived as the wrong exception type
+
+`_request` parsed a successful body with a bare `json.loads`, so a 2xx whose
+body was not JSON raised `JSONDecodeError`. That is a `ValueError`, not an
+`AIecError`, so the documented `except AIecError` — the way the SDK tells
+callers to handle this API's failures — did not catch it, and the caller's error
+handling simply did not run.
+
+The odd part is that the same function already gets this right twice. The
+transport branch wraps `URLError` and `OSError` with the comment that they
+"escape the documented `except AIecError` as an unrelated type while a caller
+believes it is handling this API's failures", and the `HTTPError` branch wraps
+its `json.loads` in a `try`. Only the success path was unguarded.
+
+An ordinary way to reach it is an intermediary answering 200 with text: a proxy
+error page or a captive portal. It is not exotic, and nothing about the status
+tells the caller it happened.
+
+**Fix.** A non-empty body that will not parse raises `AIecError` carrying the
+status that was actually received. The status is kept deliberately: the call did
+reach the control plane and was answered, so reporting a transport failure
+would be a lie. The body itself is left out of the message so arbitrary server
+text is not copied into the caller's logs. An empty body still returns `None`,
+because a 204 is a legitimate empty success and the new guard must not turn "no
+content" into a failure — that path has its own test.
+
+## Leads investigated and closed without a change
+
+Three reported leads were checked against the source and did not survive
+contact with it. They are recorded so they are not re-investigated.
+
+**E2B stderr collapsing to 4 KiB.** The range decoder bounds stderr by
+`MAX_STDERR` (1 MiB) but by a flat 4096 whenever `stdout_limit` is set, which
+reads like an accidental coupling. It is not reachable as a truncation bug:
+`stdout_limit` is `None` on every exec, and the only `Some(..)` in the tree is
+the file-chunk read, where it is `request.length * 4 + 4096` and the command is
+a small `python3 -c` whose stderr is a traceback. There is no path where a
+caller sets a stdout limit and then gets 4 KiB of stderr. It remains a latent
+sharp edge if a second `Some(..)` caller ever appears.
+
+**Idempotent sandbox create failing on retry.** Replay returns the first
+sandbox, not an error. The dedup cannot be coming from the caller's sandbox id
+or its timestamps, because a replay builds a fresh `Sandbox` with both
+different — `sandbox_fingerprint` covers the requested shape and deliberately
+excludes id and timestamps. That exclusion is also what makes the epoch
+`created_at` repair safe. Both halves are now pinned: a replay returns the
+first sandbox and provisions no second row, and the same key with a different
+shape is refused by name.
+
+**Credentials in acceptance reports.** `benchmarks/guard-approval-acceptance.json`
+is tracked in git and carries ten evidence strings. Scanned for bearer tokens,
+URL userinfo, PEM blocks, JWTs and long key/token/secret-shaped runs: all clean.
+Its one `endpoint` field is a bare https origin with no query string and no
+userinfo. This is a scan of the committed artifact and of what the writer is
+asked to emit, not a proof that no future run could write a secret — the writer
+is what would need the guarantee, and it was not changed.
+
+## `/exec` echoed back the secret it had just injected
+
+`exec_sandbox` merges the sandbox's live secrets into the outgoing command's
+environment, which is the point of the feature. It then returned the runtime's
+`ExecResult` verbatim. `ExecResult` carries `stdout` and `stderr`, so a command
+of the caller's choosing could print a secret and get it back in the HTTP
+response body.
+
+The run path already gets this right three times over. `run_command` builds a
+`SecretRedactor` from the same resolved secret set it injects, scrubs stdout and
+stderr with `redact_output_uncapped`, and scrubs the transport error with
+`redact_error` because the runtime is handed the environment and an error can
+quote it. `/exec` called none of it.
+
+**Fix.** The injected values are collected into a `SecretRedactor` before being
+merged, and the response is scrubbed with the same helpers: streams through
+`redact_output_uncapped`, errors through `redact_error`. When nothing was
+injected the redactor is empty and the streams are moved rather than rebuilt, so
+an exec that asked for no secrets does not pay to copy a megabyte. The audit
+record was already correct — it records environment *keys* only — so this closes
+the response and leaves the audit trail as it was.
+
+**Evidence.** `an_exec_cannot_echo_back_the_secret_it_was_given` stores a secret,
+execs a `cat` against it, and asserts on the whole serialized response that the
+value is absent and `[redacted]` is present in both stdout and stderr. The mock
+runtime used for it echoes the injected environment onto both streams, which is
+what makes the redaction observable rather than merely present.
+
+**Severity, honestly.** The caller already holds the value they stored, so this
+is not privilege escalation. It is credential propagation into everything that
+touches a response body afterwards — request logs, error trackers, a pasted
+issue. `put_secret` returns 501 in production, so the in-memory secret store is
+development-only today; the exec code path is identical in both modes and is
+unguarded, so the leak is real wherever the store is populated.
+
+## Leads investigated and closed without a change (continued)
+
+**Public metrics.** The suspicion was a public `GET /v1/metrics` leaking
+capacity without a rate limit. The route is top-level `GET /metrics`, not under
+`/v1`. It is genuinely unauthenticated and genuinely unthrottled, but it is
+wired in the same chained block as `/health` and `/ready`, outside both `/v1`
+nests and outside the limiter, so there is no differential wiring to fix. It
+emits exactly three scalars — requests served by the process, and fleet-wide
+available vCPUs and memory — from one aggregate `SUM` over `nodes` with no
+`GROUP BY`, no tenant predicate and no labels. There is no code path from the
+handler to a `TenantId`: it takes no `Principal`, and the storage method it
+calls returns only two scalars. A test already asserts a per-sandbox gauge is
+absent, which suggests the wider surface was deliberately cut down. No change.
+
+What remains is information disclosure, not a tenant leak: an anonymous caller
+learns aggregate spare capacity and request rate. Whether fleet sizing is
+sensitive enough to want a limiter or a config gate on the outer router is a
+threat-model decision, not a defect, so nothing was changed.

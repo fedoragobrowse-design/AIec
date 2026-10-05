@@ -98,6 +98,88 @@ impl SandboxRuntime for MockRuntime {
     }
 }
 
+struct EnvEchoRuntime;
+#[async_trait]
+impl SandboxRuntime for EnvEchoRuntime {
+    async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn exec(&self, _: &Sandbox, r: ExecRequest) -> Result<ExecResult, CoreError> {
+        // Stands in for `sh -c 'cat "$API_TOKEN"'`. The injected secret is
+        // handed back on *both* streams, which is what makes the redaction
+        // observable rather than merely present.
+        let echoed = r
+            .environment
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ExecResult {
+            exit_code: 0,
+            stdout: format!("{}|{echoed}", r.command.join(" ")),
+            stderr: echoed,
+            duration_ms: 1,
+            timed_out: false,
+        })
+    }
+    async fn put_file(&self, _: &Sandbox, request: PutFileRequest) -> Result<(), CoreError> {
+        mock_writes().lock().push(request);
+        Ok(())
+    }
+    async fn get_file(&self, _: &Sandbox, p: &str) -> Result<FileContent, CoreError> {
+        Ok(FileContent {
+            path: p.into(),
+            content_base64: "aGk=".into(),
+        })
+    }
+    async fn get_file_chunk(
+        &self,
+        _: &Sandbox,
+        _: aiec_core::runtime::FileChunkRequest,
+    ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+        Err(CoreError::Backend("unused".into()))
+    }
+    async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+        Ok(vec![])
+    }
+    async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn make_directory(&self, _: &Sandbox, _: MakeDirectoryRequest) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported(
+            "mock runtime does not restore workspaces".into(),
+        ))
+    }
+    async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+        Ok(())
+    }
+    async fn health(&self) -> RuntimeHealth {
+        RuntimeHealth::healthy()
+    }
+    fn capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            exec: true,
+            files: true,
+            ..RuntimeCapabilities::default()
+        }
+    }
+}
+
 struct TaggedRuntime {
     label: &'static str,
     calls: Arc<Mutex<Vec<String>>>,
@@ -1221,6 +1303,106 @@ fn setup_with_artifacts() -> (axum::Router, String, String) {
         .build()
         .unwrap();
     (app(AppState::development(platform)), a, b)
+}
+
+#[tokio::test]
+async fn an_exec_cannot_echo_back_the_secret_it_was_given() {
+    // The sandbox's secrets are injected into the command's environment, and
+    // the command is the caller's to choose -- `cat "$API_TOKEN"` is one line.
+    // `run_command` scrubs stdout, stderr and the transport error for exactly
+    // this reason; `/exec` did not, so the value came straight back in the
+    // response body. The caller already holds the value they stored, but the
+    // response is what gets written to logs, pasted into issues and captured
+    // by anything watching the endpoint, so it must not carry the secret.
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    futures::executor::block_on(repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&key),
+        scopes: vec![Scope::SandboxesRead, Scope::SandboxesWrite],
+        expires_at: None,
+        name: "test".to_string(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    }))
+    .unwrap();
+    let (platform, _artifacts) = development_platform(Arc::new(EnvEchoRuntime), repo, None);
+    let router = app(AppState::development(platform));
+    let auth = format!("Bearer {key}");
+
+    let create = router
+        .clone()
+        .oneshot(
+            Request::post("/v1/sandboxes")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    let secret = "sk-live-do-not-echo-this-value";
+    let put = router
+        .clone()
+        .oneshot(
+            Request::put(format!("/v1/sandboxes/{id}/secrets/API_TOKEN"))
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"value": secret}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let exec = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{id}/exec"))
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"command":["/bin/sh","-lc","cat \"$API_TOKEN\""]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(exec.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: Value = serde_json::from_slice(&body).unwrap();
+
+    // The whole body, not just one field: the leak was in the response, so the
+    // assertion is about the response.
+    let rendered = String::from_utf8_lossy(&body);
+    assert!(
+        !rendered.contains(secret),
+        "the injected secret came back in the exec response: {rendered}"
+    );
+    assert!(
+        result["stdout"].as_str().unwrap().contains("[redacted]"),
+        "the command's own output must survive redaction: {rendered}"
+    );
+    assert!(
+        result["stderr"].as_str().unwrap().contains("[redacted]"),
+        "stderr is a leak route too: {rendered}"
+    );
 }
 
 #[tokio::test]
