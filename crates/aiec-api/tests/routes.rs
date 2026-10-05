@@ -2327,6 +2327,121 @@ async fn rate_limiting_refuses_without_corrupting_state() {
     assert_eq!(works.status(), StatusCode::OK);
 }
 #[tokio::test]
+async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
+    let root = std::env::temp_dir().join(format!("aiec-diff-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let repo = MemoryRepository::new();
+    let key = generate_api_key();
+    repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: Uuid::now_v7(),
+        digest: key_digest(&key),
+        scopes: vec![Scope::Admin],
+        expires_at: None,
+        name: "diff-redaction".into(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    })
+    .await
+    .unwrap();
+    let runtime = Arc::new(aiec_runtime::BubblewrapRuntime::new(&root));
+    let (platform, _) = development_platform(runtime, repo, None);
+    let router = app(AppState::development(platform));
+    let auth = format!("Bearer {key}");
+    let create = router.clone().oneshot(
+        Request::post("/v1/sandboxes")
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"image":"python:3.13","cpu":1,"memory_mb":512,"disk_mb":2048,"timeout_seconds":300,"network":{"enabled":false}}"#,
+            ))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created: Value = serde_json::from_slice(
+        &axum::body::to_bytes(create.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let id = created["id"].as_str().unwrap();
+    let secret = format!("fixture-{}", Uuid::now_v7());
+    let put = router
+        .clone()
+        .oneshot(
+            Request::put(format!("/v1/sandboxes/{id}/secrets/API_TOKEN"))
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"value": secret}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    // The diff command receives no injected environment. The credential is
+    // already in the worktree, written by an earlier secret-bearing command.
+    let exec = router.clone().oneshot(
+        Request::post(format!("/v1/sandboxes/{id}/exec"))
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "command": ["/bin/sh", "-c",
+                    "set -eu; mkdir -p repository; cd repository; git init -q; printf 'baseline\\n' > tracked.txt; git add tracked.txt; git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm baseline; printf 'public-marker\\n%s\\n' \"$API_TOKEN\" > tracked.txt"]
+            }).to_string()))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(exec.status(), StatusCode::OK);
+    let executed: ExecResult =
+        serde_json::from_slice(&axum::body::to_bytes(exec.into_body(), 4096).await.unwrap())
+            .unwrap();
+    assert_eq!(executed.exit_code, 0, "repository preparation failed");
+    let diff = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/sandboxes/{id}/git/diff"))
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diff.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(diff.into_body(), 8192).await.unwrap();
+    let result: Value = serde_json::from_slice(&body).unwrap();
+    let destroy = router
+        .oneshot(
+            Request::delete(format!("/v1/sandboxes/{id}"))
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(destroy.status(), StatusCode::OK);
+
+    assert!(
+        !String::from_utf8_lossy(&body).contains(&secret),
+        "git diff disclosed a stored sandbox credential"
+    );
+    let stdout = result["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains("-baseline"),
+        "the tracked-file diff must survive"
+    );
+    assert!(
+        stdout.contains("+public-marker"),
+        "non-secret additions must survive"
+    );
+    assert!(
+        stdout.contains("+[redacted]"),
+        "the secret addition must be scrubbed"
+    );
+}
+
+#[tokio::test]
 async fn real_bubblewrap_lifecycle_file_snapshot_restore() {
     use aiec_runtime::BubblewrapRuntime;
     use serde_json::Value;

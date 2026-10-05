@@ -3307,12 +3307,11 @@ decide which of two failures to report — "never registered" versus "lost a
 concurrent update race" — and it did that with `self.get_worker`, which acquires
 a connection from `self.pool`. The transaction was still open.
 
-The pool is `max_connections(20)` with no `acquire_timeout`, so twenty
-heartbeats arriving together would each hold one connection in an open
-transaction and then each wait for a connection none of them could release. That
-is a self-deadlock: no database failure is required, nothing times out, and
-nothing logs. Mass worker restart is exactly when heartbeats arrive together,
-because every worker that comes back beats at once.
+The pool is `max_connections(20)` with no explicit acquire-timeout override.
+SQLx 0.8.6 defaults acquisition to 30 seconds (`sqlx-core/src/pool/options.rs`),
+so the earlier claim that nothing times out was wrong. A burst of refused
+heartbeats can exhaust the pool with transactions waiting for second
+connections until acquisition times out. No database failure is required.
 
 **Fix.** The node row is read through the transaction already held
 (`fetch_optional(&mut *tx)`), so a heartbeat needs one connection whether it
@@ -3325,7 +3324,7 @@ now the only call in the function that takes a fresh connection.
 runs eight concurrent refused heartbeats against a deliberately two-connection
 pool. It passes in 0.11 s. Restoring the nested `self.get_worker` call makes it
 fail with `heartbeats deadlocked waiting for a second pool connection` after the
-full 30 s bound — the same hang, reproduced on demand.
+test's 30-second bound. That establishes pool starvation, not an infinite hang.
 
 A sweep of every transaction-holding method in `postgres.rs` for a pool
 acquisition reachable from inside its open transaction found this one site and
@@ -3450,3 +3449,38 @@ What remains is information disclosure, not a tenant leak: an anonymous caller
 learns aggregate spare capacity and request rate. Whether fleet sizing is
 sensitive enough to want a limiter or a config gate on the outer router is a
 threat-model decision, not a defect, so nothing was changed.
+
+## `/git/diff` disclosed credentials written by an earlier command
+
+`git_diff` executes Git with an empty environment, but that does not make
+tracked files secret-free. A previous sandbox command can write an injected
+secret into a tracked file; the route returned that secret in its raw diff.
+Unlike `/exec`, this route requires only `sandboxes:read`, not exec scope.
+
+**Fix.** Fetch the sandbox's live secret values after the tenant-scoped sandbox
+lookup and use the existing `SecretRedactor` for stdout, stderr and backend
+errors, matching exec/run response handling. Empty-secret responses move the
+original streams without copying. Exit status, duration and non-secret diff
+content remain intact.
+
+**Evidence.** `real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file`
+uses the actual HTTP router, Bubblewrap runtime and Git. It initializes and
+commits a baseline file, then executes a command that writes a public marker
+and the injected credential into that file. Before the fix the regression
+failed with `git diff disclosed a stored sandbox credential`. After the fix it
+passes and asserts `-baseline`, `+public-marker` and `+[redacted]`, with no raw
+credential anywhere in the serialized response. The sandbox and fixture root
+are destroyed before assertions. The complete API route suite passes 44 tests.
+
+Workspace verification after the repair: 1,133 Rust tests passed, zero failed
+across 43 suites with the configured local PostgreSQL URL; fmt and workspace
+all-feature/all-target clippy with `-D warnings` passed. SDK contract, 76 Python
+SDK tests and 21 benchmark tests passed. Commands captured their originating
+exit statuses.
+
+**Limits.** This is local Bubblewrap evidence, not remote Docker/Firecracker
+evidence. Sandbox secret storage remains development-only through the current
+`put_secret` API; the shared diff handler is fixed. Redaction covers the current
+registered values and existing redactor encodings, not arbitrary credentials,
+binary Git encodings or values revoked before the request. Backend-error
+scrubbing is implemented but not exercised by this new real-runtime regression.

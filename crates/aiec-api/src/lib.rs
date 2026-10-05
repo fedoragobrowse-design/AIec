@@ -3200,6 +3200,14 @@ async fn git_diff(
             "sandbox is not running".into(),
         )));
     }
+    // Earlier commands can write injected credentials into tracked files.
+    // An empty git environment does not make the resulting diff secret-free.
+    let redactor = SecretRedactor::new(
+        s.secret_values(p.tenant_id, id)
+            .await
+            .into_values()
+            .collect(),
+    );
     let result = s
         // The sandbox's own runtime, not the deployment's primary one. Every
         // other sandbox verb dispatches through `runtime_for`, so on a
@@ -3224,7 +3232,7 @@ async fn git_diff(
             },
         )
         .await
-        .map_err(ApiFailure::from)?;
+        .map_err(|error| ApiFailure::from(redactor.redact_error(&error)))?;
     if result.exit_code != 0 || result.timed_out {
         return Err(ApiFailure::new(
             StatusCode::BAD_GATEWAY,
@@ -3235,9 +3243,14 @@ async fn git_diff(
             ),
         ));
     }
+    let (stdout, stderr) = if redactor.is_empty() {
+        (result.stdout, result.stderr)
+    } else {
+        redactor.redact_output_uncapped(&result.stdout, &result.stderr)
+    };
     Ok(Json(json!({
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
         "exit_code": result.exit_code,
         "duration_ms": result.duration_ms,
     })))
