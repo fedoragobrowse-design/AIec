@@ -17,7 +17,41 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Refuse to follow a redirect, and say so as an API error.
+
+    ``urllib``'s default handler forwards the ``Authorization`` header to
+    whatever host a 30x names, across origins, and rewrites the method to GET
+    while discarding the body. So a control plane that answers a redirect -- a
+    compromised or misconfigured one, or one behind a proxy that rewrites a
+    path to an SSO login -- is handed the caller's API key in full, and the
+    caller receives a ``200`` from a host it never meant to talk to. Measured
+    against a 302 to a second listener on the same machine: the token arrived
+    verbatim, and ``HTTPRedirectHandler`` contains no ``Authorization``
+    handling at all, so nothing in the stdlib would have stripped it.
+
+    The API has no legitimate use for a redirect, so following one is never
+    right here regardless of where it points.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _no_redirect_opener():
+    """An opener that reports a redirect as a failure instead of following it.
+
+    Returning ``None`` from ``redirect_request`` makes ``open`` raise
+    ``HTTPError``, which ``_request`` already maps onto ``AIecError`` carrying
+    the status, so the redirect is visible as a failed call rather than as a
+    successful one from an unintended host.
+    """
+    return build_opener(_NoRedirect)
+
+
 from .runs import MAX_LIST_LIMIT, Runs, _listed
 from .evals import Evals
 
@@ -202,7 +236,7 @@ class AIec:
             },
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with _no_redirect_opener().open(request, timeout=timeout) as response:
                 body = response.read()
                 return json.loads(body) if body else None
         except HTTPError as error:

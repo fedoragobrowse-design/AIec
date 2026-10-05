@@ -234,8 +234,15 @@ log() { printf '[%s] %s\n' "$(now)" "$*"; }
 
 # Reads control-plane state straight from the backing PostgreSQL so the
 # assertions do not depend on the docker CLI.
+#
+# `SQL_ARGV_URL` is built below, once `DATABASE_URL` is known — after the
+# database is chosen or prepared, which is where this function's first use is
+# reachable. The password goes to `PGPASSWORD` in this shell's environment and
+# only the rest travels as an argument; `DATABASE_URL` itself is left intact
+# because the control plane reads it from its own environment, where sqlx
+# parses the password out of the URI.
 sql() {
-  psql "$DATABASE_URL" -t -A -F '|' -c "$1" 2>/dev/null
+  psql "$SQL_ARGV_URL" -t -A -F '|' -c "$1" 2>/dev/null
 }
 
 snapshot_state() {
@@ -380,7 +387,7 @@ cleanup() {
   # The only DROP this scenario issues, and the name can only be this run's:
   # it carries the run's random tag and is dropped only if this run created it.
   if [ -n "${PROVISIONED_DB_NAME:-}" ] && [ "${PROVISIONED_DB_CREATED:-0}" = 1 ]; then
-    psql "$PROVISIONED_ADMIN_URL" -v ON_ERROR_STOP=1 -q \
+    psql "$PROVISIONED_ADMIN_ARGV" -v ON_ERROR_STOP=1 -q \
       -c "DROP DATABASE IF EXISTS $PROVISIONED_DB_NAME" >/dev/null 2>&1
     PROVISIONED_DB_CREATED=0
   fi
@@ -502,14 +509,18 @@ if [ "${AIEC_RECOVERY_PROVISION_DATABASE:-0}" = 1 ]; then
   log "provisioning run-tagged database $DB_NAME"
   PROVISIONED_DB_NAME=$DB_NAME
   PROVISIONED_DB_CREATED=0
-  if psql "$PROVISIONED_ADMIN_URL" -t -A -c \
+  # The password leaves the URL and becomes `PGPASSWORD` for every `psql` in
+  # this run; the sanitized copy is what the arguments carry.
+  acceptance_database_export_password "$PROVISIONED_ADMIN_URL" || exit 2
+  PROVISIONED_ADMIN_ARGV=$(acceptance_database_url_without_password "$PROVISIONED_ADMIN_URL")
+  if psql "$PROVISIONED_ADMIN_ARGV" -t -A -c \
     "select 1 from pg_database where datname='$DB_NAME'" 2>/dev/null | grep -q 1; then
     # A name carrying this run's random tag already existing means another run
     # drew it, which is not a coincidence worth trusting.
     echo "refusing to reuse the existing database $DB_NAME" >&2
     exit 2
   fi
-  psql "$PROVISIONED_ADMIN_URL" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $DB_NAME" >/dev/null
+  psql "$PROVISIONED_ADMIN_ARGV" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $DB_NAME" >/dev/null
   PROVISIONED_DB_CREATED=1
   # Only the database component is replaced. `${url%/*}/name` drops the query,
   # and on a Unix-socket URL the query is what says where the server is, so that
@@ -524,6 +535,13 @@ else
   acceptance_prepare_database "$OUT" "$OUT/pg" "$OUT/s" "${AIEC_RECOVERY_PG_BIN:-}"
   : "${DATABASE_URL:?acceptance database preparation left no URL}"
 fi
+
+# `DATABASE_URL` exists from here on, so the argument that every `sql` call
+# carries can be built. The password goes into this shell's environment; the
+# URL itself stays whole for the control plane, which is started with it in its
+# own environment.
+acceptance_database_export_password "$DATABASE_URL" || exit 2
+SQL_ARGV_URL=$(acceptance_database_url_without_password "$DATABASE_URL")
 
 # ------------------------------------------------------------------ ports
 # Refused before anything binds. On a shared host these are somebody else's

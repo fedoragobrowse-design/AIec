@@ -20,6 +20,67 @@ cd "$REPO"
 ADMIN_URL=${AIEC_DRILL_ADMIN_URL:-${DATABASE_URL%/*}/postgres}
 DRILL_DB=${AIEC_DRILL_DB:-aiec_drill}
 WORK=$(mktemp -d)
+
+# A connection string on a command line is not private: any local user can read
+# another process's argv through /proc, which makes the password in every URL
+# below readable to every account on the machine for as long as the process
+# lives. libpq reads the password from the environment instead, so it is taken
+# out of the URLs once here and given to it that way.
+#
+# A percent sign is refused rather than handled: libpq percent-decodes a password
+# that arrives inside a URI and does not decode `PGPASSWORD`, so an encoded
+# password would silently stop authenticating. Failing is the honest answer —
+# this is a drill, not a service, and an operator sees the message immediately.
+db_url_password() {
+  local rest=${1#*://} credentials
+  case $rest in
+    *@*) ;;
+    *) return 0 ;;
+  esac
+  credentials=${rest%%@*}
+  case $credentials in
+    *:*) printf '%s' "${credentials#*:}" ;;
+  esac
+}
+
+db_url_without_password() {
+  local url=$1 rest credentials
+  rest=${url#*://}
+  case $rest in
+    *@*) ;;
+    *) printf '%s' "$url"; return ;;
+  esac
+  credentials=${rest%%@*}
+  # Only the password is dropped. Dropping the role as well would leave libpq
+  # to connect as the OS user of whoever ran the drill, which is a different
+  # database role and fails to authenticate — the redaction would trade a leak
+  # for a broken drill.
+  case $credentials in
+    *:*) printf '%s://%s@%s' "${url%%://*}" "${credentials%%:*}" "${rest#*@}" ;;
+    *) printf '%s://%s' "${url%%://*}" "$rest" ;;
+  esac
+}
+
+db_password=$(db_url_password "$DATABASE_URL")
+if [ -n "$db_password" ]; then
+  case $db_password in
+    *%*)
+      printf '%s\n' \
+        'refusing to run: the database password is percent-encoded, and moving it out of the argv would change how it is read. Set it in ~/.pgpass instead.' >&2
+      exit 1
+      ;;
+  esac
+  PGPASSWORD=$db_password
+  export PGPASSWORD
+fi
+# The full URLs stay intact: the control plane below is started with
+# `DATABASE_URL=$RESTORED_URL` in its environment, and sqlx parses the password
+# out of the URI itself rather than reading `PGPASSWORD` the way libpq does.
+# Only the copies handed to `psql`/`pg_dump`/`pg_restore` as arguments are
+# stripped, which is the only place the value was ever exposed to another
+# account.
+ADMIN_ARGV=$(db_url_without_password "$ADMIN_URL")
+DATABASE_ARGV=$(db_url_without_password "$DATABASE_URL")
 CREATED_DB=0
 SERVER_PID=""
 FAILED=0
@@ -32,7 +93,7 @@ cleanup() {
   set +e
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
   if [ "$CREATED_DB" = 1 ]; then
-    psql "$ADMIN_URL" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null 2>&1
+    psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null 2>&1
   fi
   rm -rf "$WORK"
 }
@@ -45,23 +106,26 @@ command -v pg_dump >/dev/null || { echo "pg_dump is required" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1. restore
 log "1. restore a dump into a disposable database"
-psql "$ADMIN_URL" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null
-psql "$ADMIN_URL" -q -c "CREATE DATABASE $DRILL_DB" >/dev/null
+psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null
+psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB" >/dev/null
 CREATED_DB=1
 RESTORED_URL="${DATABASE_URL%/*}/$DRILL_DB"
+# Same split as above: the full URL goes to the control plane's environment, the
+# stripped one to `pg_restore`'s arguments.
+RESTORED_ARGV="${DATABASE_ARGV%/*}/$DRILL_DB"
 
-pg_dump --format=custom --no-owner --no-privileges --file="$WORK/aiec.dump" "$DATABASE_URL"
+pg_dump --format=custom --no-owner --no-privileges --file="$WORK/aiec.dump" "$DATABASE_ARGV"
 [ -s "$WORK/aiec.dump" ] && ok "dumped $(du -h "$WORK/aiec.dump" | cut -f1) of database state" \
   || bad "pg_dump produced nothing"
 
-pg_restore --dbname="$RESTORED_URL" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
+pg_restore --dbname="$RESTORED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
   || bad "pg_restore failed"
 ok "restored into $DRILL_DB"
 
 # The restored copy must be a working schema, not just a file.
-tables=$(psql_q "$RESTORED_URL" "select count(*) from information_schema.tables where table_schema='public'")
+tables=$(psql_q "$RESTORED_ARGV" "select count(*) from information_schema.tables where table_schema='public'")
 [ "${tables:-0}" -gt 0 ] && ok "restored schema has $tables public tables" || bad "restored schema is empty"
-migrations=$(psql_q "$RESTORED_URL" "select count(*) from _sqlx_migrations where success")
+migrations=$(psql_q "$RESTORED_ARGV" "select count(*) from _sqlx_migrations where success")
 [ "${migrations:-0}" -gt 0 ] && ok "restored migration history ($migrations applied)" || bad "no migration history restored"
 
 # ------------------------------------------------- 2. AIec on restored data
@@ -110,17 +174,17 @@ log "3. disaster-recovery drill: stop, wipe, restore, reconnect"
 # into a fresh database, which is the same path an operator takes after an
 # outage: the durable state must come back, not be reconstructed by hand.
 DRILL_DB2=${DRILL_DB}_recovery
-psql "$ADMIN_URL" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
-psql "$ADMIN_URL" -q -c "CREATE DATABASE $DRILL_DB2" >/dev/null
-RECOVERED_URL="${DATABASE_URL%/*}/$DRILL_DB2"
-pg_restore --dbname="$RECOVERED_URL" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
+psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
+psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB2" >/dev/null
+RECOVERED_ARGV="${DATABASE_ARGV%/*}/$DRILL_DB2"
+pg_restore --dbname="$RECOVERED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
   && ok "restored a second copy after the simulated outage" \
   || bad "recovery restore failed"
-recovered_tables=$(psql_q "$RECOVERED_URL" "select count(*) from information_schema.tables where table_schema='public'")
+recovered_tables=$(psql_q "$RECOVERED_ARGV" "select count(*) from information_schema.tables where table_schema='public'")
 [ "${recovered_tables:-0}" = "${tables:-x}" ] \
   && ok "recovered copy matches the restored schema ($recovered_tables tables)" \
   || bad "recovered copy differs: $recovered_tables vs ${tables:-none}"
-psql "$ADMIN_URL" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
+psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
 
 # ----------------------------------------------------------------- summary
 log "summary"

@@ -2195,11 +2195,14 @@ async fn create_sandbox(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
         .unwrap_or_else(new_id);
-    let now = if headers.get("idempotency-key").is_some() {
-        chrono::DateTime::<Utc>::from_timestamp(0, 0).expect("epoch timestamp is valid")
-    } else {
-        Utc::now()
-    };
+    // The id is the idempotency key, so a replay is already deduplicated by it
+    // and by the `(tenant, request_id)` join in `provision_sandbox`. Pinning
+    // `created_at` to the epoch bought no determinism the id did not already
+    // give, and it made every timestamp derived from it wrong: the Guard
+    // budget's ceiling is `created_at + timeout_seconds`, so an idempotent
+    // Guard sandbox was born already expired — its first model request was
+    // refused as `Guard sandbox lifetime expired` and the reaper collected it.
+    let now = Utc::now();
     let x = Sandbox {
         id: request_id,
         tenant_id: p.tenant_id,
@@ -7859,6 +7862,55 @@ mod tests {
         tenant: Uuid,
         key: String,
         root: std::path::PathBuf,
+    }
+
+    /// An idempotency key makes the *id* deterministic; it says nothing about
+    /// when the machine was created. Pinning `created_at` to the epoch made
+    /// every timestamp derived from it wrong, and the Guard budget's ceiling is
+    /// exactly that: `created_at + timeout_seconds`. A Guard sandbox created
+    /// with a key was therefore born expired — its first model request was
+    /// refused as `Guard sandbox lifetime expired` and the reaper collected a
+    /// machine that had never run anything.
+    #[tokio::test]
+    async fn an_idempotent_create_is_not_born_in_the_epoch() {
+        let fixture = RunFixture::new();
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let before = Utc::now();
+        let request = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/sandboxes")
+            .header("authorization", format!("Bearer {}", fixture.key))
+            .header("content-type", "application/json")
+            // A parseable UUID: an unparseable key is not treated as idempotent.
+            .header("idempotency-key", new_id().to_string())
+            .body(Body::from(json!({ "image": "alpine:3.21" }).to_string()))
+            .expect("create request");
+        let response = app(fixture.state.clone())
+            .oneshot(request)
+            .await
+            .expect("create response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let document: Value = serde_json::from_slice(&bytes).expect("sandbox document");
+        let created_at = document["created_at"]
+            .as_str()
+            .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+            .unwrap_or_else(|| panic!("no parseable created_at: {document}"));
+
+        assert!(
+            created_at >= before - chrono::Duration::seconds(5),
+            "an idempotent create was stamped {} , over a minute before the request",
+            created_at
+        );
+        // The budget ceiling this timestamp feeds. With the epoch it was already
+        // in the past, so every debit against it was refused on arrival.
+        let ceiling = created_at + chrono::Duration::seconds(60);
+        assert!(
+            ceiling > Utc::now(),
+            "the Guard budget for a fresh machine expires before it is used: {ceiling}"
+        );
     }
 
     #[tokio::test]

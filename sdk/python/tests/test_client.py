@@ -365,6 +365,105 @@ class TransportFailureTest(unittest.TestCase):
             client.usage()
 
 
+class RedirectTest(unittest.TestCase):
+    """A redirect must never carry the API key to the host that names it.
+
+    `urllib`'s default redirect handler forwards `Authorization` to whatever
+    host a 30x names, across origins, so a control plane that answers a redirect
+    is handed the caller's credential in full. Both servers below are real
+    sockets on this machine and the token is checked at the *second* one: a test
+    that only asserted on the client's own result would still pass while the key
+    was delivered.
+    """
+
+    def test_a_redirect_is_refused_and_the_token_is_never_forwarded(self):
+        forwarded = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                forwarded.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"id":"owned"}')
+
+            def log_message(self, *args):
+                pass
+
+        elsewhere = http.server.HTTPServer(("0.0.0.0", 0), Elsewhere)
+        threading.Thread(target=elsewhere.serve_forever, daemon=True).start()
+        port = elsewhere.server_port
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                # A different hostname, so this is a genuine cross-origin
+                # redirect rather than the same origin on another port.
+                self.send_header("Location", f"http://localhost:{port}/steal")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=redirector.serve_forever, daemon=True).start()
+        try:
+            client = a_client(base_url=f"http://127.0.0.1:{redirector.server_port}")
+            with self.assertRaises(AIecError) as raised:
+                client.runs.get("r1")
+            # The redirect is visible as a failed call, carrying its status.
+            self.assertEqual(raised.exception.status, 302)
+        finally:
+            redirector.shutdown()
+            redirector.server_close()
+            elsewhere.shutdown()
+            elsewhere.server_close()
+        # The point of the test: the second server saw nothing at all.
+        self.assertEqual(forwarded, [])
+
+    def test_a_body_carrying_redirect_does_not_leak_the_token_either(self):
+        forwarded = []
+
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                forwarded.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"cancelled"}')
+
+            def log_message(self, *args):
+                pass
+
+        elsewhere = http.server.HTTPServer(("0.0.0.0", 0), Elsewhere)
+        threading.Thread(target=elsewhere.serve_forever, daemon=True).start()
+
+        class Redirector(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://localhost:{elsewhere.server_port}/steal",
+                )
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+        threading.Thread(target=redirector.serve_forever, daemon=True).start()
+        try:
+            client = a_client(base_url=f"http://127.0.0.1:{redirector.server_port}")
+            with self.assertRaises(AIecError):
+                client.runs.cancel("r1")
+        finally:
+            redirector.shutdown()
+            redirector.server_close()
+            elsewhere.shutdown()
+            elsewhere.server_close()
+        self.assertEqual(forwarded, [])
+
+
 def rate_limited_by(retry_after):
     """The error one 429 carrying this `Retry-After` produces.
 

@@ -288,6 +288,70 @@ acceptance_check_database_identifier() {
   return 2
 }
 
+# The password inside a PostgreSQL URL, or nothing when the URL carries none.
+acceptance_database_url_password() {
+  local rest=${1#*://} credentials
+  [[ $rest == *@* ]] || return 0
+  credentials=${rest%%@*}
+  [[ $credentials == *:* ]] && printf '%s' "${credentials#*:}"
+}
+
+# The same URL with the password removed and everything else — scheme, role,
+# host, port, database and query — preserved verbatim. Only the role stays
+# because dropping it too would leave libpq to connect as the OS user of
+# whoever ran the script, which is a different database role and fails to
+# authenticate: the redaction would trade a leak for a broken run.
+acceptance_database_url_without_password() {
+  local url=$1 rest credentials
+  rest=${url#*://}
+  case $rest in
+    *@*) ;;
+    *) printf '%s' "$url"; return 0 ;;
+  esac
+  credentials=${rest%%@*}
+  case $credentials in
+    *:*) printf '%s://%s@%s' "${url%%://*}" "${credentials%%:*}" "${rest#*@}" ;;
+    *) printf '%s://%s' "${url%%://*}" "$rest" ;;
+  esac
+}
+
+# Hands a URL's password to libpq through the environment, as a side effect of
+# running in the *current* shell.
+#
+# A connection string on a command line is not private: any local user can read
+# another process's argv through /proc, so a password passed to `psql`,
+# `pg_dump` or `pg_restore` that way is readable by every account on the machine
+# for as long as the process lives. libpq reads `PGPASSWORD` instead, which
+# `/proc` does not expose to other users.
+#
+# This is deliberately not combined with `acceptance_database_url_without_password`
+# into one call that prints the sanitized URL: a caller writing
+# `URL=$(acceptance_database_argv_url "$url")` runs that in a command
+# substitution, and the `export` would die with the subshell — leaving every
+# later `psql` with no password at all. Two calls, one effect and one value, so
+# a mistake in how it is called cannot silently drop the credential.
+#
+# A percent sign in the password is refused rather than handled: libpq
+# percent-decodes a password that arrives inside a URI and does not decode
+# `PGPASSWORD`, so an encoded password would silently stop authenticating.
+#
+# The full URL stays available to the caller for anything that needs it — the
+# control plane is started with `DATABASE_URL` in its *environment*, and sqlx
+# parses the password out of the URI itself rather than reading `PGPASSWORD`.
+acceptance_database_export_password() {
+  local password
+  password=$(acceptance_database_url_password "$1")
+  [ -n "$password" ] || return 0
+  case $password in
+    *%*)
+      printf 'refusing to hide a percent-encoded database password: libpq decodes it inside a URI and does not decode PGPASSWORD. Set it in ~/.pgpass instead.\n' >&2
+      return 2
+      ;;
+  esac
+  PGPASSWORD=$password
+  export PGPASSWORD
+}
+
 # Succeeds when nothing is listening on a loopback TCP port.
 #
 # A launcher binds a fixed, documented port on a shared host. Finding one

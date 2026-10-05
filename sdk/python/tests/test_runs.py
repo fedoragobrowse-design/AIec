@@ -206,6 +206,69 @@ class RunRequestTest(unittest.TestCase):
         self.assertEqual(stated - default, 7200 - 600)
 
 
+class RunIdentifierTest(unittest.TestCase):
+    """A run id must stay one path segment.
+
+    A run id arrives from wherever the caller got it -- a webhook body, a CSV
+    column, another system's identifier -- and it is interpolated into the
+    request target. Escaped, an unexpected id is a 404; unescaped, one
+    containing `/` or `?` changes which endpoint is called and the rest of the
+    intended path becomes query text.
+    """
+
+    #: Contains a path traversal and a query separator, so an unescaped
+    #: interpolation both walks the path and starts a query.
+    HOSTILE = "../../v1/sandboxes?x="
+
+    def setUp(self):
+        self.transport = FakeTransport()
+        self.runs = Runs(client_with(self.transport))
+
+    def test_a_run_id_cannot_rewrite_the_request_target(self):
+        self.runs.get(self.HOSTILE)
+        self.runs.events(self.HOSTILE)
+        self.runs.artifacts(self.HOSTILE)
+        self.runs.cancel(self.HOSTILE)
+        for method, path, _payload in self.transport.calls:
+            self.assertTrue(
+                path.startswith("/v1/runs/"),
+                f"{method} left its route: {path}",
+            )
+            # Exactly one segment between the collection and the operation.
+            tail = path[len("/v1/runs/"):]
+            self.assertNotIn("/", tail.split("/")[0], f"{method} leaked a path: {path}")
+            # No unescaped `?`, so nothing became query text.
+            self.assertNotIn("?", tail, f"{method} leaked a query: {path}")
+
+    def test_an_ordinary_run_id_is_still_sent_verbatim(self):
+        identifier = "8f14e45f-ceea-4d1a-9d2b-000000000001"
+        self.runs.get(identifier)
+        self.runs.cancel(identifier)
+        self.assertEqual(self.transport.calls[0][1], f"/v1/runs/{identifier}")
+        self.assertEqual(
+            self.transport.calls[1][1], f"/v1/runs/{identifier}/cancel"
+        )
+
+    def test_the_segment_helper_escapes_every_reserved_character(self):
+        from agentforge.runs import _segment
+
+        # Pinned rather than computed from `quote` itself: the property that
+        # matters is the exact spelling that reaches the server, and a test
+        # derived from the same function it calls would pass whatever that
+        # function was changed to do.
+        for raw, escaped in [
+            ("a/b", "a%2Fb"),
+            ("a?b", "a%3Fb"),
+            ("a#b", "a%23b"),
+            ("a b", "a%20b"),
+            ("a%b", "a%25b"),
+            ("..", ".."),
+            ("a:b", "a%3Ab"),
+            ("a&b", "a%26b"),
+        ]:
+            self.assertEqual(_segment(raw), escaped, raw)
+
+
 class RunReadTest(unittest.TestCase):
     def setUp(self):
         self.transport = FakeTransport()

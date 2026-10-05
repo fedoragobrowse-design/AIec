@@ -3167,3 +3167,135 @@ concern — one 8 KiB read per 20 ms poll wake, capping a drain at ~400 KiB/s �
 contradicted by measurement: 512 KiB drains in 0.01 s. `poll` returns as soon as
 the descriptor is readable rather than after its timeout, so a wake is not rate
 limited to one chunk per 20 ms. No change made.
+
+## Python SDK: credentials forwarded to a redirect target, and run ids that rewrote the request target
+
+Two defects in the Python SDK transport, both fixed, both with a mutation that
+fails on the intended assertion.
+
+### Redirects carried the API key to another host
+
+`agentforge/client.py` called `urllib.request.urlopen`, whose default redirect
+handler forwards `Authorization` across origins. A control plane that answers a
+30x therefore handed the caller's full credential to whatever host the redirect
+named. Reproduced in a fresh process against two real loopback servers: the
+second server received `Bearer <key>` and returned `200` with a body the SDK
+accepted as a sandbox.
+
+The fix is `_NoRedirect(HTTPRedirectHandler)`, used by `_no_redirect_opener()`.
+Redirects are not a legitimate response for this API, so the 30x surfaces as
+`AIecError` with status `302` instead of being followed.
+
+**One caveat worth stating, because it changed how the test was read.** The
+first post-fix check reported the leak still present. That was a stale
+evaluation kernel, not a surviving defect: rerun in a fresh process, the same
+scenario prints `AIecError status: 302` and `attacker saw: []`. A cached kernel
+is not evidence about the file on disk.
+
+### Run ids were interpolated raw into the request path
+
+`agentforge/runs.py` built `get`, `events`, `artifacts` and `cancel` paths by
+interpolating `run_id` directly. A run id is caller-supplied and may come from a
+webhook body or another system's identifier, so one containing `../`, `?` or `#`
+changed which endpoint was called and turned the rest of the intended path into
+query text. Confirmed on the wire: `../../v1/sandboxes?x=` produced
+`GET /v1/runs/../../v1/sandboxes?x=`.
+
+The fix is `_segment(value)`, `urllib.parse.quote(value, safe="")`, applied to
+every run route. `safe=""` rather than the default safe set, because the default
+keeps `/`, and a path separator surviving is the whole bug. The same path now
+carries `..%2F..%2Fv1%2Fsandboxes%3Fx%3D`, and an ordinary UUID is unchanged.
+
+| Test | Mutation | Result |
+|---|---|---|
+| `RedirectTest::test_a_redirect_is_refused_and_the_token_is_never_forwarded` | back to `urlopen` | FAILED, `AIecError not raised` |
+| `RedirectTest::test_a_body_carrying_redirect_does_not_leak_the_token_either` | back to `urlopen` | FAILED |
+| `RunIdentifierTest::test_a_run_id_cannot_rewrite_the_request_target` | `_segment(run_id)` → `run_id` | FAILED, `'?' unexpectedly found in '../../v1/sandboxes?x='` |
+
+The redirect tests assert on the *second* server having received nothing, not
+only on the client's own result: a test that checked only that the call failed
+would still pass while the key was delivered on the way.
+
+**Not claimed:** the Rust SDK was not audited for the same two patterns as part
+of this work. Whether its request builder percent-encodes path identifiers is
+unexamined here.
+
+## An idempotent create was stamped with the epoch
+
+`crates/aiec-api/src/lib.rs` set a sandbox's `created_at` and `updated_at` to
+the Unix epoch whenever an `Idempotency-Key` header was present.
+
+The id is already the idempotency key, and `provision_sandbox` joins a replay on
+`(tenant, request_id)`, so nothing about deduplication needed the timestamp to be
+constant. What the epoch did break is everything derived from that timestamp. The
+Guard budget's ceiling is `sandbox.created_at + timeout_seconds`
+(`guard.rs:62`), so a Guard sandbox created with a key was born with a budget
+that expired in 1970: `guard::reserve` refuses a debit whose `expires_at` is not
+in the future (`storage/src/guard.rs:94`), so its first model request was
+refused as `Guard sandbox lifetime expired`, and `expired()` reported it to the
+reaper on sight.
+
+`an_idempotent_create_is_not_born_in_the_epoch` covers it through the router. It
+restores the epoch branch and fails at the timestamp assertion.
+
+## Acceptance scripts: a predictable secret directory, and passwords on the command line
+
+Both found by the deploy/config audit and both fixed.
+
+### `/tmp/aiec-approval` was a fixed, world-readable directory
+
+`scripts/guard-approval-acceptance.sh` wrote the run's TLS private keys and its
+API and worker credentials under a constant path created with `mkdir -p`. Any
+local account could read that directory, and could create it first — so the keys
+were written into a directory someone else already owned. It now uses
+`mktemp -d` and `umask 077`, matching `guard-core-acceptance.sh`, and pins
+`chmod 700` on the directories it creates. `APPROVAL_ROOT` still overrides it
+for a run that needs the directory to outlive itself.
+
+### Database passwords were passed to `psql` as arguments
+
+`psql`, `pg_dump` and `pg_restore` were called with a full connection URL on the
+command line. Another local account can read any process's argv through `/proc`,
+so the password in that URL was readable to every account on the machine for as
+long as the process lived. This affected `scripts/backup-restore-drill.sh` and
+`scripts/worker-recovery-validation.sh`.
+
+The password now goes to libpq through `PGPASSWORD`, which `/proc` does not
+expose to other users, and the argument carries the rest of the URL.
+
+**Two things this first got wrong, both caught by running it rather than by
+reading it, and both worth recording because they are easy to repeat.**
+
+1. The first redaction dropped `user:pass@` wholesale, leaving
+   `postgresql://127.0.0.1:5432/postgres`. libpq would then connect as the OS
+   user of whoever ran the drill — a different database role — so the redaction
+   would have traded a leak for a broken drill. Only the password is dropped;
+   the role is preserved.
+2. The helper that did the redaction also performed `export PGPASSWORD` and
+   printed the sanitized URL, so callers naturally wrote
+   `URL=$(acceptance_database_argv_url "$url")`. That runs in a command
+   substitution: the `export` dies with the subshell and every later `psql` runs
+   with no password at all. The helpers are now split into
+   `acceptance_database_export_password` (a side effect in the current shell)
+   and `acceptance_database_url_without_password` (a pure value), so a
+   mistaken call cannot silently drop the credential.
+
+**`DATABASE_URL` itself is deliberately left intact.** The control plane is
+started with it in its *environment*, and sqlx parses the password out of the URI
+rather than reading `PGPASSWORD` the way libpq does — stripping it would break
+authentication. Only the copies handed to the PostgreSQL tools as arguments are
+sanitized. In `worker-recovery-validation.sh` the sanitized copy is also built
+after `DATABASE_URL` exists, because the script refuses to read it under `set -u`
+before the database is chosen or prepared.
+
+A percent sign in the password is refused rather than handled: libpq
+percent-decodes a password that arrives inside a URI and does not decode
+`PGPASSWORD`, so an encoded password would silently stop authenticating.
+
+**What these tests prove and what they do not.** The redaction is verified by
+running the script's real helpers against a stub `psql` that records its argv:
+the password is absent, the role is present, a URL with no password is passed
+through unchanged, and `PGPASSWORD` is confirmed set in the parent shell after a
+command substitution. They do not prove a live PostgreSQL connection still
+authenticates — that needs the drill run against a real server, which is not
+available here.

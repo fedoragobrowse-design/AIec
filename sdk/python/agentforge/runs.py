@@ -17,7 +17,7 @@ import shlex
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Sequence
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 #: How long the control plane can hold a run in its durable queue before it
 #: stops trying to claim one. This is server configuration the client cannot
@@ -87,6 +87,23 @@ DEFAULT_LIST_LIMIT = 50
 #: ``after_requested_at``/``after_id``; the clamp is still refused here rather
 #: than discovered later, because one page cannot hold what was asked for.
 MAX_LIST_LIMIT = 200
+
+
+def _segment(value: str) -> str:
+    """Escape an identifier that becomes exactly one path segment.
+
+    A run id reaches these methods from wherever the caller got it -- a webhook
+    body, a CSV column, another system's identifier -- and it was interpolated
+    straight into the request target. Every other identifier in this SDK is
+    escaped (``matrix_id``, artifact names, sandbox file paths, cursor values),
+    which made this the one place where an id containing ``/`` or ``?`` could
+    change which endpoint was called: measured on the wire, the run id
+    ``../../v1/sandboxes?x=`` produced the request target
+    ``/v1/runs/../../v1/sandboxes?x=``, and the remainder of the intended path
+    became query text. Escaping every reserved character keeps it one segment,
+    so an unexpected id is a 404 rather than a different request.
+    """
+    return quote(str(value), safe="")
 
 #: The same bound the control plane puts on a client-side batch.
 MAX_BATCH_PARALLEL = 64
@@ -410,15 +427,15 @@ class Runs:
 
     def get(self, run_id: str) -> dict:
         """One run's authoritative document."""
-        return self.client._request("GET", f"/v1/runs/{run_id}")
+        return self.client._request("GET", f"/v1/runs/{_segment(run_id)}")
 
     def events(self, run_id: str) -> list:
         """A run's history, in the order it happened."""
-        return self.client._request("GET", f"/v1/runs/{run_id}/events")
+        return self.client._request("GET", f"/v1/runs/{_segment(run_id)}/events")
 
     def artifacts(self, run_id: str) -> list:
         """The artifacts a run collected, each with a ``download_url``."""
-        return self.client._request("GET", f"/v1/runs/{run_id}/artifacts")
+        return self.client._request("GET", f"/v1/runs/{_segment(run_id)}/artifacts")
 
     def cancel(self, run_id: str) -> dict:
         """Stop a run and reclaim the machine it was holding.
@@ -428,7 +445,7 @@ class Runs:
         mistake.
         """
         return self.client._request(
-            "POST", f"/v1/runs/{run_id}/cancel", timeout=CANCEL_TIMEOUT_SECONDS
+            "POST", f"/v1/runs/{_segment(run_id)}/cancel", timeout=CANCEL_TIMEOUT_SECONDS
         )
 
     # -- workflows ------------------------------------------------------

@@ -13,12 +13,24 @@
 # suites do not diverge in how they reach the server.
 set -euo pipefail
 
-root=${APPROVAL_ROOT:-${TMPDIR:-/tmp}/aiec-approval}
+# `APPROVAL_ROOT` is an operator override for a run that needs its directory to
+# outlive it. The default must not be a fixed path: this one holds the run's TLS
+# private keys and the API and worker credentials, and a name any local user can
+# predict is a name any local user can read first — or own before we do, so the
+# files below are written into a directory prepared to hand them over. `mktemp -d`
+# creates the directory fresh with 0700 in one step, which is also why nothing
+# here can be pre-created by someone else.
+root=${APPROVAL_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/aiec-approval.XXXXXXXX")}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=${APPROVAL_REPO:-$(cd "$here/.." && pwd)}
 bin=${P2_BIN:-$repo/target/release}
 
-mkdir -p "$root" "$root/state" "$root/tls"
+# Everything written below is a secret or a key. The permissions of the
+# directory are only the first line; `openssl` and the servers also create files
+# of their own, so the mode they are created with is pinned here as well.
+umask 077
+mkdir -p "$root/state" "$root/tls"
+chmod 700 "$root" "$root/state" "$root/tls"
 key=$(python3 -c 'import secrets;print(secrets.token_hex(24))')
 
 cp_port=${P2_CP_PORT:-18544}
