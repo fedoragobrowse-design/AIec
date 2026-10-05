@@ -1007,6 +1007,46 @@ mod tests {
     /// closes that pipe and the writer sees `EPIPE`. Measured — disabling only
     /// the reader abort still leaks two threads per exec, and disabling only a
     /// writer abort leaked none.
+    /// Large output must survive intact.
+    ///
+    /// The readers are released only after both collectors have their answer,
+    /// and that ordering is load-bearing: releasing them earlier stops the
+    /// reads and silently truncates the output. A one-line command cannot
+    /// detect it, because one chunk has usually been delivered already. This
+    /// writes far more than one poll cycle carries, so moving the release back
+    /// above the collectors loses bytes and fails here.
+    #[test]
+    fn a_large_output_is_not_truncated_by_the_reader_release() {
+        // 2 MiB of distinct bytes, so a short read is visible in the length and
+        // not only in the content.
+        let script = "i=0; while [ $i -lt 512 ]; do printf '%01024d' $i; i=$((i+1)); done";
+        let ResponsePayload::Exec { stdout, .. } = run_command(RequestPayload::Exec {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 60_000,
+            output_limit: 4 * 1024 * 1024,
+            stdin: Vec::new(),
+        })
+        .expect("the command succeeded") else {
+            panic!("exec must answer with its exit status");
+        };
+        let expected = 512 * 1024;
+        assert_eq!(
+            stdout.len(),
+            expected,
+            "output was truncated: {} of {expected} bytes",
+            stdout.len()
+        );
+        // And it is the right output, not just the right amount.
+        let expected_prefix = format!("{:0>1024}", 0).into_bytes();
+        let expected_suffix = format!("{:0>1024}", 511).into_bytes();
+        assert!(
+            stdout.starts_with(&expected_prefix) && stdout.ends_with(&expected_suffix),
+            "the output is the wrong content for its length"
+        );
+    }
+
     #[test]
     fn a_descendant_holding_output_pipes_does_not_retain_a_thread_per_exec() {
         fn threads() -> usize {

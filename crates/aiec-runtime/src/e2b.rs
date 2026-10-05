@@ -1629,6 +1629,59 @@ mod tests {
         }
     }
 
+    /// The exec start request is bounded by the command's own window.
+    ///
+    /// A provider that accepts the connection and never answers is the case
+    /// that hangs: the request is sent before the stream is read, so an
+    /// unbounded `.send()` holds the exec open past the deadline the caller
+    /// passed. A listener that accepts and then says nothing reproduces it
+    /// exactly -- no provider, no guest, no credentials.
+    #[tokio::test]
+    async fn a_provider_that_never_answers_does_not_outlive_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Hold the connection open and never write a response, so the client
+        // waits on headers rather than on the stream.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let config = test_config(
+            "https://api.e2b.app".into(),
+            Some(format!("http://{address}")),
+        );
+        let runtime = E2bRuntime::new(config).expect("runtime");
+        let binding = ProviderSandbox {
+            id: "sbx_1".into(),
+            access_token: "token".into(),
+        };
+        let started = Instant::now();
+        let result = runtime
+            .run_exec(
+                &binding,
+                &["/bin/true".to_string()],
+                GuestExec {
+                    working_directory: None,
+                    environment: Default::default(),
+                    stdin: None,
+                    timeout_seconds: 1,
+                    stdout_limit: Some(1024),
+                },
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_err(),
+            "an unanswered provider must not produce a result: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the exec outlived its deadline: {elapsed:?}"
+        );
+    }
+
     #[test]
     fn runtime_path_round_trips_only_our_own_handles() {
         assert_eq!(format_runtime_path("sbx_1"), "e2b://sbx_1");

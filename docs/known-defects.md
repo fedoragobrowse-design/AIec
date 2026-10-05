@@ -3031,3 +3031,87 @@ backgrounded process still runs until the sandbox or guest tears down, and
 output past the two-second collector bound is still discarded rather than
 reported as truncated. Thread counts are measured inside the test binary, so
 they cover the guest's own threads and not the host's.
+
+## 2026-10-04 review follow-up: four corrections to the exec-status work
+
+A review of the previous commit raised four points. Three changed code; one is
+recorded as a negative result.
+
+**The one-shot `None` refusal could fail ordinary commands.** The first repair
+read `inspect_exec` once and refused a `None`. But the attach stream and the
+recorded status are not published at the same instant: the stream reaches EOF
+when its last writer closes, which for a normal command is at or just before the
+daemon records the code. Refusing a single `None` therefore replaces a false
+success with an intermittent false failure — the same defect with the opposite
+sign, and one that would only appear in production. `await_exec_status` now polls
+every 20 ms under the exec's own deadline until a code is published. Three
+states are kept distinct by `exec_status`:
+
+| Observation | Verdict |
+|---|---|
+| `Some(code)` | the command's real status |
+| `None, running: true` | not published yet — ask again |
+| `None, running: false` | finished without recording a code — refuse |
+| `None, running: unknown` | treated as still running |
+
+The live counterweight is
+`a_successful_command_still_reports_its_status`, which runs `/bin/true` and
+`exit 7` against the local daemon and asserts both codes survive; repeated five
+times, all passing.
+
+**What the local daemon does not exercise.** A mutant that reads the status
+once and refuses `None` passes that live test. So the publish race this polling
+defends against does not occur on the local daemon within these bounds, and the
+reason the first repair's `unwrap_or(0)` looked unreachable is now explained:
+the daemon published the code every time. The polling is therefore justified by
+the documented publish semantics and by the fail-closed requirement, not by a
+reproduced local failure. Recorded as reasoning, not as a measured defect.
+
+**The E2B send deadline now has coverage.** `a_provider_that_never_answers_does_not_outlive_the_deadline`
+binds a `TcpListener`, accepts the connection and never writes a response, then
+runs `run_exec` with a one-second window: it returns an error in 1.00 s. Mutant
+(deadline extended by 600 s) did not fail — it hung until the 400 s harness
+timeout, exit 124, which is the defect itself.
+
+**A negative result worth keeping.** The suggestion that the guest's reader
+release ordering is load-bearing and untested is only half right. The test
+`a_large_output_is_not_truncated_by_the_reader_release` (512 KiB, asserted on
+length and on both ends) passes. But a mutant that moves `abort.store` back
+above both `collect_output` calls *also passes* — the readers have already
+drained the pipe by the time the command's status is observed. So the ordering is
+not proven load-bearing by that test, and no claim is made that it is. The test
+is kept as a guard on output integrity; the ordering is currently safe because
+drain precedes status, not because it was proved to be.
+
+| Mutation | Result |
+|---|---|
+| `exec_status` treats `None, running: false` as `0` | `an_exec_without_a_published_status_is_not_a_success` FAILED (exit 101) |
+| E2B exec send deadline extended 600 s | `a_provider_that_never_answers_does_not_outlive_the_deadline` hung to the 400 s harness timeout (exit 124) |
+| guest `abort.store` moved above the collectors | `a_large_output_is_not_truncated_by_the_reader_release` still PASSED — not load-bearing, see above |
+
+Every mutant was reverted immediately.
+
+**Still open and unchanged.** A Docker exec that crosses its deadline leaves its
+process running in the sandbox container until that container is destroyed
+(PIDs 7 and 13 survived a 2 s deadline, `elapsed_ms=2003`). bollard 0.21.1
+exposes no exec-kill endpoint, so this is a limit rather than an unfixed bug;
+Docker Engine has no such endpoint to call either. The timeout verdict reported
+to callers is accurate about what this client observed and says nothing about
+termination.
+
+### Timeout exit codes differ by runtime, deliberately
+
+A timeout is reported as `-124` by the two runtimes that own the process
+(`BubblewrapRuntime` at `lib.rs:602`, the guest at `main.rs:483`) and as `124` by
+the two that ask a daemon to report one (Docker and E2B). The distinction is
+meaningful: the in-process paths genuinely cannot observe an exit status, so
+they synthesize a negative value no real process returns, while the
+daemon-backed paths relay a convention borrowed from `timeout(1)`.
+
+No caller can confuse the two. Every path also sets `timed_out`, so a timeout is
+never inferred from the code alone; and the negative form is unreachable from a
+real process while `124` is reachable, which is what keeps them apart. Left
+as-is deliberately: normalizing would mean either inventing an exit status for
+the in-process runtimes or losing the only signal that distinguishes "killed"
+from "exited" on the daemon-backed ones. Asserted directly at `lib.rs:4989` and
+`main.rs:929`.

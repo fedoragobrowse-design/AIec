@@ -680,18 +680,15 @@ impl DockerRuntime {
                 ));
             }
         }
-        let inspect = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.docker.inspect_exec(&exec.id),
-        )
-        .await
-        .map_err(|_| {
-            RuntimeError::Unavailable(format!("Docker exec inspect timed out for {}", exec.id))
-        })?
-        .map_err(|error| {
-            RuntimeError::Unavailable(format!("Docker exec inspect failed: {error}"))
-        })?;
-        let exit_code = exec_exit_code(&exec.id, inspect.exit_code, inspect.running)?;
+        let exit_code = self
+            .await_exec_status(&exec.id, deadline)
+            .await
+            .map_err(|reason| {
+                RuntimeError::Unavailable(format!(
+                    "Docker exec {} reported no exit status: {reason}",
+                    exec.id
+                ))
+            })?;
         Ok(ExecResult {
             exit_code: exit_code as i32,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -700,23 +697,54 @@ impl DockerRuntime {
             timed_out: false,
         })
     }
+
+    /// Waits for the daemon to publish an exec's exit code.
+    ///
+    /// The attach stream and the recorded status are not published together:
+    /// the stream reaches EOF as soon as its last writer closes, which for an
+    /// ordinary command is at or just before the moment the daemon records the
+    /// code. Reading it once therefore turns a normal race into a failed exec,
+    /// which is as wrong as the `0` this replaced. So the status is polled until
+    /// it appears, bounded by the exec's own deadline, and an exec that never
+    /// gets one is refused rather than reported as a success.
+    async fn await_exec_status(
+        &self,
+        id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<i64, &'static str> {
+        loop {
+            let inspect = tokio::time::timeout_at(deadline, self.docker.inspect_exec(id))
+                .await
+                .map_err(|_| "the daemon did not answer within the exec deadline")?
+                .map_err(|_| "the daemon refused to describe the exec")?;
+            // A `None` here means the code is not published yet: the exec is
+            // still running as far as the daemon can tell, so ask again.
+            if let Some(exit_code) = exec_status(inspect.exit_code, inspect.running)? {
+                return Ok(exit_code);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("the exec was still running when its deadline passed");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }
 
-/// The daemon reports no exit code while an exec is still running, and
-/// `exec_raw` has already stopped reading output by the time it inspects, so
-/// `None` means the command's status was never obtained. Returning `0` there
-/// turned a command that had not finished into a reported success, and every
-/// success check above this is `exit_code == 0`.
-fn exec_exit_code(
-    id: &str,
-    exit_code: Option<i64>,
-    running: Option<bool>,
-) -> Result<i64, RuntimeError> {
-    exit_code.ok_or_else(|| {
-        RuntimeError::Unavailable(format!(
-            "Docker exec {id} reported no exit status (running: {running:?})"
-        ))
-    })
+/// The verdict for one status observation.
+///
+/// `None` is not itself a verdict: while a command is running the daemon has
+/// nothing to report, and reporting the absence as `0` would tell every
+/// success check in this codebase that a command which had not finished had
+/// succeeded. It means "ask again" while the exec is running and "refuse" once
+/// the daemon has stopped without a code.
+fn exec_status(exit_code: Option<i64>, running: Option<bool>) -> Result<Option<i64>, &'static str> {
+    match (exit_code, running.unwrap_or(true)) {
+        (Some(exit_code), _) => Ok(Some(exit_code)),
+        // Not running and no code: the daemon finished with the exec without
+        // ever recording how it ended, and that is not a success.
+        (None, false) => Err("the exec stopped without recording an exit code"),
+        (None, true) => Ok(None),
+    }
 }
 
 fn ensure_success(result: ExecResult) -> Result<(), aiec_core::CoreError> {
@@ -2640,9 +2668,8 @@ mod tests {
     }
 
     /// Starts a real sandbox on the local daemon, or returns `None` when there
-    /// is no daemon. These are the only exec tests that can observe a real
-    /// still-running exec: the daemon's decision to report no exit code is the
-    /// behavior under test, so a fixture cannot stand in for it.
+    /// is no daemon. A fixture cannot stand in for the daemon's timing, which
+    /// is the point of these tests.
     async fn started_sandbox() -> Option<(DockerRuntime, Sandbox, std::path::PathBuf)> {
         let root = std::env::temp_dir().join(format!("af-exec-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2653,27 +2680,61 @@ mod tests {
         Some((runtime, sandbox, root))
     }
 
-    /// An exec with no exit code has no verdict, and `0` is a verdict: it is
-    /// the value every success check above this compares against.
+    /// An ordinary successful exec must still report success.
+    ///
+    /// This is the counterweight to refusing an unpublished status: the daemon
+    /// closes the attach stream and records the exit code at slightly different
+    /// moments, so waiting for the status has to stay a wait rather than become
+    /// a failure. A one-shot read that refused `None` would fail here
+    /// intermittently instead, which is the same defect wearing the opposite
+    /// sign.
+    #[tokio::test]
+    async fn a_successful_command_still_reports_its_status() {
+        let Some((runtime, sandbox, root)) = started_sandbox().await else {
+            eprintln!("skipping: no Docker daemon");
+            return;
+        };
+        for (expected, command) in [
+            (0, vec!["/bin/true".to_string()]),
+            (7, vec!["/bin/sh".to_string(), "-c".into(), "exit 7".into()]),
+        ] {
+            let result = runtime
+                .exec_raw(&sandbox, command, None, Default::default(), 20, None)
+                .await
+                .expect("an ordinary exec must not be refused");
+            assert_eq!(
+                result.exit_code, expected,
+                "wrong status for a command that exited {expected}"
+            );
+            assert!(!result.timed_out);
+        }
+        let _ = runtime.destroy(&sandbox).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `None` is not a verdict. Reporting the absence of a status as `0` told
+    /// every success check above this that a command which had not finished had
+    /// succeeded, so the three states have to stay distinct: published, still
+    /// running, and finished without ever recording a code.
     ///
     /// Tested on the mapping rather than through a live daemon. A running exec
-    /// whose output has already closed could not be produced on the local
-    /// daemon — both attempts (redirecting, then closing, the output file
-    /// descriptors) ran to natural exit — so a live assertion here would be a
+    /// whose stream had already closed could not be produced on the local
+    /// daemon -- both attempts (redirecting, then closing, the output file
+    /// descriptors) ran to natural exit -- so a live assertion here would be a
     /// test of a premise that was measured to be false.
     #[test]
-    fn an_exec_without_an_exit_status_is_not_a_success() {
-        assert_eq!(exec_exit_code("id", Some(0), Some(false)).ok(), Some(0));
-        assert_eq!(exec_exit_code("id", Some(7), Some(false)).ok(), Some(7));
-        let running = exec_exit_code("abc", None, Some(true))
-            .expect_err("a still-running exec was reported as a success");
+    fn an_exec_without_a_published_status_is_not_a_success() {
+        assert_eq!(exec_status(Some(0), Some(false)).ok(), Some(Some(0)));
+        assert_eq!(exec_status(Some(7), Some(false)).ok(), Some(Some(7)));
+        // Running: no code yet, so ask again rather than guess.
+        assert_eq!(exec_status(None, Some(true)).ok(), Some(None));
+        // The daemon knows neither answer; treat unknown as still running.
+        assert_eq!(exec_status(None, None).ok(), Some(None));
+        // Finished without a code is the case that must not become a success.
         assert!(
-            matches!(&running, RuntimeError::Unavailable(message) if message.contains("abc")),
-            "{running:?}"
+            exec_status(None, Some(false)).is_err(),
+            "finished without a code must not be a success"
         );
-        // A daemon that knows neither the code nor whether it is running is
-        // still not evidence of success.
-        assert!(exec_exit_code("abc", None, None).is_err());
     }
 
     /// Standard input is delivered under the exec's own deadline. A command
