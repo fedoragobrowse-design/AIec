@@ -136,6 +136,18 @@ SITE_URL = "https://aiec.gobrowse.dev"
 GITHUB_URL = "https://github.com/fedoragobrowse-design/AIec"
 
 
+def canonical_url(route: str) -> str:
+    """The address a visitor is actually on.
+
+    Cloudflare's `auto-trailing-slash` serves `/docs` at `/docs/`, so a
+    canonical written from the bare route pointed at the redirect that leads
+    here rather than at this page — telling a search engine the real address
+    is somewhere else. The sitemap has to name the same address, or the two
+    disagree about where the site lives.
+    """
+    return f"{SITE_URL}/" if route == "/" else f"{SITE_URL}{route.rstrip('/')}/"
+
+
 def load_data(name: str) -> dict:
     """Loads one reviewed data file. A missing file is a build failure."""
     path = DATA / f"{name}.json"
@@ -735,7 +747,10 @@ def render_error_page(status: int) -> str:
     return SHELL.format(
         title=html.escape(f"{status} {spec['title'].split('—')[0].strip()}"),
         description=html.escape(spec["headline"]),
-        canonical=f"{SITE_URL}/{status}",
+        # Error pages are individual files at the root, and `auto-trailing-slash`
+        # serves a file without one, so `/404/` would name a redirect rather
+        # than this page. They stay out of the sitemap for the same reason.
+        canonical=f"{SITE_URL}/{status}.html",
         og_image=f"{SITE_URL}/assets/og.svg",
         nav=render_nav(""),
         footer_nav=render_footer_nav(),
@@ -910,7 +925,7 @@ def expand_data(body: str) -> str:
 def render_sitemap(routes: list[str]) -> str:
     """Writes sitemap.xml from the routes that actually rendered."""
     entries = "".join(
-        f"  <url><loc>{SITE_URL}{route}</loc></url>\n" for route in routes
+        f"  <url><loc>{canonical_url(route)}</loc></url>\n" for route in routes
     )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1031,7 +1046,7 @@ def main() -> int:
                 description=html.escape(
                     _meta(fragment, "description", "AIec — computers for AI agents.")
                 ),
-                canonical=f"{SITE_URL}{route}",
+                canonical=canonical_url(route),
                 og_image=og_image,
                 nav=render_console_nav(route) if is_console else render_nav(route),
                 footer_nav=render_footer_nav(),

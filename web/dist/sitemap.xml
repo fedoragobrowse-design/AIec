@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>https://aiec.gobrowse.dev/</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/docs</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/mcp</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/pricing</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/security</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/status</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/benchmarks</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/ecosystem</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/limitations</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/roadmap</loc></url>
-  <url><loc>https://aiec.gobrowse.dev/contributing</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/mcp/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/pricing/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/security/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/status/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/benchmarks/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/ecosystem/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/limitations/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/roadmap/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/contributing/</loc></url>
   <url><loc>https://aiec.gobrowse.dev/docs/deployment/</loc></url>
   <url><loc>https://aiec.gobrowse.dev/docs/api/</loc></url>
   <url><loc>https://aiec.gobrowse.dev/docs/mcp/</loc></url>
