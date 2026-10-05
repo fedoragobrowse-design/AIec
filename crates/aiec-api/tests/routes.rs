@@ -2332,9 +2332,11 @@ async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
     std::fs::create_dir_all(&root).unwrap();
     let repo = MemoryRepository::new();
     let key = generate_api_key();
+    let tenant = Uuid::now_v7();
+    let read_key = generate_api_key();
     repo.put_key(ApiKeyRecord {
         id: Uuid::now_v7(),
-        tenant_id: Uuid::now_v7(),
+        tenant_id: tenant,
         digest: key_digest(&key),
         scopes: vec![Scope::Admin],
         expires_at: None,
@@ -2345,10 +2347,24 @@ async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
     })
     .await
     .unwrap();
+    repo.put_key(ApiKeyRecord {
+        id: Uuid::now_v7(),
+        tenant_id: tenant,
+        digest: key_digest(&read_key),
+        scopes: vec![Scope::SandboxesRead],
+        expires_at: None,
+        name: "diff-reader".into(),
+        created_at: chrono::Utc::now(),
+        last_used_at: None,
+        revoked_at: None,
+    })
+    .await
+    .unwrap();
     let runtime = Arc::new(aiec_runtime::BubblewrapRuntime::new(&root));
     let (platform, _) = development_platform(runtime, repo, None);
     let router = app(AppState::development(platform));
     let auth = format!("Bearer {key}");
+    let read_auth = format!("Bearer {read_key}");
     let create = router.clone().oneshot(
         Request::post("/v1/sandboxes")
             .header("authorization", &auth)
@@ -2401,7 +2417,7 @@ async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
         .clone()
         .oneshot(
             Request::post(format!("/v1/sandboxes/{id}/git/diff"))
-                .header("authorization", &auth)
+                .header("authorization", &read_auth)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2410,6 +2426,27 @@ async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
     assert_eq!(diff.status(), StatusCode::OK);
     let body = axum::body::to_bytes(diff.into_body(), 8192).await.unwrap();
     let result: Value = serde_json::from_slice(&body).unwrap();
+    // Redacted evidence is not a sandbox data-confidentiality boundary:
+    // read scope still permits an exact, binary-safe file download.
+    let file_response = router
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/v1/sandboxes/{id}/files/content?path=/workspace/repository/tracked.txt"
+            ))
+            .header("authorization", &read_auth)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(file_response.status(), StatusCode::OK);
+    let file: Value = serde_json::from_slice(
+        &axum::body::to_bytes(file_response.into_body(), 8192)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let destroy = router
         .oneshot(
             Request::delete(format!("/v1/sandboxes/{id}"))
@@ -2421,6 +2458,14 @@ async fn real_bubblewrap_git_diff_redacts_a_secret_written_to_a_tracked_file() {
         .unwrap();
     std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(destroy.status(), StatusCode::OK);
+    use base64::Engine;
+    let raw_file = base64::engine::general_purpose::STANDARD
+        .decode(file["content_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        raw_file == format!("public-marker\n{secret}\n").as_bytes(),
+        "raw file downloads must preserve the original bytes"
+    );
 
     assert!(
         !String::from_utf8_lossy(&body).contains(&secret),

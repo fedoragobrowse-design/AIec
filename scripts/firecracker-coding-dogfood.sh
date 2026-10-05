@@ -147,8 +147,8 @@ fc_tap_name() { printf 'af%s' "$(printf '%s' "$1" | cut -c1-12)"; }
 # Reads sandbox and lease state from this run's own database, so a diagnostic
 # cannot describe somebody else's rows.
 pg_state() {
-  psql "$DATABASE_URL" -c "select id, state, runtime, node_id, created_at from sandboxes order by created_at desc limit 5" >&2 2>&1
-  psql "$DATABASE_URL" -c "select sandbox_id, node_id, generation, status, expires_at from sandbox_leases order by created_at desc limit 5" >&2 2>&1
+  psql "$SQL_ARGV_URL" -c "select id, state, runtime, node_id, created_at from sandboxes order by created_at desc limit 5" >&2 2>&1
+  psql "$SQL_ARGV_URL" -c "select sandbox_id, node_id, generation, status, expires_at from sandbox_leases order by created_at desc limit 5" >&2 2>&1
 }
 
 dump_diagnostics() {
@@ -243,6 +243,9 @@ else
 fi
 acceptance_prepare_database "$OUT" "$OUT/pg" "$OUT/s" "$PG_BIN"
 : "${DATABASE_URL:?acceptance database preparation left no URL}"
+# Keep sqlx's full URI, but pass libpq credentials through the environment.
+acceptance_database_export_password "$DATABASE_URL" || exit 2
+SQL_ARGV_URL=$(acceptance_database_url_without_password "$DATABASE_URL")
 
 # ------------------------------------------------------------------- ports
 # Refused before anything binds: on a shared host these are somebody else's

@@ -6,6 +6,7 @@ database directly which sandboxes are still alive, which run owned them, and
 whether that run is finished. Anything in the last group is a leak.
 """
 import os
+from pathlib import Path
 import paramiko
 
 nc = paramiko.SSHClient()
@@ -13,11 +14,14 @@ nc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 nc.connect("192.168.1.250", username="gobrowse",
            key_filename=os.path.expanduser("~/.ssh/id_ed25519"), timeout=30)
 
-script = r'''
+# Send the current shared helpers, rather than assuming a matching remote copy.
+script = Path(__file__).with_name("acceptance-db.sh").read_text() + r'''
 set -a; . /home/gobrowse/aiec/env.systemd; set +a
+acceptance_database_export_password "$DATABASE_URL" || exit 2
+SQL_ARGV_URL=$(acceptance_database_url_without_password "$DATABASE_URL")
 psql_out() {
-  podman run --rm --network host docker.io/library/postgres:16 \
-    psql "$DATABASE_URL" -t -A -F ' | ' -c "$1" 2>/dev/null
+  podman run --rm --network host -e PGPASSWORD docker.io/library/postgres:16 \
+    psql "$SQL_ARGV_URL" -t -A -F ' | ' -c "$1" 2>/dev/null
 }
 
 echo "== live sandboxes, their owning run, and whether that run is finished"

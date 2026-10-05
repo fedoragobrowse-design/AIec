@@ -18,6 +18,10 @@ Base path `/v1`. Except health/metrics, send `Authorization: Bearer af_live_...`
 - `PUT|DELETE /v1/sandboxes/{id}/secrets/{name}` and `GET /v1/sandboxes/{id}/secrets` manage one-hour, per-sandbox process environment secrets. Values are never returned by metadata endpoints.
 - `GET /v1/sandboxes/{id}/files?path=/workspace` — list.
 - `GET /v1/sandboxes/{id}/files/content?path=/workspace/x` — download.
+  Downloads preserve the file's exact bytes; they do not redact secrets.
+  `sandboxes:read` therefore grants access to credentials a command writes
+  into the workspace. Exec/diff output redaction limits accidental disclosure
+  through evidence and logs, not access by an authorized file reader.
 - `POST /v1/sandboxes/{id}/files/mkdir` — create directory.
 - `DELETE /v1/sandboxes/{id}/files` with JSON `{path}` — delete file.
 - `POST /v1/sandboxes/{id}/snapshots`, `GET /v1/sandboxes/{id}/snapshots`.

@@ -3484,3 +3484,36 @@ evidence. Sandbox secret storage remains development-only through the current
 registered values and existing redactor encodings, not arbitrary credentials,
 binary Git encodings or values revoked before the request. Backend-error
 scrubbing is implemented but not exercised by this new real-runtime regression.
+
+**File-read boundary, directly exercised.** The regression now requests both
+the diff and `GET /v1/sandboxes/{id}/files/content` with a key holding only
+`sandboxes:read`. The diff is scrubbed; the downloaded file still contains the
+exact original public marker and credential bytes. This fix limits credential
+propagation through formatted evidence, not secrecy against an authorized
+workspace reader. Raw files/artifacts and versioned binary chunks must preserve
+bytes, sizes and checksums; redacting them would break that contract rather than
+close a confidentiality boundary. Do not grant read scope to a principal that
+must not see credentials written into the sandbox.
+
+## Diagnostic database clients still carried passwords in argv
+
+Two callers remained after the acceptance launcher repair:
+`firecracker-coding-dogfood.sh::pg_state` passed the full URL to both failure
+diagnostic queries, and `trace-leaks.sh` passed it through Podman to `psql`.
+An isolated local harness executed the actual shell functions with a synthetic
+password and stubbed clients. Both exposed the password in argv before the
+repair, with no `PGPASSWORD` export.
+
+Both now reuse `acceptance_database_export_password` in the current shell and
+`acceptance_database_url_without_password` for client argv. The full URL stays
+available to sqlx. Trace sends the current local shared helper definitions over
+its existing SSH stdin stream rather than relying on a matching remote file;
+Podman receives `-e PGPASSWORD` (the variable name, never its value in argv).
+
+The same local fixtures pass after repair: no password in either argv, the
+password present in the child environment, and the role, destination and query
+preserved in the sanitized URL. A real PostgreSQL 17 libpq client in a local
+Docker container also authenticated to the configured local database through
+the shared export/sanitization helpers, returning the expected database role.
+No SSH, Podman execution or privileged Firecracker dogfood launch was performed;
+those runtime limits remain.
