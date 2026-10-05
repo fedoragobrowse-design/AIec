@@ -10,7 +10,8 @@ from pathlib import Path
 import paramiko
 
 nc = paramiko.SSHClient()
-nc.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+# Use the operator's verified known_hosts; retain SSHClient's reject policy.
+nc.load_system_host_keys()
 nc.connect("192.168.1.250", username="gobrowse",
            key_filename=os.path.expanduser("~/.ssh/id_ed25519"), timeout=30)
 

@@ -3569,3 +3569,26 @@ Verification: integrated local fmt, strict workspace clippy, all-target/all-feat
 workspace tests with an explicit local PostgreSQL URL, SDK contract, acceptance
 HTTP regression and Python SDK gates passed; benchmark suite passed 21 tests.
 The aarch64 cross-check was explicitly skipped, not reported as passing.
+
+## Trace diagnostics silently trusted an unknown SSH server
+
+`scripts/trace-leaks.sh` constructed a Paramiko client with `AutoAddPolicy`
+without loading the operator's known host keys. An unrecognized server key
+was accepted automatically in memory, so the script did not authenticate the
+server before trusting its diagnostic output. This also ignored already
+verified keys in the operator's `~/.ssh/known_hosts`.
+
+The setup now calls `load_system_host_keys()` and retains Paramiko's default
+`RejectPolicy`. The destination, key filename and timeouts are unchanged.
+Operators must have an independently verified host key in their known-hosts
+file; do not populate it from an unverified scan merely to bypass the refusal.
+
+Evidence used no SSH connections: the actual previous policy callback accepted
+an unfamiliar generated fixture key. After repair, executing the real script's
+setup statements (stopping before `connect`) loaded an isolated fixture
+known-hosts file and retained that exact public key; the actual policy callback
+rejected an unrecognized key without adding it. Removing the fixture file did
+not enable auto-trust. A local socket pair supplied Paramiko's logging transport
+only; it performed no handshake, authentication or remote command. Syntax
+compilation passed. This is configuration/policy evidence, not a verified
+deployment-host handshake or a remote diagnostic run.
