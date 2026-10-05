@@ -253,7 +253,7 @@ SHELL = """<!doctype html>
 <meta property="og:image" content="{og_image}">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="AIec — run agents safely, reproduce failures, compare versions.">
+<meta property="og:image:alt" content="AIec — disposable virtual machines for AI agents.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{title} — AIec">
 <meta name="twitter:description" content="{description}">
@@ -927,17 +927,17 @@ def render_robots() -> str:
 def render_og_image() -> str:
     """A social card drawn in the site palette, written as an SVG asset."""
     return """<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" \
-viewBox="0 0 1200 630" role="img" aria-label="AIec — run agents safely, reproduce \
-failures, compare versions.">
+viewBox="0 0 1200 630" role="img" aria-label="AIec — disposable virtual machines \
+for AI agents.">
   <rect width="1200" height="630" fill="#edf0f4"/>
   <rect x="0" y="0" width="1200" height="8" fill="#1b44e8"/>
   <g font-family="Archivo, Helvetica, Arial, sans-serif" fill="#0f1a2e">
     <text x="80" y="150" font-size="86" font-weight="700" letter-spacing="-2">AIec</text>
-    <text x="80" y="240" font-size="52" font-weight="650" letter-spacing="-1">Run agents safely.</text>
-    <text x="80" y="304" font-size="52" font-weight="650" letter-spacing="-1">Reproduce failures.</text>
-    <text x="80" y="368" font-size="52" font-weight="650" letter-spacing="-1">Compare versions.</text>
+    <text x="80" y="240" font-size="52" font-weight="650" letter-spacing="-1">Disposable virtual</text>
+    <text x="80" y="304" font-size="52" font-weight="650" letter-spacing="-1">machines for AI</text>
+    <text x="80" y="368" font-size="52" font-weight="650" letter-spacing="-1">agents.</text>
     <text x="80" y="452" font-size="27" fill="#5b6b84" font-family="IBM Plex Mono, \
-monospace">Disposable, isolated machines for AI agents.</text>
+monospace">Records what it did. Destroys the machine.</text>
     <text x="80" y="500" font-size="27" fill="#5b6b84" font-family="IBM Plex Mono, \
 monospace">Firecracker &#183; Docker &#183; Bubblewrap &#183; self-hosted</text>
     <text x="80" y="566" font-size="24" fill="#1b44e8" font-family="IBM Plex Mono, \

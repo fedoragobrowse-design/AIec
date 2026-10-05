@@ -1,5 +1,5 @@
-<!-- meta:title=Run agents safely. Reproduce failures. Compare versions. -->
-<!-- meta:description=AIec is an open-source control plane for running, isolating, reproducing and evaluating AI agents in disposable computers. Firecracker isolation, out-of-guest Guard governance, durable runs and evaluations. Self-hosted, Apache 2.0, with published benchmarks and explicit limits. -->
+<!-- meta:title=Disposable virtual machines for AI agents -->
+<!-- meta:description=AIec hands an AI agent a disposable Firecracker microVM to work in, records what it did, and then destroys the machine. Open source, self-hosted, Apache 2.0. -->
 
 <!-- block:rail -->
     <div class="rail__group">
@@ -28,15 +28,16 @@
     </div>
 <!-- /block:rail -->
 
-<h1>Run agents safely. Reproduce failures. Compare versions.</h1>
-<p class="lead">An open-source control plane that gives an AI agent a disposable,
-isolated computer to work in — and keeps the evidence after the machine is
-gone.</p>
+<h1>Disposable virtual machines for AI&nbsp;agents.</h1>
+<p class="lead">AIec hands an AI agent a Firecracker microVM to work in, records
+what it did, and then destroys the machine. Nothing to clean up between runs —
+and the evidence outlives the VM.</p>
 
-<p>An agent that writes code needs somewhere to run it, a way to reach a model
-without holding a raw credential, and someone who can reproduce what happened.
-AIec provides the machine, the policy boundary, and the record. The agent gets a
-computer. It does not get to decide what that computer may reach.</p>
+<p>A container gives an agent a filesystem and a process. AIec gives it a
+virtual machine: its own kernel, its own network namespace, its own CPU and
+memory, built in seconds and gone a few minutes later. The agent never holds a
+credential for anything it can reach, and whatever it produced is collected
+before the machine disappears.</p>
 
 <div class="actions">
   <a class="btn btn--solid" href="https://github.com/fedoragobrowse-design/AIec">Clone the repository</a>
