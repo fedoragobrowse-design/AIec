@@ -31,6 +31,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import uuid
+from acceptance_http import urlopen
 from pathlib import Path
 
 ROOT = Path(os.environ["P5_ROOT"])
@@ -109,7 +110,7 @@ def http(method: str, path: str, body=None, token: str = API_KEY, timeout: float
         data = json.dumps(body).encode()
         request.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(
+        with urlopen(
             request, data=data, timeout=timeout,
             context=ssl.create_default_context(cafile=str(CA)),
         ) as response:
@@ -204,7 +205,7 @@ def wait_for_health(process: subprocess.Popen, url: str, token: str | None = Non
             request = urllib.request.Request(url)
             if token:
                 request.add_header("authorization", f"Bearer {token}")
-            with urllib.request.urlopen(request, timeout=5.0, context=context) as response:
+            with urlopen(request, timeout=5.0, context=context) as response:
                 if response.status == 200:
                     return True, "200"
                 last = f"HTTP {response.status}"

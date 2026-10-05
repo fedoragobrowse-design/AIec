@@ -51,6 +51,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from acceptance_http import urlopen
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -127,7 +128,7 @@ def http(method: str, path: str, body=None, token: str | None = None, timeout: f
         data = json.dumps(body).encode()
         request.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(request, data=data, timeout=timeout, context=CTX) as response:
+        with urlopen(request, data=data, timeout=timeout, context=CTX) as response:
             raw = response.read()
             return response.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as error:
@@ -201,7 +202,7 @@ def wait_for_worker(seconds: float = 120.0) -> dict:
         request = urllib.request.Request(WORKER + "/health")
         request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
         try:
-            with urllib.request.urlopen(request, timeout=5.0, context=CTX) as response:
+            with urlopen(request, timeout=5.0, context=CTX) as response:
                 return {"status": response.status, "authenticated_health": 200}
         except urllib.error.HTTPError as error:
             # `401` is the worker refusing an *unauthenticated* probe, and it is
@@ -445,7 +446,7 @@ def stream_chat(messages: list[dict], timeout: float = 30.0) -> dict:
     calls: dict[int, dict] = {}
     finish_reason = None
     events = 0
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urlopen(request, timeout=timeout) as response:
         media = response.headers.get("content-type") or ""
         if "text/event-stream" not in media:
             raise RuntimeError(f"the model did not stream: {media}")
@@ -777,9 +778,9 @@ def main() -> int:
         request = urllib.request.Request(f"http://127.0.0.1:{S3_PORT}/{probe}",
                                          data=b"probe", method="PUT")
         request.add_header("content-type", "application/octet-stream")
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urlopen(request, timeout=15) as response:
             put_status = response.status
-        with urllib.request.urlopen(f"http://127.0.0.1:{S3_PORT}/{probe}", timeout=15) as response:
+        with urlopen(f"http://127.0.0.1:{S3_PORT}/{probe}", timeout=15) as response:
             body = response.read()
         return {"endpoint": f"http://127.0.0.1:{S3_PORT}", "put_status": put_status,
                 "get_bytes": len(body), "round_trip_ok": body == b"probe"}

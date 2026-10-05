@@ -29,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+from acceptance_http import urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,7 +118,7 @@ def http(method: str, path: str, body=None, token: str = API_KEY, timeout: float
         request.add_header("content-type", "application/json")
     context = ssl.create_default_context(cafile=str(CA))
     try:
-        with urllib.request.urlopen(request, data=data, timeout=timeout, context=context) as response:
+        with urlopen(request, data=data, timeout=timeout, context=context) as response:
             raw = response.read()
             return response.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as error:
@@ -296,8 +297,8 @@ def main() -> int:
         try:
             request = urllib.request.Request(WORKER + "/health")
             request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
-            with urllib.request.urlopen(request, timeout=5.0,
-                                        context=ssl.create_default_context(cafile=str(CA))) as response:
+            with urlopen(request, timeout=5.0,
+                         context=ssl.create_default_context(cafile=str(CA))) as response:
                 if response.status == 200:
                     detail = {"health": json.loads(response.read())}
                     registered = True
@@ -491,7 +492,7 @@ def exhaust_budget(sandbox_id: str) -> dict:
     request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
     request.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(
+        with urlopen(
             request, timeout=30.0, context=ssl.create_default_context(cafile=str(CA))
         ) as response:
             body = response.read()

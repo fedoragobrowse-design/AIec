@@ -46,6 +46,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from acceptance_http import urlopen
+
 CP = os.environ["P2_CP"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 BOOTSTRAP_KEY = os.environ["P2_API_KEY"]
@@ -158,7 +160,7 @@ def wait_for_worker(seconds: float = 60.0) -> bool:
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(WORKER + "/health", context=CTX, timeout=3.0) as response:
+            with urlopen(WORKER + "/health", context=CTX, timeout=3.0) as response:
                 if response.status == 200:
                     return True
         except urllib.error.HTTPError as error:
@@ -220,7 +222,7 @@ def http(method: str, path: str, body=None, token: str | None = None, timeout: f
     request.add_header("content-type", "application/json")
     request.add_header("authorization", f"Bearer {token if token is not None else API_KEY}")
     try:
-        with urllib.request.urlopen(request, context=CTX, timeout=timeout) as response:
+        with urlopen(request, context=CTX, timeout=timeout) as response:
             raw = response.read()
             try:
                 parsed = json.loads(raw) if raw else None

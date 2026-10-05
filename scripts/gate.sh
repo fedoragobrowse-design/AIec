@@ -37,6 +37,7 @@ run_gate "cargo test --workspace" cargo test --workspace --all-targets --all-fea
 # The documented Python import is `from agentforge import AIec`; this keeps the
 # site, the README and the SDK from drifting apart.
 run_gate "sdk import contract" python3 scripts/check-sdk-contract.py
+run_gate "acceptance HTTP" python3 -m unittest discover -s scripts/tests
 
 # The import contract only checks one line, so a suite that cannot even be
 # collected - a stale import, a syntax error - left the gate green. That is

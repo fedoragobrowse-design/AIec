@@ -18,9 +18,20 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+
 BASE = os.environ.get("AIEC_BASE", "https://127.0.0.1:18443")
 KEY = os.environ["AIEC_API_KEY"]
 CTX = ssl.create_default_context(cafile=os.environ["AIEC_TLS_CA_CERT"])
+# This driver is copied to the deployment host as a standalone file.
+_OPENER = urllib.request.build_opener(
+    _NoRedirect, urllib.request.HTTPSHandler(context=CTX)
+)
 DOCKER_IMAGE = "python:3.13"
 
 results = []
@@ -43,7 +54,7 @@ def call(method, path, body=None, timeout=300):
         },
     )
     try:
-        with urllib.request.urlopen(request, context=CTX, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             raw = response.read()
             return response.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as error:

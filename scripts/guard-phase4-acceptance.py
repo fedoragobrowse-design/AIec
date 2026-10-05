@@ -20,6 +20,8 @@ from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from acceptance_http import urlopen
+
 
 ROOT = Path(os.environ["P2_ROOT"])
 BIN = Path(os.environ["P2_BIN"])
@@ -216,7 +218,7 @@ def main():
         while time.monotonic() < deadline and worker.poll() is None:
             try:
                 request = p2.urllib.request.Request(p2.WORKER + "/health", headers={"authorization": f"Bearer {p2.WORKER_TOKEN}"})
-                with p2.urllib.request.urlopen(request, context=ssl.create_default_context(cafile=str(p2.CA)), timeout=3) as response:
+                with urlopen(request, context=ssl.create_default_context(cafile=str(p2.CA)), timeout=3) as response:
                     ready = response.status == 200
                 if ready:
                     break

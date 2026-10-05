@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from acceptance_http import urlopen
+
 REPO = Path(__file__).resolve().parent.parent
 PROVIDER_IP = "198.18.0.10"
 PROVIDER_PORT = 18880
@@ -121,7 +123,7 @@ def api(method, path, body=None, token=None, base=CP, timeout=120):
     request.add_header("authorization", "Bearer " + (TOKEN if token is None else token))
     request.add_header("content-type", "application/json")
     try:
-        response = urllib.request.urlopen(request, context=CTX, timeout=timeout)
+        response = urlopen(request, context=CTX, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
     with response:

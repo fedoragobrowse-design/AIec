@@ -27,6 +27,8 @@ from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 
+from acceptance_http import urlopen
+
 ROOT = Path(os.environ["P2_ROOT"])
 BIN = Path(os.environ["P2_BIN"])
 CA = Path(os.environ["P2_CA"])
@@ -68,7 +70,7 @@ def http(method: str, path: str, body=None, token: str = API_KEY, timeout: float
         request.add_header("content-type", "application/json")
     context = ssl.create_default_context(cafile=str(CA))
     try:
-        with urllib.request.urlopen(request, data=data, timeout=timeout, context=context) as response:
+        with urlopen(request, data=data, timeout=timeout, context=context) as response:
             raw = response.read()
             return response.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as error:
@@ -226,7 +228,7 @@ def main() -> int:
         try:
             request = urllib.request.Request(WORKER + "/health")
             request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
-            with urllib.request.urlopen(
+            with urlopen(
                 request, timeout=5.0, context=ssl.create_default_context(cafile=str(CA))
             ) as response:
                 if response.status == 200:

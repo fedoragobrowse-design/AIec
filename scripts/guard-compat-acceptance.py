@@ -37,6 +37,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from acceptance_http import urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def http(method: str, path: str, body=None, token: str | None = None, timeout: f
     request.add_header("content-type", "application/json")
     request.add_header("authorization", f"Bearer {token if token is not None else API_KEY}")
     try:
-        with urllib.request.urlopen(request, context=CTX, timeout=timeout) as response:
+        with urlopen(request, context=CTX, timeout=timeout) as response:
             raw = response.read()
             try:
                 parsed = json.loads(raw) if raw else None
@@ -174,7 +175,7 @@ def wait_for_worker(process: subprocess.Popen, seconds: float = 60.0) -> bool:
         try:
             request = urllib.request.Request(WORKER + "/health")
             request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
-            with urllib.request.urlopen(request, timeout=5.0, context=worker_ctx) as response:
+            with urlopen(request, timeout=5.0, context=worker_ctx) as response:
                 if response.status == 200:
                     return True
         except Exception:

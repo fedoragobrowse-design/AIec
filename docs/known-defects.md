@@ -3517,3 +3517,55 @@ Docker container also authenticated to the configured local database through
 the shared export/sanitization helpers, returning the expected database role.
 No SSH, Podman execution or privileged Firecracker dogfood launch was performed;
 those runtime limits remain.
+
+## Acceptance HTTP clients forwarded bearer keys across redirects
+
+The SDK fix did not cover the independent host acceptance drivers. Their
+`urllib.request.urlopen` calls still followed redirects, forwarding bearer
+authorization to a different origin and accepting its success response.
+A two-origin local reproduction executed the actual approval `http()` helper
+for GET and POST: both followed a 302 and the second listener received the
+synthetic bearer. The standalone live benchmark likewise accepted the redirected
+server's 200 instead of the configured server's 302.
+
+**Fix.** `scripts/acceptance_http.py` implements the existing SDK's `_NoRedirect`
+policy while preserving caller-supplied TLS contexts, deadlines, proxies,
+request bodies and `HTTPError` handling. Approval, compatibility, phases 2–5,
+reaper, topology B and snapshot host drivers now use it. A redirect is an HTTP
+failure, not a successful call to an unrelated endpoint. The standalone
+`benchmarks/bug-hunt-live.py` keeps the same policy inline because it is copied
+to a deployment host as a single file.
+
+The new sibling module must accompany acceptance drivers when copying them out
+of `scripts/`; normal launchers execute them in that directory. Phase 4's
+path-loaded phase 2 adapter resolves the same helper.
+
+**Evidence.** The permanent real-socket regression exercises GET/POST against
+301, 302, 303, 307 and 308, preserving the original error status/body and sending
+no request to the redirect target. Delegating back to urllib's default redirect
+handler made it fail; the mutation was restored and the integrated gate passed.
+The gate now includes this regression.
+
+Local smoke also imported all nine real host driver modules with isolated
+fixture configuration and exercised every control-plane adapter against 302
+and ordinary authenticated POST responses. Compatibility's three-element
+response/header contract remained intact. Phase 4's actual worker-health branch
+refused redirected readiness and accepted direct 200 readiness. Topology B's
+real adapter consumed SSE to completion and its store probe completed a PUT/GET
+byte roundtrip. The standalone benchmark reported GET/POST 302 without contacting
+the target. A real TLS listener accepted the provided CA/matching hostname and
+rejected both an untrusted certificate and a hostname mismatch.
+
+**Boundaries.** No privileged or remote acceptance suite was launched. The Rust
+core acceptance model client already sets `redirect::Policy::none()`. The guest
+probe's remaining `urlopen` deliberately tests adversarial proxy behavior with
+guest placeholders, not the outside-guest credential; its behavior is unchanged.
+Snapshot's signed S3 bucket-creation PUT is also unchanged: urllib's default
+redirect handler refuses PUT redirects rather than forwarding the signature.
+These are explicit boundaries, not a claim that every possible transport in
+the repository is safe.
+
+Verification: integrated local fmt, strict workspace clippy, all-target/all-feature
+workspace tests with an explicit local PostgreSQL URL, SDK contract, acceptance
+HTTP regression and Python SDK gates passed; benchmark suite passed 21 tests.
+The aarch64 cross-check was explicitly skipped, not reported as passing.

@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from acceptance_http import urlopen
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,7 +97,7 @@ def http(method: str, path: str, body=None, token: str = API_KEY, timeout: float
     request.add_header("authorization", f"Bearer {token}")
     request.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(
+        with urlopen(
             request, timeout=timeout, context=ssl.create_default_context(cafile=str(CA))
         ) as response:
             raw = response.read()
@@ -375,7 +376,7 @@ def main() -> int:
         try:
             request = urllib.request.Request(WORKER + "/health")
             request.add_header("authorization", f"Bearer {WORKER_TOKEN}")
-            with urllib.request.urlopen(
+            with urlopen(
                 request, timeout=5.0, context=ssl.create_default_context(cafile=str(CA))
             ) as response:
                 if response.status == 200:
