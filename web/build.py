@@ -256,6 +256,7 @@ SHELL = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — AIec</title>
 <meta name="description" content="{description}">
+{robots}
 <link rel="canonical" href="{canonical}">
 <meta property="og:title" content="{title} — AIec">
 <meta property="og:description" content="{description}">
@@ -745,12 +746,16 @@ def render_error_page(status: int) -> str:
   </div>
 </div>"""
     return SHELL.format(
-        title=html.escape(f"{status} {spec['title'].split('—')[0].strip()}"),
+        # `spec["title"]` already opens with the status, so taking the text
+        # before the dash produced "403 403 — AIec" in the tab.
+        title=html.escape(f"{status} {spec['title'].split('—', 1)[1].strip()}"),
         description=html.escape(spec["headline"]),
-        # Error pages are individual files at the root, and `auto-trailing-slash`
-        # serves a file without one, so `/404/` would name a redirect rather
-        # than this page. They stay out of the sitemap for the same reason.
-        canonical=f"{SITE_URL}/{status}.html",
+        # `auto-trailing-slash` serves a root file without a trailing slash, so
+        # this page is reached at `/404`, not `/404.html`. It stays out of the
+        # sitemap, and it is noindex: a page that only renders when a request
+        # failed is not something to offer a search engine.
+        canonical=f"{SITE_URL}/{status}",
+        robots='<meta name="robots" content="noindex">',
         og_image=f"{SITE_URL}/assets/og.svg",
         nav=render_nav(""),
         footer_nav=render_footer_nav(),
@@ -1047,6 +1052,7 @@ def main() -> int:
                     _meta(fragment, "description", "AIec — computers for AI agents.")
                 ),
                 canonical=canonical_url(route),
+                robots="",
                 og_image=og_image,
                 nav=render_console_nav(route) if is_console else render_nav(route),
                 footer_nav=render_footer_nav(),
