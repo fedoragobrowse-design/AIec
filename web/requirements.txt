@@ -1,0 +1,9 @@
+# The site's only build dependency.
+#
+# The documentation section renders the repository's Markdown at build time.
+# Everything else the site needs is in the standard library, which is a
+# deliberate constraint: a stranger should be able to read build.py and know
+# where every byte of the output came from.
+#
+# Pinned rather than ranged, so a rebuild produces the same anchors.
+mistune==3.3.3

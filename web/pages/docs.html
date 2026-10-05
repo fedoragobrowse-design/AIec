@@ -1,9 +1,21 @@
 <!-- meta:title=Documentation -->
 <!-- meta:description=Run AIec yourself: prerequisites, install, first sandbox, the SDK, self-hosting and operations. AIec is open source with no hosted API. -->
+<!-- prose -->
 
 <h1>Docs</h1>
 <p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL,
 S3-compatible storage, and a configured control plane and worker.</p>
+
+<h2 id="reference">The full documentation</h2>
+<p>The reference documents below are the same files the repository ships,
+rendered here. Everything on this list is written for someone running AIec
+themselves. If you are here deciding whether to, start with
+<a href="/docs/design/">Design</a>
+and <a href="/limitations">Limitations</a>; if you already have one running,
+go straight to <a href="/docs/guard/">Guard operations</a> or the page for what
+you are changing.</p>
+
+<!-- data:doc_index -->
 
 <h2 id="prerequisites">What you need</h2>
 <div class="grid-2">
@@ -146,15 +158,23 @@ create a sandbox, run commands, read and write files, clone a repository,
 destroy it. It talks only to a control plane you run, so the workload stays on
 hardware you control.</p>
 
-<h2 id="operations">Operating it</h2>
-<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>
-covers TLS, workers, object storage, backup and restore. The
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DESIGN.md">architecture guide</a>
-explains placement and fencing; the
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/API.md">API reference</a>
-lists request and response shapes. Use the
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
-for acceptance evidence, exact reproduction commands and measured limits.</p>
+
+<h2 id="records">Engineering records</h2>
+<p>These stay in the repository and are not rendered here. They are working
+documents with the dates and run identifiers in them — an audit trail rather
+than instructions, and much longer than anything you would want in a sidebar.</p>
+<ul class="tight">
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/known-defects.md">Known defects</a>
+      — every defect found in review, whether it is fixed, and what the fix was
+      tested against.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
+      — the acceptance evidence for Guard: reproduction commands and measured
+      limits.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/PRIVATE_ALPHA.md">Private alpha status</a>
+      — what the alpha milestone claims, and the checks behind each claim.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/skills/aiec-sandboxes/SKILL.md">Agent skill</a>
+      — the skill definition an agent loads to drive a sandbox.</li>
+</ul>
 
 <p>There is no cloud, no hosted API and no sign-up. Everything runs where you put
 it.</p>

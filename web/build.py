@@ -19,9 +19,25 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import shutil
+import sys
 from pathlib import Path
+from urllib.parse import quote
+
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    import render as docrender
+except ModuleNotFoundError as missing:  # pragma: no cover - build guard
+    raise SystemExit(
+        f"{missing.name} is required to render the documentation: "
+        f"pip install -r {ROOT / 'requirements.txt'}"
+    ) from missing
+
+
 PAGES = ROOT / "pages"
 DATA = ROOT / "data"
 DIST = ROOT / "dist"
@@ -34,7 +50,12 @@ directives still in place. `dist/` is self-contained — copy it to a web root
 and nothing but the site is reachable.
 """
 
-SOURCE_NAMES = ("build.py", "pages", "data", "src", "__pycache__")
+REPO = ROOT.parent
+"""The repository the documentation is written in. Documents are rendered from
+here rather than copied into `web/pages/`, so there is exactly one of each and
+the site cannot drift from what the repository says."""
+
+SOURCE_NAMES = ("build.py", "render.py", "pages", "data", "src", "__pycache__")
 """Source-root entries that must never appear inside the publish root."""
 
 
@@ -57,6 +78,57 @@ def assert_publishable(root: Path) -> None:
                 f"{path} would be published. The publish root must contain only "
                 "rendered pages and copied assets."
             )
+
+
+
+ANCHOR_RE = re.compile(r'id="([^"]+)"')
+HREF_RE = re.compile(r'href="([^"]+)"')
+
+
+def assert_links_resolve(root: Path) -> None:
+    """Every internal link and every anchor in the publish root resolves.
+
+    Rendering a repository's Markdown onto a site gives every document a second
+    address, and the failure mode is quiet: a heading renamed last week leaves
+    a `#section` link pointing at a page with no such section, and the reader is
+    told the section does not exist rather than that the link is out of date.
+    Checking the rendered bytes catches it here instead.
+    """
+    broken: list[str] = []
+    for path in sorted(root.rglob("*.html")):
+        text = path.read_text(encoding="utf-8")
+        route = "/" + path.relative_to(root).as_posix()
+        route = route[: -len("index.html")] if route.endswith("index.html") else route
+        anchors = set(ANCHOR_RE.findall(text))
+        for href in HREF_RE.findall(text):
+            if href.startswith(("http://", "https://", "mailto:", "//", "data:")):
+                continue
+            target, _, fragment = href.partition("#")
+            if not target:  # an anchor into the page it is on
+                if fragment not in anchors:
+                    broken.append(f"{route} -> #{fragment}")
+                continue
+            if not target.startswith("/"):
+                broken.append(f"{route} -> {href} (not a site path)")
+                continue
+            candidate = root / target.strip("/")
+            if candidate.is_file():  # a stylesheet, an icon, an image
+                continue
+            page = candidate / "index.html"
+            if not page.is_file():
+                broken.append(f"{route} -> {target} (no such page)")
+                continue
+            if fragment and fragment not in set(
+                ANCHOR_RE.findall(page.read_text(encoding="utf-8"))
+            ):
+                broken.append(f"{route} -> {target}#{fragment} (no such section)")
+    if broken:
+        raise SystemExit(
+            "the rendered site links to things it does not contain:\n  "
+            + "\n  ".join(sorted(set(broken)))
+            + "\nThese are dead ends a reader can reach. Fix the source and rebuild."
+        )
+
 
 CONSOLE_ROUTES: set[str] = set()
 
@@ -220,6 +292,287 @@ SHELL = """<!doctype html>
 </body>
 </html>
 """
+
+DOCS_SHELL = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — AIec</title>
+<meta name="description" content="{description}">
+<link rel="canonical" href="{canonical}">
+<meta property="og:title" content="{title} — AIec">
+<meta property="og:description" content="{description}">
+<meta property="og:type" content="article">
+<meta property="og:url" content="{canonical}">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="{og_image}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      {nav}
+    </nav>
+  </div>
+</header>
+<div class="{shell_class}">
+  <nav class="docnav" aria-label="Documentation">
+    {nav_html}
+  </nav>
+  <main class="docmain">
+{body}
+    {pager}
+  </main>
+{toc_html}
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav">{footer_nav}</nav>
+  </div>
+</footer>
+</body>
+</html>
+"""
+
+
+WORDS_PER_MINUTE = 220
+"""Reading time is derived from the rendered document's own word count, so the
+number on the page is the length of the thing being read and not a guess."""
+
+
+def load_docs() -> tuple[list[dict], list[dict]]:
+    """The curated document set and the groups it is filed under.
+
+    Curated rather than a directory scan on purpose: the repository also holds
+    audit records, measurement write-ups and working notes that are real
+    documents and are not documentation. Publishing whatever happens to be in
+    `docs/` would put a 160 KB defect ledger next to the API reference in a
+    sidebar, and the sidebar is how a reader decides what to trust.
+    """
+    manifest = load_data("docs")
+    groups = manifest["groups"]
+    known = {group["id"] for group in groups}
+    docs = []
+    for entry in manifest["docs"]:
+        if entry["group"] not in known:
+            raise SystemExit(
+                f"docs.json: {entry['slug']} names group {entry['group']!r}, "
+                f"which is not one of {', '.join(sorted(known))}"
+            )
+        source = REPO / entry["source"]
+        if not source.is_file():
+            raise SystemExit(f"docs.json: {entry['slug']} has no source at {source}")
+        docs.append(entry)
+    slugs = [doc["slug"] for doc in docs]
+    if len(set(slugs)) != len(slugs):
+        raise SystemExit("docs.json: duplicate slug; each document needs its own route")
+    return docs, groups
+
+
+def doc_route(entry: dict) -> str:
+    return f"/docs/{entry['slug']}/"
+
+
+def doc_reading_time(text: str) -> str:
+    words = len(text.split())
+    return f"{max(1, round(words / WORDS_PER_MINUTE))} min read"
+
+
+def content_variant(fragment: str) -> str:
+    """The `.content` modifier a hand-written page asked for.
+
+    `<!-- wide -->` gives a page the whole column, which is what a page of
+    diagram or code wants. `<!-- prose -->` takes it away, which is what a
+    page of running text wants: the column is 662px, and at 17px that is about
+    88 characters a line, which is past the point where the eye reliably finds
+    the start of the next one. The generated documents set the same cap in
+    `.docmain`; this is the hand-written equivalent.
+    """
+    if "<!-- wide -->" in fragment:
+        return " content--wide"
+    if "<!-- prose -->" in fragment:
+        return " content--prose"
+    return ""
+
+
+def render_doc_nav(docs: list[dict], groups: list[dict], current: str | None) -> str:
+    """The documentation sidebar: every document, filed under why you would
+    read it. The index link stays at the top because most readers arrive
+    through `/docs` and want the way back out."""
+    parts = ['<a class="docnav__home" href="/docs">All documentation</a>']
+    for group in groups:
+        members = [doc for doc in docs if doc["group"] == group["id"]]
+        if not members:
+            continue
+        parts.append(f'<div class="docnav__group"><h2>{html.escape(group["title"])}</h2><ul>')
+        for doc in members:
+            mark = ' aria-current="page"' if doc["slug"] == current else ""
+            parts.append(
+                f'<li><a href="{doc_route(doc)}"{mark}>{html.escape(doc["title"])}</a></li>'
+            )
+        parts.append("</ul></div>")
+    return "\n    ".join(parts)
+
+
+def render_doc_toc(headings: list[tuple[int, str, str]]) -> str:
+    """The on-page contents, from the document's own `##` and `###` headings.
+
+    Short documents are not given one. A contents list beside four headings is
+    noise that pushes the prose down the page.
+    """
+    if len(headings) < 3:
+        return ""
+    rows = [
+        f'<li class="doctoc__item doctoc__item--{level}">'
+        f'<a href="#{anchor}">{html.escape(label)}</a></li>'
+        for level, anchor, label in headings
+    ]
+    return (
+        '<h2 class="doctoc__title">On this page</h2>\n'
+        f'    <ol class="doctoc__list">\n      {"".join(rows)}\n    </ol>'
+    )
+
+
+def render_doc_pager(docs: list[dict], current: str) -> str:
+    """Previous and next in reading order, so a reader who finishes a document
+    at the bottom of the page is told what comes after it rather than being
+    left to scroll back up to the sidebar."""
+    index = next(i for i, doc in enumerate(docs) if doc["slug"] == current)
+    cells = []
+    if index:
+        previous = docs[index - 1]
+        cells.append(
+            '<a class="docpager__cell docpager__cell--prev" '
+            f'href="{doc_route(previous)}"><span class="docpager__dir">Previous</span>'
+            f'<span class="docpager__name">{html.escape(previous["title"])}</span></a>'
+        )
+    if index + 1 < len(docs):
+        following = docs[index + 1]
+        cells.append(
+            '<a class="docpager__cell docpager__cell--next" '
+            f'href="{doc_route(following)}"><span class="docpager__dir">Next</span>'
+            f'<span class="docpager__name">{html.escape(following["title"])}</span></a>'
+        )
+    return f'<nav class="docpager" aria-label="Documents">{"".join(cells)}</nav>'
+
+
+def render_doc_index() -> str:
+    """The document catalogue on `/docs`: every published document, its group,
+    and one line on what it answers.
+
+    Grouped rather than one flat alphabetical list, because a reader arriving
+    at `/docs` is asking "where do I start" or "how do I do X", not "what
+    documents exist". The group order is the reading order.
+    """
+    docs, groups = load_docs()
+    out = []
+    for group in groups:
+        members = [doc for doc in docs if doc["group"] == group["id"]]
+        if not members:
+            continue
+        out.append(
+            f'<div class="docgroup"><h2 id="{html.escape(group["id"])}">'
+            f'{html.escape(group["title"])}</h2>'
+            f'<p class="docgroup__blurb">{html.escape(group["blurb"])}</p>'
+            '<dl class="doclist">'
+        )
+        for doc in members:
+            text = (REPO / doc["source"]).read_text(encoding="utf-8")
+            out.append(
+                f'<dt><a href="{doc_route(doc)}">{html.escape(doc["title"])}</a></dt>'
+                f'<dd>{html.escape(doc["summary"])} '
+                f'<span class="doclist__meta">{html.escape(doc_reading_time(text))}</span></dd>'
+            )
+        out.append("</dl></div>")
+    return "\n".join(out)
+
+
+def render_doc_pages() -> list[str]:
+    """Renders every curated document as a page, and returns its routes.
+
+    The manifest title is checked against the document's own first heading:
+    a sidebar that calls a document something the document does not call
+    itself is the kind of small wrongness a reader trusts less without being
+    able to say why.
+    """
+    docs, groups = load_docs()
+    links = docrender.LinkMap(
+        published={doc["source"]: doc_route(doc) for doc in docs},
+        repo_root=REPO,
+    )
+    routes: list[str] = []
+    for entry in docs:
+        source = REPO / entry["source"]
+        text = source.read_text(encoding="utf-8")
+        heading = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
+        if not heading or heading.group(1).strip() != entry["title"]:
+            raise SystemExit(
+                f"{entry['source']}: its first heading is "
+                f"{heading.group(1).strip() if heading else None!r}, but "
+                f"web/data/docs.json titles it {entry['title']!r}. One of them "
+                "is wrong; the sidebar and the page must agree."
+            )
+        # Reading time and provenance sit under the title. The sidebar already
+        # carries the group, and a tracked label on its own block above an h1
+        # is a decorative kicker that adds nothing the title does not say.
+        meta = (
+            f'<p class="docmeta">'
+            f'<span>{html.escape(doc_reading_time(text))}</span>'
+            f'<a href="{docrender.REPO_BLOB}/{quote(entry["source"])}" '
+            f'rel="noopener noreferrer">{html.escape(entry["source"])}</a>'
+            f"</p>"
+        )
+        rendered = docrender.render_markdown(
+            entry["source"], text, links, after_title=meta
+        )
+        group = next(g for g in groups if g["id"] == entry["group"])
+        body = rendered.body
+        toc = render_doc_toc(rendered.headings)
+        page_path(doc_route(entry)).parent.mkdir(parents=True, exist_ok=True)
+        page_path(doc_route(entry)).write_text(
+            DOCS_SHELL.format(
+                title=html.escape(entry["title"]),
+                description=html.escape(entry["summary"]),
+                canonical=f"{SITE_URL}{doc_route(entry)}",
+                og_image=f"{SITE_URL}/assets/og.png",
+                nav=render_nav("/docs"),
+                footer_nav=render_footer_nav(),
+                nav_html=render_doc_nav(docs, groups, entry["slug"]),
+                body=body,
+                shell_class="docshell docshell--wide"
+                if not toc
+                else "docshell",
+                toc_html=(
+                    '<aside class="doctoc" aria-label="On this page">\n'
+                    + toc
+                    + "\n  </aside>"
+                    if toc
+                    else ""
+                ),
+                pager=render_doc_pager(docs, entry["slug"]),
+            ),
+            encoding="utf-8",
+        )
+        routes.append(doc_route(entry))
+    if links.missing:
+        raise SystemExit(
+            "these links in the documentation point at files that do not exist:\n  "
+            + "\n  ".join(sorted(set(links.missing)))
+            + "\nFix the document, or publish it, before the site renders a dead link."
+        )
+    return routes
 
 
 
@@ -530,6 +883,7 @@ DATA_RENDERERS = {
     "capability_rows": render_capability_rows,
     "status_terms": render_status_terms,
     "capability_summary": render_capability_summary,
+    "doc_index": render_doc_index,
 }
 
 
@@ -682,19 +1036,26 @@ def main() -> int:
                 nav=render_console_nav(route) if is_console else render_nav(route),
                 footer_nav=render_footer_nav(),
                 rail=render_rail(fragment) if not is_console else "",
-                wide=" content--wide" if "<!-- wide -->" in fragment else "",
+                wide=content_variant(fragment),
                 body=body,
             ),
             encoding="utf-8",
         )
         rendered.append(route)
 
+    # Rendered after the hand-written pages so `/docs` can be written as an
+    # index over documents that already exist, and after the copy so a
+    # document that fails to render cannot leave a half-built publish root.
+    doc_routes = render_doc_pages()
+    rendered.extend(doc_routes)
+
     pages = render_error_pages()
     (DIST / "sitemap.xml").write_text(render_sitemap(rendered), encoding="utf-8")
     (DIST / "robots.txt").write_text(render_robots(), encoding="utf-8")
     assert_publishable(DIST)
     print(
-        f"rendered {len(rendered)} pages and {pages} error pages into {DIST}, "
+        f"rendered {len(rendered) - len(doc_routes)} pages, "
+        f"{len(doc_routes)} documents and {pages} error pages into {DIST}, "
         f"plus sitemap.xml, robots.txt, {copied} static assets and "
         f"{og_image.rsplit('/', 1)[-1]}"
     )

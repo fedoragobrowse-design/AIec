@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Production deployment — AIec</title>
+<meta name="description" content="Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/deployment/">
+<meta property="og:title" content="Production deployment — AIec">
+<meta property="og:description" content="Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/deployment/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/" aria-current="page">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="production-deployment">Production deployment</h1>
+<p class="docmeta"><span>16 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md" rel="noopener noreferrer">docs/DEPLOYMENT.md</a></p>
+<h2 id="host-prerequisites">Host prerequisites<a class="anchor" href="#host-prerequisites" aria-label="Link to this section: Host prerequisites">#</a></h2>
+<p>Use dedicated Linux worker hosts with:</p>
+<ul>
+<li>readable/writable <code>/<wbr>dev/<wbr>kvm</code> for the worker service account;</li>
+<li>Firecracker v1.17+ and optional jailer;</li>
+<li>an AIec-compatible Linux guest kernel and ext4 rootfs;</li>
+<li><code>ip(8)</code>, <code>nft</code>, <code>e2fsck</code>, and <code>resize2fs</code> for network/disk enforcement;</li>
+<li>a cgroup-v2-enabled kernel for predictable Firecracker snapshot performance;</li>
+<li>private connectivity among API, PostgreSQL, S3, and workers.</li>
+</ul>
+<p>Docker workers are explicit runtime backends, not a production fallback. Start one with <code>aiec worker --runtime docker</code>; the worker uses the Docker Engine API, advertises <code>container</code>, <code>exec</code>, and <code>files</code> capabilities (<code>streaming:<wbr> false</code>), and registers those capabilities for capability-aware scheduling. Docker containers use a managed workspace bind mount under the configured state root, drop all capabilities, disable privilege escalation, use a read-only root filesystem, and run a long-lived <code>sh -c 'sleep 3600'</code> process so exec operations have a stable container process. The default seccomp profile is left to Docker's daemon defaults; restricted network policies fail closed until an egress allowlist backend exists. Docker snapshot capture/restore is currently <code>UNSUPPORTED</code>.</p>
+<h2 id="guard-on-a-worker">Guard on a worker<a class="anchor" href="#guard-on-a-worker" aria-label="Link to this section: Guard on a worker">#</a></h2>
+<p>Guard is additive: a Firecracker worker enforces it by default, and a sandbox
+with no policy selected gets no network. Two operator settings enable it.</p>
+<div class="code"><span class="code__lang">bash</span><pre><code># Binding name -&gt; real secret. Owner-only, mode 0600, never passed as an argument.
+AIEC_GUARD_CREDENTIALS_FILE=/etc/aiec/guard/credentials.json
+
+# Operator boundary: extra blocked ranges, protected addresses, blocked hosts.
+AIEC_GUARD_BOUNDARY_FILE=/etc/aiec/guard/boundary.json
+</code></pre></div>
+<p>The worker needs the privileges the existing network backend already required
+— <code>CAP_NET_ADMIN</code> and <code>CAP_NET_RAW</code> — because Guard installs nftables tables
+and TAP devices of its own.</p>
+<p>The packaged unit, <code>deploy/<wbr>aiec-worker.service</code>, grants both as ambient
+capabilities, so a worker installed from it enforces Guard out of the box. A
+worker started some other way — a container, a hand-written unit, a
+supervisor — needs them granted by whatever starts it, and the startup probe
+below is what tells you whether it has them.</p>
+<p>That is checked rather than assumed. The worker probes <code>nft list ruleset</code> once
+at startup — a read, which does not modify the firewall — and advertises the
+<code>network_policy</code> capability only if it succeeds. A host without <code>nft</code>, or
+without the privilege to use it, therefore reports <code>network_policy:<wbr> false</code>, and
+a guarded run or sandbox is refused <em>at placement</em> rather than admitted and
+then failing at boot. Check it yourself with:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>nft list ruleset &gt;/dev/null &amp;&amp; echo &quot;can enforce&quot; || echo &quot;cannot&quot;
+</code></pre></div>
+<p>The pre-Guard network backend is available only when the operator asks for it
+explicitly:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>AIEC_ALLOW_LEGACY_NETWORK=1
+</code></pre></div>
+<p>Without that variable, a sandbox that asks for a network but selects no Guard
+policy is refused rather than silently placed on the ordinary NAT path. See
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/GUARD_POLICY.md" rel="noopener noreferrer"><code>GUARD_POLICY.md</code></a> for the policy, the templates, and how
+to verify a policy without deploying it.</p>
+<p>Docker workers are explicit runtime backends, not a production fallback. Start one with <code>aiec worker --runtime docker</code>; the worker uses the Docker Engine API, advertises <code>container</code>, <code>exec</code>, and <code>files</code> capabilities (<code>streaming:<wbr> false</code>), and registers those capabilities for capability-aware scheduling. Docker containers use a managed workspace bind mount under the configured state root, drop all capabilities, disable privilege escalation, use a read-only root filesystem, and run a long-lived <code>sh -c 'sleep 3600'</code> process so exec operations have a stable container process. The default seccomp profile is left to Docker's daemon defaults; restricted network policies fail closed until an egress allowlist backend exists. Docker snapshot capture/restore is currently <code>UNSUPPORTED</code>.</p>
+<p>Build the local guest artifacts with:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>export AIEC_GUEST_SECRET=&quot;$(openssl rand -hex 32)&quot;
+export AIEC_KERNEL=/var/lib/aiec/images/vmlinux
+scripts/build-firecracker-guest.sh /var/lib/aiec/images
+</code></pre></div>
+<p>The resulting image starts <code>/<wbr>sbin/<wbr>init</code>, mounts guest pseudo-filesystems, starts <code>aiec-guest</code>, and listens on vsock port 1024. The secret is baked into the private rootfs and must be protected as a host credential.</p>
+<p>Artifact collection reads sandbox files over the guest wire protocol, so the guest agent inside the root filesystem must speak the protocol revision this control plane requires. <code>guest-capabilities.json</code> records it as <code>guest_protocol_version</code>, and the runtime refuses metadata that records a different revision, so an image built before bounded range reads are refused at startup instead of failing at the first artifact collection. Rebuild the image with <code>scripts/<wbr>build-firecracker-guest.sh</code> (it records the current revision), and re-sign the admission manifest whose rootfs digest changed.</p>
+<h2 id="tls-certificates">TLS certificates<a class="anchor" href="#tls-certificates" aria-label="Link to this section: TLS certificates">#</a></h2>
+<p>The control plane's certificate authority must carry its extensions explicitly:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 \
+  -subj '/CN=AIec CA' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -out ca.crt
+</code></pre></div>
+<p>A CA minted without them still passes <code>openssl verify</code> and works for clients
+that trust the file directly, so the omission is easy to miss. It fails at
+handshake time for stricter clients: Python 3.13 and later reject it with
+<code>CERTIFICATE_VERIFY_FAILED:<wbr> CA cert does not include key usage extension</code>,
+which makes the Python SDK unable to reach an otherwise healthy control plane
+while the Rust client keeps working. Note that <code>openssl req -x509</code> accepts
+<code>-addext</code> but rejects <code>-extfile</code>.</p>
+<h2 id="postgresql-and-s3">PostgreSQL and S3<a class="anchor" href="#postgresql-and-s3" aria-label="Link to this section: PostgreSQL and S3">#</a></h2>
+<p>The production server runs committed SQLx migrations and refuses to start without <code>DATABASE_URL</code>. Use TLS, backups, least privilege, and migration rollback procedures. Configure a private bucket through <code>AIEC_S3_ENDPOINT</code>, region, bucket, prefix, and credentials. S3 requests use AWS Signature V4 and SHA-256 checksums; the bucket must not be public.</p>
+<h2 id="api-server">API server<a class="anchor" href="#api-server" aria-label="Link to this section: API server">#</a></h2>
+<p>Required configuration:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>export AIEC_RUNTIME=firecracker
+export DATABASE_URL='postgres://...'
+export AIEC_TENANT_ID='&lt;uuid&gt;'
+export AIEC_API_KEY='af_live_&lt;48 hex chars&gt;'
+export AIEC_WORKER_TOKEN='&lt;at least 32 bytes&gt;'
+export AIEC_IMAGE_MANIFEST=/var/lib/aiec/images/manifest.json
+export AIEC_IMAGE_MANIFEST_SECRET='&lt;protected manifest signing secret&gt;'
+export AIEC_S3_ENDPOINT='https://minio.internal:9000'
+export AIEC_S3_REGION=us-east-1
+export AIEC_S3_BUCKET=aiec
+export AIEC_S3_ACCESS_KEY_ID='...'
+export AIEC_S3_SECRET_ACCESS_KEY='...'
+export AIEC_TLS_CERT_FILE=/etc/aiec/tls/api.crt
+export AIEC_TLS_KEY_FILE=/etc/aiec/tls/api.key
+aiec-server
+</code></pre></div>
+<p>The production API accepts <code>AIEC_RUNTIME=docker</code> without Firecracker image-manifest variables in that mode. A Docker worker still requires a reachable Docker daemon and a worker registration; the API itself remains a scheduler/control plane. The production launcher does not silently substitute another backend.
+Docker containers use an explicit long-lived <code>sh -c 'sleep 3600'</code> process rather than preserving the image entrypoint. The private-alpha Docker test image is Alpine and verifies exec, binary files, nested workspace creation, pause/resume, security settings, and cleanup. Operators using other images must provide a shell and <code>sleep</code> compatible with that image until configurable process supervision is implemented.
+Docker containers use a TTY and keep stdin open to support common image-provided REPL entrypoints. This does not change the runtime API contract: AIec exec remains buffered rather than a streaming PTY protocol.
+Docker exec requests are buffered and time-bounded at the API response level, but timeout handling does not yet kill the process tree inside the container. Treat Docker exec process-tree timeout and cleanup as unsupported until container-level termination is implemented.</p>
+<p>The durable run queue is sized once at startup and is never read per request:
+<code>AIEC_RUN_QUEUE_MAX_ACTIVE</code> (default 4) bounds concurrent runs cluster-wide,
+<code>AIEC_RUN_QUEUE_GLOBAL_PENDING</code> (1024) and <code>AIEC_RUN_QUEUE_TENANT_PENDING</code> (128)
+bound admission, <code>AIEC_RUN_QUEUE_TIMEOUT_SECONDS</code> (300) is how long a run may wait
+before it fails, and <code>AIEC_RUN_QUEUE_LEASE_SECONDS</code> (30) is the executor
+ownership lease, heartbeated every third of that and never extended past the run's
+own execution deadline. Every API replica may run a dispatcher: dispatch is
+fenced by the database, so replicas share the same active cap rather than
+multiplying it. An invalid value refuses startup instead of silently falling back
+to a default, because a queue that is not the size the operator asked for is a
+capacity surprise. See <a href="/docs/architecture/#run-admission-and-executor-ownership">ARCHITECTURE.md</a>.</p>
+<p><code>AIEC_REPO_CACHE_ENABLED=1</code> turns on the optional node-local repository object
+cache on the API host. It is off by default because it trades a cold-start
+failure mode for a warm-start one: with it off, every run clones from the
+network and any git error is the run's own; with it on, a run whose commit is
+already cached materializes from a bounded local mirror. The cache is bounded
+(16 entries, 64 MiB total, 30-minute TTL, LRU), keyed by tenant plus the
+resolved commit, and only ever used for anonymous HTTPS repositories with no
+run secrets, so a private repository or a credentialed run always takes the
+ordinary clone path. Each run still gets its own working tree, index and
+<code>.git</code>. See
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/benchmarks/EFFICIENCY-AUDIT.md#repository-object-cache-opt-in-measured-and-not-shippable-as-written" rel="noopener noreferrer">EFFICIENCY-AUDIT.md</a>
+for the measured cost and why it should remain disabled.</p>
+<p>The systemd API unit starts <code>aiec-server</code>. The shorter <code>aiec server</code> command supports explicit <code>bwrap-dev</code> and <code>docker</code> single-process development distributions.</p>
+<h2 id="firecracker-workers">Firecracker workers<a class="anchor" href="#firecracker-workers" aria-label="Link to this section: Firecracker workers">#</a></h2>
+<div class="code"><span class="code__lang">bash</span><pre><code>export AIEC_FIRECRACKER_BIN=/opt/firecracker/firecracker
+export AIEC_KERNEL=/var/lib/aiec/images/vmlinux
+export AIEC_ROOTFS=/var/lib/aiec/images/aiec-rootfs.ext4
+export AIEC_GUEST_SECRET='&lt;same protected secret used to build the rootfs&gt;'
+export AIEC_STATE_DIR=/var/lib/aiec/firecracker
+export AIEC_WORKER_TOKEN='&lt;same protected worker token used by the API&gt;'
+export AIEC_TLS_CERT_FILE=/etc/aiec/tls/worker.crt
+export AIEC_TLS_KEY_FILE=/etc/aiec/tls/worker.key
+# For a private CA, also set AIEC_TLS_CA_CERT to its PEM trust anchor.
+aiec --url https://aiec-api.internal:8080 worker --runtime firecracker --name worker-a \
+  --advertise-url https://worker-a.internal:9000 \
+  --bind 0.0.0.0:9000 --capacity 8 --state-dir /var/lib/aiec/worker
+</code></pre></div>
+<p>The worker endpoint must be reachable only from the API/control network and protected by <code>AIEC_WORKER_TOKEN</code>. Run at least two workers for a multi-node deployment. Worker registration, versioned heartbeats, assignment claims, and lease renewal are persisted in PostgreSQL.</p>
+<p>The example units are starting points. A Firecracker worker needs narrowly scoped <code>/<wbr>dev/<wbr>kvm</code>, network administration, writable VM/snapshot storage, and <code>NoNewPrivileges=false</code> or an equivalent reviewed jailer arrangement. API and worker storage should be separate encrypted volumes.</p>
+<p>The packaged worker unit creates an <code>aiec</code>-owned <code>/<wbr>var/<wbr>lib/<wbr>aiec</code> with
+<code>StateDirectory=aiec</code>, sets that working directory, and passes an absolute
+<code>--state-dir /<wbr>var/<wbr>lib/<wbr>aiec/<wbr>worker</code>. This is the durable worker identity and
+the filesystem used for host disk-pressure measurement. <code>AIEC_STATE_DIR</code>
+separately configures Firecracker VM/snapshot storage; it does not override
+the worker's <code>--state-dir</code>. Put both on the intended writable data volume.</p>
+<p>Keep <code>node-id</code> with the worker's durable state. Automatic identity generation
+is permitted only when that file is missing; malformed, unreadable or
+non-file state refuses startup without replacing it. Restore the original
+identity from a trusted backup rather than deleting the file while that node
+owns work. An explicit <code>--node-id UUID</code> remains an operator-controlled
+override; registration persists the assigned identity. On Unix, new identity
+files are mode <code>0600</code>, newly created state directories are mode <code>0700</code>, and
+publication syncs the complete file and directory ancestry. Concurrent first
+starts adopt one published identity; assigned replacements use atomic rename.</p>
+<p>For systemd, set <code>AIEC_RUNTIME=firecracker</code>, <code>AIEC_URL</code> to the HTTPS API
+origin, <code>AIEC_WORKER_ADVERTISE_URL</code>, the token and TLS variables in
+<code>/<wbr>etc/<wbr>aiec/<wbr>aiec.env</code>; its <code>EnvironmentFile</code> does not inherit shell exports.
+An advertised HTTPS worker origin must match the certificate and be reachable
+from the API.</p>
+<p>Neither packaged unit imposes <code>MemoryMax</code>, <code>CPUQuota</code> or <code>LimitNOFILE</code>; process
+and task limits otherwise inherit systemd/OS defaults. Capacity and pressure
+checks are admission gates, not a cgroup resource ceiling. Set service/slice
+budgets for the host allocation and runtime in an operator-managed drop-in,
+including child microVM processes and descriptor/process headroom. A small
+generic cap can kill active sandboxes and invalidate the declared capacity,
+so no guessed fixed value is shipped. <code>/<wbr>dev/<wbr>kvm</code> access still requires the
+service account's device permissions; <code>ReadWritePaths</code> is not a device ACL.</p>
+<h3 id="long-running-http-requests">Long-running HTTP requests<a class="anchor" href="#long-running-http-requests" aria-label="Link to this section: Long-running HTTP requests">#</a></h3>
+<p>The production API and non-development worker listeners require TLS. Keep
+<code>/<wbr>ready</code> and <code>/<wbr>metrics</code> on the trusted management network; the public probes
+are intentionally unauthenticated. If a reverse proxy fronts the API, its
+response timeout and the client's timeout must cover synchronous
+<code>POST /<wbr>v1/<wbr>runs</code>: queue wait (default 300 seconds), workload execution
+(<code>timeout_seconds</code> plus the 120-second placement/teardown grace), and the bounded
+30-second settlement wait, plus transport headroom. A default 60-second
+proxy/client timeout is insufficient for a
+900-second workload. Configure the supported upper bound for your deployment,
+not just the probe timeout. Disconnecting the caller stops its wait, not the
+durable run: use the idempotency key and the run detail/list routes to recover
+the outcome rather than submitting duplicate work.</p>
+<h2 id="host-pressure-and-reserves">Host pressure and reserves<a class="anchor" href="#host-pressure-and-reserves" aria-label="Link to this section: Host pressure and reserves">#</a></h2>
+<p>A worker's declared capacity (<code>total_*</code>, seeded once into <code>available_*</code>) is the
+operator's allocation and nothing else: <code>--capacity 8</code> declares 8 GiB of memory
+and 80 GiB of disk whatever the host currently reports. Host pressure is a
+separate measurement that gates admission and never rewrites a ledger counter.</p>
+<p>Each registration and each 5-second heartbeat publishes, under
+<code>metadata.pressure</code>:</p>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Field</th>
+<th scope="col">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>host_id</code></td>
+<td>32 hex characters, a truncated SHA-256 of <code>/<wbr>etc/<wbr>machine-id</code> (falling back to the DMI product UUID, then the hostname). Stable per machine and shared by every worker on it; never the raw identifier, which is a host credential.</td>
+</tr>
+<tr>
+<td><code>observed_at</code></td>
+<td>When the reading was taken.</td>
+</tr>
+<tr>
+<td><code>total_memory_bytes</code> / <code>total_disk_bytes</code></td>
+<td><code>MemTotal</code>, and the size of the filesystem backing <code>--state-dir</code>.</td>
+</tr>
+<tr>
+<td><code>memory_available_bytes</code> / <code>disk_available_bytes</code></td>
+<td><code>MemAvailable</code> and <code>f_bavail</code> <strong>after</strong> the reserve. <code>null</code> when the measurement could not be taken.</td>
+</tr>
+<tr>
+<td><code>reserves.memory_bytes</code> / <code>reserves.disk_bytes</code></td>
+<td>The reserve this reading was taken against.</td>
+</tr>
+</tbody>
+</table></div>
+<p>Disk is measured on the filesystem holding <code>--state-dir</code>, not on <code>/<wbr></code>. They are
+the same filesystem on an ordinary host and emphatically not the same in a
+container, where <code>/<wbr></code> is the image's overlay and the workspaces live on a
+mounted volume.</p>
+<p>Reserves are configurable and default to 512 MiB of memory and 2 GiB of disk:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>aiec worker --runtime firecracker --name worker-a \
+  --memory-reserve-mib 1024 --disk-reserve-mib 8192
+</code></pre></div>
+<p><code>AIEC_WORKER_MEMORY_RESERVE_MIB</code> and <code>AIEC_WORKER_DISK_RESERVE_MIB</code> are the
+environment equivalents. The reserve is subtracted from every reading and never
+spendable, so lowering it hands the host's last bytes to tenants. A reading that
+falls below the reserve saturates to zero, which is a host with no headroom left
+rather than a host nobody could measure.</p>
+<h3 id="the-boot-re-checks-the-host">The boot re-checks the host<a class="anchor" href="#the-boot-re-checks-the-host" aria-label="Link to this section: The boot re-checks the host">#</a></h3>
+<p>The heartbeat decides <em>placement</em>. It cannot decide the boot, because a host
+fills between the two: a placement admitted against a reading from ten seconds
+ago spends memory and disk that something else may have taken since. So every
+Firecracker <code>create</code> measures the host again, immediately before it materializes
+anything, and refuses on three counts:</p>
+<ul>
+<li>a reading that could not be taken (it is not a reading of a host with room);</li>
+<li>less memory than the guest is configured with;</li>
+<li>less disk than the sandbox needs, where &quot;needs&quot; is the larger of the requested
+<code>disk_mb</code> and the base image's own size. Every sandbox disk starts as a copy
+of that image, so a request below the image's size is a request the host
+cannot honour however small it is. Firecracker reports that floor as
+<code>minimum_disk_mb</code> in its advertised capabilities.</li>
+</ul>
+<p>The refusal costs one <code>stat</code> of the base image and one read of <code>/<wbr>proc/<wbr>meminfo</code>
+and the state directory's filesystem, and it happens before the sandbox
+directory, the owner marker, and the image copy exist. A refused create has
+spent nothing, so the caller can retry it on another worker or after the host
+recovers, and the same reserve is used as for the heartbeat — set
+<code>AIEC_WORKER_MEMORY_RESERVE_MIB</code> / <code>AIEC_WORKER_DISK_RESERVE_MIB</code>, or
+<code>--memory-reserve-mib</code> / <code>--disk-reserve-mib</code> on the worker command, and the
+runtime uses the same value.</p>
+<p>This is admission only. It never rewrites <code>available_*</code> or any other ledger
+counter, and a host that refuses a boot keeps every sandbox already running.</p>
+<h3 id="failure-behaviour">Failure behaviour<a class="anchor" href="#failure-behaviour" aria-label="Link to this section: Failure behaviour">#</a></h3>
+<ul>
+<li><strong>Measurement failed</strong> (<code>null</code>): a production worker stops claiming new
+assignments and its pressure publishes as <code>null</code>, so the scheduler refuses
+placement on it too. Existing sandboxes keep running and keep their leases;
+only new placements stop, and they resume on the first heartbeat that
+measures successfully. A worker that cannot measure its host must not claim
+its allocation - that fallback is what let a full host keep taking work.
+<code>bwrap-dev</code> is the exception: it runs the developer's own shell, so it claims
+anyway rather than becoming a worker that registers and silently never runs
+anything. A <em>measured</em> full host stops claiming under every runtime.</li>
+<li><strong>Reading below the reserve</strong>: zero, and the worker stops claiming while the
+scheduler refuses placements larger than the measured headroom. It does not
+stop work already running and does not modify <code>available_*</code>.</li>
+<li><strong>Health is never pressure</strong>: <code>healthy</code> stays the worker's own answer about
+itself. A host that cannot be measured is not a broken worker, and the two
+call for different responses. <code>healthy = false</code> additionally hides the node
+from <code>list_workers(false)</code> and bypasses the ownership check at
+<code>heartbeat_worker</code>, neither of which pressure should be able to trigger.</li>
+<li><strong>Recovery</strong>: pressure moves on every heartbeat. A host that frees memory or
+disk admits again with no ledger row rewritten, because nothing about
+admission is stored in the ledger in the first place.</li>
+</ul>
+<h3 id="aggregate-admission-across-workers-on-one-host">Aggregate admission across workers on one host<a class="anchor" href="#aggregate-admission-across-workers-on-one-host" aria-label="Link to this section: Aggregate admission across workers on one host">#</a></h3>
+<p><code>host_id</code> exists so that N workers on one machine can be accounted for as one
+machine. Without it, four workers each read the same figures and each spend
+them, and the cluster comes to believe 35 GiB of memory exists where the host
+has 26.</p>
+<p><code>aiec_core::<wbr>host_pressure::<wbr>host_admission_budget</code> implements the arithmetic.
+The scheduler equivalent, for the integration to apply in
+<code>select_schedulable_node</code>, is:</p>
+<div class="code"><span class="code__lang">sql</span><pre><code>-- Freshness, measured on the DATABASE clock. `observed_at` is a string the
+-- worker wrote and is kept as data only: gating on it would let a worker whose
+-- clock runs fast keep contributing a stale reading indefinitely, and one whose
+-- clock runs slow have a fresh reading discarded.
+AND n.last_heartbeat &gt;= now() - ($8::bigint * interval '1 second')
+AND (n.metadata-&gt;'pressure'-&gt;&gt;'host_id') IS NOT NULL
+AND (n.metadata-&gt;'pressure'-&gt;&gt;'memory_available_bytes') IS NOT NULL
+AND (n.metadata-&gt;'pressure'-&gt;&gt;'disk_available_bytes') IS NOT NULL
+-- Aggregate across every node reporting the same host_id, and only across
+-- those that heartbeated recently.
+--
+-- MIN, not MAX. A sibling that is inside the freshness window but has not
+-- re-measured yet still reports its last reading, and that reading may be more
+-- generous than the host's current state. Taking the least favourable fresh
+-- reading means a stale-but-in-window peer can only ever understate capacity,
+-- which costs some utilization; taking the most favourable would let it
+-- overstate it, which costs tenants their jobs.
+AND (
+  SELECT COALESCE(MIN((p.metadata-&gt;'pressure'-&gt;&gt;'memory_available_bytes')::bigint), 0)
+       - COALESCE(SUM(p.total_memory_bytes - p.available_memory_bytes), 0)
+  FROM nodes p
+  WHERE (p.metadata-&gt;'pressure'-&gt;&gt;'host_id') IS NOT NULL
+    AND (p.metadata-&gt;'pressure'-&gt;&gt;'host_id') = (n.metadata-&gt;'pressure'-&gt;&gt;'host_id')
+    AND p.last_heartbeat &gt;= now() - ($8::bigint * interval '1 second')
+    AND (p.metadata-&gt;'pressure'-&gt;&gt;'memory_available_bytes') IS NOT NULL
+) &gt;= $3::bigint
+-- The same shape, with disk_available_bytes, total_disk_bytes,
+-- available_disk_bytes and $4::bigint.
+</code></pre></div>
+<p>with <code>$8</code> bound to <code>NODE_HEARTBEAT_TTL_SECONDS</code>, <code>$3</code> to the sandbox's memory
+demand and <code>$4</code> to its disk demand. The subquery is a correlated aggregate over
+<code>nodes</code>, so it must see every sibling's row at the same snapshot the outer scan
+used; take <code>pg_advisory_xact_lock(hashtextextended('host:<wbr>' |<wbr>|<wbr> host_id,<wbr> 0))</code>
+before the select when a worker is admitted to a placement concurrently with
+another placement on the same machine, so two placements cannot each read the
+same aggregate and each spend it. <code>debit_capacity</code> remains the only writer of
+<code>available_*</code>, and <code>release_capacity</code> its only restorer.</p>
+<p>The subtraction is deliberately pessimistic, and the cost is real. The memory
+the running sandboxes already hold is <em>inside</em> the reading and is counted a
+second time, because deciding which worker's sandboxes a reading was taken with
+in front of them is not something the control plane can know. A host therefore
+gets used to roughly <code>available /<wbr> (available + held)</code> of what it could have
+taken, which on a busy host means new placements are refused earlier than
+strictly necessary. An idle host pays nothing. This is the direction to be
+wrong in: under-booking wastes headroom, over-booking fails tenants' jobs at
+boot after their quota has been charged.</p>
+<h3 id="re-checking-immediately-before-vm-create">Re-checking immediately before VM create<a class="anchor" href="#re-checking-immediately-before-vm-create" aria-label="Link to this section: Re-checking immediately before VM create">#</a></h3>
+<p>Pressure is re-read inside <code>aiec_core::<wbr>host_pressure::<wbr>HostPressure::<wbr>admits</code>
+immediately before the runtime materialises a VM, because a host can fill
+between the heartbeat that admitted the placement and the boot that spends it.
+The integration point, in the sandbox runtime's <code>create</code>, ahead of any
+allocation and ahead of writing anything to disk:</p>
+<div class="code"><span class="code__lang">rust</span><pre><code>let reserves = HostReserves::from_mib(memory_reserve_mib, disk_reserve_mib);
+HostPressure::measure(&amp;state_dir, reserves)
+    .admits(u64::from(sandbox.memory_mb) * 1_048_576,
+            u64::from(sandbox.disk_mb) * 1_048_576)?;
+</code></pre></div>
+<p><code>admits</code> returns <code>CoreError::<wbr>Unavailable</code> for an incomplete reading, which is
+the retryable class the placement loop already treats as transient. It is a
+synchronous read of <code>/<wbr>proc/<wbr>meminfo</code> and one <code>statvfs</code> - no probe task and no
+detached background work.</p>
+<h2 id="snapshots-and-restore">Snapshots and restore<a class="anchor" href="#snapshots-and-restore" aria-label="Link to this section: Snapshots and restore">#</a></h2>
+<p>Firecracker worker advertisements must use <code>https://</code>. The API/PostgreSQL registration path rejects plaintext Firecracker control endpoints, and the CLI rejects plaintext <code>--advertise-url</code> before launch. Terminate TLS with a private-network trust boundary or add native mTLS before treating bearer authentication alone as sufficient identity verification.
+Firecracker snapshot memory and VM-state files reference the disk path active when the snapshot was created. AIec stores a checksummed manifest and restores that compatible local disk path before loading state. Do not move snapshots between hosts or Firecracker versions until a supported block-path override is available and verified. S3 supplies durable artifact storage; reconcile completed object uploads whose database transaction failed before relying on automatic crash recovery.</p>
+<h2 id="network-policy">Network policy<a class="anchor" href="#network-policy" aria-label="Link to this section: Network policy">#</a></h2>
+<p>Disabled-network sandboxes have no NIC. Enabled-network sandboxes receive a per-VM TAP and nftables output rules blocking metadata, loopback, and RFC1918 destinations. Production operators must additionally verify host routing/NAT, DNS policy, domain allowlists, egress accounting, and cleanup after crashes. Never bridge these TAPs to the management network.</p>
+<h2 id="production-gate">Production gate<a class="anchor" href="#production-gate" aria-label="Link to this section: Production gate">#</a></h2>
+<p>The opt-in Firecracker runtime test passed locally with Firecracker v1.17.0, the approved uncompressed kernel, a freshly built rootfs, and the retained guest secret; it exercised exec, files, pause/resume, snapshot, destroy, and restore. Production multi-worker deployment and recovery remain blocked on this host because no TLS-terminated worker endpoints are available. Before strangers can execute code, complete live two-worker recovery, failure-injection convergence, rate limits and lifetime quotas, backups/alert rules, TLS/mTLS and secret rotation, vulnerability scanning, and an independent Firecracker/network security assessment.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--next" href="/docs/api/"><span class="docpager__dir">Next</span><span class="docpager__name">REST API</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#host-prerequisites">Host prerequisites</a></li><li class="doctoc__item doctoc__item--2"><a href="#guard-on-a-worker">Guard on a worker</a></li><li class="doctoc__item doctoc__item--2"><a href="#tls-certificates">TLS certificates</a></li><li class="doctoc__item doctoc__item--2"><a href="#postgresql-and-s3">PostgreSQL and S3</a></li><li class="doctoc__item doctoc__item--2"><a href="#api-server">API server</a></li><li class="doctoc__item doctoc__item--2"><a href="#firecracker-workers">Firecracker workers</a></li><li class="doctoc__item doctoc__item--3"><a href="#long-running-http-requests">Long-running HTTP requests</a></li><li class="doctoc__item doctoc__item--2"><a href="#host-pressure-and-reserves">Host pressure and reserves</a></li><li class="doctoc__item doctoc__item--3"><a href="#the-boot-re-checks-the-host">The boot re-checks the host</a></li><li class="doctoc__item doctoc__item--3"><a href="#failure-behaviour">Failure behaviour</a></li><li class="doctoc__item doctoc__item--3"><a href="#aggregate-admission-across-workers-on-one-host">Aggregate admission across workers on one host</a></li><li class="doctoc__item doctoc__item--3"><a href="#re-checking-immediately-before-vm-create">Re-checking immediately before VM create</a></li><li class="doctoc__item doctoc__item--2"><a href="#snapshots-and-restore">Snapshots and restore</a></li><li class="doctoc__item doctoc__item--2"><a href="#network-policy">Network policy</a></li><li class="doctoc__item doctoc__item--2"><a href="#production-gate">Production gate</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

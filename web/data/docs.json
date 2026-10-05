@@ -1,0 +1,131 @@
+{
+  "groups": [
+    {
+      "id": "start",
+      "title": "Start here",
+      "blurb": "Get a cluster running and drive your first sandbox through it."
+    },
+    {
+      "id": "understand",
+      "title": "How it works",
+      "blurb": "The design decisions behind the interface, and what they promise."
+    },
+    {
+      "id": "operate",
+      "title": "Operating it",
+      "blurb": "Governance, images, snapshots and the deployment you are responsible for."
+    },
+    {
+      "id": "build",
+      "title": "Build on it",
+      "blurb": "Extend Core, or bring a policy format you already run."
+    }
+  ],
+  "docs": [
+    {
+      "slug": "deployment",
+      "source": "docs/DEPLOYMENT.md",
+      "title": "Production deployment",
+      "summary": "Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards.",
+      "group": "start"
+    },
+    {
+      "slug": "api",
+      "source": "docs/API.md",
+      "title": "REST API",
+      "summary": "Every route, its status codes and its error body, base path /v1.",
+      "group": "start"
+    },
+    {
+      "slug": "mcp",
+      "source": "docs/MCP.md",
+      "title": "AIec Local MCP",
+      "summary": "The local MCP server: how an agent is given a disposable machine, and what it may do with one.",
+      "group": "start"
+    },
+    {
+      "slug": "architecture",
+      "source": "docs/ARCHITECTURE.md",
+      "title": "Production architecture",
+      "summary": "Where control plane, workers, storage and runtimes sit, and the failure each boundary contains.",
+      "group": "understand"
+    },
+    {
+      "slug": "design",
+      "source": "docs/DESIGN.md",
+      "title": "Design",
+      "summary": "Which mechanisms came from the DSec paper, which are independent engineering, and where AIec deliberately differs.",
+      "group": "understand"
+    },
+    {
+      "slug": "versioning",
+      "source": "docs/VERSIONING.md",
+      "title": "Versioning and compatibility",
+      "summary": "The six boundaries that version independently, and which changes to each are breaking.",
+      "group": "understand"
+    },
+    {
+      "slug": "guard",
+      "source": "docs/GUARD.md",
+      "title": "Guard operations",
+      "summary": "Running the policy broker: approvals, budgets, incidents, quarantine, and what an operator can see.",
+      "group": "operate"
+    },
+    {
+      "slug": "guard-policy",
+      "source": "docs/GUARD_POLICY.md",
+      "title": "Guard policy reference",
+      "summary": "The policy format field by field, the templates, and what the verifier will and will not accept.",
+      "group": "operate"
+    },
+    {
+      "slug": "guard-threat-model",
+      "source": "docs/GUARD_THREAT_MODEL.md",
+      "title": "Guard threat model",
+      "summary": "Who an untrusted agent is assumed to be, the attacks each control answers, and the ones left open.",
+      "group": "operate"
+    },
+    {
+      "slug": "images",
+      "source": "docs/IMAGES.md",
+      "title": "Images",
+      "summary": "Building, signing and materialising images, and the digest checks a guest must pass before it boots.",
+      "group": "operate"
+    },
+    {
+      "slug": "snapshots",
+      "source": "docs/SNAPSHOTS.md",
+      "title": "Snapshots",
+      "summary": "What a snapshot preserves, what it does not, and the restore and recovery paths.",
+      "group": "operate"
+    },
+    {
+      "slug": "firecracker-guest",
+      "source": "docs/FIRECRACKER_GUEST.md",
+      "title": "Firecracker guest image",
+      "summary": "Building the guest the Firecracker runtime boots, and the agent inside it that serves exec requests.",
+      "group": "operate"
+    },
+    {
+      "slug": "billing",
+      "source": "docs/BILLING.md",
+      "title": "Usage and billing foundation",
+      "summary": "The usage events the control plane emits, where quantities come from, and what production billing still needs.",
+      "group": "operate"
+    },
+    {
+      "slug": "extending",
+      "source": "docs/EXTENDING.md",
+      "title": "Extending AIec Core",
+      "summary": "Writing a backend or a scheduler behind the Core traits, and the dependency direction that keeps them honest.",
+      "group": "build"
+    },
+    {
+      "slug": "openshell",
+      "source": "docs/openshell-compatibility.md",
+      "title": "OpenShell policy compatibility",
+      "summary": "Importing an OpenShell policy into a Guard policy: what maps, what is refused, and what is left manual.",
+      "group": "build"
+    }
+  ]
+}

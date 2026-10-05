@@ -277,5 +277,6 @@ yet read the planted file.
 
 ## What to read next
 
-`docs/GUARD_POLICY.md` for the policy format and what each field means, and
-`docs/GUARD_THREAT_MODEL.md` for what is and is not defended.
+[`Guard policy reference`](GUARD_POLICY.md) for the policy format and what each
+field means, and [`Guard threat model`](GUARD_THREAT_MODEL.md) for what is and is
+not defended.

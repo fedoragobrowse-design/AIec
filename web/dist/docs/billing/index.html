@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage and billing foundation — AIec</title>
+<meta name="description" content="The usage events the control plane emits, where quantities come from, and what production billing still needs.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/billing/">
+<meta property="og:title" content="Usage and billing foundation — AIec">
+<meta property="og:description" content="The usage events the control plane emits, where quantities come from, and what production billing still needs.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/billing/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell docshell--wide">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/" aria-current="page">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="usage-and-billing-foundation">Usage and billing foundation</h1>
+<p class="docmeta"><span>1 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/BILLING.md" rel="noopener noreferrer">docs/BILLING.md</a></p>
+<p>Usage events are append-only facts: <code>tenant_id</code>, optional <code>sandbox_id</code>, metric, signed integer quantity, and server timestamp. The API aggregates by tenant. Core metrics are <code>sandbox_runtime_seconds</code>, <code>vcpu_seconds</code>, <code>memory_gb_seconds</code>, <code>disk_usage_bytes</code>, <code>snapshot_bytes</code>, <code>network_bytes</code> when observable, and <code>commands_executed</code>.</p>
+<p>Quantities must come from control-plane state transitions and runtime observations, not client-declared values. Corrections are compensating events, never edits. Production billing additionally needs immutable event export, currency/rate versioning, idempotency keys, reconciliation against worker telemetry, rounding rules, and an auditable invoice pipeline. No payment provider is integrated.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/firecracker-guest/"><span class="docpager__dir">Previous</span><span class="docpager__name">Firecracker guest image</span></a><a class="docpager__cell docpager__cell--next" href="/docs/extending/"><span class="docpager__dir">Next</span><span class="docpager__name">Extending AIec Core</span></a></nav>
+  </main>
+
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

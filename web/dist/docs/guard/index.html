@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guard operations — AIec</title>
+<meta name="description" content="Running the policy broker: approvals, budgets, incidents, quarantine, and what an operator can see.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/guard/">
+<meta property="og:title" content="Guard operations — AIec">
+<meta property="og:description" content="Running the policy broker: approvals, budgets, incidents, quarantine, and what an operator can see.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/guard/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/" aria-current="page">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="guard-operations">Guard operations</h1>
+<p class="docmeta"><span>9 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD.md" rel="noopener noreferrer">docs/GUARD.md</a></p>
+<p>Guard is optional per sandbox and on by default for Firecracker. This guide
+covers what an operator runs, what they observe, and what they must decide.</p>
+<h2 id="what-runs-and-where">What runs, and where<a class="anchor" href="#what-runs-and-where" aria-label="Link to this section: What runs, and where">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Component</th>
+<th scope="col">Where</th>
+<th scope="col">Runs as</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Guard packet rules (nftables)</td>
+<td>worker host, per attachment</td>
+<td>worker</td>
+</tr>
+<tr>
+<td>Guard gateway (DNS, model broker, credentials)</td>
+<td>worker host, per attachment</td>
+<td>worker</td>
+</tr>
+<tr>
+<td><code>aiec-guard-watchdog</code></td>
+<td>outside the guest, one per guarded sandbox</td>
+<td>operator service</td>
+</tr>
+<tr>
+<td>Budget, lifetime and incident state</td>
+<td>control plane database</td>
+<td>control plane</td>
+</tr>
+</tbody>
+</table></div>
+<p>Nothing in this list runs inside the guest, and nothing in it is reachable from
+the guest's network.</p>
+<h2 id="enabling-guard">Enabling Guard<a class="anchor" href="#enabling-guard" aria-label="Link to this section: Enabling Guard">#</a></h2>
+<p>Guard is attached by the sandbox's <code>guard</code> configuration:</p>
+<div class="code"><span class="code__lang">yaml</span><pre><code>resources:
+  guard:
+    topology: inside            # or `outside` for topology B
+    policy_template: model_only
+    model_endpoint:
+      host: api.model.example
+      port: 443
+      scheme: https
+      allowed_methods: [POST]
+      allowed_paths: [&quot;/v1/chat/completions&quot;]
+      credential: model-main
+    watchdog_timeout_ms: 10000  # 1000..60000; the dead-man deadline
+    max_model_requests: 10000   # immutable durable ceiling
+</code></pre></div>
+<p><code>no_network</code>, <code>model_only</code>, <code>model_plus_allowlist</code> and <code>read_only_api</code> are the
+built-in templates. An explicit <code>policy</code> replaces the template. Guard requires
+the Firecracker runtime and refuses a guarded sandbox on a weaker one by
+default. Setting <code>AIEC_ALLOW_REDUCED_ISOLATION=1</code> on the control plane accepts
+the weaker boundary deliberately; the creation response then carries an
+<code>x-aiec-isolation</code> header naming what was given up, so the downgrade is visible
+to whoever reads the sandbox rather than buried in a log.</p>
+<p>The guest receives <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code>, <code>ALL_PROXY</code> (both cases) and an
+empty <code>NO_PROXY</code>, plus an <code>AIEC_AGENT_API_KEY</code> placeholder. Nothing else in the
+guest's environment is needed for governance.</p>
+<h2 id="the-watchdog">The watchdog<a class="anchor" href="#the-watchdog" aria-label="Link to this section: The watchdog">#</a></h2>
+<p>One process per guarded sandbox, started outside the guest:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>aiec-guard-watchdog \
+  --control-plane https://api.internal:8443 \
+  --sandbox-id  &quot;$SANDBOX&quot; \
+  --tenant-id    &quot;$TENANT&quot; \
+  --policy-hash  &quot;$POLICY_HASH&quot; \
+  --token-file   /etc/aiec/guard-watchdog.token \
+  --config       /etc/aiec/guard-watchdog.json \
+  --control-plane-ca-cert /etc/aiec/tls/ca.crt
+</code></pre></div>
+<p>The token must carry <code>guard:<wbr>read</code>, <code>guard:<wbr>heartbeat</code> and <code>guard:<wbr>quarantine</code>, and
+nothing else. An ordinary tenant key will not do: it would be refused on the
+first poll and the dead-man switch would cut the sandbox.</p>
+<p>The watchdog polls authoritative telemetry, verifies the journal against its
+acknowledged head, and heartbeats only on an observation it could verify. It may
+request a quarantine; it can never approve a policy or release one.</p>
+<p><strong>Dead-man behaviour.</strong> An attachment starts deny-all. The first heartbeat
+installs its rules. If heartbeats stop for <code>watchdog_timeout_ms</code>, the gateway
+and the kernel rules cut the attachment and the cut latches. The guest is not
+destroyed: an operator may still pause it and take a forensic capture.</p>
+<h2 id="incident-reports-and-notification">Incident reports and notification<a class="anchor" href="#incident-reports-and-notification" aria-label="Link to this section: Incident reports and notification">#</a></h2>
+<p>A quarantine writes a Markdown report into the durable incident record and, if
+<code>AIEC_GUARD_WEBHOOK_URL</code> is set, posts a secret-free notification. The webhook
+receives the incident id, identity, rules, and stage timestamps; it does not
+receive reasons, destinations, evidence or the report body. Without a webhook
+the notifier is explicitly disabled, and a completed incident says so rather
+than claiming delivery.</p>
+<h2 id="budgets-and-lifetime">Budgets and lifetime<a class="anchor" href="#budgets-and-lifetime" aria-label="Link to this section: Budgets and lifetime">#</a></h2>
+<p>Model requests and bytes are reserved against the control plane before they are
+forwarded. Ceilings and expiry are immutable once written, so a worker restart
+cannot hand a machine a fresh allowance. A sandbox whose lifetime expires, or
+whose model budget is spent, is quarantined by the control-plane reaper rather
+than destroyed.</p>
+<h2 id="privileges">Privileges<a class="anchor" href="#privileges" aria-label="Link to this section: Privileges">#</a></h2>
+<p>A worker that installs Guard rules needs <code>CAP_NET_ADMIN</code> for nftables and TUN/TAP.
+A worker without it advertises <code>network_policy:<wbr> false</code> and refuses every
+governed placement - visibly, and correctly. This is worth checking before a
+deployment is declared protected:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code># `nft list tables` shows whether Guard's rules are installed on this host.
+# `aiec doctor` reports runtime prerequisites, not Guard state.
+nft list tables | grep aiec_guard
+</code></pre></div>
+<h2 id="approving-a-high-risk-call">Approving a high-risk call<a class="anchor" href="#approving-a-high-risk-call" aria-label="Link to this section: Approving a high-risk call">#</a></h2>
+<p>Guard refuses by default. A small number of calls are refused <em>pending a human
+decision</em>, and those go through a two-phase exchange so that the answer comes
+from a person rather than from the caller.</p>
+<p>The two phases are separate endpoints with separate scopes, on purpose. Asking
+needs only <code>SandboxesWrite</code>, because a harness must be able to ask; deciding
+needs <code>GuardApprove</code>, because deciding is an operator's act and not a caller's.</p>
+<div class="code"><pre><code>POST /v1/sandboxes/{id}/guard/approval              # ask, needs SandboxesWrite
+GET  /v1/sandboxes/{id}/guard/tool-approvals        # the operator's queue, needs GuardApprove
+POST /v1/sandboxes/{id}/guard/tool-approvals        # decide, needs GuardApprove
+</code></pre></div>
+<p>An ask carries the sandbox, the tool, and <code>digest</code> — a SHA-256 over the
+canonical JSON of that one call's arguments, hex encoded. The digest is what
+makes an approval an approval <em>of a call</em> rather than of a tool. An operator
+who permitted <code>write_file(&quot;/<wbr>etc/<wbr>rc&quot;,<wbr> A)</code> did not permit <code>write_file(&quot;/<wbr>etc/<wbr>rc&quot;,<wbr> B)</code>, and the request body has no field that could persuade the control plane
+otherwise. <code>digest</code> is required, and a request without one is refused.</p>
+<p>Asking returns a refusal, never a wait: the caller is told <code>approved:<wbr> false</code>,
+and the request is recorded as <code>pending</code>. Nothing polls.</p>
+<p>Deciding takes the <code>request_id</code> from the queue and a <code>decision</code> of <code>granted</code> or
+<code>denied</code>. The recorded requester comes from the authenticated principal, never
+from the body, so a caller cannot nominate who decides for it.</p>
+<p>Three properties are enforced in the database, beneath the API:</p>
+<ul>
+<li><strong>Self-approval is refused.</strong> A key holding both <code>SandboxesWrite</code> and
+<code>GuardApprove</code>, or <code>Admin</code>, still cannot decide its own request. This is a
+constraint on <code>requested_by_key_id</code>, not on scope names, because one
+principal can hold both scopes. The API returns one <code>409</code> for unknown,
+already-decided and self-approval alike, so probing for authority reveals
+nothing.</li>
+<li><strong>A grant is spent once.</strong> Spending is a single conditional <code>UPDATE</code> that
+requires the row to be unconsumed, granted, unexpired and written by this
+requester. Two concurrent spends cannot both match the same row.</li>
+<li><strong>A grant belongs to the key that asked.</strong> Another key in the same tenant
+holding <code>SandboxesWrite</code> cannot spend an approval a different harness
+requested.</li>
+</ul>
+<p>The digest is defined once, in <code>aiec_core::<wbr>approval_request_digest</code>: the tool
+name, a NUL byte, and the canonical JSON of the arguments, SHA-256'd and hex
+encoded. A pinned test holds the expected value for a fixed call, because the
+acceptance suite implements the same rule in Python and is only meaningful as
+an independent check if the two cannot drift apart silently. The separator is
+spelled out because getting it wrong is not a loud failure — a client that
+guessed a newline would present a digest no call ever matches, and its grant
+would simply never be spendable.</p>
+<p>The queue is readable only with <code>GuardApprove</code>. It has to be: an operator
+cannot decide what they cannot see, and without it <code>request_id</code> would only be
+discoverable by reading the table directly.</p>
+<h3 id="what-has-actually-been-run">What has actually been run<a class="anchor" href="#what-has-actually-been-run" aria-label="Link to this section: What has actually been run">#</a></h3>
+<p><code>benchmarks/<wbr>guard-approval-acceptance.json</code> — 10 cases, all passing, no
+cleanup errors, against the release binaries over HTTPS with PostgreSQL as the
+store. The suite runs the control plane and a worker on a database of its own
+and drives the flow over HTTP only; no case reads the table to decide whether
+it passed, because &quot;the row says so&quot; is a weaker claim than &quot;the next call was
+allowed and the one after it was refused&quot;.</p>
+<p>It mints its keys per run, so the scope and identity properties are tested
+against the narrowest keys that can play each part: a harness holding only
+<code>SandboxesWrite</code>, an operator holding only <code>GuardApprove</code>, and one holding
+every scope. Three properties are worth recording, because each is a way the
+suite would otherwise have passed for the wrong reason.</p>
+<ul>
+<li>The self-approval case asserts that the decider's key id <strong>equals the
+requester's recorded key id</strong>, read back from the account API rather than
+assumed from the mint. Approving another key's request is an operator's job,
+not a self-approval; a test that reused another harness's request would pass
+with the constraint removed.</li>
+<li>The all-scopes key is refused <code>409</code> on a request it raised itself, and
+refused <code>403</code> by the narrow key before reaching the approval check at all.
+Two different refusals, and conflating them would hide which one is doing
+the work.</li>
+<li>Replay and changed-content are separate cases. An approval that survived a
+replay, or that covered a changed payload, would each pass while looking
+like a successful grant.</li>
+</ul>
+<p>Underneath, <code>crates/<wbr>aiec-storage/<wbr>src/<wbr>postgres/<wbr>guard/<wbr>approvals.rs</code> runs eleven
+cases against a real PostgreSQL, two of which write directly to the table so
+the only thing that can refuse them is the migration's own trigger: a
+self-approval, and a requester rewritten after the fact.</p>
+<p>Tools not classified as safe are refused until somebody classifies them. The
+allowlist is small and explicit (<code>sandbox.get</code>, <code>sandbox.read_file</code>,
+<code>sandbox.list_files</code>, <code>sandbox.list_owned</code>, <code>secret.list</code>, <code>snapshot.list</code>), so
+a tool added tomorrow fails closed rather than open.</p>
+<p>The MCP server opts into this with <code>AIEC_MCP_APPROVAL_REQUIRED=1</code>. It is off by
+default because switching it on denies destructive tools to every existing MCP
+client at once. Once enabled it fails closed: an unreachable control plane is a
+refusal, and the refusal distinguishes an unanswered request (<code>unreachable:<wbr> true</code>) from an explicit denial so an operator can tell the two apart.</p>
+<h2 id="hardware">Hardware<a class="anchor" href="#hardware" aria-label="Link to this section: Hardware">#</a></h2>
+<p>The gate compiles the whole workspace for <code>aarch64-unknown-linux-gnu</code> as well
+as the host architecture, so an x86_64 build cannot hide an aarch64-only type
+error. That check found one: a <code>gethostname</code> buffer typed <code>i8</code>, which is
+correct on x86_64 and wrong on aarch64, where <code>c_char</code> is <code>u8</code>. It is now
+typed as <code>c_char</code> and the workspace cross-checks clean.</p>
+<p><strong>What this is and is not.</strong> It is a compile check of every target, including
+tests and examples. It is not a run: no aarch64 machine, emulator or
+Firecracker-on-aarch64 run is part of the evidence, and no performance number
+here was taken on aarch64. The guest image build is a separate matter and
+still has only been produced for x86_64; <code>scripts/<wbr>build-firecracker-guest.sh</code>
+builds whatever host it runs on and has not been run on aarch64.</p>
+<p>The cross-check needs a C toolchain for the target, which the host does not
+have and cannot install without root, so it runs in
+<code>ghcr.io/<wbr>cross-rs/<wbr>aarch64-unknown-linux-gnu</code>. Where Docker is unavailable the
+step reports <code>SKIPPED</code> rather than <code>ok</code>; <code>AIEC_SKIP_CROSS=1</code> skips it
+deliberately.</p>
+<h2 id="deployment-modes">Deployment modes<a class="anchor" href="#deployment-modes" aria-label="Link to this section: Deployment modes">#</a></h2>
+<ul>
+<li><strong>Worker-host hardened process</strong> (default). The gateway and the rules live on
+the worker. A root attacker on that host defeats the boundary.</li>
+<li><strong>Separate gateway VM.</strong> The gateway runs on its own machine. Worker
+compromise no longer reaches the credential, at the cost of a network hop and
+an extra hardened host.</li>
+<li><strong>Separate physical gateway.</strong> The same, with a small dedicated appliance.
+Higher operational cost, narrower blast radius.</li>
+</ul>
+<p>The modes are not equivalent and are not claimed to be.</p>
+<p><strong>Only the first is implemented.</strong> The worker allocates the gateway's <code>/<wbr>30</code>
+from its own host address space and runs the gateway in-process on that
+address, so there is no setting that points a guest's gateway at another
+machine. Modes B and C are the deployment shapes this design supports and the
+trust properties they would change; neither has a code path or has been
+validated. Treat them as design intent, not as a feature.</p>
+<h2 id="operating-checks">Operating checks<a class="anchor" href="#operating-checks" aria-label="Link to this section: Operating checks">#</a></h2>
+<div class="code"><span class="code__lang">bash</span><pre><code>aiec guard show &lt;sandbox&gt;          # policy hash, attachment, budgets, incident
+aiec guard events &lt;sandbox&gt;        # verified journal entries
+aiec guard quarantine &lt;sandbox&gt;    # operator-initiated quarantine
+aiec guard release &lt;sandbox&gt;       # operator release of a held sandbox
+aiec guard proposals               # pending policy proposals
+aiec guard proposal approve &lt;id&gt;   # human only; runs the verifier first
+aiec guard proposal deny &lt;id&gt;
+aiec guard verify &lt;policy&gt;         # compile and verify without applying
+aiec guard import-openshell &lt;file&gt;
+</code></pre></div>
+<h2 id="guest-images-and-per-sandbox-identities">Guest images and per-sandbox identities<a class="anchor" href="#guest-images-and-per-sandbox-identities" aria-label="Link to this section: Guest images and per-sandbox identities">#</a></h2>
+<p>A guarded sandbox authenticates its control channel with a per-sandbox identity
+that the worker issues when the machine is created and plants in the sandbox's
+own disk. The guest reads it from <code>/<wbr>etc/<wbr>aiec-guest-secret</code>; an image built
+before that file existed falls back to the build-time <code>AIEC_GUEST_SECRET</code>.</p>
+<p>The two sides must agree. A guest image that predates the planted identity will
+authenticate with the shared build-time secret while the host uses the
+per-sandbox one, and the machine will fail to boot with an unexplained
+handshake error. <strong>Rebuild the guest image after this change</strong> (<code>scripts/<wbr>build-firecracker-guest.sh</code>);
+<code>benchmarks/<wbr>guard-core-acceptance.json</code> was produced against images that do not
+yet read the planted file.</p>
+<h2 id="what-to-read-next">What to read next<a class="anchor" href="#what-to-read-next" aria-label="Link to this section: What to read next">#</a></h2>
+<p><a href="/docs/guard-policy/"><code>Guard policy reference</code></a> for the policy format and what each
+field means, and <a href="/docs/guard-threat-model/"><code>Guard threat model</code></a> for what is and is
+not defended.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/versioning/"><span class="docpager__dir">Previous</span><span class="docpager__name">Versioning and compatibility</span></a><a class="docpager__cell docpager__cell--next" href="/docs/guard-policy/"><span class="docpager__dir">Next</span><span class="docpager__name">Guard policy reference</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#what-runs-and-where">What runs, and where</a></li><li class="doctoc__item doctoc__item--2"><a href="#enabling-guard">Enabling Guard</a></li><li class="doctoc__item doctoc__item--2"><a href="#the-watchdog">The watchdog</a></li><li class="doctoc__item doctoc__item--2"><a href="#incident-reports-and-notification">Incident reports and notification</a></li><li class="doctoc__item doctoc__item--2"><a href="#budgets-and-lifetime">Budgets and lifetime</a></li><li class="doctoc__item doctoc__item--2"><a href="#privileges">Privileges</a></li><li class="doctoc__item doctoc__item--2"><a href="#approving-a-high-risk-call">Approving a high-risk call</a></li><li class="doctoc__item doctoc__item--3"><a href="#what-has-actually-been-run">What has actually been run</a></li><li class="doctoc__item doctoc__item--2"><a href="#hardware">Hardware</a></li><li class="doctoc__item doctoc__item--2"><a href="#deployment-modes">Deployment modes</a></li><li class="doctoc__item doctoc__item--2"><a href="#operating-checks">Operating checks</a></li><li class="doctoc__item doctoc__item--2"><a href="#guest-images-and-per-sandbox-identities">Guest images and per-sandbox identities</a></li><li class="doctoc__item doctoc__item--2"><a href="#what-to-read-next">What to read next</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

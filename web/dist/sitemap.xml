@@ -11,4 +11,19 @@
   <url><loc>https://aiec.gobrowse.dev/limitations</loc></url>
   <url><loc>https://aiec.gobrowse.dev/roadmap</loc></url>
   <url><loc>https://aiec.gobrowse.dev/contributing</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/deployment/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/api/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/mcp/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/architecture/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/design/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/versioning/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/guard/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/guard-policy/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/guard-threat-model/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/images/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/snapshots/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/firecracker-guest/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/billing/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/extending/</loc></url>
+  <url><loc>https://aiec.gobrowse.dev/docs/openshell/</loc></url>
 </urlset>

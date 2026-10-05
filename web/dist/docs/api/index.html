@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REST API — AIec</title>
+<meta name="description" content="Every route, its status codes and its error body, base path /v1.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/api/">
+<meta property="og:title" content="REST API — AIec">
+<meta property="og:description" content="Every route, its status codes and its error body, base path /v1.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/api/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/" aria-current="page">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="rest-api">REST API</h1>
+<p class="docmeta"><span>13 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/API.md" rel="noopener noreferrer">docs/API.md</a></p>
+<p>Base path <code>/<wbr>v1</code>. Except health/metrics, send <code>Authorization:<wbr> Bearer af_live_...</code>. JSON uses <code>snake_case</code>; errors are <code>{&quot;error&quot;:<wbr>{&quot;code&quot;:<wbr>&quot;...&quot;,<wbr>&quot;message&quot;:<wbr>&quot;...&quot;,<wbr>&quot;request_id&quot;:<wbr>&quot;...&quot;}}</code>. Every response includes <code>x-operation-id</code>; clients may supply a UUID in that header, otherwise the server generates one. This correlation header is not yet propagated into structured logs.</p>
+<h2 id="sandboxes">Sandboxes<a class="anchor" href="#sandboxes" aria-label="Link to this section: Sandboxes">#</a></h2>
+<ul>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes</code> — create. Body: <code>image</code>, <code>cpu</code>, <code>memory_mb</code>, <code>disk_mb</code>, <code>timeout_seconds</code>, <code>network.enabled</code>.
+<code>environment.workspace</code> accepts <code>{&quot;type&quot;:<wbr>&quot;empty&quot;}</code> or <code>{&quot;type&quot;:<wbr>&quot;git&quot;,<wbr>&quot;repo&quot;:<wbr>&quot;https://...&quot;,<wbr>&quot;reference&quot;:<wbr>&quot;main&quot;,<wbr>&quot;shallow&quot;:<wbr>true}</code>. Repository credentials in URLs are rejected. <code>environment.toolkits</code> is a bounded list of named <code>setup_commands</code> argv arrays.
+<code>environment.guard</code> selects an out-of-guest policy, with the same shape as <code>resources.guard</code> below. It replaces <code>network.enabled</code> rather than accompanying it. A Firecracker request with no <code>environment.guard</code> gets the default no-network policy; a request that asks for <code>network.enabled</code> without selecting a policy is refused unless the operator has set <code>AIEC_ALLOW_LEGACY_NETWORK=1</code>. Model credentials are configured on the worker and never travel in this document; the guest receives <code>placeholder://&lt;binding&gt;</code> instead.</p>
+</li>
+<li><p><code>GET /<wbr>v1/<wbr>sandboxes</code> — one bounded page of the tenant's sandbox history, newest first: <code>limit</code> (default 50, store-clamped to 200) and the optional <code>after_created_at</code> + <code>after_id</code> cursor, which must be given together. It returns <code>{sandboxes,<wbr> next}</code>, ordered <code>created_at DESC,<wbr> id DESC</code>; <code>next</code> is the cursor for the following page and is <code>null</code> exactly on the last one, so a page says whether it truncated rather than looking complete. A destroyed sandbox stays in the history — teardown is a state transition, not a delete — so this is the tenant's whole history and it grows with tenure. Exposed as <code>client.list_all_sandboxes(...)</code> and <code>client.list_sandboxes_after(...)</code> in the Rust client, and as <code>sandboxes.list_all()</code> and <code>sandboxes.list_after(...)</code> in the Python SDK.</p>
+</li>
+<li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}</code> — tenant-scoped detail.</p>
+</li>
+<li><p><code>DELETE /<wbr>v1/<wbr>sandboxes/<wbr>{id}</code> — destroy.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>start|<wbr>pause|<wbr>stop|<wbr>resume</code> — explicit lifecycle operations. <code>pause</code> is supported by Firecracker PATCH semantics; development Bubblewrap returns <code>501</code>.
+Rust SDK: <code>AIecClient::<wbr>pause(id)</code> (crate <code>aiec-client</code>) / <code>resume(id)</code>; Python SDK: <code>Sandbox.pause()</code> / <code>Sandbox.resume()</code>.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>git/<wbr>diff</code> — return bounded <code>git diff --binary</code> for a running Git workspace.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>exec</code> — body <code>command</code> argv, <code>working_directory</code>, <code>environment</code>, <code>timeout_seconds</code>, <code>stdin</code>. Returns exit code, bounded stdout/stderr, duration, timeout flag.</p>
+</li>
+<li><p><code>PUT /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files</code> — body <code>path</code>, <code>content_base64</code>, optional <code>mode</code>.</p>
+</li>
+<li><p><code>PUT|<wbr>DELETE /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>secrets/<wbr>{name}</code> and <code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>secrets</code> manage one-hour, per-sandbox process environment secrets. Values are never returned by metadata endpoints.</p>
+</li>
+<li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files?path=/<wbr>workspace</code> — list.</p>
+</li>
+<li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files/<wbr>content?path=/<wbr>workspace/<wbr>x</code> — download.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files/<wbr>mkdir</code> — create directory.</p>
+</li>
+<li><p><code>DELETE /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files</code> with JSON <code>{path}</code> — delete file.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>snapshots</code>, <code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>snapshots</code>.</p>
+</li>
+<li><p><code>POST /<wbr>v1/<wbr>snapshots/<wbr>{id}/<wbr>restore</code> — creates a new sandbox and returns it.</p>
+</li>
+<li><p><code>DELETE /<wbr>v1/<wbr>snapshots/<wbr>{id}</code>.</p>
+</li>
+<li><p><code>POST|<wbr>GET|<wbr>DELETE /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>artifacts/<wbr>{name}</code> provides tenant-scoped upload/download/delete with a 64 MiB decoded-size limit. <code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>artifacts</code> lists sorted object metadata for the development filesystem backend. The production S3 backend returns a typed <code>501</code> for listing until ListObjectsV2 support is implemented and verified.</p>
+<p>The listing is bounded by <code>MAX_LISTED_OBJECTS</code> (1000) objects under the sandbox's prefix, and is <strong>refused with <code>413 limit_exceeded</code></strong> past that rather than truncated — a shorter list would be indistinguishable from a complete one. The bound is on the walk rather than on uploads: <code>PUT</code> of distinct names is uncapped, so a sandbox can hold more than one listing will describe. On the filesystem backend the listing also computes each object's size and SHA-256 by reading it, so its cost is the bytes of the prefix, not just its directory entries; the bound exists to keep that proportional to the platform rather than to tenant storage.</p>
+</li>
+<li><p><code>GET /<wbr>v1/<wbr>usage</code> — metric totals for current tenant.</p>
+</li>
+</ul>
+<p>The Python SDK exposes the same size-guarded partial path as <code>Sandbox.upload_artifact</code>, <code>download_artifact</code>, and <code>delete_artifact</code>; listing remains unsupported, and the production S3 path remains unverified.</p>
+<h2 id="runs">Runs<a class="anchor" href="#runs" aria-label="Link to this section: Runs">#</a></h2>
+<ul>
+<li><p><code>POST /<wbr>v1/<wbr>runs</code> — create and drive a run to a terminal state, returning the settled run. Body: <code>workload</code> (<code>image</code>, <code>command</code>, <code>setup</code>, <code>validations</code>, <code>artifacts</code>, <code>environment</code>, <code>secrets</code>, <code>timeout_seconds</code>, <code>git_evidence</code>, <code>repo</code>), <code>resources</code>, <code>requirements</code>, <code>retention</code>, <code>max_attempts</code>, <code>idempotency_key</code>, <code>requested_runtime</code>, <code>retained_seconds</code>. The handler is synchronous on purpose: it places a machine, runs the work, collects artifacts and reclaims the machine before answering, so the response is the record of what happened.</p>
+<p>High-risk tool calls are approved in two phases by different principals.
+<code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>guard/<wbr>approval</code> (scope <code>SandboxesWrite</code>) asks about
+one call and always answers immediately with <code>approved:<wbr> false</code> when nothing has
+decided it, recording the request as <code>pending</code>. <code>GET</code> and <code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>guard/<wbr>tool-approvals</code> (scope <code>GuardApprove</code>) are the
+operator's queue and the decision itself. The ask carries <code>digest</code>, a SHA-256
+over the canonical JSON of the call's arguments; it is required, because an
+approval that is not bound to one call is a capability rather than an approval.
+A grant is spendable once, only for the digest it was made for, and only by the
+key that asked. Self-approval is refused however much authority the key holds.
+See <a href="/docs/guard/#approving-a-high-risk-call">GUARD.md</a>.</p>
+</li>
+</ul>
+<p>Both Guard history listings are paged the same way, for the same reason. A
+proposal row is never reclaimed, and a decided tool approval is deliberately
+retained, so a sandbox left running grows both without bound. <code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>guard/<wbr>proposals</code> (scope <code>GuardRead</code>) and <code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>guard/<wbr>tool-approvals</code> (scope <code>GuardApprove</code>) take the same
+<code>limit</code> (default 50, store-clamped to 200) and the same paired
+<code>after_created_at</code> + <code>after_id</code> cursor, and return <code>{proposals,<wbr> next}</code> and
+<code>{approvals,<wbr> next}</code> respectively, ordered <code>created_at DESC,<wbr> id DESC</code>, with
+<code>next</code> non-null exactly when another page follows. The id half of the cursor is
+not decoration: <code>created_at</code> is not unique, and a keyset that cannot break a
+tie either re-reads or skips the rows sharing a timestamp.</p>
+<p><code>resources.guard</code> selects an out-of-guest policy: either
+<code>{&quot;policy_template&quot;:<wbr> &quot;no-network&quot; |<wbr> &quot;model-only&quot; |<wbr> &quot;model-plus-allowlist&quot; |<wbr> &quot;read-only-api&quot;}</code>
+with optional <code>model_endpoint</code> and <code>allowlist</code> inputs, or a full
+<code>{&quot;policy&quot;:<wbr> {...}}</code> document. It replaces <code>resources.network</code> rather than
+accompanying it — two descriptions of one egress would be two paths to the
+internet — and it is enforced by the worker's Guard gateway, not by the
+guest. A guarded run is placed on a microVM runtime; there is no weaker
+fallback. Model credentials are configured on the worker and never travel in
+this document; the guest receives a <code>placeholder://&lt;binding&gt;</code> instead. See
+<code>GUARD_POLICY.md</code>.</p>
+<ul>
+<li><code>GET /<wbr>v1/<wbr>runs</code> — a tenant-scoped bare array, filtered by optional <code>state</code>, ordered by <code>(requested_at DESC,<wbr> id DESC)</code>. <code>limit</code> defaults to 50 and is clamped to 1–200. For the next page, pass the last returned run's <code>requested_at</code> and <code>id</code> as <code>after_requested_at</code> + <code>after_id</code>; both must be given together or the route returns HTTP 400. The cursor is exclusive. Keep the same state filter and continue until a short or empty page; an exactly full final page requires one additional empty request because this compatible array shape has no <code>next</code> field.
+Consumers expose the same one-page cursor: Rust
+<code>AIecClient::<wbr>list_runs(state,<wbr> limit,<wbr> Option&lt;MatrixCursor&gt;)</code>; Python
+<code>client.runs.list(state,<wbr> limit,<wbr> after_requested_at=...,<wbr> after_id=...)</code>;
+CLI <code>aiec run list --after-requested-at TIMESTAMP --after-id RUN_ID</code>.
+Python's cursor fields are keyword-only; existing positional state/limit
+calls remain valid. Python and CLI refuse half cursors before sending.</li>
+<li><code>GET /<wbr>v1/<wbr>runs/<wbr>{id}</code> — tenant-scoped detail.</li>
+<li><code>GET /<wbr>v1/<wbr>runs/<wbr>{id}/<wbr>events</code>, <code>GET /<wbr>v1/<wbr>runs/<wbr>{id}/<wbr>attempts</code> — the run's history and its attempts.</li>
+<li><code>POST /<wbr>v1/<wbr>runs/<wbr>{id}/<wbr>cancel</code> — stop a run and reclaim its machine. Cancelling a finished run returns it unchanged.</li>
+<li><code>POST /<wbr>v1/<wbr>eval/<wbr>batch</code>, <code>POST /<wbr>v1/<wbr>eval/<wbr>repetitions</code>, <code>POST /<wbr>v1/<wbr>eval/<wbr>matrix</code> — bounded parallel evaluation. <code>batch</code> takes <code>{requests,<wbr> options}</code> and returns <code>Vec&lt;Run&gt;</code>; <code>repetitions</code> takes <code>{request,<wbr> repetitions,<wbr> options}</code> and returns <code>Vec&lt;Run&gt;</code>; <code>matrix</code> takes <code>{cells:<wbr> [{axis,<wbr> request}],<wbr> options}</code> and returns <code>{matrix_id,<wbr> requested_at,<wbr> max_parallel,<wbr> results:<wbr> [{axis,<wbr> run?,<wbr> error?}]}</code>. Every submitted cell appears in <code>results</code>: a cell that was refused before it ran comes back with its <code>axis</code> and an <code>error</code> and no <code>run</code>, beside the cells that did run, so a partial failure never hides the runs that were executed and billed — and never costs the caller the <code>matrix_id</code> that is the only way to find them. A matrix must also be keyed throughout or not at all; a partly-keyed matrix is <code>400</code> before anything is admitted, because keyed cells keep their keys across a retry and unkeyed cells do not, and the clash between those two is only visible after the batch has been spent. <code>repetitions</code> must be at least 1 and <code>max_parallel</code> is bounded; every evaluation route needs the sandbox write scope. The Python SDK exposes these as <code>af.evals.batch(...)</code>, <code>.repetitions(...)</code> and <code>.matrix(...)</code>, and expands a suite document into the <code>matrix</code> request with <code>af.evals.run_suite(...)</code> and <code>.compare(...)</code>; <code>af.evals.compare</code> reports both revisions' outcomes and picks no winner.
+<code>GET /<wbr>v1/<wbr>eval/<wbr>matrix/<wbr>{matrix_id}</code> reads one bounded page back, for a caller that lost the submission response: <code>limit</code> (default 50, store-clamped) and the optional <code>after_requested_at</code> + <code>after_id</code> cursor, which must be given together. It returns <code>{matrix_id,<wbr> cells:<wbr> [{run,<wbr> index,<wbr> axis}],<wbr> successes,<wbr> by_axis,<wbr> next}</code>. <code>successes</code> and <code>by_axis</code> describe <strong>that page only</strong>, and <code>next</code> is the cursor for the following one; <code>cells</code> keep the labels the cell was submitted under, which are stored on the run at admission. <code>GET</code> needs the sandbox read scope and is tenant-scoped, so another tenant's matrix is a <code>404</code>, not an empty page. Exposed as <code>af.evals.matrix_page(...)</code> and <code>client.eval_matrix_page(...)</code>.
+A run's stored evidence is bounded: <code>setup</code> and <code>validations</code> accept at most 32 commands each, and the previews kept in the run row are clipped (task 128 KiB, setup and validations 32 KiB each, git evidence 64 KiB), keeping the head and the tail. <code>results.task.output_preview_truncated</code> and <code>results.git_evidence_truncated</code> say so explicitly and are distinct from <code>truncated</code> and from <code>ok</code>: a command that ran to completion and exited zero is a pass whether or not its output fitted. Full output is collected as a Run artifact when the workload asks for it. Captured stdout, stderr and git evidence are scrubbed of any resolved <code>workload.secrets</code> values before being stored.
+<code>results.phase_ms</code> decomposes a run. <code>placement</code> is the whole of getting a
+machine, and <code>placement.scheduler</code>, <code>placement.allocation</code>, <code>placement.boot</code>
+and <code>placement.workspace</code> are its parts: reservation, runtime
+<code>create</code>, runtime <code>start</code> (for Firecracker, rootfs materialization plus VM
+boot), and workspace preparation (clone or cache import) respectively. A
+dotted name is a subset of its top-level phase, so a tool that adds up
+unaccounted client wait must exclude them rather than count the same interval
+twice. <code>attempts</code> is the only entry in that map that is a count rather than a
+duration.</li>
+</ul>
+<p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>snapshots</code> (scope <code>SnapshotsRead</code>) is paged the same way
+and returns <code>{snapshots,<wbr> next}</code>. Snapshots are retained until one is deleted
+and nothing prunes them automatically, so a sandbox that is snapshotted
+repeatedly grows that list for as long as it lives. It was the third listing
+with the same missing index tie-breaker, after the sandbox list and the two
+Guard histories, which is what suggests the shape is now shared deliberately
+rather than reproduced.</p>
+<h3 id="run-queue">Run queue<a class="anchor" href="#run-queue" aria-label="Link to this section: Run queue">#</a></h3>
+<p>Every <code>POST /<wbr>v1/<wbr>runs</code> (and matrix/evaluation submission) is admitted to the durable
+run queue first and the handler still answers with the settled run, so the response
+is unchanged for existing clients. Admission and idempotency are resolved in one
+transaction; a full queue is <code>429 quota exceeded</code>, and a reused
+<code>idempotency_key</code> returns the original run without a second execution. The HTTP
+connection is not part of run ownership: dropping it stops the waiting, not the
+work, and execution continues against the durable run. Limits default to 4
+concurrent runs cluster-wide (<code>AIEC_RUN_QUEUE_MAX_ACTIVE</code>), 1024 pending runs
+cluster-wide (<code>AIEC_RUN_QUEUE_GLOBAL_PENDING</code>), 128 per tenant
+(<code>AIEC_RUN_QUEUE_TENANT_PENDING</code>), a 300 s queue deadline
+(<code>AIEC_RUN_QUEUE_TIMEOUT_SECONDS</code>) and a 30 s renewable executor lease
+(<code>AIEC_RUN_QUEUE_LEASE_SECONDS</code>). A run that cannot start before its queue
+deadline settles <code>failed</code> with <code>Run queue deadline exceeded</code>, and any run whose
+executor loses ownership is failed and reclaimed by recovery, never restarted.</p>
+<p>A handler waits for the run to settle <strong>and</strong> for its queue row to reach
+<code>finished</code>, so the response carries the persisted cleanup evidence. That second
+wait is bounded at 30 s: a teardown that keeps failing repopulates
+<code>results.cleanup_failed</code>, which is exactly what keeps the queue row out of
+<code>finished</code>, so an unbounded wait would never return. When the bound expires the
+run is returned as it stands — outcome known, <code>results.cleanup_failed</code> saying
+that teardown is still outstanding — rather than holding the connection open
+with no run, no id and no error.</p>
+<h3 id="run-secrets">Run secrets<a class="anchor" href="#run-secrets" aria-label="Link to this section: Run secrets">#</a></h3>
+<p><code>workload.secrets</code> is a list of secret <strong>names</strong>, not values. Names are stored
+with the run; values are resolved from the operator-configured tenant secret
+store (<code>AIEC_RUN_SECRETS_DIR</code>) immediately before each command is executed and
+are injected through the command's <code>environment</code>. They are never returned,
+persisted, logged or written to a snapshot — see the deployment format in
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/SECURITY.md#secrets" rel="noopener noreferrer">SECURITY.md</a>.</p>
+<ul>
+<li>A run with no <code>secrets</code> needs no store and works unchanged.</li>
+<li>A requested name the tenant has no value for fails the run before a machine
+is placed, naming the reference (<code>404</code>/<code>not_found</code>). No placeholder and no
+empty value is ever substituted.</li>
+<li>A name that is not a valid environment variable (uppercase ASCII, digits and
+underscores, up to 64 characters) is rejected the same way.</li>
+<li>A name present in both <code>workload.environment</code> and <code>workload.secrets</code> is
+rejected, so a literal in the run document cannot silently shadow a secret.</li>
+<li>Names appear in <code>workload.secrets</code> on <code>GET /<wbr>v1/<wbr>runs/<wbr>{id}</code>. <strong>There is no
+endpoint that returns a run secret's value.</strong></li>
+<li>Captured command output is scrubbed of resolved values before it is stored,
+bounded to 8 KiB per stream; error text is scrubbed while keeping its error
+type.</li>
+</ul>
+<h3 id="run-artifacts">Run artifacts<a class="anchor" href="#run-artifacts" aria-label="Link to this section: Run artifacts">#</a></h3>
+<p><code>workload.artifacts</code> names paths inside the sandbox — <code>/<wbr>workspace/<wbr>report.txt</code> — collected once the task is done. They are collected into object storage under a server-generated key derived from a digest of the name, so a caller's path never becomes a key and a re-collection overwrites rather than duplicates.</p>
+<p>Collection is streamed in binary 64 KiB chunks from the runtime (sandbox → worker → control plane → object store), and the object store writes them incrementally, so no stage holds the whole file or a base64 copy of it in memory. Every chunk read is authorized against the sandbox's active lease generation, and each read revalidates the file's identity (device/inode/size/mtime), so an artifact is never a concatenation of two file generations. A file over the 16 MiB per-file limit is refused and fails the run.</p>
+<ul>
+<li><code>GET /<wbr>v1/<wbr>runs/<wbr>{id}/<wbr>artifacts</code> — every collected artifact, each with its recorded <code>name</code> (the path as it appeared in the sandbox), <code>object_key</code>, <code>size_bytes</code>, <code>checksum_sha256</code>, <code>content_type</code> and a <code>download_url</code>.</li>
+<li><code>GET /<wbr>v1/<wbr>runs/<wbr>{id}/<wbr>artifacts/<wbr>{name}</code> — the bytes, streamed. The object is read under the checksum recorded at collection and the whole body is verified before the response starts, so a corrupted or overwritten object is refused rather than served; a caller never receives bytes whose digest does not match what was recorded.</li>
+</ul>
+<p>The stored object is the file's own bytes: <code>size_bytes</code> and <code>checksum_sha256</code> describe the file. The public sandbox artifact API (<code>/<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>artifacts/<wbr>{name}</code>) still answers in the same JSON shape with <code>content_base64</code>, but it too encodes from the bounded verified stream. <code>download_url</code> percent-encodes the name, so an absolute or nested name round-trips exactly; a hand-written path still has to name an artifact this run collected, and cross-tenant reads are <code>404</code>.</p>
+<p>Collection failures fail the run rather than returning a shorter list than was asked for. A requested artifact that cannot be read, exceeds the limit, changes while it is being read, or cannot be stored sets <code>failure_reason</code> naming the artifact, and the run settles <code>failed</code>. Artifacts collected before the failure are still recorded and downloadable, because a failed run is the one whose evidence somebody opens.</p>
+<p>Operational endpoints: <code>/<wbr>health</code>, <code>/<wbr>ready</code>, <code>/<wbr>metrics</code>.</p>
+<h3 id="api-keys">API keys<a class="anchor" href="#api-keys" aria-label="Link to this section: API keys">#</a></h3>
+<p>Three routes, and only three: <code>GET /<wbr>v1/<wbr>keys</code> lists the caller's own tenant's
+keys; <code>POST /<wbr>v1/<wbr>keys</code> mints one; <code>DELETE /<wbr>v1/<wbr>keys/<wbr>{id}</code> revokes one. There is no
+rotate route and there is no <code>POST /<wbr>v1/<wbr>keys/<wbr>{id}/<wbr>revoke</code> — revocation is the
+<code>DELETE</code> verb on the key itself.</p>
+<p>Key management is the one place where <strong>omitting a field grants authority</strong>, so
+it is worth being explicit. <code>POST /<wbr>v1/<wbr>keys</code> with no <code>scopes</code> is a request for
+the default set — <code>sandboxes:<wbr>read</code>, <code>sandboxes:<wbr>write</code>, <code>snapshots:<wbr>read</code>,
+<code>snapshots:<wbr>write</code> — and that is a grant, not a shortcut. Every scope that would
+be granted, defaulted or explicit, must be held by the calling credential, so a
+key carrying only <code>sandboxes:<wbr>read</code> is refused both an omitted <code>scopes</code> field and
+an explicit <code>[&quot;sandboxes:<wbr>write&quot;]</code>. The rule is the same on both paths on purpose:
+the default is a way of asking for four scopes, not a way around needing them.</p>
+<p>Revocation follows the same principle, because destroying a credential is a use
+of authority. To revoke a key, the caller must hold <strong>every</strong> scope the target
+holds. A <code>sandboxes:<wbr>read</code> key cannot revoke a key that can write, and neither
+can it revoke a tenant admin key. A key from another tenant, or one that does
+not exist, is <code>404</code> — a key's existence is not disclosed across a tenant
+boundary. Revoking a key revokes it immediately; there is no grace period.</p>
+<h2 id="status-codes">Status codes<a class="anchor" href="#status-codes" aria-label="Link to this section: Status codes">#</a></h2>
+<p><code>400</code> invalid JSON/path/argv/image; <code>401</code> missing/invalid/expired/revoked key; <code>403</code> missing scope or cross-tenant access (cross-tenant resources are not disclosed); <code>404</code> tenant-scoped missing resource; <code>409</code> invalid state/race; <code>413</code> upload/resource limit too large; <code>422</code> semantic validation; <code>429</code> PostgreSQL tenant quota exceeded; <code>500</code> internal; <code>503</code> runtime/dependency unavailable.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/deployment/"><span class="docpager__dir">Previous</span><span class="docpager__name">Production deployment</span></a><a class="docpager__cell docpager__cell--next" href="/docs/mcp/"><span class="docpager__dir">Next</span><span class="docpager__name">AIec Local MCP</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#sandboxes">Sandboxes</a></li><li class="doctoc__item doctoc__item--2"><a href="#runs">Runs</a></li><li class="doctoc__item doctoc__item--3"><a href="#run-queue">Run queue</a></li><li class="doctoc__item doctoc__item--3"><a href="#run-secrets">Run secrets</a></li><li class="doctoc__item doctoc__item--3"><a href="#run-artifacts">Run artifacts</a></li><li class="doctoc__item doctoc__item--3"><a href="#api-keys">API keys</a></li><li class="doctoc__item doctoc__item--2"><a href="#status-codes">Status codes</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

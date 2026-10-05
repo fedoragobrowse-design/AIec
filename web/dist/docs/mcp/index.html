@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AIec Local MCP — AIec</title>
+<meta name="description" content="The local MCP server: how an agent is given a disposable machine, and what it may do with one.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/mcp/">
+<meta property="og:title" content="AIec Local MCP — AIec">
+<meta property="og:description" content="The local MCP server: how an agent is given a disposable machine, and what it may do with one.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/mcp/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/" aria-current="page">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="aiec-local-mcp">AIec Local MCP</h1>
+<p class="docmeta"><span>8 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/MCP.md" rel="noopener noreferrer">docs/MCP.md</a></p>
+<p>An MCP server that hands any MCP-capable agent a disposable computer on <strong>your
+own</strong> AIec cluster.</p>
+<aside class="note"><p><strong>This server uses LOCAL AIEC COMPUTE.</strong> AIec is open source and self-hosted;
+there is no hosted API. This server does not use an external sandbox provider
+either. Every command runs inside a sandbox on a control plane you control,
+and it refuses to start if it is pointed at a remote endpoint.</p>
+</aside>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="quickstart">Quickstart<a class="anchor" href="#quickstart" aria-label="Link to this section: Quickstart">#</a></h2>
+<div class="code"><span class="code__lang">bash</span><pre><code>cargo build --release -p aiec-mcp
+</code></pre></div>
+<p>Configure it:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>export AIEC_LOCAL_API_URL=https://127.0.0.1:18443
+export AIEC_LOCAL_API_KEY=af_live_...
+export AIEC_TLS_CA_CERT=/path/to/ca.pem     # if the control plane uses TLS
+
+./target/release/aiec-mcp
+</code></pre></div>
+<p>It listens on <code>127.0.0.1:<wbr>8765</code> and serves MCP at <code>http://127.0.0.1:<wbr>8765/<wbr>mcp</code>.</p>
+<p>On first run a bearer token is generated and stored at
+<code>~/<wbr>.config/<wbr>aiec/<wbr>mcp-token</code> with mode <code>0600</code>. Set <code>AIEC_MCP_TOKEN</code> to supply your
+own, or <code>AIEC_MCP_TOKEN_FILE</code> to move it.</p>
+<h3 id="connecting-an-mcp-client">Connecting an MCP client<a class="anchor" href="#connecting-an-mcp-client" aria-label="Link to this section: Connecting an MCP client">#</a></h3>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col"></th>
+<th scope="col"></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Name</td>
+<td><code>AIec Local</code></td>
+</tr>
+<tr>
+<td>URL</td>
+<td><code>http://127.0.0.1:<wbr>8765/<wbr>mcp</code></td>
+</tr>
+<tr>
+<td>Transport</td>
+<td>Streamable HTTP</td>
+</tr>
+<tr>
+<td>Authorization</td>
+<td><code>Bearer &lt;contents of ~/<wbr>.config/<wbr>aiec/<wbr>mcp-token&gt;</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The token is required on every <code>/<wbr>mcp</code> request. <code>GET /<wbr>health</code> is deliberately
+left open so a supervisor can probe it without holding a credential.</p>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="tools">Tools<a class="anchor" href="#tools" aria-label="Link to this section: Tools">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Tool</th>
+<th scope="col">What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aiec_create_sandbox</code></td>
+<td>Create a disposable local sandbox</td>
+</tr>
+<tr>
+<td><code>aiec_list_sandboxes</code></td>
+<td>List sandboxes this server created</td>
+</tr>
+<tr>
+<td><code>aiec_get_sandbox</code></td>
+<td>Current state of one sandbox</td>
+</tr>
+<tr>
+<td><code>aiec_destroy_sandbox</code></td>
+<td>Destroy a sandbox and confirm cleanup</td>
+</tr>
+<tr>
+<td><code>aiec_exec</code></td>
+<td>Run a command <strong>inside</strong> a sandbox</td>
+</tr>
+<tr>
+<td><code>aiec_read_file</code> / <code>aiec_write_file</code> / <code>aiec_list_files</code></td>
+<td>Files inside a sandbox</td>
+</tr>
+<tr>
+<td><code>aiec_prepare_repo</code></td>
+<td>Clone a repo into a fresh sandbox</td>
+</tr>
+<tr>
+<td><code>aiec_run_repo_task</code></td>
+<td>Clone → setup → task → validate → diff → destroy</td>
+</tr>
+<tr>
+<td><code>aiec_test_omp</code></td>
+<td>Submit one durable Run for an OMP revision and task</td>
+</tr>
+<tr>
+<td><code>aiec_compare_omp</code></td>
+<td>Bounded generic Run batch for baseline vs candidate</td>
+</tr>
+<tr>
+<td><code>aiec_run</code></td>
+<td>Run one workload and return the settled result</td>
+</tr>
+<tr>
+<td><code>aiec_run_batch</code></td>
+<td>Run several workloads, bounded concurrency</td>
+</tr>
+<tr>
+<td><code>aiec_run_matrix</code></td>
+<td>Run a matrix of cells, summarised per axis</td>
+</tr>
+<tr>
+<td><code>aiec_run_status</code></td>
+<td>Current state of one run</td>
+</tr>
+<tr>
+<td><code>aiec_run_events</code></td>
+<td>A run's history, in order</td>
+</tr>
+<tr>
+<td><code>aiec_run_cancel</code></td>
+<td>Stop a run and reclaim its machines</td>
+</tr>
+<tr>
+<td><code>aiec_health</code></td>
+<td>Local control-plane and capacity status</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="what-quotsandboxes-this-server-createdquot-means">What &quot;sandboxes this server created&quot; means<a class="anchor" href="#what-quotsandboxes-this-server-createdquot-means" aria-label="Link to this section: What &amp;quot;sandboxes this server created&amp;quot; means">#</a></h3>
+<p><code>aiec_list_sandboxes</code>, the <code>aiec://sandboxes</code> resource and <code>aiec_health</code> all read
+the same list: the machines this MCP server process created, fetched by id
+rather than by scanning the tenant's list. Two properties of that list are worth
+knowing before relying on it.</p>
+<p>It <strong>forgets</strong>. A machine that has finished — destroyed, failed, or aged past
+retention so the control plane no longer has it — is dropped from the list the
+first time it is seen. So the list is &quot;machines I still hold&quot;, not &quot;machines I
+have ever made&quot;, and a long-running server does not accumulate every sandbox it
+has ever created. An explicitly destroyed sandbox was always removed.</p>
+<p>It is <strong>bounded</strong>, and past the bound it is refused rather than shortened. A
+partial list would be indistinguishable from a complete one, and a caller
+treating &quot;these are my machines&quot; as complete would leave the rest running
+without ever learning of them. Keep fewer than 200 live at once and destroy what
+you no longer need. The bound is on this list only — the control plane's own
+<code>GET /<wbr>v1/<wbr>sandboxes</code> is separately paged.</p>
+<p>A typical loop from an agent:</p>
+<div class="code"><span class="code__lang">json</span><pre><code>{&quot;name&quot;: &quot;aiec_create_sandbox&quot;, &quot;arguments&quot;: {&quot;image&quot;: &quot;aiec-coding:latest&quot;, &quot;runtime&quot;: &quot;firecracker&quot;}}
+{&quot;name&quot;: &quot;aiec_exec&quot;, &quot;arguments&quot;: {&quot;sandbox_id&quot;: &quot;&lt;id&gt;&quot;, &quot;command&quot;: [&quot;git&quot;, &quot;status&quot;]}}
+{&quot;name&quot;: &quot;aiec_destroy_sandbox&quot;, &quot;arguments&quot;: {&quot;sandbox_id&quot;: &quot;&lt;id&gt;&quot;}}
+</code></pre></div>
+<p>The same loop as one durable run, which is the shape to reach for when the work
+is a self-contained task rather than an interactive session:</p>
+<div class="code"><span class="code__lang">json</span><pre><code>{&quot;name&quot;: &quot;aiec_run&quot;, &quot;arguments&quot;: {
+  &quot;repo_url&quot;: &quot;https://github.com/me/fixture&quot;,
+  &quot;command&quot;: [&quot;pytest&quot;, &quot;-q&quot;],
+  &quot;validation_commands&quot;: [[&quot;pytest&quot;, &quot;-q&quot;]],
+  &quot;artifacts&quot;: [&quot;report.txt&quot;],
+  &quot;requirements&quot;: {&quot;full_kernel_isolation&quot;: true}
+}}
+</code></pre></div>
+<p><code>aiec_run</code> returns the settled run: state, the task's exit code, bounded
+stdout/stderr, changed files, artifact URLs and any machine that outlived it.
+A workload that <em>failed</em> is reported on that document, not as a tool error --
+&quot;the work failed&quot; is an outcome you asked for.</p>
+<p>Runs are the control plane's own workflow, so this server does not rebuild it:
+the API reserves the record, places the machine through the same registry the
+sandbox API uses, runs the command, collects artifacts and reclaims the machine
+before it answers. That is why a run keeps a history (<code>aiec_run_events</code>) and why
+<code>idempotency_key</code> returns the run that already exists instead of doing the work
+twice. <code>aiec_run_batch</code>, <code>aiec_run_matrix</code> and OMP comparisons use the generic
+client's bounded Run batch, with <code>max_parallel</code> enforced before submission.
+Generic HTTP evaluation routes also exist under <code>/<wbr>v1/<wbr>eval/<wbr></code>.</p>
+<p>Resources: <code>aiec://sandboxes</code>, <code>aiec://sandboxes/<wbr>{id}</code>, <code>aiec://local-capacity</code>.
+Prompts: <code>test-repo-in-clean-sandbox</code>, <code>reproduce-bug-in-clean-machine</code>.</p>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="guarantees">Guarantees<a class="anchor" href="#guarantees" aria-label="Link to this section: Guarantees">#</a></h2>
+<p>These are enforced in code, with tests, not just documented:</p>
+<ul>
+<li><strong>Local only.</strong> A non-loopback AIec URL is refused at startup. A private
+network address additionally requires <code>AIEC_MCP_ALLOW_PRIVATE_NETWORK=1</code>;
+A public cloud endpoint would be refused outright and cannot be enabled.</li>
+<li><strong>No host execution.</strong> Workload commands are sent to AIec as an argument
+vector. There is no <code>std::<wbr>process::<wbr>Command</code> anywhere in the execution path, and
+a test asserts the crate contains none.</li>
+<li><strong>No provider fallback.</strong> <code>hosted</code> and <code>e2b</code> runtimes are refused. If the local
+cluster is full you get <code>LOCAL_CAPACITY_UNAVAILABLE</code>, never a silent handoff.</li>
+<li><strong>Bounded.</strong> Exec output is clipped and commands are subject to a timeout,
+enforced by AIec itself.</li>
+<li><strong>Clean.</strong> Durable workflows use the Run's retention policy; destruction
+failures are returned as <code>cleanup_failed</code>, never silently treated as cleanup.
+<code>keep_sandbox</code> retains an OMP Run's machine for the configured debugging TTL.
+Legacy interactive sandbox ownership remains scoped to this server.</li>
+</ul>
+<h3 id="errors">Errors<a class="anchor" href="#errors" aria-label="Link to this section: Errors">#</a></h3>
+<p><code>SANDBOX_NOT_FOUND</code>, <code>SANDBOX_NOT_RUNNING</code>, <code>LOCAL_CAPACITY_UNAVAILABLE</code>,
+<code>COMMAND_TIMEOUT</code>, <code>OUTPUT_LIMIT_EXCEEDED</code>, <code>FILE_TOO_LARGE</code>,
+<code>UNSUPPORTED_OPERATION</code>, <code>AIEC_API_UNAVAILABLE</code>, <code>LOCAL_RUNTIME_UNAVAILABLE</code>,
+<code>AUTH_FAILED</code>, <code>INVALID_ARGUMENT</code>, <code>APPROVAL_REFUSED</code>.</p>
+<p><code>APPROVAL_REFUSED</code> is returned only when <code>AIEC_MCP_APPROVAL_REQUIRED=1</code> and the
+control plane did not approve the call. Its details carry
+<code>unreachable:<wbr> true</code> when nobody answered, which is not the same as a refusal
+and is not retryable.</p>
+<p>The ask carries a SHA-256 digest of the whole call, not of its name, so an
+operator's approval covers one invocation rather than a tool. <code>aiec_write_file</code>
+digests <code>path</code> and <code>content</code> together: an approval to write one payload at a
+path is not an approval to write another. For <code>aiec_write_file</code> the digest
+covers every argument the tool accepts, and the operator queue shows the path
+with a content length rather than the content itself — enough to recognise the
+call, without printing an arbitrary payload into an approval queue.</p>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="configuration">Configuration<a class="anchor" href="#configuration" aria-label="Link to this section: Configuration">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Variable</th>
+<th scope="col">Default</th>
+<th scope="col">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AIEC_MCP_BIND</code></td>
+<td><code>127.0.0.1:<wbr>8765</code></td>
+<td>Listen address; non-loopback needs <code>AIEC_MCP_ALLOW_REMOTE_BIND=1</code></td>
+</tr>
+<tr>
+<td><code>AIEC_LOCAL_API_URL</code></td>
+<td><code>https://127.0.0.1:<wbr>18443</code></td>
+<td>Local control plane</td>
+</tr>
+<tr>
+<td><code>AIEC_LOCAL_API_KEY</code></td>
+<td>—</td>
+<td><strong>Required</strong>; the control-plane key</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_TOKEN</code></td>
+<td>generated</td>
+<td>Token MCP clients present</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_TOKEN_FILE</code></td>
+<td><code>~/<wbr>.config/<wbr>aiec/<wbr>mcp-token</code></td>
+<td>Where the token lives</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_MAX_PARALLEL</code></td>
+<td><code>2</code></td>
+<td>Maximum concurrent Runs in comparisons</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_DEFAULT_TTL</code></td>
+<td><code>1800</code></td>
+<td>Sandbox lifetime in seconds</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_MAX_OUTPUT_BYTES</code></td>
+<td><code>1048576</code></td>
+<td>Output and file size bound</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_ALLOW_PRIVATE_NETWORK</code></td>
+<td>off</td>
+<td>Permit a control plane on your LAN</td>
+</tr>
+<tr>
+<td><code>AIEC_MCP_APPROVAL_REQUIRED</code></td>
+<td>off</td>
+<td>Ask the control plane before a high-risk tool runs</td>
+</tr>
+</tbody>
+</table></div>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="the-omp-workflow">The OMP workflow<a class="anchor" href="#the-omp-workflow" aria-label="Link to this section: The OMP workflow">#</a></h2>
+<p><code>aiec_test_omp</code> and <code>aiec_compare_omp</code> are thin adapters to ordinary durable
+Runs, not another sandbox scheduler. A comparison submits a bounded generic
+batch for the baseline and candidate, with each repetition in its <strong>own</strong>
+clean sandbox against the same target repository, task, validations and resources:</p>
+<aside class="note"><p>I changed OMP's compaction implementation. Does it actually improve things?</p>
+</aside>
+<div class="code"><span class="code__lang">json</span><pre><code>{&quot;name&quot;: &quot;aiec_compare_omp&quot;, &quot;arguments&quot;: {
+  &quot;omp_repo&quot;: &quot;https://github.com/can1357/oh-my-pi&quot;,
+  &quot;baseline_ref&quot;: &quot;main&quot;,
+  &quot;candidate_ref&quot;: &quot;feature/compaction-v2&quot;,
+  &quot;target_repo&quot;: &quot;https://github.com/me/fixture&quot;,
+  &quot;task&quot;: &quot;add a regression test for truncated output&quot;,
+  &quot;repetitions&quot;: 3
+}}
+</code></pre></div>
+<p>Results contain real durable <code>run_id</code>s, setup/task/validation outcomes, timing
+phases, actual agent and target commits, git evidence and cleanup failures.
+The <code>omp</code> task outcome and its exit-code slot are <code>null</code> if preparation failed
+before execution; unknown wall time is <code>null</code>, not zero. Side summaries include
+successful output as well as failed setup and validation diagnostics, and every
+run's evidence remains in <code>baseline_runs</code> / <code>candidate_runs</code>. A rejected
+submission is listed in <code>submission_failures</code>, not dropped or turned into a
+fabricated task failure. Measurements are returned without choosing a winner.</p>
+<p>The adapter always fetches the requested OMP branch, tag or commit into
+<code>/<wbr>workspace/<wbr>omp</code>. By default it runs <code>bun install &amp;&amp; bun run build</code> there;
+<code>build_command</code> overrides that step. <code>setup_command</code> prepares the <strong>target</strong>
+repository afterwards and cannot silently skip the OMP checkout. For a custom
+invocation that does not need a build, explicitly use <code>build_command:<wbr> [&quot;true&quot;]</code>.
+The default invocation is the checkout's
+<code>/<wbr>bin/<wbr>sh /<wbr>workspace/<wbr>omp/<wbr>packages/<wbr>coding-agent/<wbr>scripts/<wbr>omp --print -- &lt;task&gt;</code>,
+not an assumed global <code>omp</code> executable. The upstream launcher starts Bun with
+the checkout CLI/preload and restores the target working directory; the task
+is one literal positional argument. An <code>omp_command</code> override gets the same
+task on stdin and in <code>OMP_TASK</code>. The invocation is recorded in the task outcome.
+The guest must provide Bun and whatever that revision's build requires.</p>
+<p>OMP tools preserve <code>runtime</code>, <code>timeout_seconds</code>, <code>cpu</code>, <code>memory_mb</code>, <code>disk_mb</code>
+and the generic <code>requirements</code> capability demands. Defaults are Firecracker,
+900 seconds, 2 CPUs, 2048 MiB RAM and 2048 MiB disk, with outbound Internet
+enabled for both repository checkouts and dependency/model access. Comparisons
+use destroy retention; <code>aiec_test_omp</code> can request <code>keep_sandbox:<wbr> true</code>, with
+expiry managed by the control plane rather than MCP-private lifetime code.
+Cleanup failure details are still returned when destruction fails.</p>
+<p>Pass model credential <strong>references</strong> in <code>secrets</code>, resolved by the tenant's
+secret store at execution time. <code>environment</code> is only for non-secret settings,
+such as model selection and cache paths. Do not embed credentials in repository
+URLs, command arguments, setup scripts or reports. Secrets are never copied
+into the OMP adapter's request/report as values. Generic Run tools remain
+agent-agnostic; OMP conventions live only in this adapter.</p>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="using-it-from-an-agent">Using it from an agent<a class="anchor" href="#using-it-from-an-agent" aria-label="Link to this section: Using it from an agent">#</a></h2>
+<p>A ready-made skill is in
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/skills/aiec-sandboxes/SKILL.md" rel="noopener noreferrer"><code>docs/<wbr>skills/<wbr>aiec-sandboxes/<wbr>SKILL.md</code></a>.
+Copy it into your agent's skills directory to teach it the whole loop — which
+tool for which situation, how to keep the sandbox TTL honest, and which typed
+errors mean &quot;wait&quot; rather than &quot;try somewhere else&quot;:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>mkdir -p ~/.omp/agent/skills
+cp docs/skills/aiec-sandboxes/SKILL.md ~/.omp/agent/skills/aiec-sandboxes/
+</code></pre></div>
+<div class="rule" aria-hidden="true"></div>
+<h2 id="architecture">Architecture<a class="anchor" href="#architecture" aria-label="Link to this section: Architecture">#</a></h2>
+<div class="code"><pre><code>MCP client  →  127.0.0.1:8765/mcp  →  aiec-mcp  →  local AIec API  →  worker  →  sandbox
+</code></pre></div>
+<p>MCP is an adapter on top of AIec, not a dependency of it: the dependency runs
+Core → API/client → MCP, and AIec is fully usable with no MCP server present.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/api/"><span class="docpager__dir">Previous</span><span class="docpager__name">REST API</span></a><a class="docpager__cell docpager__cell--next" href="/docs/architecture/"><span class="docpager__dir">Next</span><span class="docpager__name">Production architecture</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#quickstart">Quickstart</a></li><li class="doctoc__item doctoc__item--3"><a href="#connecting-an-mcp-client">Connecting an MCP client</a></li><li class="doctoc__item doctoc__item--2"><a href="#tools">Tools</a></li><li class="doctoc__item doctoc__item--3"><a href="#what-quotsandboxes-this-server-createdquot-means">What &amp;quot;sandboxes this server created&amp;quot; means</a></li><li class="doctoc__item doctoc__item--2"><a href="#guarantees">Guarantees</a></li><li class="doctoc__item doctoc__item--3"><a href="#errors">Errors</a></li><li class="doctoc__item doctoc__item--2"><a href="#configuration">Configuration</a></li><li class="doctoc__item doctoc__item--2"><a href="#the-omp-workflow">The OMP workflow</a></li><li class="doctoc__item doctoc__item--2"><a href="#using-it-from-an-agent">Using it from an agent</a></li><li class="doctoc__item doctoc__item--2"><a href="#architecture">Architecture</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

@@ -60,13 +60,47 @@
     </div>
 
   </aside>
-  <main class="content">
+  <main class="content content--prose">
 <!-- meta:title=Documentation -->
 <!-- meta:description=Run AIec yourself: prerequisites, install, first sandbox, the SDK, self-hosting and operations. AIec is open source with no hosted API. -->
+<!-- prose -->
 
 <h1>Docs</h1>
 <p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL,
 S3-compatible storage, and a configured control plane and worker.</p>
+
+<h2 id="reference">The full documentation</h2>
+<p>The reference documents below are the same files the repository ships,
+rendered here. Everything on this list is written for someone running AIec
+themselves. If you are here deciding whether to, start with
+<a href="/docs/design/">Design</a>
+and <a href="/limitations">Limitations</a>; if you already have one running,
+go straight to <a href="/docs/guard/">Guard operations</a> or the page for what
+you are changing.</p>
+
+<div class="docgroup"><h2 id="start">Start here</h2><p class="docgroup__blurb">Get a cluster running and drive your first sandbox through it.</p><dl class="doclist">
+<dt><a href="/docs/deployment/">Production deployment</a></dt><dd>Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards. <span class="doclist__meta">16 min read</span></dd>
+<dt><a href="/docs/api/">REST API</a></dt><dd>Every route, its status codes and its error body, base path /v1. <span class="doclist__meta">13 min read</span></dd>
+<dt><a href="/docs/mcp/">AIec Local MCP</a></dt><dd>The local MCP server: how an agent is given a disposable machine, and what it may do with one. <span class="doclist__meta">8 min read</span></dd>
+</dl></div>
+<div class="docgroup"><h2 id="understand">How it works</h2><p class="docgroup__blurb">The design decisions behind the interface, and what they promise.</p><dl class="doclist">
+<dt><a href="/docs/architecture/">Production architecture</a></dt><dd>Where control plane, workers, storage and runtimes sit, and the failure each boundary contains. <span class="doclist__meta">9 min read</span></dd>
+<dt><a href="/docs/design/">Design</a></dt><dd>Which mechanisms came from the DSec paper, which are independent engineering, and where AIec deliberately differs. <span class="doclist__meta">5 min read</span></dd>
+<dt><a href="/docs/versioning/">Versioning and compatibility</a></dt><dd>The six boundaries that version independently, and which changes to each are breaking. <span class="doclist__meta">1 min read</span></dd>
+</dl></div>
+<div class="docgroup"><h2 id="operate">Operating it</h2><p class="docgroup__blurb">Governance, images, snapshots and the deployment you are responsible for.</p><dl class="doclist">
+<dt><a href="/docs/guard/">Guard operations</a></dt><dd>Running the policy broker: approvals, budgets, incidents, quarantine, and what an operator can see. <span class="doclist__meta">9 min read</span></dd>
+<dt><a href="/docs/guard-policy/">Guard policy reference</a></dt><dd>The policy format field by field, the templates, and what the verifier will and will not accept. <span class="doclist__meta">3 min read</span></dd>
+<dt><a href="/docs/guard-threat-model/">Guard threat model</a></dt><dd>Who an untrusted agent is assumed to be, the attacks each control answers, and the ones left open. <span class="doclist__meta">6 min read</span></dd>
+<dt><a href="/docs/images/">Images</a></dt><dd>Building, signing and materialising images, and the digest checks a guest must pass before it boots. <span class="doclist__meta">8 min read</span></dd>
+<dt><a href="/docs/snapshots/">Snapshots</a></dt><dd>What a snapshot preserves, what it does not, and the restore and recovery paths. <span class="doclist__meta">1 min read</span></dd>
+<dt><a href="/docs/firecracker-guest/">Firecracker guest image</a></dt><dd>Building the guest the Firecracker runtime boots, and the agent inside it that serves exec requests. <span class="doclist__meta">4 min read</span></dd>
+<dt><a href="/docs/billing/">Usage and billing foundation</a></dt><dd>The usage events the control plane emits, where quantities come from, and what production billing still needs. <span class="doclist__meta">1 min read</span></dd>
+</dl></div>
+<div class="docgroup"><h2 id="build">Build on it</h2><p class="docgroup__blurb">Extend Core, or bring a policy format you already run.</p><dl class="doclist">
+<dt><a href="/docs/extending/">Extending AIec Core</a></dt><dd>Writing a backend or a scheduler behind the Core traits, and the dependency direction that keeps them honest. <span class="doclist__meta">2 min read</span></dd>
+<dt><a href="/docs/openshell/">OpenShell policy compatibility</a></dt><dd>Importing an OpenShell policy into a Guard policy: what maps, what is refused, and what is left manual. <span class="doclist__meta">4 min read</span></dd>
+</dl></div>
 
 <h2 id="prerequisites">What you need</h2>
 <div class="grid-2">
@@ -209,15 +243,23 @@ create a sandbox, run commands, read and write files, clone a repository,
 destroy it. It talks only to a control plane you run, so the workload stays on
 hardware you control.</p>
 
-<h2 id="operations">Operating it</h2>
-<p>The <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md">deployment guide</a>
-covers TLS, workers, object storage, backup and restore. The
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DESIGN.md">architecture guide</a>
-explains placement and fencing; the
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/API.md">API reference</a>
-lists request and response shapes. Use the
-<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
-for acceptance evidence, exact reproduction commands and measured limits.</p>
+
+<h2 id="records">Engineering records</h2>
+<p>These stay in the repository and are not rendered here. They are working
+documents with the dates and run identifiers in them — an audit trail rather
+than instructions, and much longer than anything you would want in a sidebar.</p>
+<ul class="tight">
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/known-defects.md">Known defects</a>
+      — every defect found in review, whether it is fixed, and what the fix was
+      tested against.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-report.md">Guard report</a>
+      — the acceptance evidence for Guard: reproduction commands and measured
+      limits.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/PRIVATE_ALPHA.md">Private alpha status</a>
+      — what the alpha milestone claims, and the checks behind each claim.</li>
+  <li><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/skills/aiec-sandboxes/SKILL.md">Agent skill</a>
+      — the skill definition an agent loads to drive a sandbox.</li>
+</ul>
 
 <p>There is no cloud, no hosted API and no sign-up. Everything runs where you put
 it.</p>

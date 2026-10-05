@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guard policy reference — AIec</title>
+<meta name="description" content="The policy format field by field, the templates, and what the verifier will and will not accept.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/guard-policy/">
+<meta property="og:title" content="Guard policy reference — AIec">
+<meta property="og:description" content="The policy format field by field, the templates, and what the verifier will and will not accept.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/guard-policy/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/" aria-current="page">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="guard-policy-reference">Guard policy reference</h1>
+<p class="docmeta"><span>3 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD_POLICY.md" rel="noopener noreferrer">docs/GUARD_POLICY.md</a></p>
+<p>A Guard policy is one document that compiles into every enforcement artifact:
+nftables rules, the DNS resolver's answers, the model broker's routes, the
+credential bindings and the telemetry reasons. Its SHA-256 hash is the
+identity Guard and the watchdog use, and it is stored on the sandbox.</p>
+<h2 id="the-two-halves">The two halves<a class="anchor" href="#the-two-halves" aria-label="Link to this section: The two halves">#</a></h2>
+<p><strong>Sandbox configuration</strong> (<code>guard</code>) is per sandbox and is not itself hashed:</p>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Field</th>
+<th scope="col">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>topology</code></td>
+<td><code>inside</code> runs the agent loop in the guest; <code>outside</code> runs it on the control plane</td>
+</tr>
+<tr>
+<td><code>policy_template</code></td>
+<td><code>no_network</code>, <code>model_only</code>, <code>model_plus_allowlist</code>, <code>read_only_api</code></td>
+</tr>
+<tr>
+<td><code>policy</code></td>
+<td>an explicit policy, mutually exclusive with the template inputs</td>
+</tr>
+<tr>
+<td><code>model_endpoint</code></td>
+<td>host, port, scheme, methods, paths, credential name</td>
+</tr>
+<tr>
+<td><code>allowlist</code></td>
+<td>extra destinations for <code>model_plus_allowlist</code></td>
+</tr>
+<tr>
+<td><code>watchdog_timeout_ms</code></td>
+<td>dead-man deadline, 1000-60000, default 10000</td>
+</tr>
+<tr>
+<td><code>max_model_requests</code></td>
+<td>immutable durable admission ceiling</td>
+</tr>
+<tr>
+<td><code>l7</code></td>
+<td>optional layer 7 governance (§27-§29)</td>
+</tr>
+<tr>
+<td><code>watcher</code></td>
+<td>optional second reviewer, disabled by default</td>
+</tr>
+<tr>
+<td><code>canaries</code></td>
+<td>optional synthetic tripwires</td>
+</tr>
+<tr>
+<td><code>require_signed_image</code></td>
+<td>refuse an untrusted image before boot</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Policy</strong> (<code>GuardPolicy</code>) is the hashed half:</p>
+<div class="code"><span class="code__lang">yaml</span><pre><code>version: 1
+network:
+  dns:
+    allowed_zones: [&quot;model.example&quot;]
+    allowed_record_types: [&quot;A&quot;, &quot;AAAA&quot;]
+  egress:
+    - host: api.model.example
+      port: 443
+      protocol: tcp
+      allowed_methods: [&quot;POST&quot;]
+      allowed_paths: [&quot;/v1/chat/completions&quot;]
+model:
+  host: api.model.example
+  port: 443
+  scheme: https
+  allowed_methods: [&quot;POST&quot;]
+  allowed_paths: [&quot;/v1/chat/completions&quot;]
+  credential: model-main
+credentials:
+  - name: model-main
+    from_env: MODEL_API_KEY
+limits:
+  requests_per_minute: 60
+  dns_queries_per_minute: 120
+  bytes_in: 1048576
+  bytes_out: 262144
+  max_request_bytes: 262144
+  max_response_bytes: 1048576
+  max_concurrent_requests: 4
+</code></pre></div>
+<p>Every list is normalized before hashing, so two documents that mean the same
+thing produce the same hash and the same rules. Unknown fields are refused
+rather than ignored: a policy that silently drops a field is a policy whose
+enforcement nobody has read.</p>
+<h2 id="templates">Templates<a class="anchor" href="#templates" aria-label="Link to this section: Templates">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Template</th>
+<th scope="col">The guest may</th>
+<th scope="col">Named for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>no_network</code></td>
+<td>nothing at all</td>
+<td>running untrusted code with no egress</td>
+</tr>
+<tr>
+<td><code>model_only</code></td>
+<td>one model endpoint, through Guard</td>
+<td>coding and tool-use agents</td>
+</tr>
+<tr>
+<td><code>model_plus_allowlist</code></td>
+<td>the model plus an operator's list</td>
+<td>agents that genuinely need a package registry</td>
+</tr>
+<tr>
+<td><code>read_only_api</code></td>
+<td>GET/HEAD on read-only APIs</td>
+<td>research and analysis agents</td>
+</tr>
+</tbody>
+</table></div>
+<p>No template can express open internet access, and adding one is a policy change
+that goes through the same verifier and the same human approval as any other.</p>
+<h2 id="the-verifier">The verifier<a class="anchor" href="#the-verifier" aria-label="Link to this section: The verifier">#</a></h2>
+<p><code>aiec guard verify &lt;policy&gt;</code> compiles the policy against the operator boundary
+and reports contradictions with counterexamples: a destination that is both
+allowed and blocked, a credential bound to a host the policy does not permit, a
+limit that exceeds the boundary, a path rule that can never match. It is not a
+linter; it refuses policies whose enforcement would not be what the document
+says.</p>
+<p>The operator boundary is separate from the policy on purpose. It is what the
+host forbids - metadata ranges, the cluster's own networks, loopback - and a
+policy cannot widen it. The acceptance suite includes counterexamples for each
+class of contradiction.</p>
+<h2 id="layer-7-governance">Layer 7 governance<a class="anchor" href="#layer-7-governance" aria-label="Link to this section: Layer 7 governance">#</a></h2>
+<p>Layer 7 rules apply only to traffic Guard can see. In the default <code>sni</code> mode
+Guard matches the requested hostname and forwards the tunnel: it sees the name,
+not the request. Method and path policy requires <code>mode:<wbr> intercept</code> and an
+explicit <code>intercept_ack</code>, because interception means Guard terminates TLS and
+can therefore read everything it forwards.</p>
+<div class="code"><span class="code__lang">yaml</span><pre><code>l7:
+  mode: intercept
+  intercept_ack: true
+  http:
+    - host: api.github.com
+      methods: [GET, HEAD]
+      paths: [&quot;/repos/*/readme&quot;]
+  mcp:
+    allowed_methods: [&quot;tools/list&quot;, &quot;tools/call&quot;]
+    allowed_tools: [&quot;read_file&quot;, &quot;search&quot;]
+    denied_tools: [&quot;delete_repository&quot;, &quot;deploy&quot;, &quot;rotate_key&quot;]
+  graphql:
+    allow_mutations: false
+    operations: [&quot;ReadRepo&quot;]
+    root_fields: [&quot;repository&quot;, &quot;viewer&quot;]
+</code></pre></div>
+<p>An unlisted MCP method or tool is denied. An unlisted GraphQL operation or root
+field is denied, and mutations are denied unless <code>allow_mutations</code>. GraphQL
+parsing is bounded: a document Guard cannot parse within its limits is refused,
+not guessed at.</p>
+<h2 id="credentials">Credentials<a class="anchor" href="#credentials" aria-label="Link to this section: Credentials">#</a></h2>
+<p>A credential is a named binding from an environment variable to a placeholder
+the guest receives. The guest never holds the real value: the broker
+substitutes it at request time, for the bound destination only, and the
+substitution is logged as a metadata event with no secret in it. A placeholder
+presented to any other destination is refused, and a canary credential
+configured for the sandbox is an immediate quarantine.</p>
+<h2 id="changing-a-policy">Changing a policy<a class="anchor" href="#changing-a-policy" aria-label="Link to this section: Changing a policy">#</a></h2>
+<p>An agent may propose. Only a human may approve, and approval runs the verifier
+first. A rejected verification blocks the apply, an applied policy produces a
+new hash, and both outcomes are audit events. The previous policy stays in force
+until the new one is applied atomically.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/guard/"><span class="docpager__dir">Previous</span><span class="docpager__name">Guard operations</span></a><a class="docpager__cell docpager__cell--next" href="/docs/guard-threat-model/"><span class="docpager__dir">Next</span><span class="docpager__name">Guard threat model</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#the-two-halves">The two halves</a></li><li class="doctoc__item doctoc__item--2"><a href="#templates">Templates</a></li><li class="doctoc__item doctoc__item--2"><a href="#the-verifier">The verifier</a></li><li class="doctoc__item doctoc__item--2"><a href="#layer-7-governance">Layer 7 governance</a></li><li class="doctoc__item doctoc__item--2"><a href="#credentials">Credentials</a></li><li class="doctoc__item doctoc__item--2"><a href="#changing-a-policy">Changing a policy</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

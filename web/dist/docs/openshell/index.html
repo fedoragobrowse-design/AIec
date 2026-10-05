@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenShell policy compatibility — AIec</title>
+<meta name="description" content="Importing an OpenShell policy into a Guard policy: what maps, what is refused, and what is left manual.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/openshell/">
+<meta property="og:title" content="OpenShell policy compatibility — AIec">
+<meta property="og:description" content="Importing an OpenShell policy into a Guard policy: what maps, what is refused, and what is left manual.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/openshell/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/" aria-current="page">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="openshell-policy-compatibility">OpenShell policy compatibility</h1>
+<p class="docmeta"><span>4 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/openshell-compatibility.md" rel="noopener noreferrer">docs/openshell-compatibility.md</a></p>
+<p>Source: NVIDIA OpenShell, Apache-2.0, policy schema reference, read at commit
+<code>71440b28f48d5fefc569d779f70d6e63893aa80a</code> (2026-10-01):
+<a href="https://github.com/NVIDIA/OpenShell/blob/71440b28f48d5fefc569d779f70d6e63893aa80a/docs/how-it-works/policies/schema.mdx" rel="noopener noreferrer">https://github.com/NVIDIA/OpenShell/blob/71440b28f48d5fefc569d779f70d6e63893aa80a/docs/how-it-works/policies/schema.mdx</a></p>
+<p>Pinned deliberately. A <code>main</code> URL moves under this document, and a branch moving
+is how a compatibility claim quietly stops describing the thing it describes.
+The path <code>docs/<wbr>reference/<wbr>policy-schema.mdx</code> is 404 at this commit and was not
+used; earlier drafts of this file that cited it were wrong.</p>
+<p>No OpenShell code is copied into AIec. This document records what its schema
+means for a Guard policy, field by field, because &quot;we support OpenShell
+policies&quot; is not a claim that can be made honestly.</p>
+<h2 id="directly-expressible">Directly expressible<a class="anchor" href="#directly-expressible" aria-label="Link to this section: Directly expressible">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">OpenShell</th>
+<th scope="col">Guard</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>version:<wbr> 1</code></td>
+<td><code>version:<wbr> 1</code></td>
+</tr>
+<tr>
+<td>endpoint <code>host</code>, <code>port</code>, <code>ports</code></td>
+<td>exact host and single port</td>
+</tr>
+<tr>
+<td><code>protocol:<wbr> tcp</code></td>
+<td><code>protocol:<wbr> tcp</code></td>
+</tr>
+<tr>
+<td><code>access:<wbr> read-only</code></td>
+<td><code>allowed_methods:<wbr> [GET,<wbr> HEAD,<wbr> OPTIONS]</code></td>
+</tr>
+<tr>
+<td><code>access:<wbr> read-write</code></td>
+<td><code>allowed_methods</code> including <code>POST</code>, <code>PUT</code>, <code>PATCH</code></td>
+</tr>
+<tr>
+<td><code>access:<wbr> full</code></td>
+<td>no method restriction</td>
+</tr>
+<tr>
+<td>REST <code>rules[].allow.method</code></td>
+<td><code>allowed_methods</code></td>
+</tr>
+<tr>
+<td>REST <code>rules[].allow.path</code></td>
+<td><code>allowed_paths</code> (segment-prefix match)</td>
+</tr>
+<tr>
+<td><code>enforcement:<wbr> enforce</code></td>
+<td>always: a rule either permits or refuses</td>
+</tr>
+<tr>
+<td><code>tls:<wbr> skip</code></td>
+<td>destination-only rules; see limitations</td>
+</tr>
+<tr>
+<td><code>allowed_ips</code></td>
+<td>not accepted; Guard resolves and checks the actual address</td>
+</tr>
+<tr>
+<td><code>network_policies.&lt;name&gt;</code></td>
+<td><code>network.egress</code> entries, keyed by host and port</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>enforcement:<wbr> audit</code> has no equivalent, deliberately. A Guard rule that cannot
+be enforced is refused rather than logged and allowed, because the audit mode's
+purpose - observing what a policy <em>would</em> block - is only meaningful while
+something else blocks it.</p>
+<h2 id="not-expressible-and-refused-rather-than-approximated">Not expressible, and refused rather than approximated<a class="anchor" href="#not-expressible-and-refused-rather-than-approximated" aria-label="Link to this section: Not expressible, and refused rather than approximated">#</a></h2>
+<p><strong>Binary-scoped rules.</strong> Every OpenShell endpoint may carry a <code>binaries</code> list,
+and the semantics are &quot;the executable that opens the connection, or any of its
+parent processes&quot;, with the executable's hash recorded on first use. A gateway
+that runs outside the guest cannot establish which executable opened a
+connection: a compromised guest controls what it reports. Guard's rules are
+therefore per-sandbox, not per-binary, and a <code>binaries</code> clause is refused. A
+policy that depends on binary scoping for its security property does not
+convert.</p>
+<p><strong>Filesystem, Landlock and process identity.</strong> <code>filesystem_policy</code>,
+<code>landlock.compatibility</code>, <code>process.run_as_user</code> and <code>process.run_as_group</code> are
+enforced by OpenShell inside the sandbox. They have no meaning to a network
+gateway, and Guard's host-side gateway cannot grant them. Note that OpenShell
+itself rejects root for <code>run_as_user</code>; that is a property of their policy
+schema, not something Guard reproduces.</p>
+<p><strong>Credential binding and signing.</strong> <code>credential_binding.provider</code>,
+<code>request_body_credential_rewrite</code>, <code>websocket_credential_rewrite</code>,
+<code>allow_uninspected_credentials</code>, <code>credential_signing</code>, <code>signing_service</code> and
+<code>signing_region</code> describe provider-profile integration. Guard substitutes a
+single bound credential on the model path and has no provider profile, body
+rewriting, WebSocket credential rewriting or AWS request signing. These fields
+are refused.</p>
+<p><strong>DNS policy.</strong> OpenShell's DNS controls are binary-scoped as well, so the same
+argument applies. Guard's DNS is a strict subset by design: exact configured
+names, <code>A</code> and <code>AAAA</code> only, no recursion into unknown zones, and
+<code>allowed_record_types</code> that cannot name <code>ANY</code>, <code>NS</code>, <code>TXT</code> or <code>NULL</code>.</p>
+<p><strong>Middleware.</strong> <code>network_middlewares</code>, including <code>on_error:<wbr> fail_closed</code>, run
+in-process on inspected traffic. Guard has no in-process middleware chain, so a
+middleware stanza is refused.</p>
+<p><strong>GraphQL, MCP and JSON-RPC inspection.</strong> OpenShell inspects request bodies
+against per-revision rules: GraphQL operation types and field globs, MCP tool
+names and method availability per protocol revision, JSON-RPC method names.
+Guard now governs the same three shapes for traffic it can see, with its own
+bounds rather than OpenShell's: <code>l7.graphql</code> decides query versus mutation,
+operation name and root fields; <code>l7.mcp</code> decides JSON-RPC method and tool name
+for <code>tools/<wbr>call</code>; an unlisted method or tool is denied. What Guard does not do
+is what OpenShell's revisioned schemas do: there is no per-revision rule table,
+and a document that names a revision Guard does not model is refused by name
+rather than approximated.</p>
+<p>Two limits follow from where enforcement lives, and are stated rather than
+papered over. Guard's layer 7 rules apply only where it can see the request,
+which in the default SNI mode means it cannot: method and path policy needs
+<code>mode:<wbr> intercept</code> and the operator's <code>intercept_ack</code>, because interception means
+Guard holds a key that can read the traffic it governs. And a CONNECT tunnel to
+a host the layer 7 policy governs is refused rather than forwarded ungoverned,
+because a gateway that cannot read a tunnel cannot claim to have governed it.</p>
+<h2 id="import-behaviour">Import behaviour<a class="anchor" href="#import-behaviour" aria-label="Link to this section: Import behaviour">#</a></h2>
+<p><code>aiec-guard-import-openshell</code> converts a document and prints a JSON report
+naming every field it converted, every field it could not, and why. It writes
+no policy file on refusal, and it refuses two shapes outright rather than
+approximating them: an endpoint set whose members need different body rules -
+which Guard's per-attachment layer 7 scope cannot hold - and any construct whose
+security property would be lost in translation.</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>aiec-guard-import-openshell --input policy.yaml --out guard.yaml --l7-out l7.yaml
+</code></pre></div>
+<p>A conversion that silently dropped a <code>binaries</code> clause would hand the operator
+a policy that looks equivalent and is strictly weaker, so it does not exist:
+the field is named in the report instead.</p>
+<h2 id="the-honest-summary">The honest summary<a class="anchor" href="#the-honest-summary" aria-label="Link to this section: The honest summary">#</a></h2>
+<p>Guard and OpenShell agree on destination-level, default-deny, operator-bounded
+network policy, and on refusing what cannot be enforced. They do not overlap on
+in-sandbox enforcement, and a policy is not portable between them in either
+direction without a report.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/extending/"><span class="docpager__dir">Previous</span><span class="docpager__name">Extending AIec Core</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#directly-expressible">Directly expressible</a></li><li class="doctoc__item doctoc__item--2"><a href="#not-expressible-and-refused-rather-than-approximated">Not expressible, and refused rather than approximated</a></li><li class="doctoc__item doctoc__item--2"><a href="#import-behaviour">Import behaviour</a></li><li class="doctoc__item doctoc__item--2"><a href="#the-honest-summary">The honest summary</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

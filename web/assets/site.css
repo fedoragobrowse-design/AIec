@@ -89,6 +89,12 @@ pre {
   border-radius: 2px;
   padding: 18px 20px;
   overflow-x: auto;
+  /* A 340px JSON manifest inside a 676px block used to run into the right
+   * edge and simply stop, which most readers read as "the JSON is short".
+   * The scrollbar is painted whenever there is something to scroll to, so
+   * the block admits it continues. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-firm) transparent;
   font-size: 13.5px;
   line-height: 1.62;
   margin: 0;
@@ -99,6 +105,31 @@ pre {
   border-radius: 2px;
   padding: 1px 5px;
   font-size: 0.9em;
+  /* Inline code is a word the reader cannot shorten, and the reference
+   * documents are full of JSON literals that are wider than the measure.
+   * Without this they push the line past the column and the whole page
+   * scrolls sideways. `break-word` only breaks where it must, so ordinary
+   * short identifiers still look whole. */
+  overflow-wrap: break-word;
+}
+
+/* A bare autolinked URL is link text, not code, so the rule above never
+ * reached it: one 730px reference URL inside a 354px column panned the
+ * entire page sideways on every phone, displacing the masthead and every
+ * paragraph with it. `break-word` only breaks where it must, so ordinary
+ * link text is untouched. */
+.docmain a {
+  overflow-wrap: break-word;
+}
+
+/* The source path is the one part of this row that goes somewhere, and
+ * `--ink-soft` on both halves made it read as two pieces of static text.
+ * An underline in the quiet rule colour keeps the line calm and says
+ * "link" without pulling in the site's link colour. */
+.docmeta a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: var(--rule-firm);
 }
 
 /* ---------------------------------------------------------------- header */
@@ -404,6 +435,12 @@ a:focus-visible, .masthead__nav a:focus-visible {
   outline-offset: 2px;
 }
 
+/* Browser surfaces the palette should own. A selected run of prose is part
+ * of how a reader reads, and the default selection blue is not a colour this
+ * site uses; the underline offset is the same complaint at 1px of scale. */
+::selection { background: var(--signal-wash); color: var(--ink); }
+a { text-underline-offset: 2px; }
+
 /* ------------------------------------------------------------------ blocks */
 
 /* Information blocks, not a card kit: one rule, no radius, no shadow. */
@@ -655,7 +692,289 @@ a:focus-visible, .masthead__nav a:focus-visible {
 .colophon__nav { margin-left: auto; display: flex; gap: 18px; flex-wrap: wrap; }
 .colophon__nav a { color: var(--ink-soft); }
 
-/* ------------------------------------------------------------- responsive */
+/* ------------------------------------------------------- documentation */
+
+/* Rendered documents. Three columns on a wide screen: where you are in the
+ * documentation, the document itself, and what is in the document. The
+ * middle column is the one that matters and it keeps the site's prose
+ * measure; the two rails are navigation and are the first things to go. */
+
+.docshell {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr) 196px;
+  gap: 0 44px;
+  align-items: start;
+}
+
+/* A document with too few headings to be worth a contents list gets two
+ * columns, not an empty 196px rail that reads like a layout that failed. */
+.docshell--wide {
+  grid-template-columns: 224px minmax(0, 1fr);
+}
+
+/* Sidebar: every document, filed under why you would read it. */
+.docnav {
+  position: sticky;
+  top: 24px;
+  /* Fifteen documents are 715px. A 1366x768 laptop has about 660px of
+   * viewport once the browser has taken its share, so a rail that sticks
+   * without a cap pins itself with its last group below the fold, with no
+   * scrollbar to say anything is missing. It scrolls inside itself instead. */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-firm) transparent;
+  padding: 36px 0 44px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.docnav__home {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  padding-bottom: 13px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--rule);
+}
+.docnav__home:hover { color: var(--signal); text-decoration: none; }
+.docnav__group + .docnav__group { margin-top: 24px; }
+.docnav__group h2 {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 0 0 9px;
+  padding: 0;
+  border: 0;
+  max-width: none;
+}
+.docnav__group ul { list-style: none; margin: 0; padding: 0; }
+.docnav__group li { margin: 0; }
+.docnav__group a {
+  display: block;
+  padding: 4px 0 4px 12px;
+  border-left: 1px solid transparent;
+  color: var(--ink-soft);
+}
+.docnav__group a:hover { color: var(--ink); border-left-color: var(--rule); text-decoration: none; }
+.docnav__group a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 650;
+  border-left-color: var(--rule-firm);
+}
+
+/* The document.
+ *
+ * The column is wider than the prose, not the same width. At the column's
+ * 662px a line of body text runs to ~88 characters, and past about 75 the eye
+ * loses the start of the next line and rereads it. Code and tables keep the
+ * full column — they are read by scanning, not by returning to the left
+ * margin — so the measure is applied to prose alone. */
+.docmain {
+  --prose: 560px;
+  padding: 36px 0 96px;
+  min-width: 0;
+  max-width: var(--measure);
+}
+.docmain > *:not(.code):not(.table-wrap):not(.docmeta) { max-width: var(--prose); }
+/* The heading anchors hang in the margin, so a capped heading needs the room
+ * to hang into or the `#` lands on the text. */
+.docmain > h2, .docmain > h3, .docmain > h4 { position: relative; }
+/* Lists are prose too, and their marker sits outside the text column. */
+.docmain > ul, .docmain > ol { padding-left: 1.3em; max-width: calc(var(--prose) + 1.3em); }
+
+/* A running-text page takes the measure down from the column to the line.
+ * Code and tables keep the full width, as in `.docmain`. */
+.content--prose > *:not(pre):not(.code):not(.table-wrap):not(.grid-2):not(.steps) {
+  max-width: 560px;
+}
+.content--prose > .steps { max-width: 640px; }
+.docmain > * + * { margin-top: 20px; }
+.docmain h2 + *, .docmain h3 + *, .docmain .code__lang + * { margin-top: 12px; }
+.docmain li { margin-bottom: 8px; }
+.docmain ol, .docmain ul { padding-left: 1.3em; }
+.docmain li > p { margin-top: 8px; }
+.docmain li > ul, .docmain li > ol { margin-top: 8px; }
+.docmain h2, .docmain h3 { position: relative; }
+.docmain h2 { max-width: 34ch; }
+.docmain h3 { margin-top: 32px; }
+/* A document's own first heading is its title, not a landing page's hero. */
+.docmain > h1 {
+  font-size: clamp(1.85rem, 3.2vw, 2.4rem);
+  line-height: 1.1;
+  max-width: 26ch;
+}
+.docmain .table { min-width: 520px; }
+
+/* Heading anchors. Absent until the heading is pointed at or hovered, so the
+ * margin stays empty until there is a reason to put a mark in it. */
+.anchor {
+  position: absolute;
+  left: -1.15em;
+  width: 1em;
+  text-align: center;
+  font-family: var(--mono);
+  font-weight: 400;
+  color: var(--ink-soft);
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+.docmain h2:hover .anchor, .docmain h3:hover .anchor, .anchor:focus-visible { opacity: 1; }
+.anchor:hover { color: var(--signal); text-decoration: none; }
+
+/* A fenced block labelled with its language, in the site's mono, set above
+ * the rule the code block draws rather than inside the text. */
+.code__lang {
+  display: block;
+  text-align: right;
+  padding-right: 20px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin-bottom: -1px;
+}
+
+/* A quotation in a document is usually a note to the reader, not a pull
+ * quote, so it is set as one: a hairline and the surrounding measure. */
+.note {
+  border-left: 1px solid var(--rule-firm);
+  padding: 1px 0 1px 20px;
+  margin-top: 24px;
+  color: var(--ink-soft);
+}
+.note > * + * { margin-top: 12px; }
+
+/* Provenance. It sits under the title, tight to it: a reader arriving
+ * mid-document wants to know how long the page is and where it is maintained,
+ * and both are answering "why should I trust this" rather than "what is
+ * this". Neither is worth a line of its own above the heading. */
+.docmeta {
+  display: flex;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.01em;
+  color: var(--ink-soft);
+  margin: 14px 0 0;
+}
+.docmeta > * + * { position: relative; }
+.docmeta > * + *::before {
+  content: "·";
+  position: absolute;
+  left: -10px;
+  color: var(--rule-firm);
+}
+.docmeta a { color: var(--ink-soft); }
+
+/* On this page. */
+.doctoc {
+  position: sticky;
+  top: 24px;
+  /* Same cap as the sidebar: a long document's contents are taller than a
+   * laptop viewport, and a contents list you cannot reach is worse than none. */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-firm) transparent;
+  padding: 40px 0 44px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.doctoc__title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 0 0 10px;
+  padding: 0;
+  border: 0;
+}
+.doctoc__list { list-style: none; margin: 0; padding: 0; }
+.doctoc__item { margin: 0 0 8px; }
+.doctoc__item--3 { padding-left: 14px; }
+.doctoc a { color: var(--ink-soft); }
+.doctoc a:hover { color: var(--signal); }
+
+/* Previous and next, so finishing a document says what comes after it. */
+.docpager {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px;
+  margin-top: 64px;
+  padding-top: 26px;
+  border-top: 1px solid var(--rule);
+}
+.docpager__cell {
+  display: block;
+  padding: 14px 18px;
+  border: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink);
+}
+.docpager__cell:hover { border-color: var(--rule-firm); text-decoration: none; }
+.docpager__dir {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+.docpager__name { display: block; font-weight: 650; margin-top: 5px; }
+.docpager__cell--next { text-align: right; }
+
+/* The catalogue on /docs: a title and what the document answers, in the
+ * site's own two-column definition shape rather than a wall of cards. */
+.docgroup { margin-top: 48px; }
+.docgroup__blurb { max-width: 56ch; }
+.doclist {
+  margin: 22px 0 0;
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  gap: 0 34px;
+}
+.doclist dt {
+  padding: 13px 0;
+  border-top: 1px solid var(--rule);
+  font-weight: 650;
+}
+.doclist dd {
+  padding: 13px 0;
+  margin: 0;
+  border-top: 1px solid var(--rule);
+  color: var(--ink-soft);
+  max-width: 52ch;
+}
+.doclist__meta {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  color: var(--ink-soft);
+}
+
+/* The on-this-page rail needs 196px the prose does not want to give up. When
+ * the two collide the contents go: a document whose sections are reachable
+ * from its own sidebar is still fully navigable, one without the rail is not. */
+@media (max-width: 1180px) {
+  .docshell { grid-template-columns: 224px minmax(0, 1fr); }
+  .doctoc { display: none; }
+}
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
@@ -679,6 +998,48 @@ a:focus-visible, .masthead__nav a:focus-visible {
    * `.table-wrap` does, instead of letting it widen the whole page. */
   .diagram { margin-inline: calc(var(--gutter) * -1); overflow-x: auto; }
   .diagram svg { min-width: 620px; }
+
+  /* Below this width the sidebar stops being a column. Fifteen stacked items
+   * is most of a phone screen before the reader reaches the title, so each
+   * group becomes one row that scrolls sideways — the standard phone answer,
+   * and the only one that keeps the document near the top of the screen. */
+  .docshell { grid-template-columns: 1fr; }
+  .docnav {
+    position: static;
+    min-width: 0;
+    padding-bottom: 20px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .docnav__home { margin-bottom: 14px; }
+  .docnav__group + .docnav__group { margin-top: 14px; }
+  .docnav__group ul {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 6px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    padding-bottom: 6px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--rule-firm) transparent;
+  }
+  .docnav__group ul::-webkit-scrollbar { height: 3px; }
+  .docnav__group ul::-webkit-scrollbar-thumb { background: var(--rule-firm); }
+  .docnav__group li { margin: 0; flex: 0 0 auto; }
+  .docnav__group a {
+    white-space: nowrap;
+    padding: 4px 11px;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+  }
+  .docnav__group a[aria-current="page"] { border-color: var(--rule-firm); }
+  .docmain { max-width: none; padding-top: 28px; }
+  .docmain .table-wrap { margin-inline: calc(var(--gutter) * -1); padding-inline: var(--gutter); }
+  .doclist { grid-template-columns: 1fr; }
+  .doclist dt { padding-bottom: 2px; }
+  .doclist dd { padding-top: 3px; }
+  /* An anchor sitting in the left margin has no margin left to sit in. */
+  .anchor { position: static; opacity: 1; width: auto; margin-left: 8px; }
 }
 
 @media (max-width: 620px) {
@@ -687,7 +1048,23 @@ a:focus-visible, .masthead__nav a:focus-visible {
   .masthead__inner { flex-direction: column; align-items: flex-start; gap: 10px; padding: 14px var(--gutter); }
   .masthead__nav { margin-left: 0; }
   .lifecycle__track { grid-template-columns: 1fr 1fr; }
+  .docpager { grid-template-columns: 1fr; }
+  .docnav__group a { font-size: 12.5px; }
   .stage:nth-child(2) { border-right: 0; }
   .stage:nth-child(-n + 2) { border-bottom: 1px solid var(--rule); }
   .colophon__nav { margin-left: 0; }
+}
+
+/* A document is the one thing on this site somebody will print, because the
+ * alternative is holding a browser open next to a terminal. Print loses the
+ * navigation — it is dead weight on paper — and gains the source line, which
+ * is the part worth having when the paper leaves the screen. */
+@media print {
+  .masthead, .colophon, .docnav, .doctoc, .docpager, .anchor { display: none; }
+  .docshell { grid-template-columns: 1fr; max-width: none; padding: 0; }
+  .docmain { max-width: none; padding: 0; }
+  .docmain h2, .docmain h3 { break-after: avoid; }
+  .docmain .table-wrap, .docmain .code, .note { break-inside: avoid; }
+  .docmain pre { white-space: pre-wrap; }
+  body { background: #fff; }
 }

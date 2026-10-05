@@ -249,7 +249,7 @@ agent-agnostic; OMP conventions live only in this adapter.
 ## Using it from an agent
 
 A ready-made skill is in
-[`docs/skills/aiec-sandboxes/SKILL.md`](docs/skills/aiec-sandboxes/SKILL.md).
+[`docs/skills/aiec-sandboxes/SKILL.md`](skills/aiec-sandboxes/SKILL.md).
 Copy it into your agent's skills directory to teach it the whole loop — which
 tool for which situation, how to keep the sandbox TTL honest, and which typed
 errors mean "wait" rather than "try somewhere else":

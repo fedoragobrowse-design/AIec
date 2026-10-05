@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design — AIec</title>
+<meta name="description" content="Which mechanisms came from the DSec paper, which are independent engineering, and where AIec deliberately differs.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/design/">
+<meta property="og:title" content="Design — AIec">
+<meta property="og:description" content="Which mechanisms came from the DSec paper, which are independent engineering, and where AIec deliberately differs.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/design/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/" aria-current="page">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="design">Design</h1>
+<p class="docmeta"><span>5 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DESIGN.md" rel="noopener noreferrer">docs/DESIGN.md</a></p>
+<p>AIec is an implementation of the ideas in <strong>DeepSeek Elastic Compute (DSec):
+A Sandbox Infrastructure for Effective Agentic Training at Scale</strong> (arXiv:2609.22978),
+reduced to what a small, honest implementation can actually stand behind.</p>
+<p>This document records which mechanisms came from the paper, which are
+independent engineering, and where AIec deliberately does something different.</p>
+<h2 id="the-problem-the-paper-names">The problem the paper names<a class="anchor" href="#the-problem-the-paper-names" aria-label="Link to this section: The problem the paper names">#</a></h2>
+<p>Agentic training and evaluation need sandboxes that:</p>
+<ul>
+<li>arrive in large bursts rather than steadily,</li>
+<li>span heterogeneous functionality and isolation requirements,</li>
+<li>retain state across long interactions,</li>
+<li>and are drawn from a large image corpus with limited reuse.</li>
+</ul>
+<p>DSec's conclusion is that this needs an <em>elastic execution platform</em>, not a single
+sandbox runtime. Two consequences shape AIec:</p>
+<ol>
+<li><strong>One contract, many backends.</strong> A caller should not have to care whether a
+sandbox is a microVM, a container, or a hosted provider's machine.</li>
+<li><strong>Ownership must be fenced.</strong> With sandboxes moving between workers, a worker
+that has lost its lease must be unable to touch a sandbox it no longer owns.</li>
+</ol>
+<h2 id="mechanism-mapping">Mechanism mapping<a class="anchor" href="#mechanism-mapping" aria-label="Link to this section: Mechanism mapping">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">DSec mechanism</th>
+<th scope="col">AIec implementation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unified SDK across FnCall / container / microVM / full-VM backends</td>
+<td><code>SandboxRuntime</code> in <code>crates/<wbr>aiec-core/<wbr>src/<wbr>runtime.rs</code>, implemented by Firecracker, the hosted E2B adapter, and Docker</td>
+</tr>
+<tr>
+<td>Heterogeneous, capability-aware placement</td>
+<td><code>RuntimeCapabilities</code> advertised per worker, persisted, and matched by the scheduler before placement</td>
+</tr>
+<tr>
+<td>Bursty arrival and resource admission</td>
+<td>Per-tenant quotas enforced inside the placement transaction, per-tenant rate limiting, and a global execution budget</td>
+</tr>
+<tr>
+<td>Sandbox lifecycle with recoverable state</td>
+<td>Leased ownership with a monotonic fencing generation; workspace archives in shared object storage, restored on a new owner</td>
+</tr>
+<tr>
+<td>Image corpora with limited reuse</td>
+<td>Content-addressed image references, signed manifests, digest verification before a guest boots</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="where-aiec-differs">Where AIec differs<a class="anchor" href="#where-aiec-differs" aria-label="Link to this section: Where AIec differs">#</a></h2>
+<p>These are choices, not omissions of the paper.</p>
+<ul>
+<li><strong>The hosted backend is E2B, not a self-operated fleet.</strong> The paper describes
+operating microVM capacity. AIec has no owned hardware fleet, so hosted
+execution is delegated to a Firecracker-backed provider behind the runtime
+interface. AIec's own Firecracker runtime is complete and is what
+self-hosted deployments run; the hosted fleet is not AIec-operated hardware, and
+the two claims are reported separately rather than merged.</li>
+<li><strong>Only workspace state is portable.</strong> A snapshot preserves <code>/<wbr>workspace</code>. Running
+VM memory does not survive a worker failure, and AIec does not claim it does.</li>
+<li><strong>One cluster, self-hosted.</strong> The paper describes a large multi-region fleet.
+AIec is a single self-hosted cluster that one team runs; there is no hosted
+service and no multi-region story.</li>
+<li><strong>No multi-host validation yet.</strong> Recovery and fencing are proven with two
+workers on one host. Genuinely distributed operation is not yet demonstrated.</li>
+</ul>
+<h2 id="guard-what-the-paper-does-not-name">Guard: what the paper does not name<a class="anchor" href="#guard-what-the-paper-does-not-name" aria-label="Link to this section: Guard: what the paper does not name">#</a></h2>
+<p>The paper's isolation story ends at the guest boundary. That is the right scope
+for training a model, where the model is the thing you are producing. For
+deploying an agent that acts on a developer's machine, the interesting failure
+is one step further in: a sandbox whose <em>guest</em> has been persuaded to want
+something the operator never agreed to.</p>
+<p>Guard answers that by moving the decisions out of the machine. A sandbox is
+still a microVM with its own kernel; what changes is that the answer to &quot;what
+may this reach, with whose credentials, and recorded where&quot; is computed on the
+worker, from a policy the guest cannot read, using secrets the guest never
+holds, into a journal the guest cannot rewrite. The consequence worth stating
+is the failure mode: compromising the guest does not grant new capability,
+because capability was never expressed in terms the guest could influence.</p>
+<p>Three design choices follow from that, and each one is a refusal rather than a
+capability:</p>
+<ul>
+<li><strong>A policy is verified before it is applied.</strong> A finite rule model is checked
+against the operator boundary at compile time, and a rule naming a blocked
+destination is a configuration error, not a runtime surprise.</li>
+<li><strong>Evidence is written before an action, not after.</strong> A cut that cannot be
+recorded is not taken, and a journal that cannot be written cuts the gateway
+permanently rather than continuing unobserved.</li>
+<li><strong>What cannot be enforced is refused.</strong> Encrypted tunnels are not inspected,
+so a rule needing method or tool visibility is rejected on that path instead
+of being recorded as satisfied. The same reasoning is why an OpenShell policy
+carrying binary-scoped rules is refused rather than translated: an
+out-of-guest gateway cannot verify which executable opened a connection, and
+pretending otherwise would be a weaker policy wearing a familiar name.</li>
+</ul>
+<p>The full contract, the operator settings and the phase-by-phase status are in
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/GUARD_POLICY.md" rel="noopener noreferrer"><code>GUARD_POLICY.md</code></a>,
+<a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-plan.md" rel="noopener noreferrer"><code>docs/<wbr>guard-plan.md</code></a> and
+<a href="/docs/openshell/"><code>docs/<wbr>openshell-compatibility.md</code></a>.</p>
+<h2 id="fencing-in-detail">Fencing, in detail<a class="anchor" href="#fencing-in-detail" aria-label="Link to this section: Fencing, in detail">#</a></h2>
+<p>A sandbox is owned through a lease carrying a generation that only ever
+increases. Every state-changing operation is checked against the current owner
+and generation before the runtime is touched:</p>
+<div class="code"><pre><code>worker A owns generation N
+  → A dies
+  → its lease expires
+  → the control plane reassigns to worker B at generation N+1
+  → B reconstructs the workspace from the newest archive
+  → if A returns, its generation-N operations are rejected
+</code></pre></div>
+<p>This is why the lease lives in the database rather than in a worker's memory: a
+restarted worker that still believes it owns a sandbox must be told otherwise.</p>
+<h2 id="what-aiec-does-not-do">What AIec does not do<a class="anchor" href="#what-aiec-does-not-do" aria-label="Link to this section: What AIec does not do">#</a></h2>
+<ul>
+<li>No GPU, QEMU or browser runtime.</li>
+<li>No multi-region scheduler, enterprise SSO, or organisation hierarchy.</li>
+<li>No marketplace, and no admin dashboard — the product is API and SDK driven.</li>
+<li>No complete data-loss prevention. Model prompts remain an information channel,
+and Guard governs egress, credentials and evidence rather than inspecting what
+an agent says.</li>
+<li>No production claim for Guard yet. The live Firecracker acceptance run is not
+executed; <a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/guard-plan.md" rel="noopener noreferrer"><code>docs/<wbr>guard-plan.md</code></a> records exactly what has and
+has not been observed.</li>
+</ul>
+<h2 id="reference">Reference<a class="anchor" href="#reference" aria-label="Link to this section: Reference">#</a></h2>
+<aside class="note"><p>Jialiang Huang, Hongxuan Tang, Jingchang Chen, Yuxuan Liu, Yixiao Chen, Yuan
+Cheng, Yi Tao, Jingli Zhou, Yupeng Chen, Haoyu Chen, Jiarui Wang, Shengkai Lin,
+Chuqi Zhang, Bryan Lee Teng, Lian Guo, Zhe Fu, Wenjun Gao, Yisong Wang, Liang
+Zhao, Zehao Wang, Ziwei Xie, Yongqiang Guo, Peixin Cong, Ziyi Gao, Shuiping Yu,
+Hanwei Xu, Zuofan Wu, Zhizhou Ren, Yuyang Zhou, … Mingxing Zhang, Liyue Zhang,
+Panpan Huang, Wenfeng Liang.
+<strong>DeepSeek Elastic Compute (DSec): A Sandbox Infrastructure for Effective
+Agentic Training at Scale.</strong> DeepSeek-AI &amp; Tsinghua University, 2026.
+arXiv:2609.22978.</p>
+</aside>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/architecture/"><span class="docpager__dir">Previous</span><span class="docpager__name">Production architecture</span></a><a class="docpager__cell docpager__cell--next" href="/docs/versioning/"><span class="docpager__dir">Next</span><span class="docpager__name">Versioning and compatibility</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#the-problem-the-paper-names">The problem the paper names</a></li><li class="doctoc__item doctoc__item--2"><a href="#mechanism-mapping">Mechanism mapping</a></li><li class="doctoc__item doctoc__item--2"><a href="#where-aiec-differs">Where AIec differs</a></li><li class="doctoc__item doctoc__item--2"><a href="#guard-what-the-paper-does-not-name">Guard: what the paper does not name</a></li><li class="doctoc__item doctoc__item--2"><a href="#fencing-in-detail">Fencing, in detail</a></li><li class="doctoc__item doctoc__item--2"><a href="#what-aiec-does-not-do">What AIec does not do</a></li><li class="doctoc__item doctoc__item--2"><a href="#reference">Reference</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

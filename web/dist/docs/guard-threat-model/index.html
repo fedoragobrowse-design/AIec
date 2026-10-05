@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guard threat model — AIec</title>
+<meta name="description" content="Who an untrusted agent is assumed to be, the attacks each control answers, and the ones left open.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/guard-threat-model/">
+<meta property="og:title" content="Guard threat model — AIec">
+<meta property="og:description" content="Who an untrusted agent is assumed to be, the attacks each control answers, and the ones left open.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/guard-threat-model/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/" aria-current="page">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="guard-threat-model">Guard threat model</h1>
+<p class="docmeta"><span>6 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/GUARD_THREAT_MODEL.md" rel="noopener noreferrer">docs/GUARD_THREAT_MODEL.md</a></p>
+<p>Guard governs the authority and communications of agent sandboxes from outside
+the guest. This document states what that does and does not defend against, in
+the terms a reader can check against the code and the acceptance runs.</p>
+<h2 id="the-separation-guard-depends-on">The separation Guard depends on<a class="anchor" href="#the-separation-guard-depends-on" aria-label="Link to this section: The separation Guard depends on">#</a></h2>
+<div class="code"><pre><code>AIec control plane  ── places, fences, budgets, quarantine
+AIec worker         ── owns the microVM and the Guard attachment
+AIec Guard gateway ── DNS, model broker, credentials, packet rules
+AIec Watchdog       ── observes authoritative telemetry, requests quarantine
+guest               ── the agent's computer; not trusted
+</code></pre></div>
+<p>The sandbox may be compromised. The harness inside it may be compromised. The
+repository contents may be malicious. What still holds is that the network and
+credential boundary is enforced by processes the guest cannot reach or modify -
+and only that. It is a statement about where enforcement runs, not about what a
+host-level attacker can do afterwards; see 'What Guard does not defend' below.</p>
+<h2 id="assets">Assets<a class="anchor" href="#assets" aria-label="Link to this section: Assets">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Asset</th>
+<th scope="col">Where it lives</th>
+<th scope="col">Who must not reach it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Model provider credential</td>
+<td>worker-side credential file</td>
+<td>the guest, always</td>
+</tr>
+<tr>
+<td>Any tenant secret</td>
+<td>control-plane secret store</td>
+<td>the guest, always</td>
+</tr>
+<tr>
+<td>Policy and its hash</td>
+<td>durable control-plane state</td>
+<td>the guest, always</td>
+</tr>
+<tr>
+<td>Guard journal</td>
+<td>worker-side file plus remote sink</td>
+<td>the guest, always</td>
+</tr>
+<tr>
+<td>Host network stack</td>
+<td>kernel</td>
+<td>the guest, always</td>
+</tr>
+<tr>
+<td>Other sandboxes</td>
+<td>other attachments</td>
+<td>this guest</td>
+</tr>
+<tr>
+<td>The control plane</td>
+<td>host</td>
+<td>the guest</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="adversaries">Adversaries<a class="anchor" href="#adversaries" aria-label="Link to this section: Adversaries">#</a></h2>
+<ol>
+<li><strong>A compromised guest.</strong> Arbitrary code as the sandbox user, arbitrary
+syscalls, arbitrary packets.</li>
+<li><strong>A compromised harness.</strong> The model's tool-calling loop is attacker-
+influenced and may issue any request the tools allow.</li>
+<li><strong>A malicious dependency or repository content.</strong> Code the agent runs is
+attacker-chosen.</li>
+<li><strong>A confused or coerced operator.</strong> A human is talked into widening a policy.</li>
+</ol>
+<h2 id="what-guard-defends">What Guard defends<a class="anchor" href="#what-guard-defends" aria-label="Link to this section: What Guard defends">#</a></h2>
+<ul>
+<li><strong>Direct egress.</strong> The guest's only permitted destination is the Guard
+gateway. Direct IPv4, IPv6, alternate DNS, metadata addresses, private ranges,
+the control plane, the worker and other sandboxes are denied by nftables
+outside the guest. Measured on real microVMs in <code>benchmarks/<wbr>guard-core-acceptance.json</code>.</li>
+<li><strong>Credential exposure.</strong> The model credential is substituted host-side for a
+placeholder. A full snapshot, memory image and disk scan finds no copy of the
+real secret, measured over 13.4 GB.</li>
+<li><strong>Exfiltration through allowed channels.</strong> Under a model-only policy the
+request and response are byte-limited and the model endpoint is bound; an
+unrelated endpoint is refused even when the guest resolves it.</li>
+<li><strong>DNS as a covert channel.</strong> Only Guard resolves names, only for zones the
+policy allows, only for record types the policy allows.</li>
+<li><strong>Loss of the watcher.</strong> If the watchdog stops reporting, the gateway and the
+kernel rules cut the attachment. Silence is not health.</li>
+<li><strong>Runaway workloads.</strong> Lifetime and model request and byte ceilings are
+durable control-plane state, and a worker restart cannot reset them. The
+reaper that acts on an expired budget is implemented and covered by database
+tests; no live run has yet observed it firing.</li>
+<li><strong>A machine that misbehaves.</strong> Repeated authoritative denials request a
+quarantine, and the control plane cuts the network, pauses the VM, captures
+forensics without resuming it, latches durable quarantine state, appends an
+authoritative event, writes an incident report and completes - observed live,
+end to end, in <code>benchmarks/<wbr>guard-phase2-acceptance.json</code>. A repeat call
+returns the same incident rather than acting twice.</li>
+<li><strong>Unauthorized policy change.</strong> An agent may propose a policy change; only a
+human may approve one, and the existing verifier runs before it is applied.</li>
+</ul>
+<h2 id="what-guard-does-not-defend">What Guard does not defend<a class="anchor" href="#what-guard-does-not-defend" aria-label="Link to this section: What Guard does not defend">#</a></h2>
+<ul>
+<li><strong>Host compromise.</strong> Everything Guard runs is on the host. A root attacker on
+the host rewrites nftables, reads the credential file and forges the journal.</li>
+<li><strong>The model API as a data channel.</strong> A model endpoint is a channel. Guard
+bounds it and binds it, but bytes that reach the model provider are bytes the
+provider received.</li>
+<li><strong>Gateway compromise.</strong> The Guard gateway holds the model credential and can
+read the traffic it proxies. A compromised gateway defeats the network
+boundary it enforces.</li>
+<li><strong>Collusion between the harness and a permitted endpoint.</strong> If the policy
+permits a destination, the guest may talk to it.</li>
+<li><strong>Layer 7 semantics without TLS interception.</strong> In the default SNI mode Guard
+sees the hostname and the connection, not the HTTP method or path. Method and
+path policy exists only where the operator has explicitly enabled
+interception, which means Guard holds a key that can read the traffic.</li>
+<li><strong>The guest's own data.</strong> Files inside the guest, and anything the guest
+writes into a permitted channel, are the guest's.</li>
+<li><strong>A watcher's judgement.</strong> The optional watcher is a second reviewer. It can
+only be more restrictive; it can be wrong, and it can be manipulated by
+untrusted evidence. It never widens anything.</li>
+<li><strong>The guest's own account of what happened.</strong> Guest and harness logs are
+untrusted input. A compromised guest can omit, reorder or forge them, so
+every claim in this document rests on host-observed evidence instead:
+counters, packet captures, listeners, process censuses and the Guard journal.
+A guest log is context for an operator, never a security verdict.</li>
+<li><strong>Hardware attestation.</strong> AIec verifies hashes and, for guarded workloads,
+signed manifests. There is no TPM-backed attestation, and none is claimed.</li>
+<li><strong>Multi-host security.</strong> Guard's assumptions are about one worker host and its
+guest. A deployment that separates the gateway from the worker changes the
+trust properties and is documented as such rather than claimed equivalent.</li>
+</ul>
+<h2 id="trust-boundaries-that-matter">Trust boundaries that matter<a class="anchor" href="#trust-boundaries-that-matter" aria-label="Link to this section: Trust boundaries that matter">#</a></h2>
+<ul>
+<li><strong>Guest → host kernel.</strong> The guest writes packets; the host decides. Guard's
+rules are installed by the worker before the guest boots and replaced only by
+a fenced action.</li>
+<li><strong>Guest → gateway.</strong> The gateway accepts connections only from the address the
+attachment assigned to this guest, and only after the watchdog's first
+heartbeat for this identity.</li>
+<li><strong>Gateway → control plane.</strong> Reservations are committed by the control plane
+before any byte is forwarded. A gateway that cannot reach it refuses traffic.</li>
+<li><strong>Watchdog → control plane.</strong> The watchdog's key carries only
+<code>guard:<wbr>read</code>, <code>guard:<wbr>heartbeat</code> and <code>guard:<wbr>quarantine</code>. It cannot create
+sandboxes, read tenant data or release a quarantine.</li>
+<li><strong>Human → policy.</strong> Approval is a separate capability from proposing.</li>
+</ul>
+<h2 id="deployment-modes-and-what-each-defeats">Deployment modes and what each defeats<a class="anchor" href="#deployment-modes-and-what-each-defeats" aria-label="Link to this section: Deployment modes and what each defeats">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Mode</th>
+<th scope="col">What it defeats</th>
+<th scope="col">What a compromise of that component defeats</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Worker-host hardened process</td>
+<td>guest escape attempts; the default</td>
+<td>a root attacker on the worker host defeats the whole boundary</td>
+</tr>
+<tr>
+<td>Separate gateway VM</td>
+<td>a compromise confined to the worker host that does not reach the gateway host</td>
+<td>the gateway host holds model credentials; its compromise reads proxied traffic</td>
+</tr>
+<tr>
+<td>Separate physical gateway</td>
+<td>a compromised worker host with no route to gateway state</td>
+<td>the gateway itself is a single high-value target; latency and operational cost are real</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="evidence-discipline">Evidence discipline<a class="anchor" href="#evidence-discipline" aria-label="Link to this section: Evidence discipline">#</a></h2>
+<p>Every claim above that says &quot;denied&quot;, &quot;bounded&quot; or &quot;measured&quot; names an artifact.
+<code>benchmarks/<wbr>guard-core-acceptance.json</code> is a run on real microVMs with real
+nftables. <code>benchmarks/<wbr>guard-phase2-acceptance.json</code> is the watchdog, dead-man
+and quarantine run. Claims not covered by an artifact are written as
+limitations, not as guarantees.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/guard-policy/"><span class="docpager__dir">Previous</span><span class="docpager__name">Guard policy reference</span></a><a class="docpager__cell docpager__cell--next" href="/docs/images/"><span class="docpager__dir">Next</span><span class="docpager__name">Images</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#the-separation-guard-depends-on">The separation Guard depends on</a></li><li class="doctoc__item doctoc__item--2"><a href="#assets">Assets</a></li><li class="doctoc__item doctoc__item--2"><a href="#adversaries">Adversaries</a></li><li class="doctoc__item doctoc__item--2"><a href="#what-guard-defends">What Guard defends</a></li><li class="doctoc__item doctoc__item--2"><a href="#what-guard-does-not-defend">What Guard does not defend</a></li><li class="doctoc__item doctoc__item--2"><a href="#trust-boundaries-that-matter">Trust boundaries that matter</a></li><li class="doctoc__item doctoc__item--2"><a href="#deployment-modes-and-what-each-defeats">Deployment modes and what each defeats</a></li><li class="doctoc__item doctoc__item--2"><a href="#evidence-discipline">Evidence discipline</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

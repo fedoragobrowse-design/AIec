@@ -94,7 +94,7 @@ or 4 GiB throughput ratio.
 
 Artifact collection over the same protocol runs in bounded 64 KiB groups rather
 than one read per chunk, because a worker-backed read is a network round trip
-plus two ownership checks. Measured on 192.168.1.250: collecting 16.8 MiB took
+plus two ownership checks. Measured on a production host: collecting 16.8 MiB took
 129 360 ms with one chunk per read and 8 945 ms grouped, with every served byte
 hashing to the digest recorded at collection. The authorization that gates
 publication is unchanged — a lease replaced during a group still stops every

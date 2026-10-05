@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firecracker guest image — AIec</title>
+<meta name="description" content="Building the guest the Firecracker runtime boots, and the agent inside it that serves exec requests.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/firecracker-guest/">
+<meta property="og:title" content="Firecracker guest image — AIec">
+<meta property="og:description" content="Building the guest the Firecracker runtime boots, and the agent inside it that serves exec requests.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/firecracker-guest/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/" aria-current="page">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="firecracker-guest-image">Firecracker guest image</h1>
+<p class="docmeta"><span>4 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/FIRECRACKER_GUEST.md" rel="noopener noreferrer">docs/FIRECRACKER_GUEST.md</a></p>
+<p>The Firecracker runtime boots <code>vmlinux</code> with the ext4 image produced by <code>scripts/<wbr>build-firecracker-guest.sh</code>. The guest is a Debian userland with a coding toolchain: it runs <code>git</code>, <code>python3</code>, <code>curl</code>, <code>tar</code>/<code>gzip</code>, and the coreutils a coding agent expects, with a real CA bundle and working DNS.</p>
+<h2 id="base-image-and-packages">Base image and packages<a class="anchor" href="#base-image-and-packages" aria-label="Link to this section: Base image and packages">#</a></h2>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Item</th>
+<th scope="col">Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Base image</td>
+<td><code>debian:<wbr>bookworm-slim</code></td>
+</tr>
+<tr>
+<td>Base digest</td>
+<td><code>debian:<wbr>bookworm-slim@sha256:<wbr>3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251</code></td>
+</tr>
+<tr>
+<td>Installed packages</td>
+<td><code>git ca-certificates curl python3 tar gzip coreutils util-linux hostname</code> (<code>--no-install-recommends</code>, apt lists and docs stripped afterwards)</td>
+</tr>
+<tr>
+<td>Guest agent</td>
+<td><code>aiec-guest</code> 0.1.0, static musl, at <code>/<wbr>usr/<wbr>local/<wbr>bin/<wbr>aiec-guest</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Versions measured inside the built container (not hardcoded):</p>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Tool</th>
+<th scope="col">Version</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>git</td>
+<td><code>git version 2.39.5</code> (Debian <code>1:<wbr>2.39.5-0+deb12u3</code>)</td>
+</tr>
+<tr>
+<td>curl</td>
+<td><code>curl 7.88.1 (x86_64-pc-linux-gnu) libcurl/<wbr>7.88.1 OpenSSL/<wbr>3.0.22</code></td>
+</tr>
+<tr>
+<td>python3</td>
+<td><code>Python 3.11.2</code></td>
+</tr>
+<tr>
+<td>tar</td>
+<td><code>tar (GNU tar) 1.34</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The base image is pinned by tag and the resolved repo digest is recorded in <code>guest-capabilities.json</code>; <code>AIEC_GUEST_BASE_IMAGE</code> overrides the tag for a controlled upgrade, and the digest in the recorded capabilities file is what identifies the result.</p>
+<h2 id="artifact-layout">Artifact layout<a class="anchor" href="#artifact-layout" aria-label="Link to this section: Artifact layout">#</a></h2>
+<p><code>.aiec/<wbr>images/<wbr></code> (the default output directory) contains:</p>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">File</th>
+<th scope="col">Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aiec-rootfs.ext4</code></td>
+<td>4 GiB ext4 image; ~282 MiB of Debian bookworm-slim userland with the guest agent and the baked guest secret</td>
+</tr>
+<tr>
+<td><code>vmlinux</code></td>
+<td>uncompressed kernel (provided separately, not produced by this script)</td>
+</tr>
+<tr>
+<td><code>guest-capabilities.json</code></td>
+<td>machine-readable description of the artifact (see below)</td>
+</tr>
+<tr>
+<td><code>SHA256SUMS</code></td>
+<td><code>sha256sum</code> lines for the rootfs and the kernel</td>
+</tr>
+<tr>
+<td><code>manifest.json</code></td>
+<td>runtime boot contract: rootfs name, kernel name, <code>control_port:<wbr> 1024</code>, <code>guest_cid:<wbr> 3</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Inside the image:</p>
+<ul>
+<li><code>/<wbr>init</code> is a symlink to <code>/<wbr>sbin/<wbr>init</code>; <code>/<wbr>sbin/<wbr>init</code> is the repository-owned <code>guest/<wbr>rootfs/<wbr>sbin/<wbr>init</code> (POSIX <code>sh</code>, no BusyBox applets). It mounts <code>/<wbr>proc</code>, <code>/<wbr>sys</code>, <code>devtmpfs</code> on <code>/<wbr>dev</code>, <code>devpts</code>, <code>tmpfs</code> on <code>/<wbr>run</code>, sets the hostname, checks <code>/<wbr>etc/<wbr>aiec-guest-secret</code>, exports <code>AIEC_GUEST_SECRET</code>, and supervises the guest agent in a restart loop. The agent listens on vsock port 1024 and serves <code>/<wbr>workspace</code>, which init guarantees exists.</li>
+<li><code>/<wbr>etc/<wbr>aiec-guest-secret</code> holds the build-time secret with mode 0600.</li>
+<li><code>/<wbr>etc/<wbr>resolv.conf</code> is a real file with <code>nameserver 1.1.1.1</code> and <code>nameserver 8.8.8.8</code> (the docker-managed bind mount is never written through).</li>
+<li>Debian bookworm is merged-usr, so <code>/<wbr>bin</code>, <code>/<wbr>sbin</code> and <code>/<wbr>lib</code> are symlinks into <code>/<wbr>usr</code>; the guest agent and the repository skeleton are installed through them.</li>
+</ul>
+<h2 id="rebuilding">Rebuilding<a class="anchor" href="#rebuilding" aria-label="Link to this section: Rebuilding">#</a></h2>
+<div class="code"><span class="code__lang">bash</span><pre><code>AIEC_GUEST_SECRET=$(openssl rand -hex 32) bash scripts/build-firecracker-guest.sh
+</code></pre></div>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Input</th>
+<th scope="col">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AIEC_GUEST_SECRET</code></td>
+<td>required, at least 32 bytes, baked into the image; rotate it and rebuild to change it</td>
+</tr>
+<tr>
+<td><code>AIEC_KERNEL</code></td>
+<td>kernel to hash and describe, default <code>.aiec/<wbr>images/<wbr>vmlinux</code></td>
+</tr>
+<tr>
+<td><code>AIEC_GUEST_BASE_IMAGE</code></td>
+<td>base image, default <code>debian:<wbr>bookworm-slim</code></td>
+</tr>
+<tr>
+<td><code>AIEC_GUEST_ROOTFS_SIZE</code></td>
+<td>image size, default <code>4G</code></td>
+</tr>
+<tr>
+<td>positional argument 1</td>
+<td>output directory, default <code>.aiec/<wbr>images</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Requirements: docker, the Rust toolchain with the <code>x86_64-unknown-linux-musl</code> target, and <code>e2fsprogs</code> (<code>mke2fs</code>, <code>e2fsck</code>, <code>resize2fs</code>, <code>debugfs</code>). The build needs the network to pull the base image and run <code>apt-get</code>. When the build user cannot reach the docker socket directly, every docker call is routed through <code>sg docker -c '...'</code>; the script fails with a clear error if neither path works.</p>
+<p>Exit codes: <code>0</code> on success, <code>1</code> on a build error, <code>2</code> when the rootfs was built but <code>AIEC_KERNEL</code> does not exist (in that case <code>guest-capabilities.json</code> is written with <code>&quot;kernel_sha256&quot;:<wbr> null</code> and <code>SHA256SUMS</code>/<code>manifest.json</code> are not rewritten).</p>
+<p>The image is verified offline without booting it:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>debugfs -R 'stat /usr/bin/git' .aiec/images/aiec-rootfs.ext4
+debugfs -R 'cat /etc/resolv.conf' .aiec/images/aiec-rootfs.ext4
+</code></pre></div>
+<h2 id="capability-profile">Capability profile<a class="anchor" href="#capability-profile" aria-label="Link to this section: Capability profile">#</a></h2>
+<p><code>guest-capabilities.json</code> describes what a sandbox built on this image can do:</p>
+<div class="code"><span class="code__lang">json</span><pre><code>{&quot;schema&quot;:1,&quot;artifact_version&quot;:&quot;1.0.0&quot;,&quot;base&quot;:&quot;&lt;base image digest&gt;&quot;,&quot;profile&quot;:&quot;coding&quot;,
+ &quot;capabilities&quot;:[&quot;sh&quot;,&quot;coreutils&quot;,&quot;git&quot;,&quot;ca-certificates&quot;,&quot;dns&quot;,&quot;https&quot;,&quot;tar&quot;,&quot;gzip&quot;,&quot;curl&quot;,&quot;python3&quot;],
+ &quot;git_version&quot;:&quot;&lt;measured&gt;&quot;,&quot;guest_agent_version&quot;:&quot;&lt;Cargo version&gt;&quot;,&quot;guest_protocol_version&quot;:2,&quot;rootfs_sha256&quot;:&quot;&lt;sha256&gt;&quot;,
+ &quot;kernel_sha256&quot;:&quot;&lt;sha256&gt;|null&quot;,&quot;built_at&quot;:&quot;&lt;RFC3339 UTC&gt;&quot;}
+</code></pre></div>
+<ul>
+<li><code>profile:<wbr> &quot;coding&quot;</code> marks the image as a coding-capable guest rather than a minimal shell.</li>
+<li><code>capabilities</code> are stable identifiers, not versions: <code>sh</code>, <code>coreutils</code>, <code>git</code>, <code>ca-certificates</code>, <code>dns</code>, <code>https</code>, <code>tar</code>, <code>gzip</code>, <code>curl</code>, <code>python3</code>.</li>
+<li><code>git_version</code> and <code>guest_agent_version</code> are the measured <code>git --version</code> output and the <code>aiec-guest</code> crate version from the workspace manifest.</li>
+<li><code>guest_protocol_version</code> is the wire protocol revision the baked agent implements, read from <code>aiec-core</code>'s <code>PROTOCOL_VERSION</code> by the build. Revision 2 adds the bounded, version-consistent artifact range reads (<code>ReadFileChunk</code>) that collection depends on.</li>
+<li><code>rootfs_sha256</code> covers <code>aiec-rootfs.ext4</code> as written by the script; <code>kernel_sha256</code> covers the kernel and is <code>null</code> when the build had none.</li>
+</ul>
+<p>The runtime consumes this file through <code>aiec-runtime</code>'s <code>guest_artifact</code> module (<code>load_guest_artifact</code>/<code>verify_guest_artifact</code>): it fails closed when the file is missing, when the rootfs is unreadable, when the recorded <code>rootfs_sha256</code> does not match the image on disk, when <code>guest_protocol_version</code> is absent or is not the revision this runtime speaks, and it verifies <code>kernel_sha256</code> whenever it is present. <code>profile == &quot;coding&quot;</code> together with <code>git</code> in <code>capabilities</code> is what marks the artifact as coding-capable; a stricter deployment can additionally require <code>ca-certificates</code>. <code>schema</code> and <code>built_at</code> are informational.</p>
+<h2 id="networking">Networking<a class="anchor" href="#networking" aria-label="Link to this section: Networking">#</a></h2>
+<p>The guest does not configure its own address. The runtime network attachment supplies the guest addresses: <code>NetworkAttachment::<wbr>guest_addresses</code> becomes the <code>ip=</code> autoconfiguration parameters on the Firecracker boot cmdline, and the kernel applies them to the virtio-net interface (<code>CONFIG_IP_PNP</code> and <code>CONFIG_VIRTIO_NET</code> in the approved <code>vmlinux</code>). The guest userland has no role in address assignment. The guest's only DNS responsibility is to ship a usable <code>/<wbr>etc/<wbr>resolv.conf</code>, which the build writes as a plain file with the public resolvers <code>1.1.1.1</code> and <code>8.8.8.8</code>. The control channel is vsock (guest CID 3, port 1024) and is unaffected by IP autoconfiguration.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/snapshots/"><span class="docpager__dir">Previous</span><span class="docpager__name">Snapshots</span></a><a class="docpager__cell docpager__cell--next" href="/docs/billing/"><span class="docpager__dir">Next</span><span class="docpager__name">Usage and billing foundation</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#base-image-and-packages">Base image and packages</a></li><li class="doctoc__item doctoc__item--2"><a href="#artifact-layout">Artifact layout</a></li><li class="doctoc__item doctoc__item--2"><a href="#rebuilding">Rebuilding</a></li><li class="doctoc__item doctoc__item--2"><a href="#capability-profile">Capability profile</a></li><li class="doctoc__item doctoc__item--2"><a href="#networking">Networking</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>

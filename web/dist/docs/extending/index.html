@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extending AIec Core — AIec</title>
+<meta name="description" content="Writing a backend or a scheduler behind the Core traits, and the dependency direction that keeps them honest.">
+<link rel="canonical" href="https://aiec.gobrowse.dev/docs/extending/">
+<meta property="og:title" content="Extending AIec Core — AIec">
+<meta property="og:description" content="Writing a backend or a scheduler behind the Core traits, and the dependency direction that keeps them honest.">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://aiec.gobrowse.dev/docs/extending/">
+<meta property="og:site_name" content="AIec">
+<meta property="og:image" content="https://aiec.gobrowse.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="theme-color" content="#edf0f4">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/assets/site.css">
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+</head>
+<body class="page-doc">
+<header class="masthead">
+  <div class="masthead__inner">
+    <a class="wordmark" href="/"><span class="wordmark__mark"></span>AIec</a>
+    <nav class="masthead__nav">
+      <a href="/">Home</a>
+      <a href="/docs" aria-current="page">Docs</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/security">Security</a>
+    </nav>
+  </div>
+</header>
+<div class="docshell">
+  <nav class="docnav" aria-label="Documentation">
+    <a class="docnav__home" href="/docs">All documentation</a>
+    <div class="docnav__group"><h2>Start here</h2><ul>
+    <li><a href="/docs/deployment/">Production deployment</a></li>
+    <li><a href="/docs/api/">REST API</a></li>
+    <li><a href="/docs/mcp/">AIec Local MCP</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>How it works</h2><ul>
+    <li><a href="/docs/architecture/">Production architecture</a></li>
+    <li><a href="/docs/design/">Design</a></li>
+    <li><a href="/docs/versioning/">Versioning and compatibility</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Operating it</h2><ul>
+    <li><a href="/docs/guard/">Guard operations</a></li>
+    <li><a href="/docs/guard-policy/">Guard policy reference</a></li>
+    <li><a href="/docs/guard-threat-model/">Guard threat model</a></li>
+    <li><a href="/docs/images/">Images</a></li>
+    <li><a href="/docs/snapshots/">Snapshots</a></li>
+    <li><a href="/docs/firecracker-guest/">Firecracker guest image</a></li>
+    <li><a href="/docs/billing/">Usage and billing foundation</a></li>
+    </ul></div>
+    <div class="docnav__group"><h2>Build on it</h2><ul>
+    <li><a href="/docs/extending/" aria-current="page">Extending AIec Core</a></li>
+    <li><a href="/docs/openshell/">OpenShell policy compatibility</a></li>
+    </ul></div>
+  </nav>
+  <main class="docmain">
+<h1 id="extending-aiec-core">Extending AIec Core</h1>
+<p class="docmeta"><span>2 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/EXTENDING.md" rel="noopener noreferrer">docs/EXTENDING.md</a></p>
+<p>AIec Core is the compile-time extension boundary for infrastructure backends. The default AIec server, worker, scheduler, storage, image resolver, network manager, snapshot provider, and policy are selected through the same public <code>Platform</code> composition used by custom products.</p>
+<h2 id="dependency-direction">Dependency direction<a class="anchor" href="#dependency-direction" aria-label="Link to this section: Dependency direction">#</a></h2>
+<div class="code"><span class="code__lang">text</span><pre><code>custom runtimes/schedulers/stores/networks/images/policies
+                         |
+                         v
+                  AIec Core
+                         ^
+                         |
+       AIec API / worker / CLI composition
+</code></pre></div>
+<p>Backend crates depend on Core. Core does not depend on Firecracker, Linux networking, SQLx/PostgreSQL, S3, Axum, or AWS. Products depend on Core and select concrete backends.</p>
+<h2 id="extension-boundaries">Extension boundaries<a class="anchor" href="#extension-boundaries" aria-label="Link to this section: Extension boundaries">#</a></h2>
+<p>A product supplies implementations of the meaningful infrastructure boundaries:</p>
+<ul>
+<li><code>runtime::<wbr>SandboxRuntime</code> controls sandbox creation, lifecycle, execution, and file operations.</li>
+<li><code>scheduler::<wbr>Scheduler</code> selects capacity and resolves the worker that owns a sandbox lease.</li>
+<li><code>storage::<wbr>MetadataStore</code> persists control-plane metadata.</li>
+<li><code>storage::<wbr>ArtifactStore</code> stores opaque snapshot artifacts by key.</li>
+<li><code>network::<wbr>NetworkBackend</code> prepares and cleans up isolated VM networking.</li>
+<li><code>images::<wbr>ImageResolver</code> maps an image reference to stable image metadata.</li>
+<li><code>snapshots::<wbr>SnapshotProvider</code> describes snapshot support and compatibility.</li>
+<li><code>policy::<wbr>PlatformPolicy</code> validates product-specific creation and restore rules.</li>
+<li><code>platform::<wbr>Platform</code> owns the selected trait objects and rejects incomplete composition.</li>
+</ul>
+<p>Not every internal function is injectable. Database queries, state transitions, HTTP routes, guest frames, and worker protocol internals stay with the subsystem that owns them unless a demonstrated use case requires a boundary.</p>
+<h2 id="custom-composition">Custom composition<a class="anchor" href="#custom-composition" aria-label="Link to this section: Custom composition">#</a></h2>
+<p>Implement the traits required by the product, then pass <code>Arc&lt;dyn Trait&gt;</code> values to <code>Platform::<wbr>builder()</code> and call <code>build()</code>. The <code>custom_core_platform</code> example uses the real <code>BubblewrapRuntime</code> and <code>FilesystemObjectStore</code> with custom scheduler, policy, and network implementations. It validates the assembled capability and artifact contracts without starting an API listener or requiring KVM.</p>
+<p>Run it with:</p>
+<div class="code"><span class="code__lang">bash</span><pre><code>cargo run -p aiec-api --example custom_core_platform
+</code></pre></div>
+<h2 id="compatibility-and-versioning">Compatibility and versioning<a class="anchor" href="#compatibility-and-versioning" aria-label="Link to this section: Compatibility and versioning">#</a></h2>
+<p>All crates are currently pre-1.0. Compatibility is tracked separately for these boundaries:</p>
+<div class="table-wrap"><table class="table"><thead>
+<tr>
+<th scope="col">Boundary</th>
+<th scope="col">Compatibility rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Core public API</td>
+<td>Rust source compatibility is not yet guaranteed; trait additions are breaking changes for implementors.</td>
+</tr>
+<tr>
+<td>Backend implementation API</td>
+<td>Constructors and backend-specific configuration may change independently of Core unless explicitly documented as a Core contract.</td>
+</tr>
+<tr>
+<td>Guest protocol</td>
+<td>Versioned at runtime; an incompatible peer must be rejected rather than guessed.</td>
+</tr>
+<tr>
+<td>Worker protocol</td>
+<td>Versioned and authenticated; request IDs, bounds, and replay rules are protocol behavior.</td>
+</tr>
+<tr>
+<td>Snapshot format</td>
+<td>Versioned independently of Core and runtime APIs; manifests carry format and integrity metadata.</td>
+</tr>
+<tr>
+<td>Image manifest</td>
+<td>Versioned independently of the image resolver implementation.</td>
+</tr>
+</tbody>
+</table></div>
+<p>A patch release should not silently change persisted snapshot or image formats. A minor release may add non-breaking Core conveniences, but adding a required trait method is breaking for extension authors and therefore requires a pre-1.0 version bump. Backend crates must not expose SQLx, Firecracker, Linux, or AWS types through Core trait signatures.</p>
+
+    <nav class="docpager" aria-label="Documents"><a class="docpager__cell docpager__cell--prev" href="/docs/billing/"><span class="docpager__dir">Previous</span><span class="docpager__name">Usage and billing foundation</span></a><a class="docpager__cell docpager__cell--next" href="/docs/openshell/"><span class="docpager__dir">Next</span><span class="docpager__name">OpenShell policy compatibility</span></a></nav>
+  </main>
+<aside class="doctoc" aria-label="On this page">
+<h2 class="doctoc__title">On this page</h2>
+    <ol class="doctoc__list">
+      <li class="doctoc__item doctoc__item--2"><a href="#dependency-direction">Dependency direction</a></li><li class="doctoc__item doctoc__item--2"><a href="#extension-boundaries">Extension boundaries</a></li><li class="doctoc__item doctoc__item--2"><a href="#custom-composition">Custom composition</a></li><li class="doctoc__item doctoc__item--2"><a href="#compatibility-and-versioning">Compatibility and versioning</a></li>
+    </ol>
+  </aside>
+</div>
+
+<footer class="colophon">
+  <div class="colophon__inner">
+    <span>Computers for AI agents. Apache 2.0, self-hosted.</span>
+    <nav class="colophon__nav"><a href="/docs">Docs</a>
+      <a href="/mcp">MCP</a>
+      <a href="/security">Security</a>
+      <a href="/ecosystem">Ecosystem</a>
+      <a href="/benchmarks">Benchmarks</a>
+      <a href="/limitations">Limitations</a>
+      <a href="/roadmap">Roadmap</a>
+      <a href="/contributing">Contribute</a></nav>
+  </div>
+</footer>
+</body>
+</html>
