@@ -1658,8 +1658,13 @@ mod tests {
             access_token: "token".into(),
         };
         let started = Instant::now();
-        let result = runtime
-            .run_exec(
+        // Bounded so that a regression which drops the deadline fails with an
+        // assertion instead of stalling the suite until the harness gives up:
+        // the elapsed check below is never reached by a call that never
+        // returns, which would make this test look like a silent pass.
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            runtime.run_exec(
                 &binding,
                 &["/bin/true".to_string()],
                 GuestExec {
@@ -1669,8 +1674,12 @@ mod tests {
                     timeout_seconds: 1,
                     stdout_limit: Some(1024),
                 },
-            )
-            .await;
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the exec never returned: the exec deadline is not bounding the request")
+        });
         let elapsed = started.elapsed();
         assert!(
             result.is_err(),

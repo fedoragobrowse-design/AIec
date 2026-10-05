@@ -14,7 +14,7 @@ use bollard::{
     Docker,
     container::LogOutput,
     exec::StartExecResults,
-    models::{ContainerCreateBody, HostConfig, Mount, MountType},
+    models::{ContainerCreateBody, ExecInspectResponse, HostConfig, Mount, MountType},
 };
 use futures_util::StreamExt;
 use std::io::Read;
@@ -403,6 +403,13 @@ pub struct DockerRuntime {
     root: PathBuf,
 }
 
+/// How long a finished exec may wait for the daemon to record its status, past
+/// the command's own deadline. That deadline governs the command and is already
+/// spent once the output stream has ended, so this is a separate, small bound on
+/// the *lookup* — it is what keeps "not published yet" from being reported as
+/// "failed", without letting an unanswerable daemon outlive the caller's budget.
+const EXEC_STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl DockerRuntime {
     fn absolute_root(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
@@ -705,28 +712,66 @@ impl DockerRuntime {
     /// ordinary command is at or just before the moment the daemon records the
     /// code. Reading it once therefore turns a normal race into a failed exec,
     /// which is as wrong as the `0` this replaced. So the status is polled until
-    /// it appears, bounded by the exec's own deadline, and an exec that never
-    /// gets one is refused rather than reported as a success.
+    /// it appears.
+    ///
+    /// `deadline` is the command's, and it is already spent by the time this is
+    /// called — the output stream reached EOF under it. Bounding this poll by
+    /// it would refuse any command that finished close to its own deadline, and
+    /// that is the same false failure this exists to remove, just moved later.
+    /// So the lookup gets its own small, hard grace. The command is still
+    /// governed by `deadline`; this bound only decides how long a *finished*
+    /// command may wait to be described.
     async fn await_exec_status(
         &self,
         id: &str,
         deadline: tokio::time::Instant,
     ) -> Result<i64, &'static str> {
-        loop {
-            let inspect = tokio::time::timeout_at(deadline, self.docker.inspect_exec(id))
-                .await
-                .map_err(|_| "the daemon did not answer within the exec deadline")?
-                .map_err(|_| "the daemon refused to describe the exec")?;
-            // A `None` here means the code is not published yet: the exec is
-            // still running as far as the daemon can tell, so ask again.
-            if let Some(exit_code) = exec_status(inspect.exit_code, inspect.running)? {
-                return Ok(exit_code);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err("the exec was still running when its deadline passed");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        poll_exec_status(status_lookup_bound(deadline), || {
+            self.docker.inspect_exec(id)
+        })
+        .await
+    }
+}
+
+/// The instant the status lookup must stop at.
+///
+/// Named separately so the bound the caller actually uses is the one under
+/// test: a test that passes its own bound into the poll proves only that the
+/// poll honours a bound it was handed, not that the exec path supplies one that
+/// outlives the spent command deadline.
+fn status_lookup_bound(deadline: tokio::time::Instant) -> tokio::time::Instant {
+    deadline + EXEC_STATUS_GRACE
+}
+
+/// Polls `inspect` until it yields a status, or the bound passes.
+///
+/// Split out from the caller so the grace can be exercised against an inspect
+/// sequence that never arrives, which is the only way to observe the window:
+/// against a real daemon the code is published within microseconds of the output
+/// ending, so the difference between a bound that outlives the spent deadline
+/// and one that does not is invisible from the outside.
+async fn poll_exec_status<F, Fut>(
+    grace: tokio::time::Instant,
+    mut inspect: F,
+) -> Result<i64, &'static str>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<ExecInspectResponse, bollard::errors::Error>>,
+{
+    loop {
+        let observed = tokio::time::timeout_at(grace, inspect())
+            .await
+            .map_err(|_| "the daemon did not describe the exec in time")?
+            .map_err(|_| "the daemon refused to describe the exec")?;
+        // A `None` here means the code is not published yet: the exec is still
+        // running as far as the daemon can tell, so ask again.
+        if let Some(exit_code) = exec_status(observed.exit_code, observed.running)? {
+            return Ok(exit_code);
         }
+        if tokio::time::Instant::now() >= grace {
+            return Err("the exec was still running when its deadline passed");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -2712,6 +2757,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The status lookup gets its own grace past the command's deadline,
+    /// because that deadline governs the *command* and is already spent by the
+    /// time the output stream has ended. Bounding the lookup by it -- as the
+    /// first version of this poll did -- refuses any command that finished
+    /// close to its own deadline, which is precisely the false failure the
+    /// polling was added to remove, just relocated to the last few
+    /// milliseconds of every exec.
+    ///
+    /// A one-second deadline is used so the command consumes a real share of
+    /// its whole budget before the lookup runs, rather than leaving the test
+    /// slack it would never exercise.
+    #[tokio::test]
+    async fn a_command_that_finishes_under_its_deadline_is_still_described() {
+        let Some((runtime, sandbox, root)) = started_sandbox().await else {
+            eprintln!("skipping: no Docker daemon");
+            return;
+        };
+        let result = runtime
+            .exec_raw(
+                &sandbox,
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".into(),
+                    "sleep 0.4; exit 3".into(),
+                ],
+                None,
+                Default::default(),
+                1,
+                None,
+            )
+            .await
+            .expect("a finished command must still be describable after its deadline");
+        assert_eq!(
+            result.exit_code, 3,
+            "the command's real status must survive the lookup grace"
+        );
+        assert!(!result.timed_out);
+        let _ = runtime.destroy(&sandbox).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The lookup's bound must outlive the command's own deadline.
+    ///
+    /// `exec_raw` hands `await_exec_status` the deadline it computed for the
+    /// command, and that budget is already spent by the time the output stream
+    /// has ended. Bounding the status poll by it -- the first version of this
+    /// code -- therefore refuses any command that happened to finish near its
+    /// deadline, which is the same false failure the polling was added to
+    /// prevent, merely moved to the last few milliseconds of every exec.
+    ///
+    /// Driven against a synthetic inspect that answers only *after* the spent
+    /// deadline rather than through the daemon, because a live one publishes the
+    /// code within microseconds of the output ending and cannot show the
+    /// difference at all. The exec-level regression above
+    /// (`a_command_that_finishes_under_its_deadline_is_still_described`) passes
+    /// either way, so it is evidence the command path works, not evidence that
+    /// the grace exists.
+    #[tokio::test]
+    async fn a_status_lookup_outlives_the_spent_command_deadline() {
+        let spent = tokio::time::Instant::now();
+        // Built per call rather than captured by value: `poll_exec_status`
+        // takes an `FnMut`, so a captured value could not be moved out.
+        let observation = || ExecInspectResponse {
+            exit_code: Some(0),
+            running: Some(false),
+            ..Default::default()
+        };
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&attempts);
+        let verdict = poll_exec_status(status_lookup_bound(spent), move || {
+            let counter = std::sync::Arc::clone(&counter);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(observation())
+            }
+        })
+        .await;
+        assert_eq!(
+            verdict.ok(),
+            Some(0),
+            "a status published after the command deadline must still be read"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// The grace is a small, hard bound and not an open-ended retry: an exec the
+    /// daemon never describes must fail rather than be waited on without limit.
+    #[tokio::test]
+    async fn a_status_lookup_that_never_answers_still_gives_up() {
+        let verdict = poll_exec_status(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+            std::future::pending,
+        )
+        .await;
+        assert!(
+            verdict.is_err(),
+            "an unanswerable daemon must not be waited on without limit"
+        );
+    }
     /// `None` is not a verdict. Reporting the absence of a status as `0` told
     /// every success check above this that a command which had not finished had
     /// succeeded, so the three states have to stay distinct: published, still

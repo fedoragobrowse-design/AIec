@@ -3115,3 +3115,55 @@ as-is deliberately: normalizing would mean either inventing an exit status for
 the in-process runtimes or losing the only signal that distinguishes "killed"
 from "exited" on the daemon-backed ones. Asserted directly at `lib.rs:4989` and
 `main.rs:929`.
+
+## 2026-10-04 the status poll reintroduced the false failure it was meant to remove
+
+The polling added above was bounded by `deadline` — the same instant `exec_raw`
+computes for the *command*. That budget is already spent by the time the poll
+runs: the output stream has to reach EOF under it before `await_exec_status` is
+called at all. So the bound was not "poll until the status appears", it was
+"poll until the deadline, which may be this instant", and any command finishing
+close to its own deadline would be refused with `the daemon did not describe the
+exec in time`. That is the same false failure the polling was written to remove,
+relocated from the first millisecond of every exec to its last.
+
+The fix is a separate, small grace for the lookup only (`EXEC_STATUS_GRACE`,
+2 s). The command remains governed by `deadline`; the grace decides how long an
+already-finished command may wait to be *described*. `status_lookup_bound` is a
+named function rather than an inline `+ EXEC_STATUS_GRACE` so that the bound the
+exec path actually supplies is the one under test.
+
+**Getting the test to discriminate took two attempts, both recorded because the
+first version proved nothing.** A live test through `exec_raw` with a 1-second
+deadline passes whether or not the grace exists — 0.6 s of budget remained, so
+the difference never arose. Reverting the grace was confirmed to leave it
+passing (`MUT=0`). The test that actually discriminates drives `poll_exec_status`
+against a synthetic inspect that answers 50 ms after the spent deadline, and it
+is pointed at `status_lookup_bound` rather than at a bound it supplies itself: a
+test that hands the poll its own bound proves only that the poll honours what it
+was given. With that, the revert fails on
+`a status published after the command deadline must still be read`.
+
+| Test | Revert mutation | Result |
+|---|---|---|
+| `a_status_lookup_outlives_the_spent_command_deadline` | `status_lookup_bound` returns `deadline` | FAILED, exit 101, on the intended assertion |
+| `a_status_lookup_that_never_answers_still_gives_up` | grace removed entirely (open-ended retry) | passes — it bounds the *other* direction, and is retained because an unbounded wait is the failure mode if the bound is ever dropped |
+| `a_command_that_finishes_under_its_deadline_is_still_described` (live) | grace removed | passes — **not** mutation evidence, see above |
+| `a_provider_that_never_answers_does_not_outlive_the_deadline` | E2B deadline extended 600 s | now FAILS cleanly at 20 s (`the exec never returned`), exit 101 |
+
+**The E2B test previously produced its mutant evidence by stalling.** Its
+elapsed-time assertion was never reached by a call that never returns, so the
+mutant hung until the harness gave up at 400 s and the run was recorded as
+exit 124 — a harness timeout, not a failing assertion, and indistinguishable in
+the log from an ordinary timeout. The call is now wrapped so an unbounded
+regression panics with a named message at 20 s instead.
+
+**Two claims checked rather than assumed.** No production caller reads `124` or
+its sign: `grep -rn "124" crates/ --include=*.rs` outside tests returns only the
+four sites that *set* it plus two assertions, so the statement that a caller
+cannot confuse `-124` with `124` rests on the absence of any such read rather
+than on inspection of each one. And the guest `bounded_reader` throughput
+concern — one 8 KiB read per 20 ms poll wake, capping a drain at ~400 KiB/s — is
+contradicted by measurement: 512 KiB drains in 0.01 s. `poll` returns as soon as
+the descriptor is readable rather than after its timeout, so a wake is not rate
+limited to one chunk per 20 ms. No change made.
