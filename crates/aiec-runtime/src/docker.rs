@@ -597,6 +597,7 @@ impl DockerRuntime {
                 RuntimeError::Unavailable(format!("Docker exec start failed: {error}"))
             })?;
         let start = Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout.max(1));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         match started {
@@ -605,11 +606,42 @@ impl DockerRuntime {
                 mut input,
             } => {
                 if let Some(data) = stdin {
-                    let _ = input.write_all(&data).await;
+                    // Delivery is bounded by the same deadline as the command,
+                    // because writing first means the deadline is not even
+                    // being polled yet. A command that never reads its input
+                    // blocked here indefinitely, past its own timeout.
+                    //
+                    // A pipe the command has already closed is not a failure:
+                    // it chose not to read, and `EPIPE` says only that the
+                    // reader went away. Every other write failure is real.
+                    match tokio::time::timeout_at(deadline, input.write_all(&data)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            if !matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) {
+                                return Err(RuntimeError::Unavailable(format!(
+                                    "Docker exec stdin write failed: {error}"
+                                )));
+                            }
+                        }
+                        Err(_) => {
+                            return Ok(ExecResult {
+                                exit_code: 124,
+                                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                                stderr: format!(
+                                    "{}\ncommand timed out delivering stdin",
+                                    String::from_utf8_lossy(&stderr)
+                                ),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                                timed_out: true,
+                            });
+                        }
+                    }
                 }
                 let _ = input.shutdown().await;
-                let deadline =
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(timeout.max(1));
                 loop {
                     let next = tokio::time::timeout_at(deadline, output.next()).await;
                     let item = match next {
@@ -648,17 +680,43 @@ impl DockerRuntime {
                 ));
             }
         }
-        let inspect = self.docker.inspect_exec(&exec.id).await.map_err(|error| {
+        let inspect = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.docker.inspect_exec(&exec.id),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::Unavailable(format!("Docker exec inspect timed out for {}", exec.id))
+        })?
+        .map_err(|error| {
             RuntimeError::Unavailable(format!("Docker exec inspect failed: {error}"))
         })?;
+        let exit_code = exec_exit_code(&exec.id, inspect.exit_code, inspect.running)?;
         Ok(ExecResult {
-            exit_code: inspect.exit_code.unwrap_or(0) as i32,
+            exit_code: exit_code as i32,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             duration_ms: start.elapsed().as_millis() as u64,
             timed_out: false,
         })
     }
+}
+
+/// The daemon reports no exit code while an exec is still running, and
+/// `exec_raw` has already stopped reading output by the time it inspects, so
+/// `None` means the command's status was never obtained. Returning `0` there
+/// turned a command that had not finished into a reported success, and every
+/// success check above this is `exit_code == 0`.
+fn exec_exit_code(
+    id: &str,
+    exit_code: Option<i64>,
+    running: Option<bool>,
+) -> Result<i64, RuntimeError> {
+    exit_code.ok_or_else(|| {
+        RuntimeError::Unavailable(format!(
+            "Docker exec {id} reported no exit status (running: {running:?})"
+        ))
+    })
 }
 
 fn ensure_success(result: ExecResult) -> Result<(), aiec_core::CoreError> {
@@ -1716,6 +1774,7 @@ impl SnapshotProvider for DockerRuntime {
 mod tests {
     use super::*;
     use sha2::Digest;
+    use std::time::Duration;
     #[test]
     fn docker_runtime_normalizes_relative_root_without_requiring_existence() {
         let docker = Docker::connect_with_unix_defaults().expect("Docker client");
@@ -2577,6 +2636,82 @@ mod tests {
             parent.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["repo", "repo-backup"].into_iter().collect());
         assert!(parent.iter().all(|entry| entry.kind == "directory"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Starts a real sandbox on the local daemon, or returns `None` when there
+    /// is no daemon. These are the only exec tests that can observe a real
+    /// still-running exec: the daemon's decision to report no exit code is the
+    /// behavior under test, so a fixture cannot stand in for it.
+    async fn started_sandbox() -> Option<(DockerRuntime, Sandbox, std::path::PathBuf)> {
+        let root = std::env::temp_dir().join(format!("af-exec-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = DockerRuntime::with_client(Docker::connect_with_unix_defaults().ok()?, &root);
+        let sandbox = sandbox_fixture();
+        runtime.create(&sandbox).await.ok()?;
+        runtime.start(&sandbox).await.ok()?;
+        Some((runtime, sandbox, root))
+    }
+
+    /// An exec with no exit code has no verdict, and `0` is a verdict: it is
+    /// the value every success check above this compares against.
+    ///
+    /// Tested on the mapping rather than through a live daemon. A running exec
+    /// whose output has already closed could not be produced on the local
+    /// daemon — both attempts (redirecting, then closing, the output file
+    /// descriptors) ran to natural exit — so a live assertion here would be a
+    /// test of a premise that was measured to be false.
+    #[test]
+    fn an_exec_without_an_exit_status_is_not_a_success() {
+        assert_eq!(exec_exit_code("id", Some(0), Some(false)).ok(), Some(0));
+        assert_eq!(exec_exit_code("id", Some(7), Some(false)).ok(), Some(7));
+        let running = exec_exit_code("abc", None, Some(true))
+            .expect_err("a still-running exec was reported as a success");
+        assert!(
+            matches!(&running, RuntimeError::Unavailable(message) if message.contains("abc")),
+            "{running:?}"
+        );
+        // A daemon that knows neither the code nor whether it is running is
+        // still not evidence of success.
+        assert!(exec_exit_code("abc", None, None).is_err());
+    }
+
+    /// Standard input is delivered under the exec's own deadline. A command
+    /// that never reads its input must not hold the exec past that deadline
+    /// with the write blocking before the clock is ever polled.
+    #[tokio::test]
+    async fn unread_stdin_does_not_outlive_the_deadline() {
+        let Some((runtime, sandbox, root)) = started_sandbox().await else {
+            eprintln!("skipping: no Docker daemon");
+            return;
+        };
+        let started = Instant::now();
+        let result = runtime
+            .exec_raw(
+                &sandbox,
+                vec!["/bin/sleep".into(), "20".into()],
+                None,
+                Default::default(),
+                2,
+                Some(vec![b'x'; 512 * 1024]),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        match result {
+            Ok(result) => {
+                assert!(
+                    result.timed_out,
+                    "a command that never read stdin outlived its deadline: {result:?}"
+                );
+                assert_eq!(result.exit_code, 124);
+            }
+            Err(error) => panic!("unread stdin should be a reported timeout, not {error}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the deadline was not enforced during stdin delivery: {elapsed:?}"
+        );
+        let _ = runtime.destroy(&sandbox).await;
         let _ = std::fs::remove_dir_all(root);
     }
 }

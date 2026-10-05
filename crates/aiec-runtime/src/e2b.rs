@@ -624,14 +624,22 @@ impl E2bRuntime {
         body.extend_from_slice(&end_stream_frame());
 
         let started = Instant::now();
-        let mut response = self
-            .envd_request(binding, reqwest::Method::POST, ENVD_START)
-            .header("Content-Type", CONNECT_CONTENT_TYPE)
-            .header("Connect-Protocol-Version", CONNECT_PROTOCOL_VERSION)
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| guest_transport(error, "exec"))?;
+        // The request is bounded by the same window as the command it starts.
+        // Unbounded, a provider that accepts the connection and never answers
+        // holds the exec open past its own deadline, which is the caller's
+        // timeout and not something this client can interrupt later.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        let mut response = tokio::time::timeout_at(deadline, async {
+            self.envd_request(binding, reqwest::Method::POST, ENVD_START)
+                .header("Content-Type", CONNECT_CONTENT_TYPE)
+                .header("Connect-Protocol-Version", CONNECT_PROTOCOL_VERSION)
+                .body(body)
+                .send()
+                .await
+                .map_err(|error| guest_transport(error, "exec"))
+        })
+        .await
+        .map_err(|_| CoreError::Unavailable("envd exec request timed out".into()))??;
         if !response.status().is_success() {
             return Err(guest_status(
                 response.status().as_u16(),
@@ -640,7 +648,6 @@ impl E2bRuntime {
             ));
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
         let mut decoder = StreamDecoder {
             stdout_limit,
             ..StreamDecoder::default()
@@ -664,11 +671,7 @@ impl E2bRuntime {
         }
         let stderr = String::from_utf8_lossy(&decoder.stderr).into_owned();
         Ok(ExecResult {
-            exit_code: if timed_out {
-                124
-            } else {
-                decoder.exit_code.unwrap_or(0)
-            },
+            exit_code: resolved_exit_code(timed_out, decoder.exit_code)?,
             stdout: String::from_utf8_lossy(&decoder.stdout).into_owned(),
             stderr: if timed_out {
                 format!("{stderr}\ncommand timed out")
@@ -679,6 +682,18 @@ impl E2bRuntime {
             timed_out,
         })
     }
+}
+
+/// `0` is not the absence of a status, it is the status callers compare against
+/// to decide a command succeeded. A stream that ended without an end frame has
+/// no verdict at all, and reporting one turns a truncated response into a
+/// success.
+fn resolved_exit_code(timed_out: bool, exit_code: Option<i32>) -> Result<i32, CoreError> {
+    if timed_out {
+        return Ok(124);
+    }
+    exit_code
+        .ok_or_else(|| CoreError::Backend("envd exec stream ended without an exit code".into()))
 }
 
 impl RuntimePathProvider for E2bRuntime {
@@ -1775,6 +1790,21 @@ mod tests {
         assert!(matches!(
             decoder.push(&header),
             Err(CoreError::LimitExceeded(_))
+        ));
+    }
+
+    /// A stream that ends without an end frame carries no status, and `0` is
+    /// the value every success check above this compares against. The guest
+    /// closed the connection, so the command's result was never received.
+    #[test]
+    fn a_stream_without_an_end_frame_is_not_a_success() {
+        assert_eq!(resolved_exit_code(false, Some(0)).ok(), Some(0));
+        assert_eq!(resolved_exit_code(false, Some(5)).ok(), Some(5));
+        // A timeout is a real verdict: the command exceeded its own window.
+        assert_eq!(resolved_exit_code(true, None).ok(), Some(124));
+        assert!(matches!(
+            resolved_exit_code(false, None),
+            Err(CoreError::Backend(_))
         ));
     }
 

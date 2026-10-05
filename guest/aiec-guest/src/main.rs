@@ -6,7 +6,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -405,6 +406,7 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
     // command that closes its input without reading it fails the whole exec
     // with `EPIPE` instead of reporting the status it exited with, and a
     // command that never reads it at all can run past its own deadline.
+    let abort = Arc::new(AtomicBool::new(false));
     let stdin_writer = child.stdin.take().map(|mut pipe| {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -418,8 +420,8 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
     let pid = child.id() as i32;
     let stdout = child.stdout.take().ok_or("stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("stderr unavailable")?;
-    let out_rx = bounded_reader(stdout);
-    let err_rx = bounded_reader(stderr);
+    let out_rx = bounded_reader(stdout, &abort);
+    let err_rx = bounded_reader(stderr, &abort);
     let started = Instant::now();
     let deadline = Duration::from_millis(timeout_ms.clamp(1, 3_600_000));
     let mut timed_out = false;
@@ -436,13 +438,19 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
         }
         thread::sleep(Duration::from_millis(5));
     };
-    // A command that never read its input is still reported as it exited. A
-    // pipe the reader has already closed is not an exec failure: the command
-    // chose not to read stdin, and `EPIPE`/`ECONNRESET` says only that the
-    // reader went away. That verdict does not depend on `timed_out`, because
-    // the writer usually fails before the wait loop notices the exit. Every
-    // other write failure is real and is reported.
+    // The command is gone, so anything still being delivered is undeliverable.
+    // Releasing the writer matters more than it looks: a descendant that
+    // inherited the read end and never reads it leaves the write blocked
+    // forever, and that thread would pin its whole buffer for as long as the
+    // guest runs. So the delivery reports what it managed, then the exec stops
+    // it rather than waiting on it.
     if let Some(receiver) = stdin_writer {
+        // A command that never read its input is still reported as it exited.
+        // A pipe the reader has already closed is not an exec failure: the
+        // command chose not to read stdin, and `EPIPE`/`ECONNRESET` says only
+        // that the reader went away. That verdict does not depend on
+        // `timed_out`, because the writer usually fails before the wait loop
+        // notices the exit. Every other write failure is real and is reported.
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -453,9 +461,8 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
                     return Err(error.to_string());
                 }
             }
-            // A writer still blocked on a process group that has already been
-            // killed cannot report anything, and its pipe is dropped with the
-            // thread.
+            // A writer that has not finished within the abort window released
+            // its pipe on the way out; there is nothing further for it to say.
             Err(_) => {}
         }
     }
@@ -465,8 +472,13 @@ fn run_command(payload: RequestPayload) -> Result<ResponsePayload, String> {
     // pipes share one bound, so a command that leaves both open costs one
     // wait rather than two.
     let output_deadline = Instant::now() + Duration::from_secs(2);
-    let stdout = collect_output(out_rx, limit, output_deadline)?;
-    let stderr = collect_output(err_rx, limit, output_deadline)?;
+    let stdout = collect_output(out_rx, limit, output_deadline);
+    let stderr = collect_output(err_rx, limit, output_deadline);
+    // Only now: before this the collectors have not seen what the command
+    // wrote, and stopping the readers early would discard it.
+    abort.store(true, Ordering::Relaxed);
+    let stdout = stdout?;
+    let stderr = stderr?;
     Ok(ResponsePayload::Exec {
         exit_code: status.code().unwrap_or(if timed_out { -124 } else { -1 }),
         stdout,
@@ -487,13 +499,43 @@ fn valid_env(key: &str, value: &str) -> bool {
 
 /// Reads one pipe in bounded chunks, sending each chunk as it arrives so a
 /// collector can stop without discarding what the command already wrote.
-fn bounded_reader<R: Read + Send + 'static>(
+fn bounded_reader<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,
+    abort: &Arc<AtomicBool>,
 ) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
+    let abort = Arc::clone(abort);
+    // Non-blocking for the same reason the stdin writer is: a descendant that
+    // inherited this pipe and never closes it leaves a blocking read parked
+    // forever, pinning a thread and its buffer for the life of the guest. The
+    // collector's answer does not depend on a stream that is still open.
+    unsafe {
+        libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    let mut waiter = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
     thread::spawn(move || {
         let mut buffer = [0; 8192];
         loop {
+            if abort.load(Ordering::Relaxed) {
+                return;
+            }
+            waiter.revents = 0;
+            let ready = unsafe { libc::poll(&mut waiter, 1, 20) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+                continue;
+            }
+            if ready == 0 {
+                continue;
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
@@ -504,6 +546,11 @@ fn bounded_reader<R: Read + Send + 'static>(
                         return;
                     }
                 }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(error) => {
                     let _ = sender.send(Err(error));
                     return;
@@ -949,6 +996,46 @@ mod tests {
         );
     }
     use super::*;
+
+    /// A backgrounded descendant inherits its parent's output pipes and keeps
+    /// them open after the parent exits, which parks both reader threads in a
+    /// blocking read for the life of the guest. The exec still answers; the
+    /// threads are the cost.
+    ///
+    /// Standard input is deliberately not part of this: an asynchronous list
+    /// gets `/dev/null` on stdin when job control is off, so the shell exiting
+    /// closes that pipe and the writer sees `EPIPE`. Measured — disabling only
+    /// the reader abort still leaks two threads per exec, and disabling only a
+    /// writer abort leaked none.
+    #[test]
+    fn a_descendant_holding_output_pipes_does_not_retain_a_thread_per_exec() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task").unwrap().count()
+        }
+        let baseline = threads();
+        // `sleep` never reads its input, and the backgrounded child inherits
+        // the pipe, so nothing ever drains it and nothing ever closes it.
+        for _ in 0..8 {
+            let ResponsePayload::Exec { .. } = run_command(RequestPayload::Exec {
+                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30 & echo done".into()],
+                cwd: None,
+                env: Default::default(),
+                timeout_ms: 30_000,
+                output_limit: 1024,
+                stdin: vec![b'x'; 256 * 1024],
+            })
+            .expect("the command itself succeeded") else {
+                panic!("exec must answer with its exit status");
+            };
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let leaked = threads().saturating_sub(baseline);
+        assert!(
+            leaked <= 2,
+            "each exec retained a stdin writer thread: {baseline} -> {}",
+            threads()
+        );
+    }
 
     #[test]
     fn hex_decodes_the_shape_the_host_writes() {

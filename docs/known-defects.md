@@ -2916,3 +2916,118 @@ already finished. Output collection is bounded but not truncated-reported: the
 caller cannot distinguish a complete stream from one that was cut at its bound
 except through `stdout` length. This path was exercised by spawning `/bin/sh`
 directly against `bounded`, not through a booted sandbox under bubblewrap.
+
+## Fixed in the 2026-10-04 audit: an exec with no exit status was reported as a success
+
+Four `SandboxRuntime::exec` implementations exist. The Firecracker guest path
+was reviewed and left unchanged; the Docker and E2B paths each had the same
+defect in a different shape, and both reported a command as successful when
+the runtime never obtained its status.
+
+**Docker.** `docker.rs`'s `exec_raw` ended with `inspect.exit_code.unwrap_or(0)`.
+`None` is what the daemon reports for an exec with no status yet, and every
+success check in this codebase is `exit_code == 0`, so the absence of a result
+became a success. `inspect_exec` was also unbounded, and standard input was
+written **before** the deadline was computed — so the write was not merely
+ungoverned, it happened while no deadline existed. A command that never reads
+its input blocked the exec indefinitely.
+
+Reproduced against the local Docker daemon with the real `DockerRuntime`,
+creating and starting the sandbox so the container name matched the runtime's
+own `aiec-{id}` addressing:
+
+```text
+UNREAD_STDIN   /bin/sleep 20, 512 KiB of stdin, timeout 2 -> reported before repair as
+              a hang with no deadline; after repair 124 / timed_out=true in ~2.0 s
+SURVIVOR       after the deadline, `ps` inside the container still showed
+              "13 /bin/sh -c echo started; sleep 20; echo finished" and "19 sleep 20"
+```
+
+The repair computes the deadline before the write and runs `write_all` under
+`timeout_at`, treats `BrokenPipe`/`ConnectionReset` as the command declining to
+read (which is not a failure) and surfaces every other write error, bounds
+`inspect_exec` at ten seconds, and routes the status through `exec_exit_code`,
+which refuses `None` instead of substituting `0`.
+
+**E2B.** `e2b.rs`'s `run_exec` had the same substitution:
+`decoder.exit_code.unwrap_or(0)` after a stream that ended without an `end`
+frame, and its `.send()` was unbounded and happened before the deadline was
+computed. Both are repaired: the request is sent under the exec's own deadline
+(a single `deadline` now covers send and stream, so the connect time is charged
+to the command's window rather than added to it), and `resolved_exit_code`
+refuses a missing status. A timeout still reports `124`, because a timeout is a
+verdict the client reached itself.
+
+**Regression coverage.** Two permanent tests in `aiec-runtime` and one live-Docker
+test. Mutation evidence, each mutant required to compile and the named test
+required to run:
+
+| Mutation | Result |
+|---|---|
+| Docker stdin write deadline extended past the exec deadline | `unread_stdin_does_not_outlive_the_deadline` FAILED after 58.56 s against its 10 s assertion (exit 101) |
+| Docker `exec_exit_code` returns `unwrap_or(0)` again | `an_exec_without_an_exit_status_is_not_a_success` FAILED (exit 101) |
+| E2B `resolved_exit_code` returns `unwrap_or(0)` again | `a_stream_without_an_end_frame_is_not_a_success` FAILED (exit 101) |
+
+Every mutation was reverted immediately.
+
+**A premise that did not hold, recorded because it cost two probe cycles.** The
+earlier note that a still-running Docker exec reports `0` through this code was
+correct about `unwrap_or(0)` but the live assertion for it was not obtainable:
+two attempts to produce it end-to-end (redirecting the output streams, then
+closing their file descriptors with `exec 1>&- 2>&-`) both ran to natural exit
+after 12.05 s and legitimately returned `0`. The permanent test therefore
+exercises the status mapping directly rather than asserting a daemon behavior
+that was measured not to reproduce here. The repair stands on the mapping being
+correct for `None`; the live case is unproven, not disproven.
+
+**Limits.** bollard 0.21.1 exposes no exec-kill API, so a Docker exec that
+crosses its deadline is still not terminated: the container keeps the process
+alive, and the survivor listing above is the measured proof of that. The
+reported `124`/`timed_out` result is accurate about what this client observed,
+but the process outlives the exec and is bounded only by sandbox teardown. The
+E2B provider may likewise leave the remote process running; no remote
+termination was attempted and none is claimed. `MAX_EXEC_SECONDS` still clamps
+the caller-supplied window, and the client-side `exec_timeout` remains the
+outer bound.
+
+## Fixed in the 2026-10-04 audit: a guest output reader outlived every exec
+
+The Bubblewrap and guest stdin repairs each left a detached reader thread
+behind. The guest's `bounded_reader` blocked in a plain `read()` and was never
+released, so a backgrounded descendant that inherited its parent's stdout and
+stderr kept both threads parked for the remaining life of the guest. One
+thread and one 8 KiB buffer per pipe per exec, accumulating.
+
+**Reproduction.** `a_descendant_holding_output_pipes_does_not_retain_a_thread_per_exec`
+in `aiec-guest` counts `/proc/self/task` before and after eight execs of
+`sh -c 'sleep 30 & echo done'`. Against shipping code: `2 -> 18`, i.e. two
+retained threads per exec, and the test failed. After the repair it passes.
+
+**Repair.** `bounded_reader` takes the abort flag, sets the pipe non-blocking
+and waits on `poll(POLLIN, 20 ms)`, so a stream that is still open is polled
+rather than parked. The exec sets the flag after both collectors have their
+answer, never before — setting it earlier stops the readers before their
+buffered chunks are drained, which is a truncation bug wearing a cleanup's
+clothes.
+
+**The stdin writer was not the leak, and the first hypothesis was wrong.** The
+prior note listed a possible detached writer-thread accumulation. It does not
+occur: with job control off, POSIX gives an asynchronous list `/dev/null` on
+standard input, so `sleep 30 &` does not hold the parent's stdin pipe, the
+shell exiting closes it, and the blocking `write_all` fails with `EPIPE`
+immediately. Measured directly — disabling only the reader abort still leaks
+two threads per exec, and disabling only a writer abort leaked none. The writer
+was therefore left as it was rather than carrying speculative non-blocking
+machinery.
+
+| Mutation | Result |
+|---|---|
+| reader abort check disabled | `a_descendant_holding_output_pipes_does_not_retain_a_thread_per_exec` FAILED with `10 -> 20` threads (exit 101) |
+
+`cargo test -p aiec-guest`: 17 passed, 0 failed.
+
+**Limits.** The repair stops the leak; it does not kill the descendant. A
+backgrounded process still runs until the sandbox or guest tears down, and
+output past the two-second collector bound is still discarded rather than
+reported as truncated. Thread counts are measured inside the test binary, so
+they cover the guest's own threads and not the host's.
