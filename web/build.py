@@ -136,6 +136,17 @@ SITE_URL = "https://aiec.gobrowse.dev"
 GITHUB_URL = "https://github.com/fedoragobrowse-design/AIec"
 
 
+# Google's HTML-meta ownership check. It has to be on the page Google fetches,
+# which is the homepage, and it is cheap and harmless to carry on every page
+# — so it goes into all three shells rather than only one, and lives here
+# rather than being repeated as a literal at each call site. The token is
+# public by design: it is in the served HTML either way.
+GOOGLE_SITE_VERIFICATION = (
+    '<meta name="google-site-verification" '
+    'content="O_CeS2xfccHtgQG77YxAgNW239U8Nu4kV1ozRR57xPc">'
+)
+
+
 def canonical_url(route: str) -> str:
     """The address a visitor is actually on.
 
@@ -191,6 +202,7 @@ DASHBOARD_SHELL = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{verification}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — AIec</title>
 <meta name="description" content="{description}">
@@ -253,6 +265,7 @@ SHELL = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{verification}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — AIec</title>
 <meta name="description" content="{description}">
@@ -310,6 +323,7 @@ DOCS_SHELL = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+{verification}
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — AIec</title>
 <meta name="description" content="{description}">
@@ -559,6 +573,7 @@ def render_doc_pages() -> list[str]:
                 title=html.escape(entry["title"]),
                 description=html.escape(entry["summary"]),
                 canonical=f"{SITE_URL}{doc_route(entry)}",
+                verification=GOOGLE_SITE_VERIFICATION,
                 og_image=f"{SITE_URL}/assets/og.png",
                 nav=render_nav("/docs"),
                 footer_nav=render_footer_nav(),
@@ -756,6 +771,7 @@ def render_error_page(status: int) -> str:
         # failed is not something to offer a search engine.
         canonical=f"{SITE_URL}/{status}",
         robots='<meta name="robots" content="noindex">',
+        verification=GOOGLE_SITE_VERIFICATION,
         og_image=f"{SITE_URL}/assets/og.svg",
         nav=render_nav(""),
         footer_nav=render_footer_nav(),
@@ -1053,6 +1069,7 @@ def main() -> int:
                 ),
                 canonical=canonical_url(route),
                 robots="",
+                verification=GOOGLE_SITE_VERIFICATION,
                 og_image=og_image,
                 nav=render_console_nav(route) if is_console else render_nav(route),
                 footer_nav=render_footer_nav(),
