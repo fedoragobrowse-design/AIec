@@ -3320,9 +3320,20 @@ impl PostgresRepository {
     ) -> Result<Vec<ReconciliationAction>, StoreError> {
         let limit = i64::from(limit.clamp(1, 10_000));
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        // `destroying` and `quarantined` are excluded here rather than only
+        // skipped below, because skipping them does not stop them costing a slot.
+        // They are the *oldest* expired leases - a sandbox has to be failing to
+        // tear down for that long - so they sit at the head of this ordering and
+        // are re-selected by every sweep, filling the limit with rows that are
+        // then discarded. Once enough sandboxes are stuck tearing down, the
+        // queue is permanently full of work that cannot be done and no live
+        // expired lease is ever reconciled: capacity that should be returned
+        // stays held. The `continue` below still stands, for a sandbox that
+        // entered `destroying` after this read.
         let rows = sqlx::query(
             "SELECT l.* FROM sandbox_leases l JOIN sandboxes s ON s.id=l.sandbox_id \
-             WHERE l.status='active' AND l.expires_at <= now() AND s.state <> 'quarantined' \
+             WHERE l.status='active' AND l.expires_at <= now() \
+               AND s.state NOT IN ('destroying','quarantined') \
              ORDER BY l.expires_at LIMIT $1 FOR UPDATE OF l SKIP LOCKED",
         )
         .bind(limit)
@@ -9824,6 +9835,124 @@ pub(crate) mod tests {
                     .is_err()
             );
         }
+        drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A stuck teardown must not fill the reconciler's whole page.
+    ///
+    /// `reconcile_expired_leases` ordered by `expires_at` and skipped
+    /// `destroying` sandboxes after selecting them. Skipping them does not stop
+    /// them costing a slot, and a sandbox stuck tearing down is stuck for a long
+    /// time, so those rows are always the oldest and always occupy the front of
+    /// the ordering. With enough of them, every sweep selects rows it then
+    /// discards, and no live expired lease is ever reconciled - so capacity that
+    /// should have been returned stays held and the node reports itself full.
+    ///
+    /// The two stuck sandboxes sit on one worker and the lease that actually
+    /// needs reconciling sits on another, because the reconciler sweeps across
+    /// every worker and the ordering is global. A page of one is then entirely
+    /// consumed by the stuck pair unless they are excluded before selection.
+    /// Putting the live lease on the same worker would not do: wedging the stuck
+    /// sandboxes there consumes that worker's capacity, so nothing behind them
+    /// could be scheduled at all and the fixture would prove nothing.
+    #[tokio::test]
+    async fn a_stuck_teardown_does_not_starve_the_lease_behind_it() {
+        // The reconciler sweeps every tenant, so a shared database would let
+        // another test's expired lease take the page slot this test is trying to
+        // prove is reachable. An isolated schema makes the ordering this test
+        // depends on the only ordering present.
+        let Some((repository, tenant, admin, schema)) = isolated_repository_and_tenant().await
+        else {
+            return;
+        };
+        let stuck_node = register_test_worker(&repository, tenant).await;
+        let live_node = register_test_worker(&repository, tenant).await;
+
+        // Two sandboxes wedged in `destroying` on one worker, their leases
+        // already expired, and the oldest of anything in the system.
+        let mut wedged: Vec<Uuid> = Vec::new();
+        for offset in 0..2 {
+            let request_id = new_id();
+            schedule_test_sandbox(
+                &repository,
+                tenant,
+                request_id,
+                sandbox(tenant),
+                Some(stuck_node),
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE sandbox_leases SET expires_at = now() - interval '2 hours' \
+                 + ($2 || ' minutes')::interval \
+                 FROM sandbox_assignments a \
+                 WHERE a.request_id = $1 AND sandbox_leases.id = a.lease_id",
+            )
+            .bind(request_id)
+            .bind(offset.to_string())
+            .execute(&repository.pool)
+            .await
+            .unwrap();
+            let stuck_ids: Vec<Uuid> = sqlx::query_scalar(
+                "UPDATE sandboxes SET state='destroying' \
+                 WHERE id = (SELECT sandbox_id FROM sandbox_assignments WHERE request_id=$1) \
+                 RETURNING id",
+            )
+            .bind(request_id)
+            .fetch_all(&repository.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                stuck_ids.len(),
+                1,
+                "the fixture must wedge exactly one sandbox"
+            );
+            wedged.extend(stuck_ids);
+        }
+
+        // One lease that actually needs reconciling, younger than both and on a
+        // worker with capacity to spare.
+        let live_request = new_id();
+        schedule_test_sandbox(
+            &repository,
+            tenant,
+            live_request,
+            sandbox(tenant),
+            Some(live_node),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE sandbox_leases SET expires_at = now() - interval '1 minute' \
+             FROM sandbox_assignments a \
+             WHERE a.request_id = $1 AND sandbox_leases.id = a.lease_id",
+        )
+        .bind(live_request)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        let stale: Vec<Uuid> =
+            sqlx::query_scalar("SELECT sandbox_id FROM sandbox_assignments WHERE request_id = $1")
+                .bind(live_request)
+                .fetch_all(&repository.pool)
+                .await
+                .unwrap();
+        assert_eq!(stale.len(), 1, "the fixture must expire exactly one lease");
+
+        let actions = repository.reconcile_expired_leases(1).await.unwrap();
+        assert_eq!(
+            actions.len(),
+            1,
+            "a page of one must produce one action, got {:?}",
+            actions
+        );
+        assert_eq!(
+            actions[0].sandbox_id,
+            Some(stale[0]),
+            "the page was consumed by a stuck teardown rather than the lease \
+             that needed reconciling; wedged were {:?}",
+            wedged
+        );
         drop_test_schema(&repository, admin, schema).await;
     }
 

@@ -3890,3 +3890,28 @@ underneath it. Letting the drain finish first would make the fast path reject
 the claim and the test would pass with the race still present. It also asserts
 the refused claim leaves the reservation `reserved` and claimable once the
 drain is lifted.
+
+## Stuck teardowns could starve the lease reconciler
+
+`reconcile_expired_leases` ordered by `expires_at` and skipped
+`destroying`/`quarantined` sandboxes *after* selecting them. Skipping a row
+does not stop it costing a slot in `LIMIT`, and those rows are the oldest
+expired leases that exist — a sandbox only gets there by failing to tear down
+for hours — so they sit at the head of the ordering and are re-selected by every
+sweep. With enough sandboxes stuck, the page fills with rows that are then
+discarded and no live expired lease is ever reconciled. Capacity that should
+have been returned stays held, and the worker keeps reporting itself full long
+after its real work is gone.
+
+The two states are now excluded in the selection itself, matching the skip that
+already ran afterwards; the post-lock `continue` still stands for a sandbox that
+entered `destroying` between the read and the lock.
+
+`a_stuck_teardown_does_not_starve_the_lease_behind_it` wedges two sandboxes in
+`destroying` on one worker and puts the lease that actually needs reconciling on
+another, then sweeps a page of one. The reconciler crosses workers and the
+ordering is global, so the page is entirely consumed by the stuck pair unless
+they are filtered before selection. The lease sits on a second worker
+deliberately: wedging the first two consumes that worker's capacity, so nothing
+behind them could be scheduled and the fixture would prove nothing. Restoring
+the old selection fails it.
