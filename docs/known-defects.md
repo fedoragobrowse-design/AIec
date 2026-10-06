@@ -3743,3 +3743,48 @@ The harness itself was not run end to end. It requires two worker processes, an
 API, S3 credentials and Docker, and the SIGKILL/reassign path it exists to prove
 is not reproducible here. What is proven is the reading of psql's answer, which
 is where the defect was.
+
+## A refused MCP sandbox create left a running machine nobody tracked
+
+`LocalAiec::create_sandbox_inner` created the sandbox, then verified that the
+control plane had placed it on the runtime the caller asked for, and only
+recorded ownership afterwards:
+
+```rust
+let sandbox = self.create_with_runtime(&request, runtime).await?;
+// ... two refusals that return Err here ...
+self.owned.lock().expect("ownership lock is not poisoned").push(Ownership { ... });
+```
+
+Both refusals are reachable — the control plane chooses the runtime, and a
+capacity-eligible machine can land on a hosted runtime or on a different local
+one. In either case the machine was live, and the error named the runtime
+mismatch without naming the machine, so the caller had no id to clean up and
+`self.owned` did not have it either. The consequences were: `aiec_list_sandboxes`
+could not show it, shutdown cleanup could not tear it down, and it ran to its
+TTL holding worker capacity and tenant quota for a sandbox the caller was told
+does not exist. A caller refused this way repeatedly leaks machines silently.
+
+Ownership is now recorded the moment the control plane says the machine exists,
+before any check that can refuse it, and both refusals go through a new
+`discard` helper that tears the machine down. It reuses `destroy_sandbox`,
+which retries the transient lease-generation race and confirms a terminal state
+before forgetting, so the same cleanup guarantee applies here as everywhere
+else. The refusal is returned whether or not the teardown worked — the reason
+the create was refused has not changed — and because `destroy_sandbox` forgets
+only on a confirmed terminal state, a teardown that fails leaves the machine in
+the owned set where a later listing can still report it.
+
+Two tests, both against a stubbed control plane that returns a placement the
+request did not ask for:
+
+- `a_refused_placement_is_destroyed_rather_than_left_running` covers `hosted`
+  and `firecracker`-when-`docker`-was-asked-for, asserting the DELETE reaches
+  the created id exactly once and the owned set is empty afterwards.
+- `a_refused_placement_whose_teardown_fails_stays_tracked` returns a failing
+  DELETE, asserting the refusal is still the reported error and the machine is
+  still owned.
+
+Removing either `discard` call fails the first test. Moving the ownership push
+back below the refusals fails the second, which is what distinguishes "no leak"
+from "leak that happens to have been cleaned up".

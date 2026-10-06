@@ -261,28 +261,12 @@ impl LocalAiec {
         };
         let sandbox = self.create_with_runtime(&request, runtime).await?;
 
-        // A caller that asked for a specific runtime must not silently get a
-        // different one: the control plane chooses, so verify what it chose.
-        if !sandbox.runtime.as_str().eq_ignore_ascii_case(runtime)
-            && !sandbox.runtime.as_str().eq_ignore_ascii_case("bwrap-dev")
-            && !sandbox.runtime.as_str().eq_ignore_ascii_case("hosted")
-        {
-            return Err(McpError::new(
-                ErrorCode::LocalRuntimeUnavailable,
-                format!(
-                    "asked for the `{runtime}` runtime but the control plane placed it on `{}`",
-                    sandbox.runtime.as_str()
-                ),
-            ));
-        }
-        if sandbox.runtime.as_str() == "hosted" {
-            return Err(McpError::new(
-                ErrorCode::LocalRuntimeUnavailable,
-                "the control plane placed this sandbox on a hosted runtime; this server only \
-                 drives local sandboxes",
-            ));
-        }
-
+        // Recorded the moment the control plane says it exists, before any
+        // check that can refuse it. Both refusals below return an error to a
+        // caller who is never told the id, so a machine refused here is one
+        // this server created and nothing else will ever tear down: it runs
+        // until its TTL expires, holding capacity and counting against the
+        // tenant's quota for a machine nobody can name.
         self.owned
             .lock()
             .expect("ownership lock is not poisoned")
@@ -293,7 +277,46 @@ impl LocalAiec {
                 owned_by_tool: false,
             });
 
+        // A caller that asked for a specific runtime must not silently get a
+        // different one: the control plane chooses, so verify what it chose.
+        if !sandbox.runtime.as_str().eq_ignore_ascii_case(runtime)
+            && !sandbox.runtime.as_str().eq_ignore_ascii_case("bwrap-dev")
+            && !sandbox.runtime.as_str().eq_ignore_ascii_case("hosted")
+        {
+            self.discard(sandbox.id).await;
+            return Err(McpError::new(
+                ErrorCode::LocalRuntimeUnavailable,
+                format!(
+                    "asked for the `{runtime}` runtime but the control plane placed it on `{}`",
+                    sandbox.runtime.as_str()
+                ),
+            ));
+        }
+        if sandbox.runtime.as_str() == "hosted" {
+            self.discard(sandbox.id).await;
+            return Err(McpError::new(
+                ErrorCode::LocalRuntimeUnavailable,
+                "the control plane placed this sandbox on a hosted runtime; this server only \
+                 drives local sandboxes",
+            ));
+        }
+
         Ok((view_of(&sandbox), sandbox.id, run_id))
+    }
+
+    /// Tears down a machine this server created but cannot drive, and forgets
+    /// it on success so nothing later polls a machine that is gone.
+    ///
+    /// The refusal is returned to the caller regardless of whether the teardown
+    /// worked: the reason the create was refused has not changed, and replacing
+    /// it with "could not destroy" would hide the cause behind a consequence.
+    /// `destroy_sandbox` only forgets on a confirmed terminal state, so a
+    /// teardown that fails leaves the machine in the owned set, which is
+    /// where a later `aiec_list_sandboxes` can still report it.
+    async fn discard(&self, id: Uuid) {
+        if let Err(error) = self.destroy_sandbox(id).await {
+            tracing::warn!(%id, %error, "a sandbox created here could not be torn down");
+        }
     }
 
     /// Lists sandboxes this server is responsible for.
@@ -998,6 +1021,213 @@ mod tests {
             "a listing past the bound must be refused, not truncated"
         );
 
+        serving.abort();
+    }
+
+    /// A create the control plane places somewhere this server cannot drive is
+    /// refused, and the machine is already running. The refusal names the
+    /// runtime mismatch but not the machine, so nothing downstream holds its
+    /// id: without an explicit teardown the machine runs to its TTL holding
+    /// capacity and quota for something the caller was told does not exist.
+    #[tokio::test]
+    async fn a_refused_placement_is_destroyed_rather_than_left_running() {
+        #[derive(Clone)]
+        struct Placement {
+            /// The runtime the control plane reports, ignoring the request.
+            placed: &'static str,
+            deleted: Arc<Mutex<Vec<String>>>,
+            states: Arc<Mutex<std::collections::HashMap<String, String>>>,
+        }
+
+        async fn placement_handle(
+            axum::extract::State(placement): axum::extract::State<Placement>,
+            request: axum::http::Request<axum::body::Body>,
+        ) -> axum::response::Response {
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
+            if method == axum::http::Method::POST {
+                let id = "00000000-0000-0000-0000-0000000000aa";
+                placement
+                    .states
+                    .lock()
+                    .expect("not poisoned")
+                    .insert(id.to_owned(), "running".to_owned());
+                let mut document = sandbox_document(id, "running");
+                document["runtime"] = serde_json::Value::String(placement.placed.to_owned());
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::CREATED,
+                    json,
+                    document.to_string(),
+                ));
+            }
+            let id = path.strip_prefix("/v1/sandboxes/").unwrap_or_default();
+            if method == axum::http::Method::DELETE {
+                placement
+                    .deleted
+                    .lock()
+                    .expect("not poisoned")
+                    .push(id.to_owned());
+                placement
+                    .states
+                    .lock()
+                    .expect("not poisoned")
+                    .insert(id.to_owned(), "destroyed".to_owned());
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::NO_CONTENT,
+                    json,
+                    String::new(),
+                ));
+            }
+            let state = placement
+                .states
+                .lock()
+                .expect("not poisoned")
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| "destroyed".to_owned());
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::OK,
+                json,
+                sandbox_document(id, &state).to_string(),
+            ))
+        }
+
+        // Both refusals: a runtime this server does not drive at all, and one
+        // it drives but the caller did not ask for. Same leak either way.
+        for placed in ["hosted", "firecracker"] {
+            let placement = Placement {
+                placed,
+                deleted: Arc::new(Mutex::new(Vec::new())),
+                states: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            };
+            let app = axum::Router::new()
+                .fallback(any(placement_handle))
+                .with_state(placement.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let url = format!("http://{}", listener.local_addr().expect("a bound address"));
+            let serving = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let aiec = LocalAiec::new(
+                LocalEndpoint::parse(&url, false).expect("a loopback endpoint"),
+                String::new(),
+                900,
+                1 << 20,
+                4,
+            )
+            .expect("a facade");
+
+            let error = aiec
+                .create_sandbox("image", "docker", 1, 128, 128, 900, false, None)
+                .await
+                .expect_err("a placement this server cannot drive must be refused");
+            assert_eq!(error.code, ErrorCode::LocalRuntimeUnavailable);
+            assert_eq!(
+                *placement.deleted.lock().expect("not poisoned"),
+                vec!["00000000-0000-0000-0000-0000000000aa".to_owned()],
+                "a machine placed on `{placed}` must be destroyed, not left running"
+            );
+            assert!(
+                aiec.owned_sandbox_ids().is_empty(),
+                "and it must leave the owned set, or every later poll asks for it again"
+            );
+            serving.abort();
+        }
+    }
+
+    /// Teardown that fails must leave the machine tracked rather than
+    /// forgotten. Forgetting it would make the refusal look clean — the caller's
+    /// error is unchanged either way — while the machine keeps running with
+    /// nothing left that knows it exists. Kept in the owned set it is still
+    /// there to be listed and to fail the process's own cleanup, which is the
+    /// only place left to report it.
+    #[tokio::test]
+    async fn a_refused_placement_whose_teardown_fails_stays_tracked() {
+        #[derive(Clone)]
+        struct Refuses {
+            deleted: Arc<Mutex<usize>>,
+        }
+
+        async fn refusing_handle(
+            axum::extract::State(state): axum::extract::State<Refuses>,
+            request: axum::http::Request<axum::body::Body>,
+        ) -> axum::response::Response {
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
+            if method == axum::http::Method::POST {
+                let id = "00000000-0000-0000-0000-0000000000bb";
+                let mut document = sandbox_document(id, "running");
+                document["runtime"] = serde_json::Value::String("hosted".to_owned());
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::CREATED,
+                    json,
+                    document.to_string(),
+                ));
+            }
+            let id = path.strip_prefix("/v1/sandboxes/").unwrap_or_default();
+            if method == axum::http::Method::DELETE {
+                *state.deleted.lock().expect("not poisoned") += 1;
+                return axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    json,
+                    serde_json::json!({"error": {
+                        "code": "internal",
+                        "message": "the worker's lease generation changed",
+                        "request_id": "00000000-0000-0000-0000-000000000004",
+                    }})
+                    .to_string(),
+                ));
+            }
+            axum::response::IntoResponse::into_response((
+                axum::http::StatusCode::OK,
+                json,
+                sandbox_document(id, "running").to_string(),
+            ))
+        }
+
+        let state = Refuses {
+            deleted: Arc::new(Mutex::new(0)),
+        };
+        let app = axum::Router::new()
+            .fallback(any(refusing_handle))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let url = format!("http://{}", listener.local_addr().expect("a bound address"));
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let aiec = LocalAiec::new(
+            LocalEndpoint::parse(&url, false).expect("a loopback endpoint"),
+            String::new(),
+            900,
+            1 << 20,
+            4,
+        )
+        .expect("a facade");
+
+        let error = aiec
+            .create_sandbox("image", "docker", 1, 128, 128, 900, false, None)
+            .await
+            .expect_err("the placement is still refused");
+        // The refusal, not the failed teardown: the caller asked the wrong
+        // question and the answer to that question has not changed.
+        assert_eq!(error.code, ErrorCode::LocalRuntimeUnavailable);
+        assert!(error.message.contains("hosted"));
+        assert!(
+            *state.deleted.lock().expect("not poisoned") > 0,
+            "a teardown must be attempted before the machine is given up on"
+        );
+        assert_eq!(
+            aiec.owned_sandbox_ids(),
+            vec![Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").expect("a uuid")],
+            "a machine that could not be torn down must stay owned, or it runs on untracked"
+        );
         serving.abort();
     }
 }
