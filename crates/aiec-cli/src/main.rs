@@ -1649,15 +1649,85 @@ async fn renew_leases(
         };
         match response.json::<aiec_core::storage::WorkerLease>().await {
             Ok(lease) => outcome.renewed.push((lease.sandbox_id, lease.generation)),
-            // The lease is extended; only the reported generation is unknown, so
-            // keep the lease rather than dropping a sandbox we still own.
-            Err(error) if outcome.failure.is_none() => {
-                outcome.failure = Some(error);
+            Err(error) => {
+                if outcome.failure.is_none() {
+                    outcome.failure = Some(error);
+                }
+                // The renewal committed; only the reply was unreadable. Ask who
+                // owns the sandbox now rather than replaying a generation the
+                // control plane has already moved past: replaying it would be
+                // refused next cycle, and that refusal drops a lease this
+                // worker still holds, leaving a running machine untracked.
+                match recover_renewed_generation(client, control, token, node_id, lease).await {
+                    Ok(Some(generation)) => outcome.renewed.push((lease.sandbox_id, generation)),
+                    Ok(None) => outcome.superseded.push(lease.sandbox_id),
+                    Err(error) => {
+                        tracing::warn!(
+                            sandbox_id = %lease.sandbox_id,
+                            %error,
+                            "a renewed lease could not be re-identified and is left tracked"
+                        );
+                    }
+                }
             }
-            Err(_) => {}
         }
     }
+
     outcome
+}
+
+/// Re-learns the generation the control plane now holds for a lease whose
+/// renewal succeeded but whose reply could not be read.
+///
+/// A renewal that cannot be decoded is not a renewal that failed: the server
+/// committed the extension and advanced the generation before it wrote the
+/// body. Replaying the generation we already had would be fenced on the next
+/// cycle and would drop a lease this worker still legitimately holds, leaving
+/// a running machine that nothing tracks. Asking who owns the sandbox now
+/// recovers the generation, and answers the same question for a lease that
+/// was reassigned while the reply was unreadable.
+async fn recover_renewed_generation(
+    client: &reqwest::Client,
+    control: &str,
+    token: &str,
+    node_id: Uuid,
+    lease: &OwnedLease,
+) -> Result<Option<i64>, String> {
+    let response = client
+        .get(format!(
+            "{control}/v1/workers/{node_id}/ownership/{}",
+            lease.sandbox_id
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("ownership request failed: {error}"))?;
+    match response.status() {
+        // Ownership is reported per node, so a foreign node answers 409. Either
+        // way the answer is "not yours", which is not a generation.
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT => Ok(None),
+        reqwest::StatusCode::OK => {
+            let ownership: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|error| format!("ownership response is invalid: {error}"))?;
+            let lease_id = ownership["lease_id"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let generation = ownership["generation"].as_i64();
+            // A different lease id on this node is a reassignment, not a renewal
+            // whose reply we failed to read. Adopting its generation would hand
+            // this worker a valid-looking identity for someone else's machine.
+            match (lease_id, generation) {
+                (Some(current), Some(generation)) if current == lease.lease_id => {
+                    Ok(Some(generation))
+                }
+                (Some(_), Some(_)) => Ok(None),
+                _ => Err("ownership response has no usable lease identity".into()),
+            }
+        }
+        other => Err(format!("ownership check returned {other}")),
+    }
 }
 
 /// Whether this host will take on another sandbox right now.
@@ -2992,5 +3062,251 @@ mod node_identity_tests {
         );
         assert_eq!(durable_node_id(&dir).unwrap(), assigned);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// A renewal whose reply cannot be parsed still renewed the lease.
+///
+/// The worker replays the generation it has on every cycle, and the control
+/// plane refuses a stale one. So a successful renewal whose body is lost or
+/// truncated leaves the worker holding a generation the server has already
+/// moved past: the next cycle is a 409, a 409 is classified as supersession,
+/// and the sandbox is dropped from the worker's lease map while its machine is
+/// still running. The regression is that the worker must recover the new
+/// generation rather than abandon a lease it still holds.
+#[cfg(test)]
+mod renewal_regression {
+    use super::*;
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::routing::{get, post};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// The control plane's side of a lease: one authoritative generation that
+    /// advances on every accepted renewal.
+    #[derive(Clone, Default)]
+    struct ControlPlane {
+        /// Authoritative generation per lease id, as the control plane holds it.
+        leases: Arc<Mutex<HashMap<String, i64>>>,
+        /// Which lease id currently fronts each sandbox, and which node.
+        lease_ids: Arc<Mutex<HashMap<String, String>>>,
+        /// When true the renew reply is committed but written as broken JSON.
+        truncate_reply: Arc<Mutex<Vec<bool>>>,
+        replays: Arc<Mutex<Vec<i64>>>,
+    }
+
+    async fn renew(
+        State(state): State<ControlPlane>,
+        Path((_, lease)): Path<(String, String)>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (axum::http::StatusCode, String) {
+        let generation = body["generation"].as_i64().unwrap_or_default();
+        state.replays.lock().unwrap().push(generation);
+        let mut leases = state.leases.lock().unwrap();
+        let Some(current) = leases.get_mut(&lease) else {
+            return (axum::http::StatusCode::NOT_FOUND, "{}".into());
+        };
+        // The control plane's rule: a renewal must present the current
+        // generation. Anything else is refused as superseded.
+        if generation != *current {
+            return (axum::http::StatusCode::CONFLICT, "{}".into());
+        }
+        *current += 1;
+        let next = *current;
+        drop(leases);
+        let broken = state
+            .truncate_reply
+            .lock()
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or(false);
+        if broken {
+            // 200, and the body is committed - the generation advanced - but the
+            // reply never arrives intact. Exactly the shape of a proxy cut or a
+            // truncated response.
+            return (
+                axum::http::StatusCode::OK,
+                format!("{{\"id\":\"{lease}\",\"generation\":{next}"),
+            );
+        }
+        (
+            axum::http::StatusCode::OK,
+            format!("{{\"generation\":{next}}}"),
+        )
+    }
+
+    async fn ownership(
+        State(state): State<ControlPlane>,
+        Path((_, sandbox)): Path<(String, String)>,
+    ) -> (axum::http::StatusCode, String) {
+        let lease_id = state
+            .lease_ids
+            .lock()
+            .unwrap()
+            .get(&sandbox)
+            .cloned()
+            .unwrap_or_default();
+        let Some(generation) = state.leases.lock().unwrap().get(&lease_id).copied() else {
+            return (axum::http::StatusCode::NOT_FOUND, "{}".into());
+        };
+        (
+            axum::http::StatusCode::OK,
+            format!("{{\"lease_id\":\"{lease_id}\",\"generation\":{generation}}}"),
+        )
+    }
+
+    /// A lease held by one worker, which the control plane reports as live.
+    fn held_lease(node: Uuid) -> (OwnedLease, ControlPlane, String) {
+        let sandbox = Uuid::now_v7();
+        let lease = OwnedLease {
+            sandbox_id: sandbox,
+            lease_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            generation: 1,
+        };
+        let state = ControlPlane {
+            leases: Arc::new(Mutex::new(HashMap::from([(lease.lease_id.to_string(), 1)]))),
+            lease_ids: Arc::new(Mutex::new(HashMap::from([(
+                sandbox.to_string(),
+                lease.lease_id.to_string(),
+            )]))),
+            truncate_reply: Arc::new(Mutex::new(Vec::new())),
+            replays: Arc::new(Mutex::new(Vec::new())),
+        };
+        (lease, state, node.to_string())
+    }
+
+    async fn serve(state: ControlPlane) -> String {
+        let app = axum::Router::new()
+            .route("/v1/workers/{node}/leases/{lease}/renew", post(renew))
+            .route("/v1/workers/{node}/ownership/{sandbox}", get(ownership))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_renewal_whose_reply_will_not_decode_keeps_the_live_lease() {
+        let node = Uuid::now_v7();
+        let (mut lease, state, _) = held_lease(node);
+        *state.truncate_reply.lock().unwrap() = vec![true];
+        let control = serve(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        // The reply is unreadable, so the only correct move is to ask who owns
+        // the sandbox now rather than to guess.
+        let outcome = renew_leases(
+            &client,
+            &control,
+            "token",
+            node,
+            std::slice::from_ref(&lease),
+        )
+        .await;
+        assert!(
+            outcome.superseded.is_empty(),
+            "a lease the worker still holds was dropped: {:?}",
+            outcome.superseded
+        );
+        assert!(
+            outcome.failure.is_some(),
+            "an unreadable reply should still be reported: {:?}",
+            outcome.failure
+        );
+        let Some((sandbox_id, generation)) = outcome.renewed.first().copied() else {
+            panic!(
+                "the generation was not recovered: renewed={:?} superseded={:?}",
+                outcome.renewed, outcome.superseded
+            );
+        };
+        assert_eq!(sandbox_id, lease.sandbox_id);
+        assert_eq!(generation, 2, "the control plane advanced to generation 2");
+        lease.generation = generation;
+
+        // The next cycle replays what was recovered. Before the fix this
+        // presented generation 1, was refused, and the sandbox was dropped.
+        let outcome = renew_leases(
+            &client,
+            &control,
+            "token",
+            node,
+            std::slice::from_ref(&lease),
+        )
+        .await;
+        assert!(
+            outcome.superseded.is_empty(),
+            "the recovered generation did not survive the next cycle: {:?}",
+            outcome.superseded
+        );
+        assert_eq!(
+            *state.replays.lock().unwrap(),
+            vec![1, 2],
+            "the second cycle must replay the recovered generation"
+        );
+        assert_eq!(
+            *state.leases.lock().unwrap(),
+            HashMap::from([(lease.lease_id.to_string(), 3)]),
+            "the lease kept renewing instead of being abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_superseded_lease_is_still_dropped() {
+        let node = Uuid::now_v7();
+        let (lease, state, _) = held_lease(node);
+        *state.truncate_reply.lock().unwrap() = vec![true];
+        // Another node's reassignment has replaced the lease behind this one.
+        state
+            .lease_ids
+            .lock()
+            .unwrap()
+            .insert(lease.sandbox_id.to_string(), Uuid::now_v7().to_string());
+        let control = serve(state.clone()).await;
+
+        let outcome = renew_leases(
+            &reqwest::Client::new(),
+            &control,
+            "token",
+            node,
+            std::slice::from_ref(&lease),
+        )
+        .await;
+        assert_eq!(
+            outcome.renewed,
+            vec![],
+            "another node's lease identity must never be adopted: {:?}",
+            outcome.renewed
+        );
+        assert_eq!(
+            outcome.superseded,
+            vec![lease.sandbox_id],
+            "a lease the control plane no longer recognises must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflict_is_still_a_supersession() {
+        let node = Uuid::now_v7();
+        let (lease, state, _) = held_lease(node);
+        // The lease was reassigned forward: the worker's generation is behind
+        // the one the control plane holds, so renewal is refused outright. An
+        // ownership read is never consulted here - the control plane has
+        // already said the lease is not the worker's.
+        state
+            .leases
+            .lock()
+            .unwrap()
+            .insert(lease.lease_id.to_string(), 9);
+        let control = serve(state).await;
+        let outcome =
+            renew_leases(&reqwest::Client::new(), &control, "token", node, &[lease]).await;
+        assert_eq!(outcome.superseded.len(), 1);
+        assert!(outcome.renewed.is_empty());
     }
 }

@@ -16,6 +16,7 @@ pub mod evaluations;
 pub mod guard;
 mod guard_proposals;
 mod guard_release;
+mod lifecycle_lock;
 pub use guard_proposals::ReviewProposalBody;
 pub use guard_release::ReleaseBody;
 pub mod omp;
@@ -74,6 +75,9 @@ pub struct AppState {
     run_queue_limits: aiec_core::run_queue::RunQueueLimits,
     upload_slots: Arc<Semaphore>,
     snapshot_slots: Arc<Semaphore>,
+    /// One lifecycle operation at a time per sandbox, so a handler's runtime
+    /// call and its durable compare-and-swap cannot interleave with another's.
+    lifecycle: lifecycle_lock::LifecycleLocks,
     /// Per-tenant / per-client admission control for the public API.
     limiter: Arc<ratelimit::RateLimiter>,
     /// Aggregate execution budget for hosted capacity. Reaching it stops new
@@ -239,6 +243,7 @@ impl AppState {
             run_queue_limits: Default::default(),
             upload_slots: Arc::new(Semaphore::new(2)),
             snapshot_slots: Arc::new(Semaphore::new(2)),
+            lifecycle: lifecycle_lock::LifecycleLocks::new(),
             limiter: Arc::new(ratelimit::RateLimiter::new(limit)),
             execution_budget,
             // Permissive by default: a self-hoster may run any runtime they
@@ -464,6 +469,25 @@ impl AppState {
         self.repository()
             .get_sandbox(sandbox.tenant_id, sandbox.id)
             .await
+    }
+
+    /// Serializes this sandbox's lifecycle operation against every other one.
+    ///
+    /// Held across the whole handler - the runtime call and the durable
+    /// compare-and-swap - because releasing it between them is the race. The
+    /// guard is a plain owned mutex guard: it drops on the error paths too, so
+    /// a handler that fails cannot leave the sandbox locked.
+    async fn lifecycle_guard(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ApiFailure> {
+        self.lifecycle.acquire(sandbox_id).await.map_err(|busy| {
+            ApiFailure::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                busy.to_string(),
+            )
+        })
     }
 
     async fn secret_values(
@@ -1261,6 +1285,21 @@ async fn sandbox_ownership(
                 "sandbox has no active lease",
             )
         })?;
+    // An expired lease is not ownership. `sandbox_ownership` reads the active
+    // lease row whether or not it has lapsed, which is what the reconciler
+    // needs to find work to recover - but this route answers a different
+    // question, one the worker asks before acting inside the guest. Reporting
+    // a lapsed lease as owned there says yes to a machine the control plane
+    // has already taken back and may have handed to another node, so the
+    // worker keeps exec-ing into a sandbox it no longer has. Reconciling the
+    // row closes the window; the wall clock closes the rest of it.
+    if ownership.expires_at <= Utc::now() {
+        return Err(ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "sandbox lease has expired",
+        ));
+    }
     if ownership.node_id != node {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
@@ -2863,6 +2902,10 @@ async fn pause_sandbox(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
+    // Held across the runtime pause and the durable swap below: without it a
+    // concurrent snapshot can move the row off Running between the two, and
+    // this handler fails its swap having already stopped the guest.
+    let _lifecycle = s.lifecycle_guard(id).await?;
     let mut x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2885,6 +2928,7 @@ async fn start_sandbox(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
+    let _lifecycle = s.lifecycle_guard(id).await?;
     let mut x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2918,6 +2962,7 @@ async fn stop_sandbox(
         record_sandbox_action(&s, &p, id, "sandbox.stop", "denied", &json!({})).await;
         return Err(ApiFailure::from(error));
     }
+    let _lifecycle = s.lifecycle_guard(id).await?;
     let x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -2948,6 +2993,7 @@ async fn resume_sandbox(
 ) -> ApiResult<Sandbox> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
+    let _lifecycle = s.lifecycle_guard(id).await?;
     let x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -3451,6 +3497,11 @@ async fn create_snapshot(
     let _permit = s.snapshot_slots.acquire().await.map_err(|_| {
         ApiFailure::from(CoreError::Unavailable("snapshot operations closed".into()))
     })?;
+    // Held for the whole capture, including the restore to `old` at the end.
+    // The capture moves the row to Snapshotting and back, and a pause landing
+    // in that window would stop the guest under the capture and then fail its
+    // own swap.
+    let _lifecycle = s.lifecycle_guard(id).await?;
     let mut x = s
         .repository()
         .get_sandbox(p.tenant_id, id)
@@ -4894,6 +4945,33 @@ mod tests {
             &state,
             axum::http::Method::GET,
             &format!("/v1/workers/{node}/ownership/{}", new_id()),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"]["code"], "not_found");
+    }
+
+    /// A lease that has run out on the clock is no longer the worker's, even
+    /// though its row still says active. This route is what a worker asks
+    /// before acting inside the guest, so answering "yes" to a lapsed lease
+    /// lets a worker keep exec-ing in a machine the control plane has already
+    /// taken back and may have handed to a different node. The reconciler will
+    /// eventually fix the row; until it does, the answer has to be no.
+    #[tokio::test]
+    async fn ownership_route_refuses_a_lease_that_has_expired() {
+        let store = LeasedRepository::new();
+        let tenant = new_id();
+        let sandbox = new_id();
+        let node = new_id();
+        let mut lapsed = lease(tenant, sandbox, node, 6);
+        lapsed.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        store.insert(lapsed).await;
+        let state = test_state(store, Arc::new(FenceRuntime));
+        let (status, value) = worker_request(
+            &state,
+            axum::http::Method::GET,
+            &format!("/v1/workers/{node}/ownership/{sandbox}"),
             Value::Null,
         )
         .await;
@@ -9151,5 +9229,329 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+/// Pause and snapshot used to be able to interleave, and the interleaving
+/// wedged the sandbox.
+///
+/// Pause acts on the guest and *then* compare-and-swaps the row from Running to
+/// Paused. A snapshot that started first has already swapped the row to
+/// Snapshotting, and when it finishes it swaps back to Running. The pause then
+/// fails its swap - having already stopped the guest. The row says Running, the
+/// guest says Paused, and `resume` refuses because it demands a durable Paused.
+/// The tenant is left with a sandbox they cannot resume, pause again, or reason
+/// about, and the only way out is to destroy it.
+///
+/// The runtime here parks inside `pause` until the capture is under way, which
+/// is exactly the window the race needs. The property asserted is not "pause
+/// eventually succeeded" but "the guest was never left disagreeing with the
+/// row": either the pause commits, or it never reached the guest at all.
+#[cfg(test)]
+mod lifecycle_serialization {
+    use super::*;
+    use aiec_core::runtime::{FileChunk, FileChunkRequest, RuntimeCapabilities, RuntimeHealth};
+    use aiec_core::snapshots::{SnapshotProvider, SnapshotRequest};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A capture that reports when it starts and only finishes once told to,
+    /// so a competing handler's window is deterministic rather than a race for
+    /// the scheduler.
+    struct GatedCapture {
+        started: Arc<AtomicBool>,
+        released: Arc<tokio::sync::Notify>,
+        attempts: Arc<AtomicUsize>,
+        /// Set by the capture for exactly the window it holds the sandbox, so a
+        /// guest operation that lands inside it is detectable. Owned by the
+        /// capture rather than the test, because the test cannot observe when
+        /// the capture entered the runtime - only the capture can.
+        running: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SnapshotProvider for GatedCapture {
+        fn capabilities(&self) -> aiec_core::snapshots::SnapshotCapabilities {
+            aiec_core::snapshots::SnapshotCapabilities {
+                workspace: true,
+                ..Default::default()
+            }
+        }
+        async fn capture(
+            &self,
+            _: &Sandbox,
+            request: &SnapshotRequest,
+        ) -> Result<aiec_core::snapshots::CapturedSnapshot, CoreError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.started.store(true, Ordering::SeqCst);
+            self.running.store(true, Ordering::SeqCst);
+            // The capture is held open until the test lets it finish, so the
+            // competing handler lands inside the Snapshotting window.
+            self.released.notified().await;
+            self.running.store(false, Ordering::SeqCst);
+            Ok(aiec_core::snapshots::CapturedSnapshot::from_archive(
+                new_id(),
+                request.kind,
+                request.object_key.clone(),
+                b"{\"version\":1,\"entries\":[]}".to_vec(),
+            ))
+        }
+        async fn restore(
+            &self,
+            _: &Sandbox,
+            _: &aiec_core::snapshots::SnapshotMetadata,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// Records what the guest was actually told to do, and whether anything
+    /// reached it while a capture was open.
+    struct ObservedRuntime {
+        paused: AtomicUsize,
+        resumed: AtomicUsize,
+        /// Set by the pause handler, checked by the capture on entry.
+        paused_during_capture: Arc<AtomicBool>,
+        capture_running: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxRuntime for ObservedRuntime {
+        async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            if self.capture_running.load(Ordering::SeqCst) {
+                self.paused_during_capture.store(true, Ordering::SeqCst);
+            }
+            self.paused.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.resumed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn get_file_chunk(
+            &self,
+            _: &Sandbox,
+            _: FileChunkRequest,
+        ) -> Result<FileChunk, CoreError> {
+            Err(CoreError::Backend("unused".into()))
+        }
+        async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete_file(&self, _: &Sandbox, _: DeleteFileRequest) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn make_directory(
+            &self,
+            _: &Sandbox,
+            _: MakeDirectoryRequest,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn import_workspace_archive(&self, _: &Sandbox, _: &[u8]) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn health(&self) -> RuntimeHealth {
+            RuntimeHealth::healthy()
+        }
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pause_racing_a_snapshot_does_not_leave_the_guest_disagreeing_with_the_row() {
+        let repository: Arc<dyn aiec_core::storage::MetadataStore> =
+            aiec_storage::MemoryRepository::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(tokio::sync::Notify::new());
+        let capture_running = Arc::new(AtomicBool::new(false));
+        let paused_during_capture = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(ObservedRuntime {
+            paused: AtomicUsize::new(0),
+            resumed: AtomicUsize::new(0),
+            paused_during_capture: paused_during_capture.clone(),
+            capture_running: capture_running.clone(),
+        });
+        let platform = Platform::builder()
+            .runtime(runtime.clone())
+            .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                RuntimeKind::Docker,
+                runtime.clone(),
+            )))
+            .metadata_store(repository.clone())
+            .scheduler(Arc::new(DevelopmentScheduler))
+            .artifact_store(Arc::new(aiec_storage::FilesystemObjectStore::new(
+                std::env::temp_dir().join(format!("af-lifecycle-{}", new_id())),
+            )))
+            .snapshots(Arc::new(GatedCapture {
+                started: started.clone(),
+                released: released.clone(),
+                attempts: attempts.clone(),
+                running: capture_running.clone(),
+            }))
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        let state = AppState::development(platform);
+
+        let tenant = new_id();
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: tenant,
+            node_id: Some(new_id()),
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        repository
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+
+        let capture = {
+            let state = state.clone();
+            let id = sandbox.id;
+            tokio::spawn(async move {
+                create_snapshot(
+                    State(state),
+                    Extension(Principal {
+                        tenant_id: tenant,
+                        key_id: new_id(),
+                        scopes: vec![Scope::SnapshotsWrite, Scope::SandboxesWrite],
+                    }),
+                    Path(id),
+                    None,
+                )
+                .await
+            })
+        };
+
+        // Wait for the capture to be genuinely inside its runtime call, then
+        // race a pause against it. This is the interleaving that wedged
+        // sandboxes: the row is Snapshotting while the guest is being stopped.
+        tokio::time::timeout(std::time::Duration::from_secs(10), started_wait(&started))
+            .await
+            .expect("the capture never started");
+        let pausing = {
+            let state = state.clone();
+            let id = sandbox.id;
+            tokio::spawn(async move {
+                pause_sandbox(
+                    State(state),
+                    Extension(Principal {
+                        tenant_id: tenant,
+                        key_id: new_id(),
+                        scopes: vec![Scope::SandboxesWrite],
+                    }),
+                    Path(id),
+                )
+                .await
+            })
+        };
+        // Give the pause every chance to interleave, then let the capture end.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        released.notify_waiters();
+
+        let snapshot_result = capture.await.unwrap();
+        let pause_result = pausing.await.unwrap();
+
+        // Whichever way the two resolved, the guest and the row must agree.
+        let after = state
+            .repository()
+            .get_sandbox(tenant, sandbox.id)
+            .await
+            .expect("read the sandbox back");
+        let guest_paused = runtime.paused.load(Ordering::SeqCst) > 0;
+        assert!(
+            !paused_during_capture.load(Ordering::SeqCst),
+            "the guest was paused inside another operation's window, so the row and the machine diverged"
+        );
+        assert_eq!(
+            guest_paused,
+            after.state == SandboxState::Paused,
+            "the guest says paused={guest_paused} but the row says {:?}; resume requires the row to agree",
+            after.state
+        );
+        assert!(
+            snapshot_result.is_ok(),
+            "the snapshot itself failed: {:?}",
+            snapshot_result.is_err()
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the capture did not run"
+        );
+
+        // And the wedged case is not merely absent but recoverable: a paused
+        // sandbox resumes, and a running one does not claim to be paused.
+        match after.state {
+            SandboxState::Paused => {
+                resume_sandbox(
+                    State(state.clone()),
+                    Extension(Principal {
+                        tenant_id: tenant,
+                        key_id: new_id(),
+                        scopes: vec![Scope::SandboxesWrite],
+                    }),
+                    Path(sandbox.id),
+                )
+                .await
+                .map(|Json(_)| ())
+                .expect("a durably paused sandbox must be resumable");
+                let resumed = state
+                    .repository()
+                    .get_sandbox(tenant, sandbox.id)
+                    .await
+                    .expect("read back");
+                assert_eq!(resumed.state, SandboxState::Running);
+                assert_eq!(runtime.resumed.load(Ordering::SeqCst), 1);
+            }
+            SandboxState::Running => {
+                assert!(
+                    pause_result.is_err(),
+                    "the row says Running but the pause reported success"
+                );
+            }
+            other => panic!("an unexpected durable state after the race: {other:?}"),
+        }
+    }
+
+    async fn started_wait(started: &AtomicBool) {
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }

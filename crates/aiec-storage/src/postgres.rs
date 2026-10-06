@@ -2951,6 +2951,32 @@ impl PostgresRepository {
         .await
         .map_err(database_error)?;
         if lease_ids.is_empty() {
+            // Nothing reserved, so nothing to claim and no node row worth
+            // locking: an idle worker does not serialize against a drain.
+            tx.commit().await.map_err(database_error)?;
+            return Ok(Vec::new());
+        }
+        // The read above is only a fast path: a drain that commits after it and
+        // before the claim would still hand a reservation to a worker that has
+        // been told to finish its work. So the flag is re-read here, inside the
+        // transaction and after the lease rows are locked, under a share lock on
+        // the node. That share lock conflicts with the row lock `set_worker_draining`
+        // takes, so a drain in flight is either already visible here or waits
+        // for this claim to finish - never slips between the two.
+        //
+        // Lease before node is the order every other path uses: `heartbeat_worker`
+        // locks its leases and only then updates the node, and so does capacity
+        // release. Taking the node first would be the inverse and could deadlock
+        // against both.
+        let still_accepting: Option<bool> =
+            sqlx::query_scalar("SELECT accepting_sandboxes FROM nodes WHERE id = $1 FOR SHARE")
+                .bind(node_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(database_error)?;
+        if still_accepting != Some(true) {
+            // Every lease row this transaction locked is left exactly as it was:
+            // the worker takes nothing, so nothing has to be undone.
             tx.commit().await.map_err(database_error)?;
             return Ok(Vec::new());
         }
@@ -9799,5 +9825,100 @@ pub(crate) mod tests {
             );
         }
         drop_test_schema(&repository, admin, schema).await;
+    }
+
+    /// A drain that commits while a claim is opening must still stop the claim.
+    ///
+    /// `claim_worker_assignments` read `accepting_sandboxes` before it opened its
+    /// transaction, so an operator draining a worker could commit in between and
+    /// the claim would then grant a reservation on a node that had just been
+    /// told to finish its work.
+    ///
+    /// The fixture reproduces that window rather than approximating it: the drain
+    /// is applied in a transaction that is deliberately left uncommitted, so the
+    /// claim's fast-path read still sees `accepting_sandboxes = true` and walks
+    /// into its own transaction believing it is safe. The claim then blocks on
+    /// the node share lock the drain's row lock is holding, and only after the
+    /// drain commits does it re-read the flag. Ordering it the other way round -
+    /// letting the drain finish first - would make the fast path reject the claim
+    /// and the test would pass with the race still present.
+    #[tokio::test]
+    async fn a_drain_committing_mid_claim_still_stops_the_claim() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+
+        // Assert the precondition explicitly: the node is still accepting.
+        assert!(
+            repository
+                .get_worker(node_id)
+                .await
+                .unwrap()
+                .accepting_sandboxes,
+            "the fixture must start from an accepting node"
+        );
+
+        // The drain, applied but not committed. Its row lock is held from here.
+        let mut drain = repository.pool.begin().await.unwrap();
+        sqlx::query("UPDATE nodes SET accepting_sandboxes=false, drain_reason='test' WHERE id=$1")
+            .bind(node_id)
+            .execute(&mut *drain)
+            .await
+            .unwrap();
+
+        // The claim runs entirely against that uncommitted drain: its fast-path
+        // read sees the old value, so it proceeds into the transaction.
+        let claim = {
+            let repository = repository.clone();
+            tokio::spawn(async move { repository.claim_worker_assignments(node_id, 1, 60).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Now the drain commits, under the claim.
+        drain.commit().await.unwrap();
+
+        let claimed = claim.await.unwrap().unwrap();
+        assert!(
+            claimed.is_empty(),
+            "a draining worker was handed {} assignment(s) mid-drain",
+            claimed.len()
+        );
+
+        // The reservation is untouched, so a refused claim damages nothing: it
+        // stays `reserved` and becomes claimable again once the drain is lifted.
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM sandbox_assignments WHERE node_id=$1 LIMIT 1")
+                .bind(node_id)
+                .fetch_one(&repository.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "reserved",
+            "a refused claim must leave the reservation for the scheduler"
+        );
+
+        repository
+            .set_worker_draining(node_id, false, None)
+            .await
+            .unwrap();
+        let after = repository
+            .claim_worker_assignments(node_id, 1, 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "lifting the drain must make the reservation claimable again"
+        );
     }
 }

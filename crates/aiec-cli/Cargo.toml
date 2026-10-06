@@ -30,3 +30,7 @@ rustls.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["full"] }

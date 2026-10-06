@@ -3788,3 +3788,105 @@ request did not ask for:
 Removing either `discard` call fails the first test. Moving the ownership push
 back below the refusals fails the second, which is what distinguishes "no leak"
 from "leak that happens to have been cleaned up".
+
+## A renewal reply that will not decode abandoned a running machine
+
+The worker replays the generation it holds on every lease renewal, and the
+control plane refuses a stale one. Renewal advances that generation server-side
+before it writes the body, so a `200` whose body is truncated or mangled in
+transit left the worker holding a generation the server had already moved past.
+The comment in the code claimed the lease was kept in that case, and it was —
+for exactly one cycle. The next cycle replayed the old generation, was refused
+with `409`, and `409` is classified as supersession, so the sandbox was dropped
+from the worker's lease map. The machine was still running, its lease was still
+expiring, and nothing tracked it: it would be reclaimed and reassigned while
+its original worker kept serving it.
+
+A renewal whose reply cannot be read is now resolved by asking who owns the
+sandbox, through the existing worker ownership route, rather than by guessing.
+The answer is interpreted rather than trusted: a `404` or `409` means the lease
+is gone and the sandbox is genuinely superseded, a different lease id on the
+same node means a reassignment and is never adopted, and only a matching lease
+id yields the recovered generation. A failed ownership read leaves the lease
+tracked and logs it, because an unanswered question is not a negative answer.
+
+Three tests in `crates/aiec-cli`, against a stub control plane holding one
+authoritative generation:
+
+- `a_renewal_whose_reply_will_not_decode_keeps_the_live_lease` returns a
+  committed-but-unreadable `200`, then asserts the generation was recovered, the
+  next cycle replays `2` rather than `1`, and the lease reaches generation `3`.
+- `a_genuinely_superseded_lease_is_still_dropped` points the sandbox at a
+  different lease id and asserts it is dropped, not adopted.
+- `a_conflict_is_still_a_supersession` asserts the `409` path is untouched.
+
+Removing the recovery call fails the first two. The first fails because the
+lease is dropped on the following cycle, which is the defect itself.
+
+## An expired lease still answered "yes, that is yours"
+
+`GET /v1/workers/{node}/ownership/{sandbox}` returned any active lease row for
+the node, including one whose `expires_at` had already passed. That route is
+what a worker asks before acting inside a guest, so between a lease lapsing and
+the reconciler sweeping it — a window of seconds under load — the control plane
+answered "yes" for a lease it had already taken back, and could have handed to a
+different node.
+
+The storage query deliberately returns expired leases, because the reconciler
+and the commit path need to see them. So the fix is at the route, which now
+refuses with `404 not_found` once `expires_at` has passed.
+
+`ownership_route_refuses_a_lease_that_has_expired` inserts a lease that expired
+a second ago and asserts the refusal. Removing the expiry check fails it.
+
+## Pause and snapshot could wedge a sandbox irrecoverably
+
+Pause acts on the guest and *then* compare-and-swaps the row from `Running` to
+`Paused`. A snapshot that started first has already moved the row to
+`Snapshotting`, and when its capture finishes it swaps back to `Running`. The
+pause then fails its swap — having already stopped the guest. The row says
+`Running`, the guest says `Paused`, and `resume` refuses because it demands a
+durable `Paused`. The tenant is left with a sandbox they cannot resume, pause
+again, or reason about; only destroying it clears the state.
+
+Lifecycle handlers now take a per-sandbox lock held across the runtime call and
+the durable swap together — `pause`, `resume`, `start`, `stop` and
+`create_snapshot`. The lock is keyed by sandbox, so unrelated sandboxes never
+wait on each other, and it is bounded at 4096 entries; stale entries are pruned
+on the way in, so a burst of distinct sandboxes cannot make the ceiling
+permanent.
+
+`a_pause_racing_a_snapshot_does_not_leave_the_guest_disagreeing_with_the_row`
+parks a capture open, races a pause against it, and asserts the two never
+disagree — the pause either commits or never reaches the guest, and a durably
+paused sandbox still resumes. The capture owns the "a capture is in flight"
+flag, so the check reads the real ordering rather than one the test assumed.
+Removing the pause guard fails it.
+
+Residual limit, stated rather than assumed: the lock is per process. Two
+control planes against one database can still interleave. Closing that needs a
+lease held in PostgreSQL, which is a larger change than this defect warrants
+and is not claimed here.
+
+## A drain could be overtaken by a claim already opening
+
+`claim_worker_assignments` read `nodes.accepting_sandboxes` before opening its
+transaction. A drain committing in that gap was invisible to the claim, which
+then granted a reservation on a node that had just been told to finish its work —
+the reservation left behind runs out and the reconciler recovers it elsewhere,
+so the cost is a machine built on a node that was being emptied.
+
+The flag is now re-read inside the transaction, after the lease rows are locked,
+under `FOR SHARE` on the node. That share lock conflicts with the row lock
+`set_worker_draining` takes, so a drain in flight is either already visible or
+waits for the claim to finish. Lease before node is the order `heartbeat_worker`
+and capacity release already use; taking the node first would be the inverse and
+could deadlock against both.
+
+`a_drain_committing_mid_claim_still_stops_the_claim` applies the drain in a
+transaction it deliberately leaves uncommitted, so the claim's fast-path read
+still sees `true` and walks into its own transaction, then commits the drain
+underneath it. Letting the drain finish first would make the fast path reject
+the claim and the test would pass with the race still present. It also asserts
+the refused claim leaves the reservation `reserved` and claimable once the
+drain is lifted.
