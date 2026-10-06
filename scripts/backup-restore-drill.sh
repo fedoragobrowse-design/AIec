@@ -17,7 +17,12 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 
 : "${DATABASE_URL:?DATABASE_URL of the source database is required}"
-ADMIN_URL=${AIEC_DRILL_ADMIN_URL:-${DATABASE_URL%/*}/postgres}
+# `acceptance_database_url_with_name` is the only way a database name is
+# replaced: cutting the last path segment with `${URL%/*}` cuts inside the query
+# when a query value carries a slash, and every rewritten URL then names the
+# source database instead of the drill's own.
+source "$REPO/scripts/acceptance-db.sh"
+ADMIN_URL=${AIEC_DRILL_ADMIN_URL:-$(acceptance_database_url_with_name "$DATABASE_URL" postgres)}
 DRILL_DB=${AIEC_DRILL_DB:-aiec_drill}
 WORK=$(mktemp -d)
 
@@ -26,7 +31,6 @@ WORK=$(mktemp -d)
 # below readable to every account on the machine for as long as the process
 # lives. libpq reads the password from the environment instead, so it is taken
 # out of the URLs once here and given to it that way.
-source "$REPO/scripts/acceptance-db.sh"
 acceptance_database_export_password "$DATABASE_URL" || exit 2
 
 # `PGPASSWORD` is one value for the whole process, so the admin role and the
@@ -81,10 +85,10 @@ log "1. restore a dump into a disposable database"
 psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null
 psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB" >/dev/null
 CREATED_DB=1
-RESTORED_URL="${DATABASE_URL%/*}/$DRILL_DB"
+RESTORED_URL=$(acceptance_database_url_with_name "$DATABASE_URL" "$DRILL_DB")
 # Same split as above: the full URL goes to the control plane's environment, the
 # stripped one to `pg_restore`'s arguments.
-RESTORED_ARGV="${DATABASE_ARGV%/*}/$DRILL_DB"
+RESTORED_ARGV=$(acceptance_database_url_with_name "$DATABASE_ARGV" "$DRILL_DB")
 
 pg_dump --format=custom --no-owner --no-privileges --file="$WORK/aiec.dump" "$DATABASE_ARGV"
 [ -s "$WORK/aiec.dump" ] && ok "dumped $(du -h "$WORK/aiec.dump" | cut -f1) of database state" \
@@ -148,7 +152,7 @@ log "3. disaster-recovery drill: stop, wipe, restore, reconnect"
 DRILL_DB2=${DRILL_DB}_recovery
 psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
 psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB2" >/dev/null
-RECOVERED_ARGV="${DATABASE_ARGV%/*}/$DRILL_DB2"
+RECOVERED_ARGV=$(acceptance_database_url_with_name "$DATABASE_ARGV" "$DRILL_DB2")
 pg_restore --dbname="$RECOVERED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
   && ok "restored a second copy after the simulated outage" \
   || bad "recovery restore failed"

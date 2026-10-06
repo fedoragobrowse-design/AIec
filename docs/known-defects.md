@@ -2943,11 +2943,11 @@ SURVIVOR       after the deadline, `ps` inside the container still showed
               "13 /bin/sh -c echo started; sleep 20; echo finished" and "19 sleep 20"
 ```
 
-The repair computes the deadline before the write and runs `write_all` under
-`timeout_at`, treats `BrokenPipe`/`ConnectionReset` as the command declining to
-read (which is not a failure) and surfaces every other write error, bounds
-`inspect_exec` at ten seconds, and routes the status through `exec_exit_code`,
-which refuses `None` instead of substituting `0`.
+The initial repair computed the deadline before the write and ran `write_all`
+under `timeout_at`, treated `BrokenPipe`/`ConnectionReset` as the command declining
+to read, and refused a missing exit code. Its ten-second inspection bound was
+subsequently replaced by polling; the current lookup bound is the command
+deadline plus the two-second `EXEC_STATUS_GRACE`, described below.
 
 **E2B.** `e2b.rs`'s `run_exec` had the same substitution:
 `decoder.exit_code.unwrap_or(0)` after a stream that ended without an `end`
@@ -3044,8 +3044,8 @@ when its last writer closes, which for a normal command is at or just before the
 daemon records the code. Refusing a single `None` therefore replaces a false
 success with an intermittent false failure — the same defect with the opposite
 sign, and one that would only appear in production. `await_exec_status` now polls
-every 20 ms under the exec's own deadline until a code is published. Three
-states are kept distinct by `exec_status`:
+every 20 ms until a code is published, bounded by the command deadline plus the
+two-second status-lookup grace described below. Three states remain distinct:
 
 | Observation | Verdict |
 |---|---|
@@ -3592,3 +3592,101 @@ not enable auto-trust. A local socket pair supplied Paramiko's logging transport
 only; it performed no handshake, authentication or remote command. Syntax
 compilation passed. This is configuration/policy evidence, not a verified
 deployment-host handshake or a remote diagnostic run.
+
+## Rust product client followed redirects with confidential request bodies
+
+`AIecClient::new` used reqwest's default redirect policy. A local two-origin
+smoke ran the actual client's `exec` with a synthetic environment credential.
+After the first origin returned 307, the second received the credential-bearing
+body and the client accepted its successful exec response. Reqwest stripped
+cross-origin `Authorization` in this scenario: this establishes body disclosure
+and response substitution, not a bearer-key leak.
+
+The shared builder now uses `reqwest::redirect::Policy::none()`. Redirects retain
+the configured origin's status/error; TLS certificate configuration and request
+deadlines are unchanged. The real-socket regression covers GET and POST across
+301/302/303/307/308, preserving the original API status/code and contacting no
+redirect target. Restoring the default policy made that regression fail; the
+mutation was restored and the client suite passed 16 tests. The actual exec
+smoke then returned an error with no redirected body or authorization observed.
+The disposable smoke example was removed.
+
+## Trace diagnostics could report success after failed queries
+
+The remote Bash body suppressed each PostgreSQL client's stderr and continued
+after a failed query. Its Python caller never read the remote exit status.
+A local fixture executed the actual Bash body with a failing first client:
+later sections still appeared and the shell returned zero. The actual Python
+execution tail also returned zero when its channel reported exit two.
+
+The Bash body now enables `set -euo pipefail` and retains client diagnostics.
+Python drains stdout/stderr concurrently to avoid sharing-window starvation,
+reads the remote status, propagates failure, treats missing status as failure,
+and closes the client in `finally`. A failed first query now stops the actual
+Bash body with its original exit 23, without printing later sections. Execution
+of the actual Python tail with controlled streams preserves report output,
+propagates exits 2/23, rejects missing status, and closes the client. A controlled
+channel-window fixture verified that both output reads begin concurrently.
+
+These are local shell/control-flow proofs with fixture clients and streams.
+No SSH connection, Podman execution, deployment query, or real SSH window-pressure
+scenario was exercised.
+
+## Diagnostic helpers ignored query-string database passwords
+
+A PostgreSQL URL can carry its password as a `password` query parameter as well
+as in the userinfo. Real local libpq accepted the configured password supplied
+that way, while `acceptance_database_url_without_password` left it untouched and
+exported nothing: every sanitized `psql`, `pg_dump` and Podman client URL still
+carried a live credential readable from `/proc`.
+
+One embedded parser now answers both questions from the same reading. It
+honours last-query-value precedence over userinfo, strips the userinfo password
+and every password-bearing query component (literal or percent-encoded name),
+preserves duplicate parameters, ordering, literal `+` and unrelated query
+values verbatim, and keeps the role so redaction does not break authentication.
+Percent-encoded effective passwords are still refused, because libpq decodes
+passwords inside a URI and does not decode `PGPASSWORD`. The URL reaches the
+parser on stdin; only a mode name is ever in argv. The parser is embedded rather
+than a sibling module because trace diagnostics transmit this library to a
+remote shell with no companion files. Query parsing is literal rather than
+`parse_qsl`, which would fold `+` into a space and collapse duplicates. Native
+libpq checks confirmed that a bare `?password` is rejected rather than treated as
+a flag, so a component without `=` is removed without overriding the userinfo.
+
+Ten real-shell tests in `scripts/tests/test_acceptance_db.py` cover both
+sources, precedence, duplicates and encoded names, `+` preservation, socket and
+TCP URLs, refusal without the value in any output, encoded overridden by plain,
+an unchanged password-free URL, and a PATH shim proving the URL never reaches
+the parser's argv. A real local psycopg connection then authenticated using the
+exported password with the sanitized URL, preserving role, database and
+`application_name=acceptance+fixture`. The gate covers this suite alongside the
+acceptance redirect regression.
+
+## Backup drill rewrites could address the source database
+
+`backup-restore-drill.sh` derived its admin, restore and recovery URLs with
+`${URL%/*}`, which cuts inside the query when any query value contains a slash.
+With a valid `application_name` carrying one, every rewritten URL named the
+source database rather than the drill's disposable targets; a real read-only
+native connection confirmed the old restore URL reached the source `aiec`
+database. All four rewrites now use `acceptance_database_url_with_name`, which
+replaces only the database name and refuses a name that is not a plain
+identifier. With synthetic fixture URLs the actual rewrite lines produce
+`postgres`, `aiec_disposable` and `aiec_disposable_recovery`, keep the full URLs
+for sqlx, and keep every client argv URL password-free and off the source
+database.
+
+The full live drill remains unrun. Its four prerequisites are not satisfiable on
+this host as configured: `psql`, `pg_dump` and `pg_restore` are absent and
+`apt-get` needs a password this session does not hold, so step 1 aborts on the
+`command -v psql` guard before touching anything. A disposable PostgreSQL 16
+instance was started on the KVM host and migrated with the real `aiec migrate`
+(29 public tables, 30 applied migrations), and the drill was reached as far as
+its parser dependency before being abandoned: the helper shells out to `python3`
+for URI parsing, which the PostgreSQL image does not carry, and its `apt` sources
+do not verify. Pointing the drill at the production Neon endpoint is not an
+option — step 3 drops `aiec_drill` and `aiec_drill_recovery` against a single
+`PGPASSWORD`, so a mistake writes to production. The rewrite logic is covered by
+the fixture tests in `scripts/tests/test_acceptance_db.py`; the dump/restore and
+recovery steps are not covered by any test.

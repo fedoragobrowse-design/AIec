@@ -288,31 +288,67 @@ acceptance_check_database_identifier() {
   return 2
 }
 
-# The password inside a PostgreSQL URL, or nothing when the URL carries none.
+# libpq query passwords override userinfo; the last query value wins. Keep
+# unrelated URI components verbatim and send credentials to the parser on stdin,
+# never in process argv. Embed the parser because trace diagnostics transmit
+# this library to the remote shell without companion files.
+ACCEPTANCE_DB_URL_PARSER=$(cat <<'PY'
+import sys
+from urllib.parse import unquote
+
+mode = sys.argv[1]
+url = sys.stdin.read()
+scheme, separator, rest = url.partition("://")
+if not separator:
+    sys.stdout.write("" if mode == "password" else url)
+    sys.exit(0)
+
+body, query_marker, query = rest.partition("?")
+authority, slash, path = body.partition("/")
+password = ""
+if "@" in authority:
+    info, host = authority.split("@", 1)
+    role, password_marker, password = info.partition(":")
+    if password_marker:
+        authority = role + "@" + host
+
+kept = []
+for component in query.split("&") if query_marker else []:
+    name, value_marker, value = component.partition("=")
+    if unquote(name) == "password" and value_marker:
+        password = value
+    else:
+        kept.append(component)
+
+if mode == "password":
+    sys.stdout.write(password)
+else:
+    query_suffix = "?" + "&".join(kept) if kept else ""
+    sys.stdout.write(scheme + separator + authority + slash + path + query_suffix)
+PY
+)
+
+# Return the effective raw password. Export below retains the established
+# refusal of percent-encoded effective values.
 acceptance_database_url_password() {
-  local rest=${1#*://} credentials
-  [[ $rest == *@* ]] || return 0
-  credentials=${rest%%@*}
-  [[ $credentials == *:* ]] && printf '%s' "${credentials#*:}"
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" password
 }
 
-# The same URL with the password removed and everything else — scheme, role,
-# host, port, database and query — preserved verbatim. Only the role stays
-# because dropping it too would leave libpq to connect as the OS user of
-# whoever ran the script, which is a different database role and fails to
-# authenticate: the redaction would trade a leak for a broken run.
+# The same URL with the password removed from both places it can appear, and
+# everything else - scheme, role, host, port, database and query - preserved
+# verbatim. Only the role stays because dropping it too would leave libpq to
+# connect as the OS user of whoever ran the script, which is a different
+# database role and fails to authenticate: the redaction would trade a leak for
+# a broken run. A percent-encoded password is not decoded on the way through,
+# so a URL carrying one loses the parameter entirely and the refusal is the
+# caller's to make.
 acceptance_database_url_without_password() {
-  local url=$1 rest credentials
-  rest=${url#*://}
-  case $rest in
-    *@*) ;;
-    *) printf '%s' "$url"; return 0 ;;
-  esac
-  credentials=${rest%%@*}
-  case $credentials in
-    *:*) printf '%s://%s@%s' "${url%%://*}" "${credentials%%:*}" "${rest#*@}" ;;
-    *) printf '%s://%s' "${url%%://*}" "$rest" ;;
-  esac
+  local sanitized
+  sanitized=$(printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" strip) || {
+    printf 'refusing to strip a database URL: the PostgreSQL URI parser failed, so no password-free URL could be produced\n' >&2
+    return 2
+  }
+  printf '%s' "$sanitized"
 }
 
 # Hands a URL's password to libpq through the environment, as a side effect of
@@ -331,16 +367,20 @@ acceptance_database_url_without_password() {
 # later `psql` with no password at all. Two calls, one effect and one value, so
 # a mistake in how it is called cannot silently drop the credential.
 #
-# A percent sign in the password is refused rather than handled: libpq
+# A percent sign in the effective password is refused rather than handled: libpq
 # percent-decodes a password that arrives inside a URI and does not decode
-# `PGPASSWORD`, so an encoded password would silently stop authenticating.
+# `PGPASSWORD`, so an encoded password would silently stop authenticating. The
+# refusal names no value, and it happens before anything is exported.
 #
 # The full URL stays available to the caller for anything that needs it — the
 # control plane is started with `DATABASE_URL` in its *environment*, and sqlx
 # parses the password out of the URI itself rather than reading `PGPASSWORD`.
 acceptance_database_export_password() {
   local password
-  password=$(acceptance_database_url_password "$1")
+  password=$(acceptance_database_url_password "$1") || {
+    printf 'refusing to export a database password: the PostgreSQL URI parser failed, so the effective password is unknown\n' >&2
+    return 2
+  }
   [ -n "$password" ] || return 0
   case $password in
     *%*)

@@ -336,11 +336,18 @@ pub struct AIecClient {
     api_key: String,
 }
 impl AIecClient {
+    /// Builds a client bound to one control plane.
+    ///
+    /// Redirects are returned as errors rather than followed: even when reqwest
+    /// strips cross-origin Authorization, a 307/308 can disclose the request
+    /// body and substitute an unrelated server's response.
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Result<Self, ClientError> {
-        let mut builder = Client::builder().timeout(Duration::from_secs(60));
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none());
         if let Ok(path) = std::env::var("AIEC_TLS_CA_CERT") {
             let pem = std::fs::read(&path)
                 .map_err(|error| ClientError::Configuration(format!("read {path}: {error}")))?;
@@ -1131,6 +1138,34 @@ mod tests {
         body: Value,
     }
 
+    /// A permanent redirect this stub answers with instead of a result.
+    ///
+    /// `location` names a different listener, so a client that follows it is
+    /// talking to an origin the control plane never vouched for.
+    #[derive(Clone)]
+    struct Redirect {
+        status: u16,
+        location: String,
+    }
+
+    /// The path a redirecting stub points its `Location` at. No other stub
+    /// route answers it, so a request arriving there is unambiguously the
+    /// client having followed a redirect.
+    const REDIRECT_PATH: &str = "/v1/sandboxes/redirect";
+
+    /// The error document the redirect carries: the envelope the API puts on
+    /// an unsuccessful status, so a refused redirect is reported through the
+    /// ordinary `ClientError::Api` path instead of as a decode failure.
+    fn redirect_error_body() -> Value {
+        serde_json::json!({
+            "error": {
+                "code": "redirect_refused",
+                "message": "this origin does not redirect",
+                "request_id": MISSING_RUN_ID,
+            }
+        })
+    }
+
     #[derive(Clone)]
     struct Stub {
         seen: Arc<Mutex<Vec<Seen>>>,
@@ -1138,6 +1173,7 @@ mod tests {
         peak_in_flight: Arc<AtomicUsize>,
         slow: bool,
         paging: SandboxPaging,
+        redirect: Option<Redirect>,
     }
 
     /// How `/v1/sandboxes` behaves when the client keeps walking. A well
@@ -1162,6 +1198,7 @@ mod tests {
                 peak_in_flight: Arc::new(AtomicUsize::new(0)),
                 slow: false,
                 paging: SandboxPaging::Finite,
+                redirect: None,
             }
         }
 
@@ -1170,6 +1207,17 @@ mod tests {
         fn paging(mode: SandboxPaging) -> Self {
             Self {
                 paging: mode,
+                ..Self::new()
+            }
+        }
+
+        /// A stub whose answers are a permanent redirect to `location`.
+        fn redirecting(status: u16, location: impl Into<String>) -> Self {
+            Self {
+                redirect: Some(Redirect {
+                    status,
+                    location: location.into(),
+                }),
                 ..Self::new()
             }
         }
@@ -1313,6 +1361,19 @@ mod tests {
             stub.peak_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
             stub.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        // Answered before the routes below, so a redirecting stub redirects
+        // whatever it is asked rather than only one path. The request is
+        // recorded first, so a test can still see exactly what the origin was
+        // asked and what it refused to forward.
+        if let Some(redirect) = &stub.redirect {
+            return Response::builder()
+                .status(redirect.status)
+                .header("location", redirect.location.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(redirect_error_body().to_string()))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
         }
 
         // One run id is reserved as "does not exist", so the error mapping can
@@ -1969,5 +2030,69 @@ mod tests {
             "a cell's own budget is waited out, after the queue it may sit in, \
              plus the slack the server needs"
         );
+    }
+
+    // Exercise reqwest's real redirect decision, including writes with
+    // confidential environment/stdin bytes, without contacting the target.
+    #[tokio::test]
+    async fn redirects_preserve_origin_errors_without_contacting_target() {
+        let exec = ExecRequest {
+            command: vec!["pytest".into(), "-q".into()],
+            working_directory: Some("/workspace".into()),
+            environment: BTreeMap::from([(
+                "AIEC_TEST_TOKEN".to_owned(),
+                "synthetic-secret-value".to_owned(),
+            )]),
+            timeout_seconds: 60,
+            stdin: Some("synthetic-stdin-bytes".to_owned()),
+        };
+
+        for status in [301u16, 302, 303, 307, 308] {
+            // Distinct loopback ports are distinct origins.
+            let elsewhere = Stub::new();
+            let (elsewhere_url, elsewhere_serving) = stub_control_plane(elsewhere.clone()).await;
+            let origin = Stub::redirecting(status, format!("{elsewhere_url}{REDIRECT_PATH}"));
+            let (origin_url, origin_serving) = stub_control_plane(origin.clone()).await;
+            let client = AIecClient::new(&origin_url, "af_live_key").expect("a client");
+            let sandbox = Uuid::now_v7();
+
+            let read = client
+                .get_sandbox(sandbox)
+                .await
+                .expect_err("a redirect is not a sandbox");
+            let write = client
+                .exec(sandbox, &exec)
+                .await
+                .expect_err("a redirect is not an exec result");
+
+            for (verb, error) in [("GET", read), ("POST", write)] {
+                let ClientError::Api {
+                    status: reported,
+                    code,
+                    ..
+                } = &error
+                else {
+                    panic!("{verb} {status} must reach the caller as an API error, got {error:?}");
+                };
+                assert_eq!(
+                    reported.as_u16(),
+                    status,
+                    "{verb} {status} is reported as the status it was, not as the \
+                     result of wherever it pointed"
+                );
+                assert_eq!(
+                    code, "redirect_refused",
+                    "{verb} {status} must keep the API error the origin returned"
+                );
+            }
+
+            assert!(
+                elsewhere.requests().await.is_empty(),
+                "{status}: the redirect target was contacted"
+            );
+
+            origin_serving.abort();
+            elsewhere_serving.abort();
+        }
     }
 }
