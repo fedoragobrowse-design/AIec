@@ -245,6 +245,40 @@ sql() {
   psql "$SQL_ARGV_URL" -t -A -F '|' -c "$1" 2>/dev/null
 }
 
+# `sql` for a value an assertion is about to decide on. A psql that fails and a
+# query that legitimately matched nothing both arrive as an empty string, and
+# `sql` discards the stderr that would tell them apart. Every caller below
+# defaults its empty result - `gen_b` empty is a failed comparison, but
+# `state_after`/`state_before` both empty is `test "" = ""`, which passes, and
+# `active_leases` empty was defaulted to 0, which is exactly the "this run
+# leaked nothing" verdict the whole census exists to refuse to reach on a
+# database it could not read. So a failure here is a failure, not a value.
+sql_value() {
+  local out err_file
+  # stderr is kept out of the value. A NOTICE or WARNING on an otherwise
+  # successful query would otherwise become the first line, and the assertions
+  # below would compare a notice against a notice - which is exactly the false
+  # green this reader exists to prevent, reached by a different route. Measured
+  # against real PostgreSQL: a query raising a notice returned
+  # `NOTICE:  lease row updated` as its value.
+  err_file=$(mktemp "${TMPDIR:-/tmp}/aiec-sql-value.XXXXXX") || return 1
+  out=$(psql "$SQL_ARGV_URL" -t -A -F '|' -v ON_ERROR_STOP=1 -c "$1" 2>"$err_file")
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'query failed, refusing to answer it with an empty value: %s\n' "$1" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+  out=${out%%$'\n'*}
+  [ -n "$out" ] || {
+    printf 'query returned no value, which this assertion cannot interpret: %s\n' "$1" >&2
+    return 1
+  }
+  printf '%s' "$out"
+}
+
 snapshot_state() {
   local label=$1
   {
@@ -665,9 +699,9 @@ run_iteration() {
   check "iteration $iteration: sandbox placed on worker A" test "$owner" = "$NODE_A" || return 1
 
   local lease gen expiry
-  lease=$(sql "select id from sandbox_leases where sandbox_id='$sandbox' and status='active' order by created_at desc limit 1" | head -1)
-  gen=$(sql "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1" | head -1)
-  expiry=$(sql "select expires_at from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1" | head -1)
+  lease=$(sql_value "select id from sandbox_leases where sandbox_id='$sandbox' and status='active' order by created_at desc limit 1") || return 1
+  gen=$(sql_value "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1") || return 1
+  expiry=$(sql_value "select expires_at from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1") || return 1
   printf 'sandbox=%s lease=%s generation=%s expires_at=%s\n' "$sandbox" "$lease" "$gen" "$expiry"
   [ -n "$lease" ] && [ -n "$gen" ] || { echo "no lease recorded" >&2; return 1; }
 
@@ -740,7 +774,7 @@ run_iteration() {
     return 1
   fi
   local gen_b
-  gen_b=$(sql "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1" | head -1)
+  gen_b=$(sql_value "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1") || return 1
   check "iteration $iteration: generation is monotonic (N=$gen -> N+1=$gen_b)" test "$gen_b" -gt "$gen" || return 1
 
   log "iteration $iteration: waiting for B to reconstruct the workspace"
@@ -826,7 +860,7 @@ run_iteration() {
   # A still reports the sandbox it lost, so the heartbeat genuinely claims
   # ownership; the fence must refuse it rather than the claim simply being absent.
   local version
-  version=$(sql "select coalesce(max(version),0) + 1000 from nodes" | head -1)
+  version=$(sql_value "select coalesce(max(version),0) + 1000 from nodes") || return 1
   # A still claims the sandbox it lost, so the control plane must refuse the
   # heartbeat outright: the node holds no unexpired lease, so it is not the
   # owner of anything it reports. Either outcome is fine for ownership, but a
@@ -838,27 +872,27 @@ run_iteration() {
   printf 'late A heartbeat -> %s\n' "$late_heartbeat"
   sleep 1
   local owner_after_hb
-  owner_after_hb=$(sql "select node_id from sandbox_leases where sandbox_id='$sandbox' and status='active' order by created_at desc limit 1" | head -1)
+  owner_after_hb=$(sql_value "select node_id from sandbox_leases where sandbox_id='$sandbox' and status='active' order by created_at desc limit 1") || return 1
   local gen_after_hb
-  gen_after_hb=$(sql "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1" | head -1)
+  gen_after_hb=$(sql_value "select generation from sandbox_leases where sandbox_id='$sandbox' order by created_at desc limit 1") || return 1
   check "iteration $iteration: late heartbeat cannot steal ownership" test "$owner_after_hb" = "$NODE_B" || return 1
   check "iteration $iteration: late heartbeat cannot reset the generation" test "$gen_after_hb" = "$gen_b" || return 1
 
   log "iteration $iteration: late completion from generation N must not overwrite N+1 state"
   local state_before
-  state_before=$(sql "select state from sandboxes where id='$sandbox'" | head -1)
+  state_before=$(sql_value "select state from sandboxes where id='$sandbox'") || return 1
   expect_http 409 "late completion from generation N" "${stale_header[@]}" -X POST \
     -d "{\"tenant_id\":\"$TENANT_ID\",\"generation\":$gen}" \
     "$API_BASE/v1/workers/$NODE_A/leases/$lease/complete" >/dev/null 2>&1 || return 1
   sleep 1
   local state_after
-  state_after=$(sql "select state from sandboxes where id='$sandbox'" | head -1)
+  state_after=$(sql_value "select state from sandboxes where id='$sandbox'") || return 1
   check "iteration $iteration: late completion cannot overwrite N+1 state" test "$state_after" = "$state_before" || return 1
 
   log "iteration $iteration: legitimate cleanup through the control plane"
   expect_http 200 "legitimate destroy" -X DELETE "$API_BASE/v1/sandboxes/$sandbox" >/dev/null 2>&1 || return 1
   local remaining
-  remaining=$(sql "select count(*) from sandbox_leases where sandbox_id='$sandbox' and status='active'" | head -1)
+  remaining=$(sql_value "select count(*) from sandbox_leases where sandbox_id='$sandbox' and status='active'") || return 1
   check "iteration $iteration: no active lease after destroy" test "${remaining:-1}" = 0 || return 1
   sleep 2
   local containers
@@ -966,8 +1000,15 @@ fi
 # destroying a machine in the same scope moves this number without this run doing
 # anything, which is why it cannot decide whether this run cleaned up after itself.
 visible_taps=$(tap_census)
-active_leases=$(sql "select count(*) from sandbox_leases where status='active' and tenant_id='$TENANT_ID'" | head -1)
-active_leases=${active_leases:-0}
+# `count(*)` always answers, so an empty result here is a psql that failed and
+# not a database with no leases. Defaulting it to 0 - which is what this line
+# used to do - turned an unreachable database into the one verdict the whole
+# census exists to earn honestly.
+if ! active_leases=$(sql_value "select count(*) from sandbox_leases where status='active' and tenant_id='$TENANT_ID'"); then
+  dump_diagnostics
+  check "no harness active leases remain" false || true
+  active_leases=unreadable
+fi
 if [ "$RUNTIME" = firecracker ]; then
   printf '%s\n' "processes=$leftover_procs containers=$leftover_containers firecracker=$leftover_fc vm_dirs=$leftover_vm_dirs socket_dirs=$leftover_sock_dirs active_leases=$active_leases"
   printf '%s\n' "taps_visible=$visible_taps (context only, not this run's to account for; was $INITIAL_TAPS at start, same scope)"
@@ -984,7 +1025,13 @@ if [ "$RUNTIME" = firecracker ]; then
   check "no Firecracker VM directories remain for this run's workers" test "$leftover_vm_dirs" -eq 0 || true
   check "no Firecracker socket directories remain for this run's workers" test "$leftover_sock_dirs" -eq 0 || true
 fi
-check "no harness active leases remain" test "$active_leases" -eq 0 || true
+if [ "$active_leases" = unreadable ]; then
+  # Already counted as a failure above; `test unreadable -eq 0` would raise a
+  # second one for the same unreadable database.
+  printf 'FAIL: no harness active leases remain (the lease census could not be read)\n' >&2
+else
+  check "no harness active leases remain" test "$active_leases" -eq 0 || true
+fi
 
 if [ "$FAILURES" -eq 0 ] && [ "$ITERATIONS" -ge 3 ]; then
   printf '\nSAME_HOST_MULTI_WORKER_VALIDATION: PASS (%s iterations)\n' "$ITERATIONS"

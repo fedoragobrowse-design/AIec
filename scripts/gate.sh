@@ -39,6 +39,11 @@ run_gate "cargo test --workspace" cargo test --workspace --all-targets --all-fea
 run_gate "sdk import contract" python3 scripts/check-sdk-contract.py
 run_gate "acceptance host helpers" python3 -m unittest discover -s scripts/tests
 
+# The shell harness tests are not Python, so unittest discovery cannot collect
+# them. Left unwired, a census that reports "this run leaked nothing" on a
+# database it could not read would go untested while the gate stayed green.
+run_gate "recovery census" bash scripts/tests/test_recovery_census.sh
+
 # The import contract only checks one line, so a suite that cannot even be
 # collected - a stale import, a syntax error - left the gate green. That is
 # exactly what happened once, so the suite itself is part of the gate now.

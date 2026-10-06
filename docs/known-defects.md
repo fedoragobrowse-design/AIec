@@ -3690,3 +3690,56 @@ option — step 3 drops `aiec_drill` and `aiec_drill_recovery` against a single
 `PGPASSWORD`, so a mistake writes to production. The rewrite logic is covered by
 the fixture tests in `scripts/tests/test_acceptance_db.py`; the dump/restore and
 recovery steps are not covered by any test.
+
+## The cleanup census reported a clean host for a database it could not read
+
+`SAME_HOST_MULTI_WORKER_VALIDATION` ends by counting what it left behind and
+printing `SAME_HOST_MULTI_WORKER_VALIDATION: PASS`. Its SQL helper discarded
+psql's stderr and returned an empty string for a psql that failed, exactly as it
+did for a query that matched no row, and the final count was then defaulted:
+
+```sh
+active_leases=$(sql "select count(*) from sandbox_leases ..." | head -1)
+active_leases=${active_leases:-0}
+```
+
+An empty result — a database that was down, or one whose credentials the run no
+longer had — became `0`, and `0` is the pass condition. The harness's entire
+value is that it reports what it leaked; it could report "leaked nothing" for a
+database it never consulted. The same defaulting made `test "" = ""` satisfy
+"late completion cannot overwrite N+1 state", because two unreadable states
+compare equal.
+
+Reads that an assertion decides on now go through `sql_value`, which refuses to
+answer rather than answering empty, refuses a psql that failed, and refuses a
+query that matched no row. The lease census guards an unreadable count
+explicitly instead of relying on a numeric comparison to reject it, and reports
+the failure through `dump_diagnostics`. `sql` is retained for `snapshot_state`
+and for the recovery poll loop, which is written to retry until the value
+appears — there an unreadable value correctly means "not reassigned yet".
+
+A second defect surfaced while fixing the first and was in the replacement:
+capturing with `2>&1` merged psql's stderr into the value, so a NOTICE or WARNING
+on an otherwise successful query became the value. Verified against real
+PostgreSQL 16 — a query raising `lease row updated` returned
+`NOTICE:  lease row updated` rather than `42`, which would have made the
+generation and state comparisons compare one notice against another. stderr is
+now captured separately and discarded on success, shown on failure.
+
+`scripts/tests/test_recovery_census.sh` covers this and is wired into
+`scripts/gate.sh` as `recovery census`; it had no prior coverage, and the Python
+discovery run that covers `scripts/tests` cannot collect a shell test. It
+extracts `sql` and `sql_value` from the script rather than copying them, and
+stubs psql so it runs without a server or a client. Three mutations of the fix
+are each caught: restoring the empty-to-zero default, making `sql_value` answer
+empty on failure, and re-merging the streams.
+
+The helper was additionally exercised against the real local PostgreSQL at
+`127.0.0.1:5432` with a real psql: a genuine zero is still reported as a clean
+census, a query matching no row is refused, a broken query is refused with its
+error text reaching stderr, and a NOTICE does not become the value.
+
+The harness itself was not run end to end. It requires two worker processes, an
+API, S3 credentials and Docker, and the SIGKILL/reassign path it exists to prove
+is not reproducible here. What is proven is the reading of psql's answer, which
+is where the defect was.
