@@ -1240,17 +1240,17 @@ store does not expose, so it is recorded here rather than tested.
 ### Accepted, not fixed: placement holds a worker row lock while it waits
 
 `select_schedulable_node` selects its candidate `FOR UPDATE SKIP LOCKED` and then
-waits, inside that lock, for the host's advisory lock — up to 40 attempts of
-5 ms. For that window every `debit_capacity`, `release_capacity`,
-`heartbeat_worker` and `revoke_worker` on that node waits behind the placement.
+polls, inside that lock, for the host advisory lock — up to 40 attempts with
+39 five-millisecond sleeps per candidate host. Capacity updates, heartbeats
+and revocation on that node can wait behind placement.
 The wait is deliberate: it is what stops a colliding placement being refused as
 `no schedulable worker has capacity` when the host has room in it, which was a
 measured failure mode. Reordering it means taking the host lock before the node
 lock, which is not possible without knowing which host the candidate is on, so
 the candidate would have to be re-selected and re-validated after the host lock —
-the reservation path this audit has already measured end to end. The bound is
-200 ms and it only occurs when two placements contend for one host, so this is
-recorded as a deliberate trade-off rather than fixed.
+the reservation path this audit has already measured end to end. The sleeps
+total 195 ms per candidate; query execution and scheduling add time, and the
+selector can examine eight candidates. This is not a 200 ms wall-time bound.
 
 ### Investigated and deliberately left alone: a rollback that lost its state CAS
 
@@ -1310,15 +1310,21 @@ returned `node_id` against the `{node}` path segment and returns
 the wrong node learns nothing; naming the right node returns that tenant's
 `lease_id`, `generation` and `expires_at`.
 
-**Not fixed, and the reason is the authentication model rather than the query.**
-Worker routes are authenticated by one shared control token with no tenant
-claim, so the handler has no tenant to scope the lookup with — adding a
-predicate would need a credential that does not exist yet. The practical
-exposure is correspondingly narrow: it requires already knowing both a
-v7 sandbox UUID and the UUID of the node holding it, and the response is lease
-bookkeeping rather than anything about the sandbox or its guest. This is
-recorded so the gap is a decision rather than an oversight; the fix belongs
-with per-tenant worker credentials.
+**Unchanged: the worker token is cluster-wide authority, not a tenant or node
+identity.** Worker routes deliberately use one shared control credential.
+The node check rejects inconsistent requests; it does not contain a compromised
+holder of that credential, who can name the actual owning node.
+
+UUID knowledge is not a security boundary here. The same credential can list
+workers through reconciliation and claim another node's pending assignments,
+which include tenant, sandbox and current lease metadata. If it can also reach
+that node's management endpoint, the shared token and current ownership
+bookkeeping authorize sandbox operations there. That is the credential's trust
+and blast radius, not an ordinary tenant-key capability.
+
+Deployment must protect the token and restrict control-network access as
+documented in `DEPLOYMENT.md`. Per-node authenticated identity would be a new
+worker trust model; adding a tenant predicate alone cannot establish it.
 
 ### The `initialize` handshake never answers `2026-07-28`
 
@@ -3923,10 +3929,9 @@ issued immediately after a create or a failed task races the worker's lease
 resync and is refused, and the identical call a moment later succeeds. But the
 retry only fired on the wire code `transient`, while that refusal arrives as
 `conflict` — the store is reporting a fencing mismatch, not a backend failure.
-So the retry never ran for the race it was written for. Every attempt was made,
-all four were refused, and the caller was told its cleanup failed while the
-machine was still running. The API's equivalent path already matched the
-conflict by its exact sentences; the MCP client did not.
+The first refusal therefore ended the loop and the caller was told cleanup
+failed. The API's run-cleanup path already matched the conflict by its exact
+sentences; the MCP client did not.
 
 `is_retryable_destroy_failure` now matches the same three sentences the store
 and the worker emit, alongside `transient`. A conflict that is not one of them
@@ -3938,3 +3943,100 @@ Found by deploying, not by reading: the four-finding tranche and F4 rebuilt the
 CLI and server, and the first live destroy after a create came back
 `worker lease generation or status changed`. Both regressions cover the match
 in both directions; reverting it fails the first.
+
+## The API destroyed without the retry its own watchdog path had
+
+The previous entry describes the same failure from the MCP client's side, and
+that fix was real but local. The cause was one level up: `DELETE
+/v1/sandboxes/{id}` and the run-cancel path both called `tear_down_sandbox`
+directly, while the retention sweeper and run cleanup called `destroy_with_retry`.
+The retry existed; DELETE and cancellation bypassed it.
+
+The direct API DELETE returned `409 worker lease generation or status changed`.
+The cancellation regression reproduced the same refusal after the run had
+already been marked cancelled, leaving its sandbox running.
+
+Both routes now use the shared retrying destroy. Two consequences of doing it
+there rather than in each client:
+
+- `destroy_with_retry` now answers `Result<(), CoreError>` instead of
+  `Result<(), String>`, so exhausted retries preserve the original API status
+  and error code. Callers that record cleanup reports stringify the error.
+- The `delete_sandbox` route keeps its own read before tearing down. Without it
+  the retry's "absent row counts as already destroyed" would have turned a
+  delete of an id that never existed into a `200 destroyed`.
+
+Regressions: `deleting_a_sandbox_retries_the_worker_lease_resync` and
+`cancelling_a_run_retries_the_worker_lease_resync`. Both assert the machine was
+stopped, not merely that the response was successful. Mutating the delete route
+back to the bare teardown reproduces the exact live `409`; mutating the cancel
+path back reproduces the leak directly, as an empty destroy log.
+
+The lease-resync sentences now live in `aiec-client::LEASE_RESYNC_MESSAGES`,
+shared by API and MCP classification. MCP also retries the named API backend
+codes (`backend`, `internal`, `backend_unavailable`) and request transport
+failures; decoding/configuration failures and unrelated conflicts still fail
+without retry. `a_destroy_the_backend_never_answered_is_retried` checks backend
+classification and an accepted TCP connection closed without an HTTP response.
+Removing those retry cases fails the regression.
+
+The rebuilt API/worker and MCP services were exercised through trusted TLS and
+the local MCP endpoint using Docker `alpine:3.21`:
+
+- Unknown-ID DELETE remained HTTP 404.
+- Three create → exec → direct DELETE rounds returned exit 0, HTTP 200, and
+  durable `destroyed` state; DELETE took 4.186, 6.134, and 3.742 seconds.
+- Cancelling a run after `task.started` returned `cancelled`, with its sandbox
+  `destroyed` and no `cleanup_failed`. The in-flight submit response also stayed
+  `cancelled`, rather than overwriting cancellation when execution unwound.
+- MCP create → argv-array exec → destroy returned `teardown-mcp-ok`, exit 0,
+  and `destroyed`.
+- A complete six-page API census found 1,121 sandbox rows and zero nonterminal
+  rows. Podman had zero running containers and no smoke-created containers
+  remaining; 23 older stopped containers were preserved. Historical runtime
+  directories were also left untouched. No TAP interfaces remained.
+
+The first smoke attempt with `aiec-coding:latest` failed with
+`backend_unavailable`; that Docker image was absent from the daemon inventory.
+The successful lifecycle evidence is for `alpine:3.21`, not the coding image or
+Firecracker.
+
+## Guard-backed Firecracker sandboxes cannot start on this host
+
+`docs/DEPLOYMENT.md` and `docs/GUARD.md` both require the Firecracker worker
+to hold `CAP_NET_ADMIN` and `CAP_NET_RAW`, and `deploy/aiec-worker.service`
+grants both as ambient capabilities. The host running the worker does not
+provide them.
+
+Measured, not inferred: the worker process reports `CapPrm=0` and `CapEff=0`,
+`systemctl --user show aiec-worker -p AmbientCapabilities` is empty, and
+`nft list ruleset` for the worker user returns `Operation not permitted (you
+must be root)`. The bounding set does contain both capabilities, so the limit
+is the manager, not the kernel.
+
+This is not a limitation of an unprivileged user manager in general, it is a
+property of this deployment: `systemctl --user` cannot raise ambient
+capabilities without root, and no passwordless sudo is available on this host.
+The unit therefore has to be installed as a **system** unit for the documented
+capabilities to take effect. That needs an administrator and has not been done.
+
+The consequence is that Guard fails closed at attach time:
+
+```
+backend unavailable: guard enforcement probe
+nft could not read the host ruleset: Operation not permitted (you must be root)
+```
+
+That is the correct behaviour - a guard that cannot enforce its policy must
+refuse, not wave traffic through. The Docker and bwrap runtimes do not use this
+path and are unaffected; a full create/exec/destroy lifecycle through MCP on the
+Docker runtime was verified working.
+
+The previously deployed binary lacked the enforcement probe present in current
+source. That establishes deployment drift, not whether every earlier sandbox
+lacked nft enforcement: absence of the probe alone does not prove that.
+The current failure is the probe detecting missing worker privileges.
+
+A drop-in at `~/.config/systemd/user/aiec-worker.service.d/30-guard-capabilities.conf`
+records the requirement but is inert under the user manager; its comment says
+so, so it is not mistaken for a working fix.

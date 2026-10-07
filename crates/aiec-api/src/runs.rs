@@ -1632,12 +1632,7 @@ fn is_transient_destroy_error(error: &CoreError) -> bool {
 /// that is already gone, and treating every conflict as transient would retry
 /// a genuine refusal forever.
 fn is_lease_resync(message: &str) -> bool {
-    matches!(
-        message,
-        "worker lease generation or status changed"
-            | "sandbox lease generation does not match the control plane"
-            | "stale sandbox lease generation"
-    )
+    aiec_client::is_lease_resync_conflict(message)
 }
 
 /// Destroys a sandbox, retrying the lease race.
@@ -1754,13 +1749,21 @@ pub(crate) async fn abandon_sandbox(
     Ok(())
 }
 
+/// Destroys a sandbox, retrying the failures that clear on their own.
+///
+/// This is the one destroy every caller shares, so a lease the worker is
+/// resyncing, a deadlock, or a backend that could not be reached is retried
+/// here rather than being reported as a cleanup failure with the machine
+/// still running. Typed, so a caller that answers over the wire reports the
+/// real code rather than a flattened one; the callers that only log the reason
+/// stringify it themselves.
 pub(crate) async fn destroy_with_retry(
     state: &AppState,
     tenant: TenantId,
     sandbox_id: Uuid,
-) -> Result<(), String> {
+) -> Result<(), CoreError> {
     const ATTEMPTS: usize = 4;
-    let mut last = String::new();
+    let mut last = CoreError::NotFound("sandbox was not destroyed".into());
     for attempt in 0..ATTEMPTS {
         // Through the shared teardown, not straight to the row. Calling the
         // repository directly marked the sandbox destroyed while its container
@@ -1775,16 +1778,15 @@ pub(crate) async fn destroy_with_retry(
         match outcome {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let message = error.to_string();
                 // Worth another try: a lease the worker is resyncing, and a
                 // database deadlock or serialization failure. A deadlock is the
                 // textbook transient error - it is a conflict between two
                 // transactions that resolves when one commits - and treating it
                 // as terminal is exactly how a finished run ends up leaking the
                 // machine it was supposed to release.
-                let transient = is_transient_destroy_error(&error);
-                last = message;
-                if !transient || attempt + 1 == ATTEMPTS {
+                let retryable = is_transient_destroy_error(&error);
+                last = error;
+                if !retryable || attempt + 1 == ATTEMPTS {
                     return Err(last);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt as u64 + 1)))
@@ -1848,11 +1850,12 @@ pub(crate) async fn expire_retention(state: &AppState, run: &Run) -> Result<(), 
         return Ok(());
     }
     if let Err(error) = destroy_with_retry(state, run.tenant_id, sandbox_id).await {
+        let message = error.to_string();
         state
             .repository()
-            .record_retention_cleanup_failure(run.tenant_id, run.id, sandbox_id, error.clone())
+            .record_retention_cleanup_failure(run.tenant_id, run.id, sandbox_id, message.clone())
             .await?;
-        return Err(CoreError::Unavailable(error));
+        return Err(CoreError::Unavailable(message));
     }
     // Clear only this machine's report, atomically with retention. A late
     // failing sweeper cannot restore it after the successful teardown.
@@ -1981,16 +1984,17 @@ async fn cleanup(
                     error = %error,
                     "could not destroy a run's sandbox"
                 );
+                let message = error.to_string();
                 if let Some(report) = &mut results.cleanup_failed {
                     use std::fmt::Write;
                     let _ = write!(
                         report.error,
-                        "; sandbox {sandbox_id} teardown failed: {error}"
+                        "; sandbox {sandbox_id} teardown failed: {message}"
                     );
                 } else {
                     results.cleanup_failed = Some(CleanupReport {
                         sandbox_id: *sandbox_id,
-                        error,
+                        error: message,
                     });
                 }
             }

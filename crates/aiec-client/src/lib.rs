@@ -324,6 +324,29 @@ pub enum ClientError {
     #[error("invalid response: {0}")]
     Decode(String),
 }
+
+/// The fencing sentences the store emits when a sandbox's worker resynced its
+/// lease between a request being issued and applied.
+///
+/// These live here rather than in each client because they are a wire contract
+/// between the storage layer and every consumer of it. Duplicated as string
+/// literals per crate, a wording change in the store silently stops every
+/// destroy retry firing again - a machine left running to its TTL, reported to
+/// the caller as a cleanup failure. One list, matched by every consumer.
+pub const LEASE_RESYNC_MESSAGES: [&str; 3] = [
+    "worker lease generation or status changed",
+    "sandbox lease generation does not match the control plane",
+    "stale sandbox lease generation",
+];
+
+/// Whether a conflict message is the lease resync race rather than a refusal.
+///
+/// The race clears by itself: the identical call a moment later succeeds. A
+/// refusal does not, and retrying one reports the same refusal repeatedly
+/// while achieving nothing.
+pub fn is_lease_resync_conflict(message: &str) -> bool {
+    LEASE_RESYNC_MESSAGES.contains(&message)
+}
 #[derive(Debug, Deserialize)]
 struct ErrorDocument {
     error: ApiErrorBody,

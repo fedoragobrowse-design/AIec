@@ -787,26 +787,37 @@ fn is_terminal(state: SandboxState) -> bool {
 
 /// Whether a destroy failure is worth retrying rather than reporting.
 ///
-/// Two shapes qualify. A `transient` code is the control plane saying so
-/// directly. A `conflict` naming a lease generation is the store reporting a
-/// fencing mismatch: the worker resynced its lease between the destroy being
-/// issued and being applied, the identical call a moment later succeeds, and
-/// the machine is still running. Those are the exact sentences the store and
-/// the worker emit. A conflict that is not one of them is a real refusal, and
-/// retrying it would only report the same refusal four times more slowly.
+/// Three shapes qualify, mirroring the control plane's own watchdog path.
+///
+/// A `transient` code is the API saying so directly. A `conflict` naming a
+/// lease generation is the store reporting a fencing mismatch: the worker
+/// resynced its lease between the destroy being issued and applied, the
+/// identical call a moment later succeeds, and the machine is still running.
+///
+/// A server-side failure is a backend that could not be reached - a Docker
+/// socket hiccup, a Firecracker process that vanished, a TLS fault. The machine
+/// is very much still there; only the conversation failed. Reporting that as a
+/// cleanup failure is what leaves a destroyed-but-running sandbox occupying
+/// capacity until its TTL expires, so these are retried too.
+///
+/// A `conflict` that is not one of the lease sentences is a genuine refusal
+/// and is reported on the first attempt, because a sandbox that cannot be
+/// torn down should be reported once rather than four times more slowly.
 pub fn is_retryable_destroy_failure(error: &aiec_client::ClientError) -> bool {
     match error {
         aiec_client::ClientError::Api { code, message, .. } => {
             code == "transient"
-                || (code == "conflict"
-                    && matches!(
-                        message.as_str(),
-                        "worker lease generation or status changed"
-                            | "sandbox lease generation does not match the control plane"
-                            | "stale sandbox lease generation"
-                    ))
+                || (code == "conflict" && aiec_client::is_lease_resync_conflict(message))
+                || matches!(
+                    code.as_str(),
+                    "backend" | "internal" | "backend_unavailable"
+                )
         }
-        _ => false,
+        // A request that never produced a response: the connection failed, was
+        // refused, or timed out. The control plane's state is unknown, and
+        // unknown is not a reason to abandon a machine that may still be up.
+        aiec_client::ClientError::Request(_) => true,
+        aiec_client::ClientError::Decode(_) | aiec_client::ClientError::Configuration(_) => false,
     }
 }
 
@@ -922,14 +933,48 @@ mod tests {
                 "{message} is a refusal and must not be retried"
             );
         }
-        // A transport failure carries no lease-race code and is not the race.
+        // A refusal stays a refusal whatever code carries it.
+        for code in ["conflict", "forbidden", "invalid_request"] {
+            assert!(!is_retryable_destroy_failure(&api_error(
+                code,
+                "quarantined sandbox requires explicit human release"
+            )));
+        }
+    }
+
+    /// A backend that could not be reached leaves the machine very much
+    /// running. The control plane's own watchdog retries exactly these, and
+    /// without the same rule here a Docker socket hiccup became a permanent
+    /// `cleanup_failed` for the caller - the same defect that path fixed.
+    #[tokio::test]
+    async fn a_destroy_the_backend_never_answered_is_retried() {
+        for code in ["backend", "internal", "backend_unavailable"] {
+            assert!(
+                is_retryable_destroy_failure(&api_error(code, "the runtime vanished")),
+                "{code} means the conversation failed, not that the machine is gone"
+            );
+        }
+        // Accept and close without a response: deterministic transport failure
+        // without assuming a fixed localhost port is unused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        });
+        let refused = aiec_client::AIecClient::new(&endpoint, "test-key")
+            .unwrap()
+            .delete_sandbox(uuid::Uuid::nil())
+            .await;
+        server.await.unwrap();
+        assert!(
+            is_retryable_destroy_failure(&refused.expect_err("connection closed without response")),
+            "a destroy whose response was lost must be retried"
+        );
+        // An unreadable response is a client-side problem and retrying it
+        // would only fail the same way four times.
         assert!(!is_retryable_destroy_failure(
-            &aiec_client::ClientError::Api {
-                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                code: "backend_unavailable".into(),
-                message: "the control plane is unreachable".into(),
-                request_id: uuid::Uuid::nil(),
-            }
+            &aiec_client::ClientError::Decode("truncated body".into())
         ));
     }
 

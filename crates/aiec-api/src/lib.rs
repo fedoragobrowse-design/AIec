@@ -2007,7 +2007,9 @@ async fn provision_admitted_sandbox(
         let cleanup = if allocated {
             // The scoped worker dispatch still carries the original lease.
             // Capacity is released only after runtime teardown confirms stop.
-            runs::destroy_with_retry(s, tenant, x.id).await
+            runs::destroy_with_retry(s, tenant, x.id)
+                .await
+                .map_err(|e| e.to_string())
         } else {
             // Guard initialization failed before runtime allocation.
             s.repository()
@@ -2743,18 +2745,24 @@ async fn delete_sandbox(
 ) -> ApiResult<Value> {
     p.authorize(Scope::SandboxesWrite)
         .map_err(ApiFailure::from)?;
-    let x = s
-        .repository()
+    // Read first, and it has to stay: `destroy_with_retry` answers success when
+    // the row is absent, so without this a caller deleting an id that never
+    // existed would be told `destroyed`. Unknown stays `404`.
+    s.repository()
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    // Same teardown the run path uses. Two callers, one order, one meaning of
-    // "destroyed": the machine is stopped before the row is forgotten.
-    // Mapped through `from`, not flattened to one code. A teardown that lost a
-    // lease race or hit a deadlock arrives as `transient` and the caller should
-    // be able to see that and try again; collapsing every failure into
-    // `scheduler_unavailable` would hide the one distinction a client needs.
-    crate::runs::tear_down_sandbox(&s, p.tenant_id, id, &x)
+    // The retrying destroy, not the bare teardown. This route used to call
+    // `tear_down_sandbox` directly, which is why a destroy issued right after a
+    // create came back `409 worker lease generation or status changed` and the
+    // machine was still running: the race this route sits on was only handled
+    // for the watchdog callers. Every client met the same failure and only the
+    // MCP one had learned to retry it, which is backwards - the retry belongs
+    // where the teardown is shared, not copied into each client.
+    //
+    // Still mapped through `from`, so a teardown that exhausted its attempts
+    // arrives with its real code rather than a flattened one.
+    crate::runs::destroy_with_retry(&s, p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
     s.secrets.lock().await.remove(&(p.tenant_id, id));
@@ -4281,18 +4289,36 @@ async fn release_run_sandboxes(state: &AppState, run: &Run) -> (Run, Vec<Uuid>) 
         .unwrap_or_default();
     for link in held {
         // The same teardown as a normal finish, so cancelling stops the machine
-        // rather than only forgetting it.
-        let outcome = match state
+        // rather than only forgetting it - and the retrying one, because a
+        // cancel that lands on the worker's lease resync used to report
+        // `cleanup_failed` with the machine still running. A cancel is exactly
+        // when the caller is least able to retry, so the server has to.
+        //
+        // The row is read first because `destroy_with_retry` answers success
+        // for an absent sandbox, and a link with no row behind it is not
+        // something this cancel tore down.
+        match state
             .repository()
             .get_sandbox(run.tenant_id, link.sandbox_id)
             .await
         {
-            Ok(sandbox) => {
-                runs::tear_down_sandbox(state, run.tenant_id, link.sandbox_id, &sandbox).await
-            }
+            Ok(_) => {}
             Err(CoreError::NotFound(_)) => continue,
-            Err(error) => Err(error),
-        };
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    sandbox_id = %link.sandbox_id,
+                    error = %error,
+                    "could not read a cancelled run's sandbox"
+                );
+                results.cleanup_failed = Some(CleanupReport {
+                    sandbox_id: link.sandbox_id,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        }
+        let outcome = runs::destroy_with_retry(state, run.tenant_id, link.sandbox_id).await;
         match outcome {
             Ok(()) => released.push(link.sandbox_id),
             Err(error) => {
@@ -7064,6 +7090,12 @@ mod tests {
         files: Option<std::sync::Arc<TestMap<String, bytes::Bytes>>>,
         failing_command: Option<Vec<String>>,
         forbid_destroy: bool,
+        /// Destroy failures to raise before the next destroy succeeds, in
+        /// order. A worker's lease resync is a one-shot event that clears on
+        /// its own, so this is how a test reproduces the race the retry exists
+        /// for: the first destroy refuses exactly as the real worker does and
+        /// the second is told nothing is in the way any more.
+        destroy_failures: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<CoreError>>>,
     }
 
     impl RunRuntime {
@@ -7170,6 +7202,14 @@ mod tests {
         }
         async fn destroy(&self, sandbox: &Sandbox) -> Result<(), CoreError> {
             assert!(!self.forbid_destroy, "runtime teardown before allocation");
+            // Raised before the machine is recorded as stopped, because a
+            // refused destroy stopped nothing: recording it would let a test
+            // pass on a log that counts a teardown that never happened.
+            if let Ok(mut queued) = self.destroy_failures.lock()
+                && let Some(error) = queued.pop_front()
+            {
+                return Err(error);
+            }
             if let Some(recorder) = &self.recorder
                 && let Ok(mut log) = recorder.destroyed.lock()
             {
@@ -7724,6 +7764,70 @@ mod tests {
             .await
             .expect("run sandboxes");
         assert_eq!(stopped, vec![linked[0].sandbox_id]);
+    }
+
+    /// Deleting a sandbox has to survive the worker's lease resync, or the
+    /// caller is told cleanup failed while the machine keeps running.
+    ///
+    /// Observed live: a sandbox created through the API and deleted a moment
+    /// later came back `409 worker lease generation or status changed` with the
+    /// container still up. The retry that would have absorbed it existed, but
+    /// only on the watchdog path - this route called the teardown directly, so
+    /// every HTTP and SDK client met a race the server already knew how to
+    /// clear. The fix belongs here rather than in each client, so the test goes
+    /// through the route and asserts both that the delete succeeds and that the
+    /// machine was actually stopped, which a `409` alone would have hidden.
+    #[tokio::test]
+    async fn deleting_a_sandbox_retries_the_worker_lease_resync() {
+        let recorder = DestroyRecorder::default();
+        let failures =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                CoreError::Conflict("worker lease generation or status changed".into()),
+            ])));
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            recorder: Some(recorder.clone()),
+            destroy_failures: failures,
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+
+        let (status, created) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/sandboxes",
+                json!({ "image": "alpine:3.21" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "create: {created}");
+        let sandbox_id = created["id"].as_str().expect("sandbox id").to_owned();
+        let sandbox_id: Uuid = sandbox_id.parse().expect("uuid");
+
+        let (status, destroyed) = fixture
+            .call_json(
+                axum::http::Method::DELETE,
+                &format!("/v1/sandboxes/{sandbox_id}"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a lease resync must not be reported as a failed delete: {destroyed}"
+        );
+        assert_eq!(
+            recorder.destroyed(),
+            vec![sandbox_id],
+            "the retry has to reach the runtime, not just report success"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox_id)
+                .await
+                .expect("sandbox row")
+                .state,
+            SandboxState::Destroyed
+        );
     }
 
     /// An artifact uploaded to a sandbox must be something the sweeper can
@@ -9158,6 +9262,89 @@ mod tests {
                 .expect("sandbox row"),
             SandboxState::Destroyed,
             "a cancelled run left its machine running"
+        );
+    }
+
+    /// Cancelling has to survive the same lease resync a delete does, and it
+    /// matters more here: a cancel is the request a caller sends when they no
+    /// longer want the machine, so there is nobody left to retry on their
+    /// behalf and nothing would be watching a leaked container.
+    ///
+    /// The cancellation itself still succeeds either way - the run is marked
+    /// cancelled before the teardown is attempted. What the race corrupted was
+    /// the cleanup that follows, so the assertions are about the machine, not
+    /// the response.
+    #[tokio::test]
+    async fn cancelling_a_run_retries_the_worker_lease_resync() {
+        let recorder = DestroyRecorder::default();
+        let failures =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                CoreError::Conflict("worker lease generation or status changed".into()),
+            ])));
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            recorder: Some(recorder.clone()),
+            destroy_failures: failures,
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let run = settled_run(fixture.tenant, RunState::Running);
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "aiec-coding:latest".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 512,
+            disk_mb: 1024,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            runtime_path: None,
+        };
+        fixture
+            .store
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+        fixture.store.seed(run.clone()).await;
+        fixture
+            .store
+            .link_run_sandbox(
+                fixture.tenant,
+                RunSandbox {
+                    run_id: run.id,
+                    sandbox_id: sandbox.id,
+                    role: "primary".into(),
+                },
+            )
+            .await
+            .expect("link sandbox");
+
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "cancel: {value}");
+        assert_eq!(
+            recorder.destroyed(),
+            vec![sandbox.id],
+            "a lease resync must not leave a cancelled run's machine running"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .map(|row| row.state)
+                .expect("sandbox row"),
+            SandboxState::Destroyed
         );
     }
 
