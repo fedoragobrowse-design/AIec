@@ -423,11 +423,15 @@ impl LocalAiec {
                         last_error = None;
                         break;
                     }
-                    // On the wire, transience is a code, so it is matched as one.
-                    let lease_race = matches!(
-                        &error,
-                        aiec_client::ClientError::Api { code, .. } if code == "transient"
-                    );
+                    // On the wire, transience is a code, so it is matched as
+                    // one - but the lease race itself is a fencing `Conflict`,
+                    // not a `Transient`: the store is reporting that the
+                    // worker's generation moved, not that a backend failed.
+                    // Matching only `transient` meant this retry never fired
+                    // for the race its own comment describes, and a destroy
+                    // issued straight after a create or a failed task failed
+                    // every attempt until the caller tried again itself.
+                    let lease_race = is_retryable_destroy_failure(&error);
                     last_error = Some(error);
                     if !lease_race || attempt == 3 {
                         break;
@@ -436,6 +440,7 @@ impl LocalAiec {
                 }
             }
         }
+
         if let Some(error) = last_error {
             return Err(map_client_error(&error).with_sandbox(id));
         }
@@ -780,6 +785,31 @@ fn is_terminal(state: SandboxState) -> bool {
     matches!(state, SandboxState::Destroyed | SandboxState::Failed)
 }
 
+/// Whether a destroy failure is worth retrying rather than reporting.
+///
+/// Two shapes qualify. A `transient` code is the control plane saying so
+/// directly. A `conflict` naming a lease generation is the store reporting a
+/// fencing mismatch: the worker resynced its lease between the destroy being
+/// issued and being applied, the identical call a moment later succeeds, and
+/// the machine is still running. Those are the exact sentences the store and
+/// the worker emit. A conflict that is not one of them is a real refusal, and
+/// retrying it would only report the same refusal four times more slowly.
+pub fn is_retryable_destroy_failure(error: &aiec_client::ClientError) -> bool {
+    match error {
+        aiec_client::ClientError::Api { code, message, .. } => {
+            code == "transient"
+                || (code == "conflict"
+                    && matches!(
+                        message.as_str(),
+                        "worker lease generation or status changed"
+                            | "sandbox lease generation does not match the control plane"
+                            | "stale sandbox lease generation"
+                    ))
+        }
+        _ => false,
+    }
+}
+
 /// Encodes to the standard base64 the control plane expects for file bodies.
 fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine as _;
@@ -846,6 +876,62 @@ pub fn map_client_error(error: &aiec_client::ClientError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_error(code: &str, message: &str) -> aiec_client::ClientError {
+        aiec_client::ClientError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            code: code.into(),
+            message: message.into(),
+            request_id: uuid::Uuid::nil(),
+        }
+    }
+
+    /// A destroy issued right after a create or a failed task races the
+    /// worker's lease resync and is refused with a fencing conflict. The
+    /// identical call a moment later succeeds, so retrying is what makes
+    /// cleanup reliable rather than merely attempted.
+    #[test]
+    fn a_destroy_refused_by_the_lease_race_is_retried() {
+        for message in [
+            "worker lease generation or status changed",
+            "sandbox lease generation does not match the control plane",
+            "stale sandbox lease generation",
+        ] {
+            assert!(
+                is_retryable_destroy_failure(&api_error("conflict", message)),
+                "{message} is the lease resync race and must be retried"
+            );
+        }
+        assert!(is_retryable_destroy_failure(&api_error(
+            "transient",
+            "transient database failure: serialization failure"
+        )));
+    }
+
+    /// A genuine refusal is not made retryable by widening the match, or a
+    /// sandbox that cannot be torn down is reported as failing four times
+    /// instead of once.
+    #[test]
+    fn a_real_refusal_is_still_reported_rather_than_retried() {
+        for message in [
+            "quarantined sandbox requires explicit human release",
+            "sandbox is not running",
+        ] {
+            assert!(
+                !is_retryable_destroy_failure(&api_error("conflict", message)),
+                "{message} is a refusal and must not be retried"
+            );
+        }
+        // A transport failure carries no lease-race code and is not the race.
+        assert!(!is_retryable_destroy_failure(
+            &aiec_client::ClientError::Api {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                code: "backend_unavailable".into(),
+                message: "the control plane is unreachable".into(),
+                request_id: uuid::Uuid::nil(),
+            }
+        ));
+    }
 
     #[test]
     fn output_is_clipped_on_a_character_boundary() {

@@ -3915,3 +3915,26 @@ they are filtered before selection. The lease sits on a second worker
 deliberately: wedging the first two consumes that worker's capacity, so nothing
 behind them could be scheduled and the fixture would prove nothing. Restoring
 the old selection fails it.
+
+## The MCP server reported a lease-race destroy as a failure
+
+`destroy_sandbox` retries four times, and its comment says why: a destroy
+issued immediately after a create or a failed task races the worker's lease
+resync and is refused, and the identical call a moment later succeeds. But the
+retry only fired on the wire code `transient`, while that refusal arrives as
+`conflict` — the store is reporting a fencing mismatch, not a backend failure.
+So the retry never ran for the race it was written for. Every attempt was made,
+all four were refused, and the caller was told its cleanup failed while the
+machine was still running. The API's equivalent path already matched the
+conflict by its exact sentences; the MCP client did not.
+
+`is_retryable_destroy_failure` now matches the same three sentences the store
+and the worker emit, alongside `transient`. A conflict that is not one of them
+is a genuine refusal and is still reported on the first attempt, because a
+sandbox that cannot be torn down should be reported once rather than four
+times more slowly.
+
+Found by deploying, not by reading: the four-finding tranche and F4 rebuilt the
+CLI and server, and the first live destroy after a create came back
+`worker lease generation or status changed`. Both regressions cover the match
+in both directions; reverting it fails the first.
