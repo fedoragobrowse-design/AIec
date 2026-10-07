@@ -4218,9 +4218,8 @@ async fn download_run_artifact(
 
 /// Stops a run and reclaims the machine it was holding.
 ///
-/// Cancelling a run that has already finished is not a failure. The caller's
-/// intent -- no machine of mine is still working -- is already true, and a
-/// second cancel after a first one succeeded must not look like a mistake.
+/// Finished runs are unchanged. Already-cancelled runs retry cleanup: the
+/// terminal verdict does not prove their machines were reclaimed.
 async fn cancel_run(
     State(s): State<AppState>,
     Extension(p): Extension<Principal>,
@@ -4233,40 +4232,47 @@ async fn cancel_run(
         .get_run(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
-    if run.state.is_terminal() {
+    if run.state.is_terminal() && run.state != RunState::Cancelled {
         return run_response(StatusCode::OK, &run);
     }
-    let cancelled = match store
-        .update_run_state(p.tenant_id, id, run.state, RunState::Cancelled)
-        .await
-    {
-        Ok(cancelled) => cancelled,
-        // The run moved while this request was in flight. If it finished in the
-        // meantime the caller gets the outcome they asked for; if it is still
-        // live, the state genuinely changed under us and saying so is more
-        // honest than cancelling a run nobody can identify any more.
-        Err(CoreError::Conflict(_)) | Err(CoreError::NotFound(_)) => {
-            let current = store
-                .get_run(p.tenant_id, id)
-                .await
-                .map_err(ApiFailure::from)?;
-            if current.state.is_terminal() {
-                return run_response(StatusCode::OK, &current);
+    let (cancelled, newly_cancelled) = if run.state == RunState::Cancelled {
+        (run, false)
+    } else {
+        match store
+            .update_run_state(p.tenant_id, id, run.state, RunState::Cancelled)
+            .await
+        {
+            Ok(cancelled) => (cancelled, true),
+            Err(CoreError::Conflict(_)) | Err(CoreError::NotFound(_)) => {
+                let current = store
+                    .get_run(p.tenant_id, id)
+                    .await
+                    .map_err(ApiFailure::from)?;
+                if current.state == RunState::Cancelled {
+                    (current, false)
+                } else if current.state.is_terminal() {
+                    return run_response(StatusCode::OK, &current);
+                } else {
+                    return Err(ApiFailure::from(CoreError::Conflict(
+                        "run state changed".into(),
+                    )));
+                }
             }
-            return Err(ApiFailure::from(CoreError::Conflict(
-                "run state changed".into(),
-            )));
+            Err(error) => return Err(ApiFailure::from(error)),
         }
-        Err(error) => return Err(ApiFailure::from(error)),
     };
-    let (cancelled, released) = release_run_sandboxes(&s, &cancelled).await;
-    runs::event(
-        &s,
-        &cancelled,
-        "run.cancelled",
-        json!({ "destroyed_sandboxes": released }),
-    )
-    .await;
+    let (cancelled, released) = release_run_sandboxes(&s, cancelled)
+        .await
+        .map_err(ApiFailure::from)?;
+    if newly_cancelled {
+        runs::event(
+            &s,
+            &cancelled,
+            "run.cancelled",
+            json!({ "destroyed_sandboxes": released }),
+        )
+        .await;
+    }
     run_response(StatusCode::OK, &cancelled)
 }
 
@@ -4279,24 +4285,21 @@ async fn cancel_run(
 /// The run to show the caller, and the machines that were actually reclaimed,
 /// both come back: "cancelled" on its own does not say whether the compute went
 /// with it.
-async fn release_run_sandboxes(state: &AppState, run: &Run) -> (Run, Vec<Uuid>) {
+async fn release_run_sandboxes(
+    state: &AppState,
+    mut run: Run,
+) -> Result<(Run, Vec<Uuid>), CoreError> {
     let mut released = Vec::new();
-    let mut results = run.results.clone();
     let held = state
         .repository()
         .list_run_sandboxes(run.tenant_id, run.id)
-        .await
-        .unwrap_or_default();
+        .await?;
+    let mut results = std::mem::take(&mut run.results);
+    // Only failures from this attempt describe the machines still held.
+    results.cleanup_failed = None;
     for link in held {
-        // The same teardown as a normal finish, so cancelling stops the machine
-        // rather than only forgetting it - and the retrying one, because a
-        // cancel that lands on the worker's lease resync used to report
-        // `cleanup_failed` with the machine still running. A cancel is exactly
-        // when the caller is least able to retry, so the server has to.
-        //
-        // The row is read first because `destroy_with_retry` answers success
-        // for an absent sandbox, and a link with no row behind it is not
-        // something this cancel tore down.
+        // Missing rows do not count as machines reclaimed by this request.
+        // Existing rows use the same fenced, retrying teardown as run cleanup.
         match state
             .repository()
             .get_sandbox(run.tenant_id, link.sandbox_id)
@@ -4335,22 +4338,11 @@ async fn release_run_sandboxes(state: &AppState, run: &Run) -> (Run, Vec<Uuid>) 
             }
         }
     }
-    let settled = match state
+    let settled = state
         .repository()
         .record_run_results(run.tenant_id, run.id, results, run.state)
-        .await
-    {
-        Ok(updated) => updated,
-        Err(error) => {
-            tracing::warn!(
-                run_id = %run.id,
-                error = %error,
-                "could not record a cancelled run's results"
-            );
-            run.clone()
-        }
-    };
-    (settled, released)
+        .await?;
+    Ok((settled, released))
 }
 
 /// Renders a run with its id in a header as well as in the body.
@@ -4803,6 +4795,8 @@ mod tests {
         /// away mid-settlement, so the run-execution failure path can be
         /// observed under a store that refuses the write.
         refuse_failure_writes: TestMutex<bool>,
+        refuse_run_sandbox_reads: TestMutex<bool>,
+        refuse_result_writes: TestMutex<bool>,
     }
 
     impl LeasedRepository {
@@ -4817,6 +4811,8 @@ mod tests {
                 sandbox_requests: TestMutex::new(TestMap::new()),
                 run_attempts: TestMutex::new(TestMap::new()),
                 refuse_failure_writes: TestMutex::new(false),
+                refuse_run_sandbox_reads: TestMutex::new(false),
+                refuse_result_writes: TestMutex::new(false),
             })
         }
 
@@ -5623,6 +5619,11 @@ mod tests {
             results: RunResults,
             state: RunState,
         ) -> Result<Run, CoreError> {
+            if *self.refuse_result_writes.lock().await {
+                return Err(CoreError::Backend(
+                    "the store refused the results write".into(),
+                ));
+            }
             let mut runs = self.runs.lock().await;
             let run = runs
                 .get_mut(&id)
@@ -5725,6 +5726,11 @@ mod tests {
             run: Uuid,
         ) -> Result<Vec<RunSandbox>, CoreError> {
             self.stored_run(tenant, run).await?;
+            if *self.refuse_run_sandbox_reads.lock().await {
+                return Err(CoreError::Backend(
+                    "the store refused the association read".into(),
+                ));
+            }
             Ok(self
                 .run_sandboxes
                 .lock()
@@ -8310,6 +8316,42 @@ mod tests {
                 .expect("put key");
         }
 
+        async fn seed_running_run(&self) -> (Run, Sandbox) {
+            let run = settled_run(self.tenant, RunState::Running);
+            let now = Utc::now();
+            let sandbox = Sandbox {
+                id: new_id(),
+                tenant_id: self.tenant,
+                node_id: None,
+                image_id: "alpine:3.21".into(),
+                state: SandboxState::Running,
+                runtime: RuntimeKind::Docker,
+                cpu: 1,
+                memory_mb: 128,
+                disk_mb: 512,
+                timeout_seconds: 60,
+                network: NetworkPolicy::Disabled,
+                environment: Default::default(),
+                created_at: now,
+                updated_at: now,
+                runtime_path: None,
+            };
+            self.store.create_sandbox(sandbox.clone()).await.unwrap();
+            self.store.seed(run.clone()).await;
+            self.store
+                .link_run_sandbox(
+                    self.tenant,
+                    RunSandbox {
+                        run_id: run.id,
+                        sandbox_id: sandbox.id,
+                        role: "primary".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            (run, sandbox)
+        }
+
         async fn call(
             &self,
             method: axum::http::Method,
@@ -9344,6 +9386,187 @@ mod tests {
                 .await
                 .map(|row| row.state)
                 .expect("sandbox row"),
+            SandboxState::Destroyed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_refuses_to_hide_an_unreadable_machine_association() {
+        let recorder = DestroyRecorder::default();
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            recorder: Some(recorder.clone()),
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (run, sandbox) = fixture.seed_running_run().await;
+        *fixture.store.refuse_run_sandbox_reads.lock().await = true;
+
+        let (status, _) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            fixture
+                .store
+                .stored_run(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .state,
+            RunState::Cancelled
+        );
+        assert!(recorder.destroyed().is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Running
+        );
+
+        *fixture.store.refuse_run_sandbox_reads.lock().await = false;
+        let (status, value) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["state"], "cancelled");
+        assert_eq!(recorder.destroyed(), vec![sandbox.id]);
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Destroyed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_retries_a_previous_failed_teardown_and_clears_its_report() {
+        let recorder = DestroyRecorder::default();
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            recorder: Some(recorder.clone()),
+            destroy_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                CoreError::Conflict("runtime ownership check refused".into()),
+            ]))),
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (run, sandbox) = fixture.seed_running_run().await;
+
+        let (status, failed) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(failed["state"], "cancelled");
+        assert_eq!(
+            failed["results"]["cleanup_failed"]["sandbox_id"],
+            sandbox.id.to_string()
+        );
+        assert!(recorder.destroyed().is_empty());
+
+        let (status, recovered) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(recorder.destroyed(), vec![sandbox.id]);
+        assert!(recovered["results"]["cleanup_failed"].is_null());
+        let durable = fixture
+            .store
+            .stored_run(fixture.tenant, run.id)
+            .await
+            .unwrap();
+        assert_eq!(durable.state, RunState::Cancelled);
+        assert!(durable.results.cleanup_failed.is_none());
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Destroyed
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_refuses_to_hide_an_unrecorded_cleanup_failure() {
+        let recorder = DestroyRecorder::default();
+        let fixture = RunFixture::with_runtime(Arc::new(RunRuntime {
+            recorder: Some(recorder.clone()),
+            destroy_failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                CoreError::Conflict("runtime ownership check refused".into()),
+            ]))),
+            ..Default::default()
+        }));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (run, sandbox) = fixture.seed_running_run().await;
+        *fixture.store.refuse_result_writes.lock().await = true;
+
+        let (status, _) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            fixture
+                .store
+                .stored_run(fixture.tenant, run.id)
+                .await
+                .unwrap()
+                .state,
+            RunState::Cancelled
+        );
+        assert!(recorder.destroyed().is_empty());
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
+            SandboxState::Running
+        );
+
+        *fixture.store.refuse_result_writes.lock().await = false;
+        let (status, recovered) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/runs/{}/cancel", run.id),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(recorder.destroyed(), vec![sandbox.id]);
+        assert!(recovered["results"]["cleanup_failed"].is_null());
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .unwrap()
+                .state,
             SandboxState::Destroyed
         );
     }

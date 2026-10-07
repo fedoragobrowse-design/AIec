@@ -4001,6 +4001,57 @@ The first smoke attempt with `aiec-coding:latest` failed with
 The successful lifecycle evidence is for `alpine:3.21`, not the coding image or
 Firecracker.
 
+## A cancelled verdict hid unfinished cleanup and made retries ineffective
+
+Three cancellation failures were reproduced independently:
+
+- `list_run_sandboxes` converted a repository error into an empty association
+  list. Cancel returned HTTP 200 with no cleanup report while the machine was
+  still running.
+- A failed `record_run_results` was logged, then the old run was returned. Even
+  a refused teardown could therefore answer HTTP 200 without its failure report.
+- A repeated cancel returned immediately for every terminal run, including
+  `cancelled`. It did not retry a previous refused teardown.
+
+Cancellation now propagates association-read and result-write failures through
+the typed API error mapping. The cancellation verdict remains durable if its
+later cleanup fails; retrying a cancelled run re-enumerates its machines and
+retries the shared fenced teardown. Other terminal outcomes remain unchanged.
+Cleanup retries do not duplicate the `run.cancelled` transition event.
+
+Each cleanup attempt clears the previous `cleanup_failed` report before
+rebuilding it from machines still held, matching run-queue recovery. Results
+are moved out of the owned run rather than cloned. Failures reading an individual
+sandbox or destroying it still produce the existing durable cleanup report.
+
+Regressions:
+
+- `cancellation_refuses_to_hide_an_unreadable_machine_association`
+- `cancellation_refuses_to_hide_an_unrecorded_cleanup_failure`
+- `cancellation_retries_a_previous_failed_teardown_and_clears_its_report`
+
+Before the fix the first two returned 200 instead of 500; the third recorded
+no destruction on the second cancel. All three passed after the fix. Removing
+the stale-report reset failed the third at the assertion that recovered cleanup
+has no failure report. The reset was restored immediately.
+
+The final workspace gate passed in 204.85 seconds: formatting, Clippy with
+`-D warnings`, workspace tests, SDK import contract, host-helper/recovery-census
+checks, Python SDK tests, and the containerized aarch64 cross-check.
+
+The rebuilt API was deployed with a binary backup and trusted TLS readiness
+check. A Docker `alpine:3.21` run was cancelled after `task.started`, then
+cancelled again: both responses were HTTP 200, the sandbox was durably
+`destroyed`, its in-flight submit stayed `cancelled`, and exactly one
+`run.cancelled` event existed. Cancelling an earlier succeeded audit run left
+its complete response unchanged. Repository failures were injected only in
+isolated regressions, not against the live database.
+
+The subsequent six-page census covered 1,122 sandboxes, all terminal. Podman
+had zero running containers and the same 23 older stopped containers; no TAP
+interfaces remained. API, workers, tunnel, and MCP services stayed active, and
+MCP health returned ready with no owned sandboxes.
+
 ## Guard-backed Firecracker sandboxes cannot start on this host
 
 `docs/DEPLOYMENT.md` and `docs/GUARD.md` both require the Firecracker worker
