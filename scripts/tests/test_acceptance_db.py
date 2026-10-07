@@ -210,6 +210,211 @@ class AcceptanceDatabaseHelpersTest(unittest.TestCase):
                          result.stdout + result.stderr)
         self.assertNotIn("synthetic-argv-secret", recorded)
 
+    def run_url_helper(self, helper, url, *args):
+        return subprocess.run(
+            ["bash", "-c", 'source "$1"; shift; "$@"',
+             "acceptance-db-url", str(SCRIPT), helper, url, *args],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "AIEC_ACCEPTANCE_RUN_ID": "synthetic-acceptance-run"},
+        )
+
+    def test_isolation_checks_the_decoded_effective_database(self):
+        for url in (
+            "postgresql://fixture@localhost/aiec_guard_owned?dbna%6de=aiec",
+            "postgresql://fixture@localhost/%61iec",
+            "postgresql://fixture@localhost/aiec_guard_owned?dbname=",
+        ):
+            with self.subTest(url=url):
+                result = self.run_url_helper("acceptance_database_is_isolated", url)
+                self.assertNotEqual(result.returncode, 0)
+        result = self.run_url_helper(
+            "acceptance_database_is_isolated",
+            "postgresql://fixture@localhost/aiec?dbname=postgres&dbname=aiec_guard_owned",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rewriting_replaces_query_database_overrides_without_losing_options(self):
+        result = self.run_url_helper(
+            "acceptance_database_url_with_name",
+            "postgresql://fixture@localhost/path?dbname=first&dbna%6de=aiec"
+            "&application_name=restore%2Faudit&sslmode=disable",
+            "aiec_guard_restored",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "postgresql://fixture@localhost/aiec_guard_restored"
+            "?application_name=restore%2Faudit&sslmode=disable",
+        )
+
+    def test_relay_uses_effective_destination_and_preserves_database_and_options(self):
+        url = ("postgresql://fixture@wrong.invalid:5432/aiec_guard_path"
+               "?ho%73t=127.0.0.1&port=5441&dbname=aiec_guard_query"
+               "&application_name=relay%2Faudit&sslmode=disable")
+        endpoint = self.run_url_helper("acceptance_database_url_tcp_endpoint", url)
+        self.assertEqual(endpoint.returncode, 0, endpoint.stderr)
+        self.assertEqual(endpoint.stdout, "127.0.0.1:5441")
+        relayed = self.run_url_helper(
+            "acceptance_database_url_for_socket", url, "/tmp/aiec-relay",
+        )
+        self.assertEqual(relayed.returncode, 0, relayed.stderr)
+        self.assertEqual(
+            relayed.stdout,
+            "postgresql://fixture@127.0.0.1/aiec_guard_path"
+            "?dbname=aiec_guard_query&application_name=relay%2Faudit"
+            "&sslmode=disable&host=/tmp/aiec-relay",
+        )
+
+    def test_socket_detection_honors_encoded_keys_and_last_host(self):
+        result = self.run_url_helper(
+            "acceptance_database_is_socket_url",
+            "postgresql://fixture@localhost/aiec_guard_owned?ho%73t=%2Frun%2Fpostgresql",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_url_helper(
+            "acceptance_database_is_socket_url",
+            "postgresql://fixture@localhost/aiec_guard_owned?host=/tmp&host=127.0.0.1",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_disagreeing_sqlx_and_libpq_transports_are_refused_before_setup(self):
+        for suffix in (
+            "host=/tmp/fixture&host=127.0.0.1",
+            "host=/tmp/fixture&hostaddr=127.0.0.1",
+            "hostaddr=127.0.0.1&host=127.0.0.2",
+        ):
+            url = "postgresql://fixture@localhost/aiec_guard_owned?" + suffix
+            with self.subTest(suffix=suffix):
+                for helper, args in (
+                    ("acceptance_database_url_name", ()),
+                    ("acceptance_database_url_with_name", ("aiec_guard_copy",)),
+                    ("acceptance_database_url_tcp_endpoint", ()),
+                    ("acceptance_database_url_for_socket", ("/tmp/relay",)),
+                ):
+                    result = self.run_url_helper(helper, url, *args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    result = subprocess.run(
+                        ["bash", "-c",
+                         'source "$1"; acceptance_prepare_database "$2" "$2/pg" "$2/socket" "$2/bin"',
+                         "transport-refusal", str(SCRIPT), directory],
+                        env={**os.environ, "AIEC_ACCEPTANCE_DATABASE_URL": url,
+                             "ACCEPTANCE_DB_NAME_PATTERN": "aiec_guard_*"},
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertFalse((root / "socket").exists())
+
+        # Both clients select the final hostaddr when no sticky socket or
+        # later conflicting host overrides it.
+        result = self.run_url_helper(
+            "acceptance_database_url_tcp_endpoint",
+            "postgresql://fixture@localhost/aiec_guard_owned"
+            "?host=127.0.0.2&hostaddr=127.0.0.1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "127.0.0.1:5432")
+
+
+class BackupRestoreDrillOwnershipTest(unittest.TestCase):
+    """A stateful database boundary: failed CREATE confers no DROP authority."""
+
+    def run_drill(self, target, *, source="source_audit", existing=(), fail_recovery=False):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            databases = root / "databases"
+            databases.mkdir()
+            for name in (source, *existing):
+                database = databases / name
+                database.mkdir()
+                (database / "foreign-state").write_text("preserve")
+            psql = root / "psql"
+            psql.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, shlex, shutil, sys\n"
+                "from pathlib import Path\n"
+                "root = Path(os.environ['DRILL_TEST_DATABASES'])\n"
+                "sql = sys.argv[sys.argv.index('-c') + 1]\n"
+                "tokens = shlex.split(sql)\n"
+                "if tokens[0] in ('CREATE', 'DROP'):\n"
+                "    name = tokens[-1][:63]\n"
+                "    database = root / name\n"
+                "    if tokens[0] == 'CREATE':\n"
+                "        if database.exists(): sys.exit(1)\n"
+                "        database.mkdir()\n"
+                "    elif database.exists(): shutil.rmtree(database)\n"
+                "else:\n"
+                "    url = next(arg for arg in sys.argv if arg.startswith('postgres'))\n"
+                "    if '_recovery' in url and os.environ.get('DRILL_TEST_FAIL_RECOVERY'):\n"
+                "        sys.exit(43)\n"
+                "    print(1)\n"
+            )
+            dump = root / "pg_dump"
+            dump.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "path = next(arg[7:] for arg in sys.argv if arg.startswith('--file='))\n"
+                "Path(path).write_bytes(b'disposable-dump')\n"
+            )
+            restore = root / "pg_restore"
+            restore.write_text("#!/usr/bin/env bash\nexit 0\n")
+            for executable in (psql, dump, restore):
+                executable.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": directory + os.pathsep + os.environ["PATH"],
+                "DATABASE_URL": f"postgresql://fixture@localhost/{source}",
+                "AIEC_DRILL_DB": target,
+                "AIEC_ACCEPTANCE_RUN_ID": "synthetic-acceptance-run",
+                "DRILL_TEST_DATABASES": str(databases),
+            }
+            for name in ("AIEC_DRILL_ADMIN_URL", "AIEC_DRILL_BIND", "AIEC_DRILL_CA",
+                         "PGPASSWORD", "DRILL_TEST_FAIL_RECOVERY"):
+                environment.pop(name, None)
+            if fail_recovery:
+                environment["DRILL_TEST_FAIL_RECOVERY"] = "1"
+            result = subprocess.run(
+                ["bash", str(REPO / "scripts/backup-restore-drill.sh")],
+                capture_output=True, text=True, timeout=30, env=environment,
+            )
+            state = {path.name: (path / "foreign-state").exists()
+                     for path in databases.iterdir()}
+        return result, state
+
+    def test_a_drill_cannot_drop_its_source_or_a_protected_database(self):
+        for source, target in (("aiec", "aiec"), ("source_audit", "source_audit"),
+                               ("source_audit_recovery", "source_audit")):
+            with self.subTest(source=source, target=target):
+                result, state = self.run_drill(target, source=source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(state, {source: True})
+
+    def test_a_preexisting_target_is_not_replaced_or_cleaned_up(self):
+        result, state = self.run_drill("audit_restore", existing=("audit_restore",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(state, {"source_audit": True, "audit_restore": True})
+
+    def test_a_preexisting_recovery_target_remains_untouched(self):
+        result, state = self.run_drill(
+            "audit_restore", existing=("audit_restore_recovery",),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(state, {"source_audit": True, "audit_restore_recovery": True})
+
+    def test_a_failed_recovery_read_cleans_up_both_owned_databases(self):
+        result, state = self.run_drill("audit_restore", fail_recovery=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(state, {"source_audit": True})
+
+    def test_recovery_suffix_cannot_truncate_into_another_database(self):
+        name = "a" * 63
+        result, state = self.run_drill(name, existing=(name,))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(state, {"source_audit": True, name: True})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -97,6 +97,40 @@ while the Rust client keeps working. Note that `openssl req -x509` accepts
 
 The production server runs committed SQLx migrations and refuses to start without `DATABASE_URL`. Use TLS, backups, least privilege, and migration rollback procedures. Configure a private bucket through `AIEC_S3_ENDPOINT`, region, bucket, prefix, and credentials. S3 requests use AWS Signature V4 and SHA-256 checksums; the bucket must not be public.
 
+### Backup and restore drills
+
+Run `bash scripts/backup-restore-drill.sh` only in an isolated staging
+environment. Provide `DATABASE_URL` through private configuration;
+`AIEC_DRILL_ADMIN_URL` optionally selects the destination server and creation
+credentials. Restored and recovery URLs use that admin connection, not the
+source connection.
+
+Use one unambiguous transport in each PostgreSQL URL. The helpers refuse
+socket-then-TCP overrides and conflicting `hostaddr`/`host` destinations because
+SQLx and libpq can select different servers from those forms. A TCP-to-socket
+acceptance relay preserves the effective database TLS hostname; keep certificate
+verification enabled.
+
+Targets default to a unique acceptance-run name. `AIEC_DRILL_DB` may select a
+plain identifier of at most 54 ASCII characters, leaving room for `_recovery`.
+Neither target may name the source, admin, or a protected database. The drill
+claims targets with `CREATE DATABASE`, refuses existing targets, and cleans up
+only acknowledged creations. A forcibly killed process or an ambiguous DDL
+connection failure still needs a manual census of its unique targets.
+
+Without server options, the drill verifies dump, restore, migration history,
+and a second recovery copy at the database level. To check the restored API,
+set both `AIEC_DRILL_BIND` and `AIEC_DRILL_CA`, supply the normal API/TLS
+configuration, and build `aiec-server` first. Binary discovery honors
+`CARGO_TARGET_DIR`; readiness verifies the supplied CA without an insecure TLS
+fallback.
+
+A restored database retains worker addresses and object-store references.
+The API starts maintenance and Guard reaping: isolate those dependencies and
+use test credentials before starting it. Database restore and `/ready` do not
+prove guest recovery, artifact recovery, or power-loss durability.
+
+
 ## API server
 
 Required configuration:

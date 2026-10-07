@@ -172,13 +172,7 @@ acceptance_netns_loopback_up() {
 # including with `ACCEPTANCE_DB_NAME_PATTERN` set to `*`: the refusal happens
 # before any pattern is consulted, so a wildcard pattern does not reopen it.
 acceptance_database_url_name() {
-  local url=$1
-  url=${url%%\?*}
-  local name=${url##*/}
-  case $name in
-    '' | /* | *@* | *:*) return 1 ;;
-  esac
-  printf '%s\n' "$name"
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" name
 }
 
 # True when the URL reaches PostgreSQL through a Unix socket: a `host` query
@@ -187,93 +181,26 @@ acceptance_database_url_name() {
 # object with no network namespace of its own, so such a URL is reachable
 # unchanged from inside a run's private namespace and needs no relay.
 acceptance_database_is_socket_url() {
-  local url=$1 query pair key value
-  [[ $url == *\?* ]] || return 1
-  query=${url#*\?}
-  local IFS='&'
-  for pair in $query; do
-    key=${pair%%=*}
-    value=${pair#*=}
-    case $key in
-      host|Host|HOST) ;;
-      *) continue ;;
-    esac
-    case $value in
-      /*) return 0 ;;
-      '%'2[Ff]*) return 0 ;;
-      *) return 1 ;;
-    esac
-  done
-  return 1
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" socket
 }
 
-# Splits a URL that reaches a TCP server into its parts, for the relay.
-# Sets ACCEPTANCE_DB_CREDS, ACCEPTANCE_DB_HOSTPORT and ACCEPTANCE_DB_NAME.
-# Credentials and query survive untouched and are never printed.
-#
-# $1 URL.
-acceptance_database_url_tcp_parts() {
-  local url=$1 rest hostport creds= db
-  case $url in
-    postgres://*|postgresql://*) ;;
-    *)
-      printf 'the acceptance database URL is not a PostgreSQL URL\n' >&2
-      return 2
-      ;;
-  esac
-  rest=${url#*://}
-  if [[ $rest == *\?* ]]; then rest=${rest%%\?*}; fi
-  db=${rest#*/}
-  if [ "$db" = "$rest" ] || [ -z "$db" ] || [[ $db == */* ]]; then
-    printf 'the acceptance database URL must name a database\n' >&2
-    return 2
-  fi
-  creds=
-  hostport=${rest%%/*}
-  if [[ $hostport == *@* ]]; then
-    creds=${hostport%@*}
-    hostport=${hostport#*@}
-  fi
-  if [ -z "$hostport" ] || [[ $hostport == */* ]]; then
-    printf 'the acceptance database URL must name a host and a port\n' >&2
-    return 2
-  fi
-  ACCEPTANCE_DB_CREDS=$creds
-  ACCEPTANCE_DB_HOSTPORT=$hostport
-  ACCEPTANCE_DB_NAME=$db
+# Effective TCP destination for the acceptance relay; credentials stay private.
+acceptance_database_url_tcp_endpoint() {
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" endpoint
 }
 
-# Rewrites the database component of a PostgreSQL URL and preserves everything
-# else verbatim: scheme, credentials, host, port and query. Only the name is
-# replaced, which is what makes the function correct for both a TCP URL and one
-# that names its socket directory in the query.
+# Retain connection/authentication options while replacing only its transport.
+acceptance_database_url_for_socket() {
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" relay "$2"
+}
+
+# Replace the effective database, including a query-form dbname override.
+# Other URI components remain verbatim.
 acceptance_database_url_with_name() {
-  local url=$1 name=$2 scheme rest authority query=
-  case $url in
-    postgres://*) scheme=postgres:// rest=${url#postgres://} ;;
-    postgresql://*) scheme=postgresql:// rest=${url#postgresql://} ;;
-    *)
-      printf 'the acceptance database URL is not a PostgreSQL URL\n' >&2
-      return 2
-      ;;
-  esac
-  if [[ $rest == *\?* ]]; then
-    query="?${rest#*\?}"
-    rest=${rest%%\?*}
-  fi
-  # The scheme comes off first: `%%/*` on the whole URL would cut at the first
-  # slash, which in `postgresql://user@host/db` belongs to the `//`.
-  if [[ ${rest#*/} == "$rest" ]]; then
-    printf 'the acceptance database URL must name a database\n' >&2
-    return 2
-  fi
-  authority=${rest%%/*}
-  acceptance_check_database_identifier "$name" || return 2
-  printf '%s%s/%s%s\n' "$scheme" "$authority" "$name" "$query"
+  acceptance_check_database_identifier "$2" || return
+  printf '%s' "$1" | python3 -c "$ACCEPTANCE_DB_URL_PARSER" rename "$2"
 }
 
-# Refuses a database name that is not a plain unquoted SQL identifier of a size
-# PostgreSQL accepts.
 #
 # A name reaches `CREATE DATABASE` and `DROP DATABASE` as interpolated text, so
 # a name carrying a quote or a semicolon is DDL the caller did not intend to
@@ -288,23 +215,25 @@ acceptance_check_database_identifier() {
   return 2
 }
 
-# libpq query passwords override userinfo; the last query value wins. Keep
-# unrelated URI components verbatim and send credentials to the parser on stdin,
-# never in process argv. Embed the parser because trace diagnostics transmit
-# this library to the remote shell without companion files.
+# Query values override URI components; the last value wins. Keep unrelated
+# components verbatim and send credentials on stdin, never in process argv.
+# Embedded because trace diagnostics transmit this library without extra files.
 ACCEPTANCE_DB_URL_PARSER=$(cat <<'PY'
 import sys
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit
 
 mode = sys.argv[1]
 url = sys.stdin.read()
 scheme, separator, rest = url.partition("://")
-if not separator:
-    sys.stdout.write("" if mode == "password" else url)
-    sys.exit(0)
+if not separator or scheme not in ("postgres", "postgresql"):
+    if mode in ("password", "strip"):
+        sys.stdout.write("" if mode == "password" else url)
+        sys.exit(0)
+    sys.exit("the acceptance database URL is not a PostgreSQL URL")
 
 body, query_marker, query = rest.partition("?")
-authority, slash, path = body.partition("/")
+original_authority, slash, path = body.partition("/")
+authority = original_authority
 password = ""
 if "@" in authority:
     info, host = authority.split("@", 1)
@@ -312,19 +241,86 @@ if "@" in authority:
     if password_marker:
         authority = role + "@" + host
 
-kept = []
+components = []
+fields = {}
 for component in query.split("&") if query_marker else []:
-    name, value_marker, value = component.partition("=")
-    if unquote(name) == "password" and value_marker:
-        password = value
-    else:
-        kept.append(component)
+    key, marker, value = component.partition("=")
+    key = unquote(key)
+    components.append((key, component))
+    if marker:
+        fields[key] = unquote(value)
+        if key == "password":
+            password = value
+
+database = fields.get("dbname", unquote(path))
+
+def suffix(parts):
+    return "?" + "&".join(parts) if parts else ""
+
+def effective_destination():
+    try:
+        parsed = urlsplit(url)
+        host = unquote(parsed.hostname or "")
+        port = parsed.port or 5432
+        socket_seen = host.startswith("/")
+        for key, component in components:
+            _, marker, value = component.partition("=")
+            if not marker:
+                continue
+            if key in ("host", "hostaddr"):
+                host = unquote(value)
+                socket_seen = socket_seen or host.startswith("/")
+            elif key == "port":
+                port = int(unquote(value))
+    except ValueError:
+        sys.exit("the acceptance database URL has an invalid TCP destination")
+    # SQLx retains a previously selected socket when a later host is TCP;
+    # libpq instead uses the last host and gives hostaddr transport priority.
+    # Refuse disagreement before either client can operate on a different DB.
+    hostaddr = fields.get("hostaddr")
+    if ((socket_seen and (not host.startswith("/") or hostaddr)) or
+            (hostaddr and host != hostaddr)):
+        sys.exit("the acceptance database URL has incompatible transport overrides")
+    return host, port
+
+if mode not in ("password", "strip"):
+    host, port = effective_destination()
 
 if mode == "password":
     sys.stdout.write(password)
+elif mode == "strip":
+    kept = [component for key, component in components if key != "password"]
+    sys.stdout.write(scheme + separator + authority + slash + path + suffix(kept))
+elif mode in ("name", "rename"):
+    if (not database or database.startswith("/") or
+            any(character in database for character in ("@", ":", "\x00", "\n", "\r"))):
+        sys.exit("the acceptance database URL must name a database")
+    if mode == "name":
+        sys.stdout.write(database)
+    else:
+        kept = [component for key, component in components if key != "dbname"]
+        sys.stdout.write(scheme + separator + original_authority + "/" +
+                         quote(sys.argv[2], safe="") + suffix(kept))
 else:
-    query_suffix = "?" + "&".join(kept) if kept else ""
-    sys.stdout.write(scheme + separator + authority + slash + path + query_suffix)
+    if mode == "socket":
+        sys.exit(0 if host.startswith("/") else 1)
+    if mode == "endpoint":
+        if (not host or any(character in host for character in "/,@ \t\r\n") or
+                not 1 <= port <= 65535):
+            sys.exit("the acceptance database URL must name one TCP host and port")
+        sys.stdout.write(host + ":" + str(port))
+    elif mode == "relay":
+        kept = [component for key, component in components
+                if key not in ("host", "hostaddr", "port")]
+        kept.append("host=" + quote(sys.argv[2], safe="/"))
+        userinfo, marker, _ = original_authority.rpartition("@")
+        # SQLx retains the authority hostname for certificate verification
+        # when a query host selects a Unix socket. Preserve the TCP identity.
+        tls_host = "[" + host + "]" if ":" in host else host
+        relay_authority = userinfo + "@" + tls_host if marker else tls_host
+        sys.stdout.write(scheme + separator + relay_authority + slash + path + suffix(kept))
+    else:
+        sys.exit("unknown PostgreSQL URI parser operation")
 PY
 )
 
@@ -567,8 +563,9 @@ acceptance_prepare_database() {
     # The suite's other half runs in its own network namespace, where the
     # host's TCP ports do not exist. The database is reached through a Unix
     # socket instead, because the filesystem is shared.
-    acceptance_database_url_tcp_parts "$AIEC_ACCEPTANCE_DATABASE_URL" || exit 2
-    local creds=$ACCEPTANCE_DB_CREDS hostport=$ACCEPTANCE_DB_HOSTPORT db=$ACCEPTANCE_DB_NAME
+    local hostport db
+    hostport=$(acceptance_database_url_tcp_endpoint "$AIEC_ACCEPTANCE_DATABASE_URL") || exit 2
+    db=$(acceptance_database_url_name "$AIEC_ACCEPTANCE_DATABASE_URL") || exit 2
     mkdir -p "$sock"
     # sqlx reaches a Unix-socket PostgreSQL by directory and appends
     # `.s.PGSQL.5432` itself, so the listener has to carry that exact name.
@@ -588,11 +585,8 @@ acceptance_prepare_database() {
         exit 2
       }
     done
-    if [ -n "$creds" ]; then
-      export DATABASE_URL="postgresql://${creds}@localhost/$db?host=$sock"
-    else
-      export DATABASE_URL="postgresql://localhost/$db?host=$sock"
-    fi
+    export DATABASE_URL
+    DATABASE_URL=$(acceptance_database_url_for_socket "$AIEC_ACCEPTANCE_DATABASE_URL" "$sock") || exit 2
     printf 'acceptance database: %s via a unix socket at %s\n' "$db" "$sock" >&2
     # Nothing of this run's is inside the server's data directory, so the trap
     # reaps the processes and leaves the server to its owner.

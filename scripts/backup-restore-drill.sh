@@ -23,7 +23,19 @@ cd "$REPO"
 # source database instead of the drill's own.
 source "$REPO/scripts/acceptance-db.sh"
 ADMIN_URL=${AIEC_DRILL_ADMIN_URL:-$(acceptance_database_url_with_name "$DATABASE_URL" postgres)}
-DRILL_DB=${AIEC_DRILL_DB:-aiec_drill}
+DRILL_DB=${AIEC_DRILL_DB:-aiec_drill_${AIEC_ACCEPTANCE_RUN_ID//-/_}}
+DRILL_DB2=${DRILL_DB}_recovery
+SOURCE_DB=$(acceptance_database_url_name "$DATABASE_URL")
+ADMIN_DB=$(acceptance_database_url_name "$ADMIN_URL")
+for target in "$DRILL_DB" "$DRILL_DB2"; do
+  acceptance_check_database_identifier "$target" || exit 2
+  case "$target" in
+    aiec|postgres|template0|template1|"$SOURCE_DB"|"$ADMIN_DB")
+      printf 'refusing to run: a drill target names a source, admin, or protected database\n' >&2
+      exit 2
+      ;;
+  esac
+done
 WORK=$(mktemp -d)
 
 # A connection string on a command line is not private: any local user can read
@@ -58,6 +70,7 @@ fi
 ADMIN_ARGV=$(acceptance_database_url_without_password "$ADMIN_URL")
 DATABASE_ARGV=$(acceptance_database_url_without_password "$DATABASE_URL")
 CREATED_DB=0
+CREATED_DB2=0
 SERVER_PID=""
 FAILED=0
 
@@ -67,36 +80,48 @@ bad()  { printf 'FAIL: %s\n' "$*" >&2; FAILED=$((FAILED + 1)); }
 
 cleanup() {
   set +e
-  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  if [ -n "$SERVER_PID" ]; then
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+  fi
+  if [ "$CREATED_DB2" = 1 ]; then
+    psql -X -v ON_ERROR_STOP=1 "$ADMIN_ARGV" -q -c "DROP DATABASE \"$DRILL_DB2\"" >/dev/null \
+      || printf 'cleanup could not drop the owned recovery database\n' >&2
+  fi
   if [ "$CREATED_DB" = 1 ]; then
-    psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null 2>&1
+    psql -X -v ON_ERROR_STOP=1 "$ADMIN_ARGV" -q -c "DROP DATABASE \"$DRILL_DB\"" >/dev/null \
+      || printf 'cleanup could not drop the owned restored database\n' >&2
   fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-psql_q() { psql "$1" -q -t -A -c "$2" 2>/dev/null; }
+psql_q() { psql -X -v ON_ERROR_STOP=1 "$1" -q -t -A -c "$2"; }
 
 command -v psql >/dev/null || { echo "psql is required" >&2; exit 1; }
 command -v pg_dump >/dev/null || { echo "pg_dump is required" >&2; exit 1; }
+command -v pg_restore >/dev/null || { echo "pg_restore is required" >&2; exit 1; }
 
 # ---------------------------------------------------------------- 1. restore
 log "1. restore a dump into a disposable database"
-psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB" >/dev/null
-psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB" >/dev/null
+# CREATE is the ownership claim. A preexisting target is never dropped.
+psql -X -v ON_ERROR_STOP=1 "$ADMIN_ARGV" -q -c "CREATE DATABASE \"$DRILL_DB\"" >/dev/null
 CREATED_DB=1
-RESTORED_URL=$(acceptance_database_url_with_name "$DATABASE_URL" "$DRILL_DB")
+RESTORED_URL=$(acceptance_database_url_with_name "$ADMIN_URL" "$DRILL_DB")
 # Same split as above: the full URL goes to the control plane's environment, the
 # stripped one to `pg_restore`'s arguments.
-RESTORED_ARGV=$(acceptance_database_url_with_name "$DATABASE_ARGV" "$DRILL_DB")
+RESTORED_ARGV=$(acceptance_database_url_with_name "$ADMIN_ARGV" "$DRILL_DB")
 
 pg_dump --format=custom --no-owner --no-privileges --file="$WORK/aiec.dump" "$DATABASE_ARGV"
 [ -s "$WORK/aiec.dump" ] && ok "dumped $(du -h "$WORK/aiec.dump" | cut -f1) of database state" \
   || bad "pg_dump produced nothing"
 
-pg_restore --dbname="$RESTORED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
-  || bad "pg_restore failed"
-ok "restored into $DRILL_DB"
+if pg_restore --exit-on-error --dbname="$RESTORED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump"; then
+  ok "restored into $DRILL_DB"
+else
+  bad "pg_restore failed"
+  exit 1
+fi
 
 # The restored copy must be a working schema, not just a file.
 tables=$(psql_q "$RESTORED_ARGV" "select count(*) from information_schema.tables where table_schema='public'")
@@ -106,18 +131,24 @@ migrations=$(psql_q "$RESTORED_ARGV" "select count(*) from _sqlx_migrations wher
 
 # ------------------------------------------------- 2. AIec on restored data
 log "2. start the control plane against the restored database"
-if [ -x ".aiec/acceptance-target/release/aiec-server" ]; then
-  SERVER_BIN=.aiec/acceptance-target/release/aiec-server
-elif [ -x "target/release/aiec-server" ]; then
-  SERVER_BIN=target/release/aiec-server
-elif [ -x "target/debug/aiec-server" ]; then
-  SERVER_BIN=target/debug/aiec-server
-else
-  bad "no aiec-server binary found; build it first"
-  SERVER_BIN=""
-fi
-
-if [ -n "$SERVER_BIN" ] && [ -n "${AIEC_DRILL_BIND:-}" ] && [ -n "${AIEC_DRILL_CA:-}" ]; then
+SERVER_BIN=""
+if [ -n "${AIEC_DRILL_BIND:-}" ] || [ -n "${AIEC_DRILL_CA:-}" ]; then
+  if [ -z "${AIEC_DRILL_BIND:-}" ] || [ -z "${AIEC_DRILL_CA:-}" ]; then
+    bad "set both AIEC_DRILL_BIND and AIEC_DRILL_CA to check the restored server"
+    exit 1
+  fi
+  for candidate in .aiec/acceptance-target/release/aiec-server \
+    "${CARGO_TARGET_DIR:-target}/release/aiec-server" \
+    "${CARGO_TARGET_DIR:-target}/debug/aiec-server"; do
+    if [ -x "$candidate" ]; then
+      SERVER_BIN=$candidate
+      break
+    fi
+  done
+  if [ -z "$SERVER_BIN" ]; then
+    bad "no aiec-server binary found; build it first"
+    exit 1
+  fi
   # The server must bind the port the drill probes.
   DATABASE_URL="$RESTORED_URL" AIEC_BIND="$AIEC_DRILL_BIND" \
     "$SERVER_BIN" >"$WORK/server.log" 2>&1 &
@@ -129,15 +160,15 @@ if [ -n "$SERVER_BIN" ] && [ -n "${AIEC_DRILL_BIND:-}" ] && [ -n "${AIEC_DRILL_C
   done
   if kill -0 "$SERVER_PID" 2>/dev/null; then
     ok "control plane started against the restored database"
-    api_status=$(curl --cacert "${AIEC_DRILL_CA:?}" -sk -o /dev/null -w '%{http_code}' \
-      "https://${AIEC_DRILL_BIND}/ready" 2>/dev/null || echo 000)
+    api_status=$(curl --cacert "${AIEC_DRILL_CA:?}" -sS -o /dev/null -w '%{http_code}' \
+      "https://${AIEC_DRILL_BIND}/ready" || echo 000)
     [ "$api_status" = 200 ] && ok "restored instance reports ready" \
       || bad "restored instance is not ready (HTTP $api_status)"
   else
     bad "control plane failed to start on restored data"
-    tail -5 "$WORK/server.log" >&2 || true
   fi
-  kill "$SERVER_PID" 2>/dev/null
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
   SERVER_PID=""
 else
   log "2. skipped: set AIEC_DRILL_BIND and AIEC_DRILL_CA to start the server"
@@ -149,18 +180,18 @@ log "3. disaster-recovery drill: stop, wipe, restore, reconnect"
 # Simulate losing the control plane's local state by restoring a *second* time
 # into a fresh database, which is the same path an operator takes after an
 # outage: the durable state must come back, not be reconstructed by hand.
-DRILL_DB2=${DRILL_DB}_recovery
-psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
-psql "$ADMIN_ARGV" -q -c "CREATE DATABASE $DRILL_DB2" >/dev/null
-RECOVERED_ARGV=$(acceptance_database_url_with_name "$DATABASE_ARGV" "$DRILL_DB2")
-pg_restore --dbname="$RECOVERED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" >/dev/null 2>&1 \
+psql -X -v ON_ERROR_STOP=1 "$ADMIN_ARGV" -q -c "CREATE DATABASE \"$DRILL_DB2\"" >/dev/null
+CREATED_DB2=1
+RECOVERED_ARGV=$(acceptance_database_url_with_name "$ADMIN_ARGV" "$DRILL_DB2")
+pg_restore --exit-on-error --dbname="$RECOVERED_ARGV" --no-owner --no-privileges "$WORK/aiec.dump" \
   && ok "restored a second copy after the simulated outage" \
-  || bad "recovery restore failed"
+  || { bad "recovery restore failed"; exit 1; }
 recovered_tables=$(psql_q "$RECOVERED_ARGV" "select count(*) from information_schema.tables where table_schema='public'")
 [ "${recovered_tables:-0}" = "${tables:-x}" ] \
   && ok "recovered copy matches the restored schema ($recovered_tables tables)" \
   || bad "recovered copy differs: $recovered_tables vs ${tables:-none}"
-psql "$ADMIN_ARGV" -q -c "DROP DATABASE IF EXISTS $DRILL_DB2" >/dev/null
+psql -X -v ON_ERROR_STOP=1 "$ADMIN_ARGV" -q -c "DROP DATABASE \"$DRILL_DB2\"" >/dev/null
+CREATED_DB2=0
 
 # ----------------------------------------------------------------- summary
 log "summary"

@@ -3683,19 +3683,29 @@ identifier. With synthetic fixture URLs the actual rewrite lines produce
 for sqlx, and keep every client argv URL password-free and off the source
 database.
 
-The full live drill remains unrun. Its four prerequisites are not satisfiable on
-this host as configured: `psql`, `pg_dump` and `pg_restore` are absent and
-`apt-get` needs a password this session does not hold, so step 1 aborts on the
-`command -v psql` guard before touching anything. A disposable PostgreSQL 16
-instance was started on the KVM host and migrated with the real `aiec migrate`
-(29 public tables, 30 applied migrations), and the drill was reached as far as
-its parser dependency before being abandoned: the helper shells out to `python3`
-for URI parsing, which the PostgreSQL image does not carry, and its `apt` sources
-do not verify. Pointing the drill at the production Neon endpoint is not an
-option — step 3 drops `aiec_drill` and `aiec_drill_recovery` against a single
-`PGPASSWORD`, so a mistake writes to production. The rewrite logic is covered by
-the fixture tests in `scripts/tests/test_acceptance_db.py`; the dump/restore and
-recovery steps are not covered by any test.
+The later audit found another effective-name mismatch: a query-form `dbname`,
+including an encoded `dbna%6de` key, overrides the URI path in libpq and SQLx.
+The isolation check accepted a private-looking path while the connection named
+the protected `aiec` database, and replacing the path left that override intact.
+The shared stdin-fed parser now decodes names, honors the last query override,
+and removes every `dbname` override when replacing the database. Relay rewriting
+also retains database/authentication/connection options while replacing only
+the destination transport; encoded host keys and query-form ports are honored.
+
+The current isolated drill has direct native evidence. PostgreSQL 17.11 tools
+inside the local development container were bridged to the host helper without
+putting passwords in argv. An isolated source was migrated by the real API:
+30 applied migrations, one bootstrap tenant, and a distinct data marker. Both
+native restored copies preserved that marker; the restored API returned trusted
+TLS `/ready` HTTP 200; both owned targets were removed and the source marker
+remained. Separate native runs exercised an encoded effective source name,
+source collision refusal, preexisting first/recovery targets, and failure after
+the second restore. Foreign markers survived and owned targets returned to zero.
+
+This is isolated database and API-readiness evidence, not a production Neon
+drill, backup of S3 objects, recovery of live guests, or filesystem power-loss
+proof. The host still lacks native PostgreSQL CLI binaries; the container bridge
+was throwaway verification tooling, not a product fallback.
 
 ## The cleanup census reported a clean host for a database it could not read
 
@@ -4091,3 +4101,112 @@ The current failure is the probe detecting missing worker privileges.
 A drop-in at `~/.config/systemd/user/aiec-worker.service.d/30-guard-capabilities.conf`
 records the requirement but is inert under the user manager; its comment says
 so, so it is not mistaken for a working fix.
+
+## Backup drills could drop foreign databases and leave failed recovery copies
+
+The drill executed `DROP DATABASE IF EXISTS` before each `CREATE DATABASE`.
+Setting `AIEC_DRILL_DB=aiec` while the source was `aiec` reached a destructive
+source drop; an intercepting executable stopped it before any connection.
+Existing first and recovery targets were also treated as disposable, and the
+exit trap tracked only the first target, so a later recovery failure could
+leave the second one behind.
+
+Both target identifiers are validated, including the recovery suffix and the
+server's 63-byte limit, and compared against effective source/admin/protected
+names. Default targets include the acceptance run ID. Creation is now
+create-only; a preexisting target is an error, not permission to replace it.
+Independent flags record acknowledged creation of each target, and the exit
+trap removes only those owned targets. DDL is quoted and uses `psql -X` with
+`ON_ERROR_STOP`; restore failure aborts instead of checking a partial restore.
+The restore destination is derived from the admin URL so an alternate admin
+server cannot create on one server and restore into a foreign database on
+another. The restored server is stopped and reaped before its database drops.
+
+Stateful boundary regressions preserve source/foreign state, cover recovery
+failure and suffix truncation, and passed with real native PostgreSQL cases
+described above. Inverting the recovery ownership guard made the foreign-copy
+and failed-recovery tests fail; restoring it passed the host-helper suite.
+
+The optional readiness probe also used `curl -k` alongside `--cacert`, silently
+ignoring trust. With `/dev/null` as the CA, that old command returned HTTP 200
+from the live TLS health endpoint. The insecure flag is removed: the restored
+isolated API with an invalid CA now fails the drill and cleans up both owned
+targets. Valid CA readiness passed; a requested server check without a CA is
+refused. Database-only mode no longer reports a missing optional server binary
+as a failure, and server discovery honors `CARGO_TARGET_DIR`.
+
+Cleanup after `SIGKILL` or a committed-but-unacknowledged database creation is
+not claimed. Inspect the unique target names before manually reclaiming them.
+Restored API maintenance can reach references retained in its database; this
+drill must stay in isolated staging with isolated worker/object-store settings.
+
+## The acceptance relay dropped data when a socket applied backpressure
+
+The relay set its peer sockets nonblocking, then called `sendall` without
+tracking partial writes. A full destination buffer raised `BlockingIOError`,
+which closed both sides. A real CLI upload of 16 MiB failed with
+`BrokenPipeError` after 2,752,512 client-completed bytes; the upstream received
+2,625,024 bytes. This is truncated transport, not a throughput observation.
+
+The relay now uses bounded async stream copies and `drain()` backpressure.
+Connection establishment and a stalled direction do not block every relay
+connection. EOF half-closes one direction so the final response can still
+return. The actual-CLI regression pauses readers in both directions, uploads
+16 MiB, half-closes, and verifies the complete 8 MiB reply plus its upload
+digest. Replacing half-close with full close failed that regression.
+
+After restoring the earlier deliberate mutations, all 21 host-helper tests passed.
+The preceding complete workspace gate passed in 188.22 seconds: formatting, Clippy with
+`-D warnings`, workspace tests, SDK import contract, host helpers, recovery
+census, Python SDK tests, and the containerized aarch64 cross-check. These
+script changes require no API/worker/MCP binary restart; the isolated restored
+API above used the actual checkout binary.
+
+## The acceptance relay changed the PostgreSQL TLS identity to localhost
+
+The socket URL retained `sslmode=verify-full` but replaced the authority host
+with `localhost`. SQLx selects the Unix socket from the query while retaining
+the authority hostname for certificate verification, so a valid remote database
+certificate stopped authenticating after transport was relayed.
+
+The actual checkout API was exercised against an isolated PostgreSQL SSL
+negotiation endpoint with a trusted certificate for `127.0.0.1`. Direct TCP
+reached encrypted PostgreSQL startup. The relayed connection instead failed
+with `NotValidForName`, expecting `localhost`; after preserving the effective
+TCP hostname in the socket URL, it reached encrypted startup too. The fixture
+then deliberately closed: this proves TLS negotiation and identity preservation,
+not a completed PostgreSQL session or an additional database restore.
+
+The permanent actual-relay TLS regression authenticates that certificate with
+both authority and encoded query-host destinations, and rejects a certificate
+for another hostname. Both trusted cases failed before the fix and passed
+afterward; the negative identity case remains rejected. IPv6 authorities retain
+their required brackets. All 22 host-helper tests now pass. Private TLS fixtures
+and relay processes were removed after verification.
+
+## SQLx and libpq selected different servers from mixed host overrides
+
+`host=/socket&host=127.0.0.1` is not universally last-wins. The actual checkout
+API connected to an isolated Unix listener, while native libpq's offline
+connection parser selected TCP. SQLx retains a previously selected socket when
+its hostname changes. The acceptance helper reported TCP and would have
+redirected that URL through a relay instead of preserving its original route.
+
+A second loopback probe used `hostaddr=127.0.0.1&host=127.0.0.2`: the API
+connected to `127.0.0.2`, whereas libpq retained the pinned `127.0.0.1`
+transport address. In a backup drill, that disagreement can send native
+creation/restore and restored API maintenance to different servers.
+
+The shared parser now refuses conflicting socket/TCP and hostaddr overrides
+before exposing a database name, rewriting a destination, or preparing a relay.
+Unambiguous single transports and compatible final hostaddr overrides remain
+supported. The regression checks refusal at the real shell setup boundary,
+before its socket directory exists. Removing the disagreement guard failed
+all three unsafe cases; it was restored immediately.
+
+All 23 host-helper tests pass. These transport probes stopped at PostgreSQL
+SSL negotiation and made no database changes. The earlier native dump/restore
+and trusted restored-API checks remain the database recovery evidence, not
+these negotiation-only probes.
+
+

@@ -10,83 +10,70 @@ run on the other can still meet.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import selectors
-import socket
 import sys
 
 CHUNK = 65536
 
 
-def open_listener(kind: str, address: str) -> socket.socket:
-    if kind == "unix":
-        if os.path.exists(address):
-            os.unlink(address)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(address)
-    else:
-        host, port = address.split(":")
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((host, int(port)))
-    listener.listen(128)
-    return listener
+def tcp_address(address: str) -> tuple[str, int]:
+    host, port = address.rsplit(":", 1)
+    return host.removeprefix("[").removesuffix("]"), int(port)
 
 
-def open_upstream(kind: str, address: str) -> socket.socket:
-    if kind == "unix":
-        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        upstream.connect(address)
-    else:
-        host, port = address.split(":")
-        upstream = socket.create_connection((host, int(port)), 10)
-    return upstream
+async def copy_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    while chunk := await reader.read(CHUNK):
+        writer.write(chunk)
+        # Backpressure pauses only this direction, not every relay connection.
+        await writer.drain()
+    # EOF closes one direction. The upstream can still send its final response.
+    writer.write_eof()
+    await writer.drain()
 
 
-def main() -> int:
-    listen_kind, listen_at, upstream_kind, upstream_at = sys.argv[1:5]
-    listener = open_listener(listen_kind, listen_at)
-    selector = selectors.DefaultSelector()
-    selector.register(listener, selectors.EVENT_READ, None)
-    while True:
-        for key, _ in selector.select():
-            if key.data is None:
-                client, _ = listener.accept()
+async def relay(client_reader, client_writer, upstream_kind, upstream_at) -> None:
+    upstream_writer = None
+    copies = []
+    try:
+        connection = (asyncio.open_unix_connection(upstream_at) if upstream_kind == "unix"
+                      else asyncio.open_connection(*tcp_address(upstream_at)))
+        upstream_reader, upstream_writer = await asyncio.wait_for(connection, 10)
+        copies = [asyncio.create_task(copy_stream(client_reader, upstream_writer)),
+                  asyncio.create_task(copy_stream(upstream_reader, client_writer))]
+        await asyncio.gather(*copies)
+    except (OSError, asyncio.TimeoutError):
+        # A refused or broken upstream closes this client, not the listener.
+        pass
+    finally:
+        for copy in copies:
+            copy.cancel()
+        await asyncio.gather(*copies, return_exceptions=True)
+        for writer in (client_writer, upstream_writer):
+            if writer is not None:
+                writer.close()
                 try:
-                    upstream = open_upstream(upstream_kind, upstream_at)
+                    await writer.wait_closed()
                 except OSError:
-                    # A client that cannot reach its upstream is closed, not
-                    # held open: the caller is better served by a refused
-                    # connection than by one that hangs until its own deadline.
-                    client.close()
-                    continue
-                client.setblocking(False)
-                upstream.setblocking(False)
-                selector.register(client, selectors.EVENT_READ, upstream)
-                selector.register(upstream, selectors.EVENT_READ, client)
-                continue
-            peer = key.data
-            try:
-                chunk = key.fileobj.recv(CHUNK)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except OSError:
-                chunk = b""
-            if not chunk:
-                selector.unregister(key.fileobj)
-                key.fileobj.close()
-                selector.unregister(peer)
-                peer.close()
-                continue
-            try:
-                peer.sendall(chunk)
-            except OSError:
-                selector.unregister(key.fileobj)
-                key.fileobj.close()
-                selector.unregister(peer)
-                peer.close()
+                    pass
+
+
+async def main() -> int:
+    listen_kind, listen_at, upstream_kind, upstream_at = sys.argv[1:5]
+
+    async def connected(reader, writer):
+        await relay(reader, writer, upstream_kind, upstream_at)
+
+    if listen_kind == "unix":
+        if os.path.exists(listen_at):
+            os.unlink(listen_at)
+        server = await asyncio.start_unix_server(connected, listen_at)
+    else:
+        server = await asyncio.start_server(connected, *tcp_address(listen_at))
+    async with server:
+        await server.serve_forever()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))
