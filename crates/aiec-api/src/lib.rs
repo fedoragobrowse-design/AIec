@@ -1348,6 +1348,13 @@ struct RecoveryOutcome {
 }
 
 /// Sandbox states whose expired lease must be recovered rather than abandoned.
+///
+/// This must stay in lockstep with the store's `reassign_expired_lease`
+/// eligibility: the reconciler expires the lease and releases capacity for
+/// anything this lists, and only the store can place it again. Listing a
+/// state the store refuses (`Stopped`, `Snapshotting`) parks the sandbox
+/// with an expired lease no later pass reselects; omitting one the store
+/// accepts (`Restoring`) leaves it expired without ever attempting recovery.
 fn is_recoverable_state(state: SandboxState) -> bool {
     matches!(
         state,
@@ -1355,8 +1362,7 @@ fn is_recoverable_state(state: SandboxState) -> bool {
             | SandboxState::Starting
             | SandboxState::Running
             | SandboxState::Paused
-            | SandboxState::Stopped
-            | SandboxState::Snapshotting
+            | SandboxState::Restoring
     )
 }
 
@@ -8310,6 +8316,25 @@ mod tests {
                 .state,
             SandboxState::Running
         );
+    }
+
+    /// The API recovery gate and the store reassignment gate must agree.
+    /// `Stopped`/`Snapshotting` were recoverable here but refused by the
+    /// store, so an expired lease on either parked the sandbox with no owner
+    /// and no later pass reselecting it; `Restoring` was reassignable in the
+    /// store but never attempted from here.
+    #[test]
+    fn recovery_eligibility_matches_store_reassignment() {
+        use SandboxState::*;
+        for state in [Creating, Starting, Running, Paused, Restoring] {
+            assert!(is_recoverable_state(state), "{state:?} must be recoverable");
+        }
+        for state in [Stopped, Snapshotting, Failed, Destroying, Destroyed] {
+            assert!(
+                !is_recoverable_state(state),
+                "{state:?} must not be recoverable"
+            );
+        }
     }
 
     impl RunFixture {

@@ -3226,7 +3226,16 @@ impl PostgresRepository {
                 .ok_or(StoreError::NotFound)?;
         let lease = lease_from_row(&row)?;
         if lease.status == "completed" {
-            if lease.reason.as_deref() != Some(result_value.to_string().as_str()) {
+            // Compared as values, not strings: `{"a":1,"b":2}` and
+            // `{"b":2,"a":1}` are the same result, and a retried completion
+            // that merely re-serialized it must stay idempotent rather than
+            // 409 on key order or whitespace.
+            let same = lease
+                .reason
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .is_some_and(|stored| stored == result_value);
+            if !same {
                 return Err(StoreError::Conflict(
                     "worker lease already has a different completion result".into(),
                 ));
@@ -6646,6 +6655,60 @@ pub(crate) mod tests {
                 .get_active_worker_lease(tenant, scheduled.sandbox.id)
                 .await
                 .is_err()
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// A retried completion that merely re-serializes the same result must
+    /// stay idempotent. The completed row used to be compared by string, so
+    // `{"a":1,"b":2}` retried as `{"b":2,"a":1}` 409'd as "a different
+    // completion result" instead of returning the stored lease.
+    #[tokio::test]
+    async fn a_reserialized_completion_result_is_still_idempotent() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        let node_id = register_test_worker(&repository, tenant).await;
+        let scheduled = schedule_test_sandbox(
+            &repository,
+            tenant,
+            new_id(),
+            sandbox(tenant),
+            Some(node_id),
+        )
+        .await
+        .unwrap();
+        let completed = repository
+            .complete_worker_lease(
+                tenant,
+                scheduled.lease_id,
+                scheduled.lease_generation,
+                serde_json::json!({"a": 1, "b": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        let retried = repository
+            .complete_worker_lease(
+                tenant,
+                scheduled.lease_id,
+                scheduled.lease_generation,
+                serde_json::from_str::<Value>("{\"b\": 2, \"a\": 1}").unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.id, completed.id);
+        assert!(
+            repository
+                .complete_worker_lease(
+                    tenant,
+                    scheduled.lease_id,
+                    scheduled.lease_generation,
+                    serde_json::json!({"a": 1, "b": 3}),
+                )
+                .await
+                .is_err(),
+            "a genuinely different result must still be refused"
         );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
