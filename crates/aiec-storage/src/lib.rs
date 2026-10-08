@@ -1207,8 +1207,13 @@ impl MetadataStore for MemoryRepository {
         generation: i64,
         ttl_seconds: u64,
     ) -> Result<WorkerLease, CoreError> {
-        if !(1..=3600).contains(&ttl_seconds) {
-            return Err(CoreError::InvalidRequest(
+        // Same contract as the Postgres implementation: a TTL outside the
+        // range is a fencing refusal (`Conflict`, surfaced as 409), not a
+        // caller error, and an expired lease reports expiry rather than the
+        // generic generation message so the worker can tell "renew sooner"
+        // from "someone else owns this now".
+        if !(1..=3_600).contains(&ttl_seconds) {
+            return Err(CoreError::Conflict(
                 "lease TTL must be between 1 and 3600 seconds".into(),
             ));
         }
@@ -1218,11 +1223,13 @@ impl MetadataStore for MemoryRepository {
             .get_mut(&lease_id)
             .filter(|lease| lease.tenant_id == tenant)
             .ok_or_else(|| CoreError::NotFound("lease not found".into()))?;
-        if lease.generation != generation
-            || lease.status != "active"
-            || lease.expires_at <= Utc::now()
-        {
-            return Err(CoreError::Conflict("lease is no longer current".into()));
+        if lease.expires_at <= Utc::now() {
+            return Err(CoreError::Conflict("worker lease has expired".into()));
+        }
+        if lease.generation != generation || lease.status != "active" {
+            return Err(CoreError::Conflict(
+                "worker lease generation or status changed".into(),
+            ));
         }
         lease.generation = lease
             .generation
