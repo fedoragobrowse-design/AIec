@@ -83,6 +83,20 @@ pub const MAX_VCPU: u32 = 32;
 pub const MAX_MEMORY_MB: u32 = 131_072;
 pub const MAX_DISK_MB: u32 = 1_048_576;
 pub const MAX_EXEC_SECONDS: u64 = 3_600;
+/// Most variables one exec may carry, for every runtime.
+///
+/// This lives on the shared intake validator rather than per backend because
+/// that is where the disagreement was: without one number, each runtime drew
+/// its own line (or none) around the same map.
+pub const MAX_EXEC_ENV_VARS: usize = 256;
+/// Longest one variable name, matching the tightest runtime bound (Docker's).
+pub const MAX_EXEC_ENV_KEY: usize = 256;
+/// Longest one variable value, matching the tightest runtime bound (Docker's).
+pub const MAX_EXEC_ENV_VALUE: usize = 4096;
+/// Largest total name+value bytes one exec may carry. Without a total, 256
+/// variables at 4 KiB each is a megabyte of env on every exec — and the guest
+/// agent reads the whole map into memory before the command starts.
+pub const MAX_EXEC_ENV_TOTAL: usize = 65_536;
 pub const MAX_LIFETIME_SECONDS: u64 = 86_400;
 
 #[derive(Debug, Error)]
@@ -1094,6 +1108,43 @@ pub fn validate_exec(req: &ExecRequest) -> Result<(), CoreError> {
     if let Some(path) = &req.working_directory {
         safe_path(path)?;
     }
+    validate_exec_environment(&req.environment)?;
+    Ok(())
+}
+
+/// The one environment-variable rule every runtime shares, checked at intake.
+///
+/// Three runtimes disagreed about what an env var may be: Docker refused keys
+/// over 256 chars or values over 4 KiB as `Unavailable` (a 503 for a caller
+/// error), Bubblewrap silently dropped invalid entries (the command ran with
+/// fewer variables than the caller sent), and Firecracker passed everything
+/// to the guest unbounded. Checking here turns all three into the same caller
+/// error before any runtime is reached, and the per-runtime checks stay as
+/// defence in depth rather than the only enforcement.
+pub fn validate_exec_environment(
+    environment: &std::collections::BTreeMap<String, String>,
+) -> Result<(), CoreError> {
+    if environment.len() > MAX_EXEC_ENV_VARS {
+        return Err(CoreError::LimitExceeded("environment variables".into()));
+    }
+    let mut total = 0usize;
+    for (key, value) in environment {
+        if key.is_empty()
+            || key.len() > MAX_EXEC_ENV_KEY
+            || key.contains('=')
+            || key.as_bytes().contains(&0)
+            || value.len() > MAX_EXEC_ENV_VALUE
+            || value.as_bytes().contains(&0)
+        {
+            return Err(CoreError::InvalidRequest(
+                "invalid environment variable".into(),
+            ));
+        }
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+        if total > MAX_EXEC_ENV_TOTAL {
+            return Err(CoreError::LimitExceeded("environment variables".into()));
+        }
+    }
     Ok(())
 }
 
@@ -1270,6 +1321,40 @@ mod tests {
         environment.layers[0].content_base64 = "dG9vbGtpdCBwYXlsb2Fk".into();
         environment.layers[0].content_digest = "0".repeat(64);
         assert!(environment.validate().is_err());
+    }
+    // The three runtimes once disagreed about env vars — Docker refused with a
+    // 503, Bubblewrap dropped silently, Firecracker passed everything. One
+    // shared gate at intake makes the same map legal or refused everywhere.
+    #[test]
+    fn exec_environment_rejects_what_runtimes_disagreed_on() {
+        let base = ExecRequest {
+            command: vec!["true".into()],
+            working_directory: None,
+            environment: BTreeMap::new(),
+            timeout_seconds: 60,
+            stdin: None,
+        };
+        let mut bad_key = base.clone();
+        bad_key.environment.insert("=oops".into(), "x".into());
+        assert!(validate_exec(&bad_key).is_err());
+        let mut bad_value = base.clone();
+        bad_value.environment.insert("OK".into(), "x".repeat(4097));
+        assert!(validate_exec(&bad_value).is_err());
+        let mut too_many = base.clone();
+        for i in 0..257 {
+            too_many.environment.insert(format!("K{i}"), "x".into());
+        }
+        assert!(validate_exec(&too_many).is_err());
+        let mut too_big = base.clone();
+        for i in 0..17 {
+            too_big
+                .environment
+                .insert(format!("K{i:02}"), "x".repeat(4096));
+        }
+        assert!(validate_exec(&too_big).is_err());
+        let mut fine = base;
+        fine.environment.insert("TOKEN".into(), "abc".into());
+        assert!(validate_exec(&fine).is_ok());
     }
     #[test]
     fn state_machine_rejects_skip() {

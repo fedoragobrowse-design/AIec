@@ -755,7 +755,17 @@ impl BubblewrapRuntime {
         if !s.network.is_enabled() {
             cmd.arg("--unshare-net");
         }
+        // Intake (`validate_exec_environment`) already refused every entry this
+        // filter would drop, so reaching the filter means the gate was bypassed
+        // rather than the caller missent. Debug-assert the contract instead of
+        // re-deciding: a silent drop here once ran commands with fewer
+        // variables than the caller sent, which reads as success with wrong
+        // inputs. Release keeps the filter as defence in depth.
         for (k, v) in &r.environment {
+            debug_assert!(
+                !k.is_empty() && !k.contains('=') && v.len() < 4096,
+                "exec environment bypassed intake validation"
+            );
             if !k.is_empty() && !k.contains('=') && v.len() < 4096 {
                 cmd.arg("--setenv").arg(k).arg(v);
             }

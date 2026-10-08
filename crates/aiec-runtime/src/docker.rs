@@ -136,25 +136,31 @@ fn container_network_mode(network: &NetworkPolicy) -> Result<&'static str, aiec_
     }
 }
 
+/// Last-resort environment check at the Docker boundary.
+///
+/// Intake (`aiec_core::validate_exec_environment`) already enforces the same
+/// bounds with the same numbers, so this fires only if the gate was bypassed —
+/// and when it fires the caller is at fault, not the backend. It used to
+/// report `Unavailable`, which surfaces as a 503 and tells the caller to retry
+/// a request that will never succeed.
 fn validate_environment(
     environment: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), RuntimeError> {
     for (key, value) in environment {
         if key.is_empty()
-            || key.len() > 256
+            || key.len() > aiec_core::MAX_EXEC_ENV_KEY
             || key.contains('=')
             || key.contains('\0')
-            || value.len() > 4096
+            || value.len() > aiec_core::MAX_EXEC_ENV_VALUE
             || value.contains('\0')
         {
-            return Err(RuntimeError::Unavailable(
+            return Err(RuntimeError::Core(aiec_core::CoreError::InvalidRequest(
                 "invalid Docker environment variable".into(),
-            ));
+            )));
         }
     }
     Ok(())
 }
-
 fn decode_file_content(value: &str) -> Result<Vec<u8>, RuntimeError> {
     if value.len() > aiec_core::MAX_FILE.saturating_mul(2) {
         return Err(RuntimeError::Archive(
@@ -976,6 +982,13 @@ impl SandboxRuntime for DockerRuntime {
         sandbox: &Sandbox,
         request: ExecRequest,
     ) -> Result<ExecResult, aiec_core::CoreError> {
+        // The one runtime entry point that skipped the shared gate: Bubblewrap
+        // and Firecracker validate here, but Docker relied on the API route
+        // having validated first. Worker dispatch (`worker.rs:1685`) reaches
+        // this path without touching the route, and internal callers build
+        // `ExecRequest`s directly — so an oversized map bypassed the intake
+        // check entirely on Docker while the other two runtimes refused it.
+        aiec_core::validate_exec(&request)?;
         self.exec_raw(
             sandbox,
             request.command,
@@ -1926,12 +1939,25 @@ mod tests {
 
     #[test]
     fn environment_rejects_invalid_keys_and_values() {
+        // A bad variable is the caller's fault, not a backend outage: this
+        // used to report `Unavailable` (a 503, retryable) for a request that
+        // will never succeed. Pin the class, not just the refusal.
         let mut environment = std::collections::BTreeMap::new();
         environment.insert("BAD=KEY".into(), "value".into());
-        assert!(validate_environment(&environment).is_err());
+        assert!(matches!(
+            validate_environment(&environment),
+            Err(crate::RuntimeError::Core(
+                aiec_core::CoreError::InvalidRequest(_)
+            ))
+        ));
         environment.clear();
         environment.insert("GOOD".into(), "bad\0value".into());
-        assert!(validate_environment(&environment).is_err());
+        assert!(matches!(
+            validate_environment(&environment),
+            Err(crate::RuntimeError::Core(
+                aiec_core::CoreError::InvalidRequest(_)
+            ))
+        ));
     }
 
     #[test]
