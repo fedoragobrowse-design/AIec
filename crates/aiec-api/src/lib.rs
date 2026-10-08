@@ -947,9 +947,18 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
         .route("/sandboxes/{id}", get(get_sandbox).delete(delete_sandbox))
         .route("/sandboxes/{id}/start", post(start_sandbox))
         .route("/sandboxes/{id}/stop", post(stop_sandbox))
-        .route("/sandboxes/{id}/resume", post(resume_sandbox))
         .route("/sandboxes/{id}/pause", post(pause_sandbox))
-        .route("/sandboxes/{id}/exec", post(exec_sandbox))
+        .route("/sandboxes/{id}/resume", post(resume_sandbox))
+        // `exec_sandbox` carries `stdin` up to `MAX_FILE` (16 MiB) plus up to
+        // 64 KiB of environment, and the same 2 MiB axum default would 413 a
+        // legal large-stdin exec before `validate_exec` ever saw it. Same
+        // derived-bound shape as the `/files` and artifact routes.
+        .route(
+            "/sandboxes/{id}/exec",
+            post(exec_sandbox).layer(axum::extract::DefaultBodyLimit::max(
+                aiec_core::MAX_FILE + aiec_core::MAX_EXEC_ENV_TOTAL + 64 * 1024,
+            )),
+        )
         .route("/sandboxes/{id}/git/diff", post(git_diff))
         .route("/sandboxes/{id}/secrets", get(list_secrets))
         .route(
@@ -969,9 +978,18 @@ fn protected_routes(state: &AppState) -> Router<AppState> {
                 .merge(get(download_artifact).delete(delete_artifact)),
         )
         .route("/sandboxes/{id}/artifacts", get(list_artifacts))
+        // `put_file` carries a base64-encoded file up to `MAX_FILE` (16 MiB,
+        // so ~22 MiB on the wire), but axum's default body limit is 2 MiB —
+        // anything over that failed with an unmapped 413 the runtime never
+        // saw. The bound is derived from the file limit rather than picked by
+        // hand, matching the artifact route elsewhere in this router.
         .route(
             "/sandboxes/{id}/files",
-            put(put_file).get(list_files).delete(delete_file),
+            put(put_file)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    aiec_core::MAX_FILE.div_ceil(3) * 4 + 1024,
+                ))
+                .merge(get(list_files).delete(delete_file)),
         )
         .route("/sandboxes/{id}/files/content", get(get_file))
         .route("/sandboxes/{id}/files/list", get(list_files))
@@ -8045,6 +8063,116 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "the refused exec must never reach the runtime"
         );
+    }
+    // A file at the advertised `MAX_FILE` must survive intake: axum's default
+    // body limit is 2 MiB, and before the `/files` route carried its own
+    // derived bound the runtime's 16 MiB acceptance was unreachable — every
+    // write over ~2 MiB failed with an unmapped 413 the runtime never saw.
+    // The payload here is 3 MiB decoded (~4 MiB on the wire): past the old
+    // default, small enough to keep the test fast, and asserted through the
+    // full route so a future limit regression fails here rather than in
+    // production.
+    #[tokio::test]
+    async fn a_file_past_axums_default_body_limit_still_reaches_the_runtime() {
+        struct AcceptRuntime;
+        #[async_trait::async_trait]
+        impl SandboxRuntime for AcceptRuntime {
+            async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: aiec_core::runtime::FileChunkRequest,
+            ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+                Ok(Vec::new())
+            }
+            async fn delete_file(
+                &self,
+                _: &Sandbox,
+                _: DeleteFileRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn make_directory(
+                &self,
+                _: &Sandbox,
+                _: MakeDirectoryRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn import_workspace_archive(
+                &self,
+                _: &Sandbox,
+                _: &[u8],
+            ) -> Result<(), CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
+                aiec_core::runtime::RuntimeHealth::healthy()
+            }
+            fn capabilities(&self) -> aiec_core::runtime::RuntimeCapabilities {
+                aiec_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    ..aiec_core::runtime::RuntimeCapabilities::default()
+                }
+            }
+        }
+        let fixture = RunFixture::with_runtime(Arc::new(AcceptRuntime));
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (status, created) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/sandboxes",
+                json!({ "image": "alpine:3.21" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "create: {created}");
+        let sandbox_id = created["id"].as_str().expect("sandbox id").to_owned();
+        use base64::Engine;
+        let content =
+            base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 3 * 1024 * 1024]);
+        let (status, outcome) = fixture
+            .call_json(
+                axum::http::Method::PUT,
+                &format!("/v1/sandboxes/{sandbox_id}/files"),
+                json!({ "path": "workspace/big.bin", "content_base64": content }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a 3 MiB write must pass intake: {outcome}"
+        );
+        assert_eq!(outcome["status"], "written");
     }
 
     /// An artifact uploaded to a sandbox must be something the sweeper can
