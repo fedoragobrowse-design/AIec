@@ -1613,6 +1613,11 @@ impl RunArtifactSource<'_> {
 fn is_transient_destroy_error(error: &CoreError) -> bool {
     match error {
         CoreError::Transient(_) => true,
+        // Docker kill/remove and workspace reclaim arrive as `Unavailable`
+        // since `into_core` stopped collapsing them into `Io`, and a worker's
+        // `runtime_unavailable` maps back to `Unavailable` too. The machine
+        // may still be up; a single hiccup must not become `cleanup_failed`.
+        CoreError::Unavailable(_) => true,
         CoreError::Conflict(message) if is_lease_resync(message) => true,
         // A runtime that cannot be reached at all. Every non-`Core` runtime
         // error is mapped to `Io`, so this is what a Docker socket hiccup, a
@@ -1622,6 +1627,12 @@ fn is_transient_destroy_error(error: &CoreError) -> bool {
         // `cleanup_failed`, which is what keeps a queue row in `reclaiming` and
         // holds its slot, so a hiccup cost the run its machine for good.
         CoreError::Io(_) => true,
+        // `reqwest` failures against a worker (`Transport`) arrive as
+        // `Backend("worker transport: ...")`; the control plane state is
+        // unknown and unknown is not a reason to abandon a live machine.
+        // Other `Backend`s (guest refusals, `worker protocol: ...`) stay
+        // terminal.
+        CoreError::Backend(message) if message.starts_with("worker transport:") => true,
         _ => false,
     }
 }
@@ -2099,9 +2110,33 @@ mod retry_policy {
             CoreError::QuotaExceeded("disk quota exceeded".into()),
             CoreError::InvalidRequest("bad id".into()),
         ] {
-            // `Io` is deliberately absent: it is the runtime-unreachable case
-            // and it is retried. A genuine refusal from a runtime arrives as
-            // `Backend`, `Conflict` or `NotFound`, all of which are here.
+            // `Io` and `Unavailable` are deliberately absent: they are the
+            // runtime-unreachable cases and both are retried. A genuine
+            // refusal from a runtime arrives as `Backend`, `Conflict` or
+            // `NotFound`, all of which are here.
+            assert!(
+                !is_transient_destroy_error(&permanent),
+                "{permanent} must not be retried"
+            );
+        }
+    }
+
+    /// Only the worker-transport `Backend` retries; guest and protocol
+    /// refusals stay terminal. The `starts_with` match is load-bearing, so it
+    /// is pinned from both sides.
+    #[test]
+    fn only_worker_transport_backend_is_retried_on_destroy() {
+        assert!(is_transient_destroy_error(&CoreError::Backend(
+            "worker transport: error sending request".into()
+        )));
+        assert!(is_transient_destroy_error(&CoreError::Unavailable(
+            "Docker container destroy failed: socket closed".into()
+        )));
+        for permanent in [
+            CoreError::Backend("guest agent refused the command".into()),
+            CoreError::Backend("worker protocol: request id mismatch".into()),
+            CoreError::Backend("a transport of a different kind".into()),
+        ] {
             assert!(
                 !is_transient_destroy_error(&permanent),
                 "{permanent} must not be retried"
