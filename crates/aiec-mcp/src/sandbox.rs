@@ -697,6 +697,38 @@ impl LocalAiec {
             .retain(|record| record.sandbox_id != id);
     }
 
+    /// Destroys every sandbox this server still owns, oldest first.
+    ///
+    /// `cleanup_on_shutdown` was parsed and plumbed for a while but nothing
+    /// ever read it: a restarted MCP left every machine it had created
+    /// running until its TTL expired, holding capacity and counting against
+    /// the tenant's quota for a machine nobody was driving. Each destroy is
+    /// bounded so one wedged machine cannot hold the shutdown open; failures
+    /// are returned so the caller can log them, and the ownership record is
+    /// kept for anything not confirmed gone so a later pass can retry.
+    pub async fn cleanup_owned(
+        &self,
+        per_sandbox_timeout: std::time::Duration,
+    ) -> Vec<(Uuid, String)> {
+        let mut owned: Vec<Uuid> = self
+            .owned
+            .lock()
+            .expect("ownership lock is not poisoned")
+            .iter()
+            .map(|record| record.sandbox_id)
+            .collect();
+        owned.sort();
+        let mut failures = Vec::new();
+        for id in owned {
+            match tokio::time::timeout(per_sandbox_timeout, self.destroy_sandbox(id)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => failures.push((id, error.message)),
+                Err(_) => failures.push((id, "shutdown destroy timed out".to_owned())),
+            }
+        }
+        failures
+    }
+
     /// Issues the create with the runtime pinned.
     async fn create_with_runtime(
         &self,

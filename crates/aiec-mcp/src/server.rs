@@ -40,14 +40,11 @@ pub struct AiecMcp {
     pub default_runtime: String,
     pub default_ttl_seconds: u64,
     pub max_parallel: usize,
-    /// The pre-tool approval gate, consulted before a high-risk tool runs.
-    ///
-    /// `None` means the deployment has not opted in. When it is `Some` the
-    /// gate is fail-closed: an approval service that cannot answer refuses
-    /// rather than allows.
     pub approval: Option<Arc<crate::approval::ApprovalGate>>,
-    /// Sandboxes this server created, used by the ownership resources.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Destroy owned sandboxes on shutdown. Parsed for a while but never
+    /// read: without it a restarted server orphaned every machine it made.
+    pub cleanup_on_shutdown: bool,
 }
 
 impl AiecMcp {
@@ -84,6 +81,7 @@ impl AiecMcp {
             max_parallel: config.max_parallel,
             started_at: chrono::Utc::now(),
             approval,
+            cleanup_on_shutdown: config.cleanup_on_shutdown,
         })
     }
 
@@ -1049,6 +1047,28 @@ mod tests {
             approval_required: false,
         };
         AiecMcp::new(&config).expect("a local endpoint builds a client")
+    }
+
+    /// The shutdown flag reaches the server: it was parsed for a while while
+    // nothing read it, so a `true` config building a `false` server would
+    // silently orphan every owned machine on restart.
+    #[test]
+    fn the_cleanup_flag_reaches_the_server() {
+        let mut config = Config {
+            bind: "127.0.0.1:0".parse().expect("a socket address"),
+            endpoint: crate::guard::LocalEndpoint::parse("http://127.0.0.1:1", false)
+                .expect("loopback is local"),
+            api_key: "test-key".to_owned(),
+            token: Arc::new(zeroize::Zeroizing::new("test-token".to_owned())),
+            max_parallel: 1,
+            default_ttl_seconds: 1800,
+            max_output_bytes: 1_048_576,
+            cleanup_on_shutdown: true,
+            approval_required: false,
+        };
+        assert!(AiecMcp::new(&config).expect("a server").cleanup_on_shutdown);
+        config.cleanup_on_shutdown = false;
+        assert!(!AiecMcp::new(&config).expect("a server").cleanup_on_shutdown);
     }
 
     /// The machine a destroy could not clean up is still the caller's to

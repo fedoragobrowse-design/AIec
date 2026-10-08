@@ -157,6 +157,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+    // The config flag was parsed for a while but nothing ever read it: a
+    // restarted server orphaned every machine it had created. Opt-out stays
+    // available (`AIEC_MCP_CLEANUP_ON_SHUTDOWN=0`), but the default collects
+    // this server's own machines, bounded so one wedged destroy cannot hold
+    // the shutdown open forever.
+    if server.cleanup_on_shutdown {
+        let failures = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            server
+                .aiec
+                .cleanup_owned(std::time::Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("shutdown cleanup timed out; owned sandboxes may remain");
+            Vec::new()
+        });
+        for (id, error) in &failures {
+            tracing::warn!(sandbox_id = %id, error = %error, "shutdown cleanup failed");
+        }
+    }
     Ok(())
+}
+
+/// SIGTERM (service stop) or Ctrl-C (interactive). Without this the process
+/// dies mid-request and the cleanup above never runs.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
 }
