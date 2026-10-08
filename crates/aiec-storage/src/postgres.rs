@@ -1356,53 +1356,7 @@ impl PostgresScheduler {
                 .checked_add(1)
                 .ok_or_else(|| StoreError::Conflict("lease generation overflow".into()))?;
         } else {
-            let quota = sqlx::query(
-                "SELECT max_active_sandboxes, max_vcpus, max_memory_mb, max_disk_mb \
-                 FROM tenant_quotas WHERE tenant_id=$1 FOR UPDATE",
-            )
-            .bind(tenant)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            let usage = sqlx::query(
-                "SELECT count(*)::bigint AS active, COALESCE(sum(cpu),0)::bigint AS vcpus, \
-                 COALESCE(sum(memory_mb),0)::bigint AS memory_mb, COALESCE(sum(disk_mb),0)::bigint AS disk_mb \
-                 FROM sandboxes WHERE tenant_id=$1 AND state NOT IN ('destroyed','failed')",
-            )
-            .bind(tenant)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(database_error)?;
-            let current = aiec_core::QuotaUsage {
-                active_sandboxes: u32::try_from(usage.try_get::<i64, _>("active")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid active usage".into()))?,
-                vcpus: u32::try_from(usage.try_get::<i64, _>("vcpus")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid vCPU usage".into()))?,
-                memory_mb: u64::try_from(usage.try_get::<i64, _>("memory_mb")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid memory usage".into()))?,
-                disk_mb: u64::try_from(usage.try_get::<i64, _>("disk_mb")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid disk usage".into()))?,
-            };
-            let next = current
-                .checked_add(&sandbox)
-                .ok_or_else(|| StoreError::QuotaExceeded("quota usage overflow".into()))?;
-            let limits = aiec_core::QuotaLimits {
-                max_active_sandboxes: u32::try_from(
-                    quota.try_get::<i32, _>("max_active_sandboxes")?,
-                )
-                .map_err(|_| StoreError::QuotaExceeded("invalid active quota".into()))?,
-                max_vcpus: u32::try_from(quota.try_get::<i32, _>("max_vcpus")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid vCPU quota".into()))?,
-                max_memory_mb: u64::try_from(quota.try_get::<i64, _>("max_memory_mb")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid memory quota".into()))?,
-                max_disk_mb: u64::try_from(quota.try_get::<i64, _>("max_disk_mb")?)
-                    .map_err(|_| StoreError::QuotaExceeded("invalid disk quota".into()))?,
-            };
-            if next.exceeds(limits) {
-                return Err(StoreError::QuotaExceeded(
-                    "tenant resource quota exceeded".into(),
-                ));
-            }
+            PostgresRepository::admit_sandbox_quota(&mut tx, tenant, &sandbox).await?;
             insert_sandbox(&mut tx, &sandbox, Some(&required_capabilities)).await?;
             sqlx::query(
                 "INSERT INTO sandbox_requests (tenant_id, request_id, sandbox_id, fingerprint) \
@@ -1780,6 +1734,7 @@ impl PostgresRepository {
     }
     async fn create_sandbox(&self, value: Sandbox) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        Self::admit_sandbox_quota(&mut tx, value.tenant_id, &value).await?;
         insert_sandbox(&mut tx, &value, None).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(())
@@ -1804,6 +1759,7 @@ impl PostgresRepository {
         if !run_state_from_str(&state)?.is_active() {
             return Err(StoreError::Conflict("run is no longer active".into()));
         }
+        Self::admit_sandbox_quota(&mut tx, sandbox.tenant_id, &sandbox).await?;
         insert_sandbox(&mut tx, &sandbox, Some(&required)).await?;
         link_attempt_sandbox(&mut tx, run_id, attempt_id, sandbox.id).await?;
         tx.commit().await.map_err(database_error)?;
@@ -2855,6 +2811,65 @@ impl PostgresRepository {
                 disk_mb: quota_amount(&usage, "disk_mb")?,
             },
         ))
+    }
+
+    /// Admits one sandbox against the tenant's locked quota row. Both the
+    /// scheduled placement path and the direct create paths funnel here: the
+    /// scheduler used to be the only caller, so non-production Hosted and every
+    /// non-production provision wrote rows with no quota check at all.
+    async fn admit_sandbox_quota(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant: Uuid,
+        sandbox: &Sandbox,
+    ) -> Result<(), StoreError> {
+        let quota = sqlx::query(
+            "SELECT max_active_sandboxes, max_vcpus, max_memory_mb, max_disk_mb \
+         FROM tenant_quotas WHERE tenant_id=$1 FOR UPDATE",
+        )
+        .bind(tenant)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_error)?;
+        let usage = sqlx::query(
+        "SELECT count(*)::bigint AS active, COALESCE(sum(cpu),0)::bigint AS vcpus, \
+         COALESCE(sum(memory_mb),0)::bigint AS memory_mb, COALESCE(sum(disk_mb),0)::bigint AS disk_mb \
+         FROM sandboxes WHERE tenant_id=$1 AND state NOT IN ('destroyed','failed')",
+    )
+    .bind(tenant)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)?;
+        let current = aiec_core::QuotaUsage {
+            active_sandboxes: u32::try_from(usage.try_get::<i64, _>("active")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid active usage".into()))?,
+            vcpus: u32::try_from(usage.try_get::<i64, _>("vcpus")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid vCPU usage".into()))?,
+            memory_mb: u64::try_from(usage.try_get::<i64, _>("memory_mb")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid memory usage".into()))?,
+            disk_mb: u64::try_from(usage.try_get::<i64, _>("disk_mb")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid disk usage".into()))?,
+        };
+        let next = current
+            .checked_add(sandbox)
+            .ok_or_else(|| StoreError::QuotaExceeded("quota usage overflow".into()))?;
+        let limits = aiec_core::QuotaLimits {
+            max_active_sandboxes: u32::try_from(quota.try_get::<i32, _>("max_active_sandboxes")?)
+                .map_err(|_| {
+                StoreError::QuotaExceeded("invalid active quota".into())
+            })?,
+            max_vcpus: u32::try_from(quota.try_get::<i32, _>("max_vcpus")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid vCPU quota".into()))?,
+            max_memory_mb: u64::try_from(quota.try_get::<i64, _>("max_memory_mb")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid memory quota".into()))?,
+            max_disk_mb: u64::try_from(quota.try_get::<i64, _>("max_disk_mb")?)
+                .map_err(|_| StoreError::QuotaExceeded("invalid disk quota".into()))?,
+        };
+        if next.exceeds(limits) {
+            return Err(StoreError::QuotaExceeded(
+                "tenant resource quota exceeded".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Starts or stops a worker draining without touching its health.
@@ -5649,6 +5664,17 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
+        // The walk seeds thirteen rows, past the default quota of eight: the
+        // quota gate now covers direct creates, so the test raises its own
+        // ceiling rather than measuring the refusal.
+        sqlx::query(
+            "UPDATE tenant_quotas SET max_active_sandboxes=32, max_vcpus=64 \
+             WHERE tenant_id=$1",
+        )
+        .bind(tenant)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
 
         // Stated timestamps, so the expected order is known rather than read
         // back out of whatever the clock happened to do.
@@ -6025,6 +6051,35 @@ pub(crate) mod tests {
                 .filter(|result| matches!(result, Err(CoreError::QuotaExceeded(_))))
                 .count(),
             1
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+
+    /// The direct create path used to skip quota entirely: only the scheduler
+    /// checked, so non-production Hosted and every non-production provision
+    /// wrote rows without ever reading `tenant_quotas`. With the quota row
+    /// shrunk to one slot, the second direct create must be refused.
+    #[tokio::test]
+    async fn direct_creates_are_admitted_against_tenant_quota() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE tenant_quotas SET max_active_sandboxes=1, max_vcpus=2, \
+             max_memory_mb=128, max_disk_mb=1024 WHERE tenant_id=$1",
+        )
+        .bind(tenant)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        repository
+            .create_sandbox(sandbox(tenant))
+            .await
+            .expect("one sandbox fits a quota of one");
+        let refused = repository.create_sandbox(sandbox(tenant)).await;
+        assert!(
+            matches!(refused, Err(StoreError::QuotaExceeded(_))),
+            "a second sandbox past a quota of one must be refused, got {refused:?}"
         );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
