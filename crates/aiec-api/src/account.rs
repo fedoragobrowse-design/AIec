@@ -217,6 +217,16 @@ pub async fn create_key(
             "a key needs at least one scope".into(),
         ));
     }
+    // The store carries a matching `api_keys_name_length` CHECK (80 chars), so
+    // this is not a second opinion: it turns a database-shaped 500 into a
+    // caller-shaped 400 with the bound in the message. Trimmed, like the
+    // stored value, so trailing whitespace cannot buy extra characters.
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(CoreError::InvalidRequest(
+            "key name must be 1-80 characters".into(),
+        ));
+    }
     let raw = generate_api_key();
     validate_api_key(&raw)?;
     let now = Utc::now();
@@ -236,7 +246,7 @@ pub async fn create_key(
         scopes: scopes.clone(),
         expires_at,
         revoked_at: None,
-        name: name.trim().to_string(),
+        name: name.to_string(),
         created_at: now,
         last_used_at: None,
     };
@@ -244,7 +254,7 @@ pub async fn create_key(
     Ok((
         CreatedKey {
             id: record.id,
-            name: name.trim().to_string(),
+            name: name.to_string(),
             key: raw,
             scopes: scopes
                 .iter()
@@ -305,5 +315,28 @@ mod tests {
         // A self-service key must never be able to administer the platform.
         assert!(!DEFAULT_KEY_SCOPES.contains(&Scope::Admin));
         assert!(DEFAULT_KEY_SCOPES.contains(&Scope::SandboxesWrite));
+    }
+    // The store carries a `api_keys_name_length` CHECK at 80 chars; without
+    // this validation an overlong name reaches the database and 500s. The
+    // memory store used here has no CHECK, so the assertion targets the
+    // validation itself: an 81-char name must be refused as InvalidRequest,
+    // not passed through to the store.
+    #[tokio::test]
+    async fn overlong_key_names_are_refused_before_the_store() {
+        let store = aiec_storage::MemoryRepository::default();
+        let tenant = Uuid::now_v7();
+        let long = "k".repeat(81);
+        match create_key(&store, tenant, &long, vec![Scope::SandboxesRead], None).await {
+            Err(CoreError::InvalidRequest(_)) => {}
+            Err(other) => panic!(
+                "overlong names are caller errors, not store failures: {}",
+                other
+            ),
+            Ok(_) => panic!("an 81-char name must not reach the store"),
+        }
+        let exact = "k".repeat(80);
+        create_key(&store, tenant, &exact, vec![Scope::SandboxesRead], None)
+            .await
+            .expect("an 80-char name is exactly at the bound");
     }
 }
