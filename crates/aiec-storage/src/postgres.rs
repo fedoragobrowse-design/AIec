@@ -2497,6 +2497,7 @@ impl PostgresRepository {
             tx.commit().await.map_err(database_error)?;
             return Ok(result);
         }
+        Self::admit_sandbox_quota(&mut tx, tenant, &sandbox).await?;
         insert_sandbox(&mut tx, &sandbox, None).await?;
         sqlx::query(
             "INSERT INTO sandbox_requests (tenant_id, request_id, sandbox_id, fingerprint) \
@@ -6090,6 +6091,44 @@ pub(crate) mod tests {
         assert!(
             matches!(refused, Err(StoreError::QuotaExceeded(_))),
             "a second sandbox past a quota of one must be refused, got {refused:?}"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
+    }
+    /// The idempotent create is a direct create: a fresh request id past a
+    /// full quota must be refused, while replaying the admitted request id
+    /// still returns the first sandbox without consuming another slot.
+    #[tokio::test]
+    async fn idempotent_creates_are_admitted_against_tenant_quota() {
+        let Some((repository, tenant)) = repository_and_tenant().await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE tenant_quotas SET max_active_sandboxes=1, max_vcpus=2, \
+             max_memory_mb=128, max_disk_mb=1024 WHERE tenant_id=$1",
+        )
+        .bind(tenant)
+        .execute(&repository.pool)
+        .await
+        .unwrap();
+        let request_id = new_id();
+        let first = repository
+            .create_sandbox_idempotent(tenant, request_id, sandbox(tenant))
+            .await
+            .expect("one sandbox fits a quota of one");
+        let replayed = repository
+            .create_sandbox_idempotent(tenant, request_id, sandbox(tenant))
+            .await
+            .expect("replaying the admitted request id must not consume quota");
+        assert_eq!(
+            replayed.id, first.id,
+            "a replay hands back the admitted sandbox"
+        );
+        let refused = repository
+            .create_sandbox_idempotent(tenant, new_id(), sandbox(tenant))
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::QuotaExceeded(_))),
+            "a fresh request id past a quota of one must be refused, got {refused:?}"
         );
         let _ = tokio::time::timeout(Duration::from_secs(1), repository.pool.close()).await;
     }
