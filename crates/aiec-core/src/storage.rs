@@ -1386,12 +1386,15 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("artifact lifecycle storage".into()))
     }
-    /// Records an explicit user delete before the bytes are removed. Unlike
+    /// Records an explicit user delete after the bytes are removed. Unlike
     /// the GC claim path, which only touches expired rows, a user delete of a
     /// live row would otherwise leave it `available` after the bytes are
     /// gone: the row keeps the name reserved forever (keys cannot be reused
-    /// after deletion) while pointing at nothing. Marking it `deleted` first
-    /// keeps the reservation the row implies and lets the bytes go.
+    /// after deletion) while pointing at nothing. Marking it `deleted` after
+    /// the bytes go keeps the reservation the row implies. Bytes go first
+    /// because the tombstone is not reversible: `deleted` rows are invisible
+    /// to the GC claim windows, so a tombstone committed before a transient
+    /// byte-delete failure would orphan the bytes permanently.
     async fn delete_artifact_upload(
         &self,
         _tenant: TenantId,

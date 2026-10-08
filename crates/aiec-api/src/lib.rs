@@ -2641,19 +2641,24 @@ async fn delete_artifact(
             "artifact storage is not configured",
         )
     })?;
-    // Tombstone the ledger row before the bytes go. Without this the row
-    // stays `available` after the delete: the name is reserved forever
-    // (keys cannot be reused after deletion) while pointing at nothing, and
-    // a later re-upload of the same name is refused as expired. A delete
-    // that finds no row to mark deletes no bytes, and one that loses the
-    // row to another owner or to the sweeper's claim is refused rather than
-    // retiring someone else's bytes. The tombstone also stops the GC from
-    // ever claiming a key the user already removed.
+    // Bytes go before the ledger tombstone. Both object-store deletes are
+    // idempotent on missing bytes (filesystem maps NotFound to Ok, S3 maps
+    // 404 to Ok), so deleting twice is safe — but the tombstone is not
+    // reversible: `deleted` rows are invisible to the GC claim windows and
+    // can never be re-reserved, so a tombstone committed before a transient
+    // byte-delete failure would orphan the bytes permanently with the name
+    // burned. The reverse window (bytes gone, tombstone write fails) still
+    // converges: the row stays `available` pointing at nothing until the
+    // sweeper claims it and finishes it to `deleted`. Byte removal is
+    // idempotent on missing bytes, so a delete that finds no row to mark
+    // returns `NotFound` after removing any stray bytes the ledger never
+    // recorded, and one that loses the row to another owner or to the
+    // sweeper's claim is refused rather than retiring someone else's bytes.
+    store.delete(&key).await.map_err(ApiFailure::from)?;
     s.repository()
         .delete_artifact_upload(p.tenant_id, None, &key)
         .await
         .map_err(ApiFailure::from)?;
-    store.delete(&key).await.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status": "deleted"})))
 }
 

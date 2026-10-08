@@ -122,13 +122,15 @@ impl PostgresRepository {
         }
         Ok(())
     }
-    /// Marks a user-deleted key as expired before the bytes are removed, so
-    /// the ledger stops advertising bytes that are about to disappear. A
-    /// missing row is `NotFound`; a row owned by another tenant or Run, or
-    /// one already claimed by the sweeper, is `Conflict`, so a delete can
+    /// Marks a user-deleted key as expired after the bytes are removed, so
+    /// the ledger stops advertising bytes that are already gone. A missing
+    /// row is `NotFound`; a row owned by another tenant or Run, or one
+    /// already claimed by the sweeper, is `Conflict`, so a delete can
     /// neither retire someone else's bytes nor race a deletion claim. The
     /// tombstone keeps the name reserved: keys cannot be reused after
-    /// deletion, and a delete that finds no row to mark deletes no bytes.
+    /// deletion. Byte removal is idempotent on missing bytes, so a delete
+    /// that finds no row to mark returns `NotFound` after removing any
+    /// stray bytes the ledger never recorded.
     pub(crate) async fn delete_artifact_upload(
         &self,
         tenant: Uuid,
