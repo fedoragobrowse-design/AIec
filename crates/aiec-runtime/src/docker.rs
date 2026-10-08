@@ -410,6 +410,14 @@ pub struct DockerRuntime {
 /// "failed", without letting an unanswerable daemon outlive the caller's budget.
 const EXEC_STATUS_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a timed-out exec is given to have finished anyway, before it is
+/// reported as still running. A command that finished just past its own
+/// deadline is reaped and reported accurately; one that survives the grace is
+/// disclosed as running, because the daemon offers no exec-kill primitive and
+/// `timed_out` alone would otherwise imply a dead process. Bounded so an
+/// unanswerable daemon cannot outlive the caller's budget by much.
+const EXEC_ZOMBIE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl DockerRuntime {
     fn absolute_root(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
@@ -607,6 +615,12 @@ impl DockerRuntime {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout.max(1));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        // Set once the command's own deadline fires. The loop then drains
+        // whatever the process still produces during the zombie grace instead
+        // of abandoning the stream, so a command that finished just past its
+        // deadline reports its real exit and complete output — still marked
+        // timed out, because the deadline did fire.
+        let mut timed_out = false;
         match started {
             StartExecResults::Attached {
                 mut output,
@@ -635,30 +649,35 @@ impl DockerRuntime {
                             }
                         }
                         Err(_) => {
-                            return Ok(ExecResult {
-                                exit_code: 124,
-                                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                                stderr: format!(
-                                    "{}\ncommand timed out delivering stdin",
-                                    String::from_utf8_lossy(&stderr)
-                                ),
-                                duration_ms: start.elapsed().as_millis() as u64,
-                                timed_out: true,
-                            });
+                            timed_out = true;
                         }
                     }
                 }
                 let _ = input.shutdown().await;
                 loop {
-                    let next = tokio::time::timeout_at(deadline, output.next()).await;
+                    // After the deadline the grace bounds the drain: a survivor
+                    // must not hold the caller past `EXEC_ZOMBIE_GRACE`.
+                    let bound = if timed_out {
+                        tokio::time::Instant::now() + EXEC_ZOMBIE_GRACE
+                    } else {
+                        deadline
+                    };
+                    let next = tokio::time::timeout_at(bound, output.next()).await;
                     let item = match next {
                         Ok(item) => item,
                         Err(_) => {
+                            if !timed_out {
+                                // First firing of the deadline: drain whatever
+                                // arrives during the grace instead of
+                                // abandoning the stream.
+                                timed_out = true;
+                                continue;
+                            }
                             return Ok(ExecResult {
                                 exit_code: 124,
                                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                                 stderr: format!(
-                                    "{}\ncommand timed out",
+                                    "{}\ncommand timed out; the process is still running in the sandbox",
                                     String::from_utf8_lossy(&stderr)
                                 ),
                                 duration_ms: start.elapsed().as_millis() as u64,
@@ -687,8 +706,16 @@ impl DockerRuntime {
                 ));
             }
         }
+        // A grace drain outlives the command deadline by design, so the status
+        // lookup gets a fresh bound: reusing the spent deadline would refuse
+        // every command the grace just reaped.
+        let status_deadline = if timed_out {
+            tokio::time::Instant::now() + EXEC_ZOMBIE_GRACE
+        } else {
+            deadline
+        };
         let exit_code = self
-            .await_exec_status(&exec.id, deadline)
+            .await_exec_status(&exec.id, status_deadline)
             .await
             .map_err(|reason| {
                 RuntimeError::Unavailable(format!(
@@ -696,6 +723,17 @@ impl DockerRuntime {
                     exec.id
                 ))
             })?;
+        if timed_out {
+            // The deadline fired but the process exited during the grace: real
+            // exit and complete output, honestly marked.
+            return Ok(ExecResult {
+                exit_code: exit_code as i32,
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                timed_out: true,
+            });
+        }
         Ok(ExecResult {
             exit_code: exit_code as i32,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -2916,6 +2954,85 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(10),
             "the deadline was not enforced during stdin delivery: {elapsed:?}"
+        );
+        let _ = runtime.destroy(&sandbox).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A command that finishes just past its deadline is reaped, not zombied.
+    /// `sleep 3` with a 2 s deadline misses the deadline but exits inside the
+    /// grace, so the caller gets the real exit and complete output — still
+    /// marked timed out, because the deadline did fire. Before the grace
+    /// drain this returned 124 with the process already gone, which lied in
+    /// both directions at once.
+    #[tokio::test]
+    async fn a_command_that_finishes_in_grace_reports_its_real_exit() {
+        let Some((runtime, sandbox, root)) = started_sandbox().await else {
+            eprintln!("skipping: no Docker daemon");
+            return;
+        };
+        let result = runtime
+            .exec_raw(
+                &sandbox,
+                vec!["/bin/sleep".into(), "3".into()],
+                None,
+                Default::default(),
+                2,
+                None,
+            )
+            .await;
+        match result {
+            Ok(result) => {
+                assert!(
+                    result.timed_out,
+                    "the deadline fired, so the result must say so: {result:?}"
+                );
+                assert_eq!(
+                    result.exit_code, 0,
+                    "the process exited cleanly in grace; 124 would be a lie: {result:?}"
+                );
+            }
+            Err(error) => panic!("a reaped command should report, not fail: {error}"),
+        }
+        let _ = runtime.destroy(&sandbox).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A command that survives the grace is disclosed, not implied dead. The
+    /// daemon offers no exec-kill primitive, so `timed_out` alone would tell
+    /// the caller the process is gone while it keeps running in the sandbox.
+    #[tokio::test]
+    async fn a_command_that_survives_grace_is_disclosed_running() {
+        let Some((runtime, sandbox, root)) = started_sandbox().await else {
+            eprintln!("skipping: no Docker daemon");
+            return;
+        };
+        let started = Instant::now();
+        let result = runtime
+            .exec_raw(
+                &sandbox,
+                vec!["/bin/sleep".into(), "30".into()],
+                None,
+                Default::default(),
+                2,
+                None,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        match result {
+            Ok(result) => {
+                assert!(result.timed_out, "the deadline fired: {result:?}");
+                assert_eq!(result.exit_code, 124);
+                assert!(
+                    result.stderr.contains("still running"),
+                    "the survivor must be disclosed: {result:?}"
+                );
+            }
+            Err(error) => panic!("a survivor should be disclosed, not failed: {error}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the grace must bound the drain: {elapsed:?}"
         );
         let _ = runtime.destroy(&sandbox).await;
         let _ = std::fs::remove_dir_all(root);
