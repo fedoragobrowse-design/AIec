@@ -363,10 +363,18 @@ pub async fn guard_command(url: &str, key: Option<String>, command: GuardCommand
     Ok(())
 }
 
+/// Production deadline for Guard reads and writes: small JSON against a
+/// loopback control plane, generous at a minute.
+const GUARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A plain HTTP client carrying the tenant key. The SDK client does not speak
 /// the Guard routes, and the routes themselves are the authority on what a key
 /// may do.
-async fn authenticated(_url: &str, key: Option<String>) -> Result<reqwest::Client> {
+async fn authenticated_with_timeout(
+    _url: &str,
+    key: Option<String>,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client> {
     let key = key
         .or_else(|| std::env::var("AIEC_API_KEY").ok())
         .context("set --api-key, --api-key-file or AIEC_API_KEY")?;
@@ -384,12 +392,18 @@ async fn authenticated(_url: &str, key: Option<String>) -> Result<reqwest::Clien
         // with would otherwise resend it to the target, the same class the
         // worker and SDK clients already refuse. The routes never redirect.
         .redirect(reqwest::redirect::Policy::none())
+        // Without any deadline a hung control plane hangs the operator's
+        // terminal forever; see a_hung_control_plane_surfaces_a_timeout.
+        .timeout(timeout)
         .build()?)
+}
+async fn authenticated(_url: &str, key: Option<String>) -> Result<reqwest::Client> {
+    authenticated_with_timeout(_url, key, GUARD_TIMEOUT).await
 }
 
 #[cfg(test)]
 mod redirect_tests {
-    use super::authenticated;
+    use super::{authenticated, authenticated_with_timeout};
 
     /// The bearer must never ride a redirect. Axum answers the 302 and a
     /// probe listener records any arrival: a request reaching it at all is
@@ -458,6 +472,53 @@ mod redirect_tests {
             arrivals.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "the redirect target was contacted"
+        );
+    }
+    /// A hung control plane must not hang the operator: the client carries
+    /// a 60s deadline, and a server that accepts but never answers must
+    /// surface as a timeout error, not a wedged terminal.
+    #[tokio::test]
+    async fn a_hung_control_plane_surfaces_a_timeout_not_a_wedge() {
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a blackhole listener");
+        let addr = blackhole.local_addr().expect("a blackhole address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = blackhole.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    // Kept open and never answered: the request sits in the
+                    // kernel buffer while the client's deadline runs out.
+                    std::mem::forget(socket);
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        // A 2-second stand-in for the 60-second production deadline: the
+        // mechanism under test is the deadline firing, not its duration.
+        let client = authenticated_with_timeout(
+            &format!("http://{addr}"),
+            Some("guard-secret".to_owned()),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("a client");
+        let started = std::time::Instant::now();
+        let outcome = client
+            .get(format!("http://{addr}/v1/guard/proposals"))
+            .send()
+            .await;
+        let elapsed = started.elapsed();
+        let error = outcome.expect_err("a blackholed call must fail, not hang");
+        assert!(
+            error.is_timeout(),
+            "a hung control plane must surface a timeout, got {error:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the deadline fired far later than configured: {elapsed:?}"
         );
     }
 }

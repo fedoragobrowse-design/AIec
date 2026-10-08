@@ -1121,6 +1121,11 @@ async fn start_worker(
     *startup_runtime = Some(runtime.clone());
     let capabilities = runtime.capabilities();
     let mut client_builder = reqwest::Client::builder()
+        // Heartbeats, claims, and renewals are small control-plane calls:
+        // 60 seconds bounds a stalled iteration so the 5s liveness and 10s
+        // claim/renew loops keep cycling instead of wedging one iteration
+        // forever on a hung control plane. Only the connect had a deadline.
+        .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(5))
         // The worker posts its token to the control plane. A redirect that a
         // compromised or misconfigured control plane (or a path-rewriting

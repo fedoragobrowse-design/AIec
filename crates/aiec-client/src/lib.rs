@@ -227,6 +227,12 @@ fn run_response_timeout(workload: &WorkloadSpec) -> Duration {
 /// machine it was holding to be destroyed.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long a destroy may take: it tears down the machine, then the server
+/// answers. Python waits `DESTROY_TIMEOUT_SECONDS` (300) for the same call;
+/// this must match, or a slow teardown fails client-side at 60s while the
+/// server keeps destroying — caller sees Err, true state unknown.
+const DESTROY_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Slack above a server-side bound, so the control plane always gives up first
 /// and the client is the last thing to decide a call has failed.
 const SERVER_OPERATION_SLACK_SECONDS: u64 = 120;
@@ -540,8 +546,11 @@ impl AIecClient {
             .await
     }
     pub async fn delete_sandbox(&self, id: Uuid) -> Result<(), ClientError> {
-        self.send_empty(self.request(reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}")))
-            .await
+        self.send_empty(
+            self.request(reqwest::Method::DELETE, &format!("/v1/sandboxes/{id}"))
+                .timeout(DESTROY_TIMEOUT),
+        )
+        .await
     }
     pub async fn start(&self, id: Uuid) -> Result<Sandbox, ClientError> {
         self.send(self.request(reqwest::Method::POST, &format!("/v1/sandboxes/{id}/start")))
@@ -1370,7 +1379,7 @@ mod tests {
             .unwrap_or_default();
         let body = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
         stub.seen.lock().await.push(Seen {
-            method,
+            method: method.clone(),
             path: path.clone(),
             query,
             authorization,
@@ -1502,6 +1511,11 @@ mod tests {
                 AxumStatus::OK,
                 run_document_for(run_id_in(other), RunState::Succeeded),
             ),
+            // A teardown answered with no body: `send_empty` treats any 2xx
+            // as destroyed, so the stub answers what the API answers.
+            other if other.starts_with("/v1/sandboxes/") && method == "DELETE" => {
+                (AxumStatus::OK, serde_json::json!({"status": "destroyed"}))
+            }
             _ => (AxumStatus::NOT_FOUND, Value::Null),
         };
         Response::builder()
@@ -1953,6 +1967,32 @@ mod tests {
             stub.peak_in_flight.load(Ordering::SeqCst)
         );
         assert_eq!(stub.requests().await.len(), 4);
+        serving.abort();
+    }
+    /// A teardown is a machine being reclaimed, not a control-plane read: it
+    /// used to inherit the 60-second default while Python waited 300, so a
+    /// slow destroy failed client-side while the server kept destroying and
+    /// the caller could not tell whether the machine was gone.
+    #[tokio::test]
+    async fn a_slow_teardown_outlasts_the_clients_default() {
+        let stub = Stub::new();
+        let (url, serving) = stub_control_plane(stub.clone()).await;
+        let client = AIecClient::new(&url, "af_live_key").expect("a client");
+        let id = Uuid::now_v7();
+        client
+            .delete_sandbox(id)
+            .await
+            .expect("a destroy the stub answered");
+        let seen = stub.requests().await;
+        assert_eq!(seen.len(), 1, "one DELETE, no retry loop in the client");
+        assert_eq!(seen[0].method, "DELETE");
+        assert_eq!(seen[0].path, format!("/v1/sandboxes/{id}"));
+        assert_eq!(
+            DESTROY_TIMEOUT.as_secs(),
+            300,
+            "the Rust destroy wait must match Python DESTROY_TIMEOUT_SECONDS, \
+             or the two SDKs disagree about how slow a teardown may be"
+        );
         serving.abort();
     }
 

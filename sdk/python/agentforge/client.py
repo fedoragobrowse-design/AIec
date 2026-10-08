@@ -10,6 +10,7 @@ caller has been told is fine, which is the expensive failure.
 import base64
 import json
 import os
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -99,6 +100,16 @@ SNAPSHOT_TIMEOUT_SECONDS = SANDBOX_PROVISION_TIMEOUT_SECONDS + EXEC_RESPONSE_SLA
 #: wait ``Runs.cancel`` takes for the same reason
 #: (``CANCEL_TIMEOUT_SECONDS`` in runs.py).
 DESTROY_TIMEOUT_SECONDS = 300
+
+#: How many DELETEs a teardown may take before it gives up. The first attempt
+#: failing on the wire is the ordinary orphan: the machine may still be running
+#: and the caller was told nothing. A second DELETE after a first that actually
+#: destroyed is safe -- the route answers success for an already-destroyed row
+#: -- so retrying a teardown cannot double-destroy. Only transport failures
+#: (status 0, never reached the control plane) and 5xx are retried: a 404 is an
+#: unknown id, a 409 is a conflict the server already retried internally
+#: (`destroy_with_retry`), and a 429 carries a `retry_after` the caller owns.
+DESTROY_MAX_ATTEMPTS = 3
 
 #: Listing a tenant's sandboxes joins each one's machine state, so it is a
 #: query over the whole inventory rather than a single record. Bounded, but not
@@ -538,10 +549,23 @@ class Sandbox:
     def destroy(self) -> Any:
         # Reclaiming a machine is a teardown, not a read: the reply is as slow
         # as the destruction the server had to do before it answered.
-        return self.client._request(
-            "DELETE", f"/v1/sandboxes/{self.data['id']}",
-            timeout=DESTROY_TIMEOUT_SECONDS,
-        )
+        last: AIecError | None = None
+        for attempt in range(1, DESTROY_MAX_ATTEMPTS + 1):
+            try:
+                return self.client._request(
+                    "DELETE", f"/v1/sandboxes/{self.data['id']}",
+                    timeout=DESTROY_TIMEOUT_SECONDS,
+                )
+            except AIecError as error:
+                # Transport failures and 5xx clear by themselves; anything the
+                # server answered decisively (4xx) does not get a second vote.
+                if not (error.status == 0 or 500 <= error.status <= 599):
+                    raise
+                last = error
+                if attempt < DESTROY_MAX_ATTEMPTS:
+                    time.sleep(2 ** (attempt - 1))
+        assert last is not None
+        raise last
 
     def delete_file(self, path: str) -> Any:
         return self.client._request(

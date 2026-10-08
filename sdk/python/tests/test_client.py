@@ -22,6 +22,7 @@ from agentforge import AIec, AIecError, Sandbox
 from agentforge.client import (
     DEFAULT_EXEC_SECONDS,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    DESTROY_MAX_ATTEMPTS,
     DESTROY_TIMEOUT_SECONDS,
     EXEC_RESPONSE_SLACK_SECONDS,
     LIST_TIMEOUT_SECONDS,
@@ -334,6 +335,72 @@ class SandboxTeardownTest(unittest.TestCase):
             with sandbox:
                 pass
 
+    def test_a_transient_teardown_failure_is_retried_not_orphaned(self):
+        # The ordinary orphan: the first DELETE dies on the wire (status 0)
+        # while the machine may still be running. A single attempt leaves it
+        # behind; the retry destroys it.
+        import agentforge.client as client_module
+        calls = []
+        outcomes = [
+            AIecError(0, {"error": {"code": "transport_error", "message": "reset"}}),
+            AIecError(503, {"error": {"code": "unavailable", "message": "restarting"}}),
+            None,
+        ]
+        sleeps = []
+        client = a_client()
+        def request(method, path, payload=None, *, timeout=120):
+            calls.append((method, path))
+            outcome = outcomes[len(calls) - 1]
+            if outcome is not None:
+                raise outcome
+            return {"status": "destroyed"}
+        client._request = request
+        sandbox = Sandbox(client, {"id": "sandbox-1"})
+        real_sleep = client_module.time.sleep
+        client_module.time.sleep = sleeps.append
+        try:
+            sandbox.destroy()
+        finally:
+            client_module.time.sleep = real_sleep
+        self.assertEqual(len(calls), 3, "two transient failures then success")
+        self.assertTrue(all(call[0] == "DELETE" for call in calls))
+        self.assertEqual(sleeps, [1, 2], "exponential backoff between attempts")
+
+    def test_a_decisive_teardown_refusal_gets_no_second_vote(self):
+        # A 404 is an unknown id and a 409 a conflict the server already
+        # retried internally: repeating the DELETE achieves nothing and, on
+        # 429, fights the rate limit the caller was told to respect.
+        for status in (404, 409, 429):
+            client = a_client()
+            calls = []
+            def request(method, path, payload=None, *, timeout=120):
+                calls.append((method, path))
+                raise AIecError(status, {"error": {"code": "refused", "message": "no"}})
+            client._request = request
+            sandbox = Sandbox(client, {"id": "sandbox-1"})
+            with self.assertRaises(AIecError):
+                sandbox.destroy()
+            self.assertEqual(len(calls), 1, f"status {status} must not be retried")
+
+    def test_a_teardown_that_never_clears_reports_the_last_failure(self):
+        # Three transient failures exhaust the attempts: the caller sees the
+        # third failure, not a success that never happened.
+        import agentforge.client as client_module
+        client = a_client()
+        calls = []
+        def request(method, path, payload=None, *, timeout=120):
+            calls.append((method, path))
+            raise AIecError(500, {"error": {"code": "broken", "message": "down"}})
+        client._request = request
+        sandbox = Sandbox(client, {"id": "sandbox-1"})
+        real_sleep = client_module.time.sleep
+        client_module.time.sleep = lambda seconds: None
+        try:
+            with self.assertRaises(AIecError):
+                sandbox.destroy()
+        finally:
+            client_module.time.sleep = real_sleep
+        self.assertEqual(len(calls), DESTROY_MAX_ATTEMPTS)
     def test_a_missing_field_raises_attribute_error_not_key_error(self):
         # `__getattr__` returned `self.data[name]` bare, so a missing field
         # raised KeyError: hasattr() and getattr-with-default both broke.
