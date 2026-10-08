@@ -380,16 +380,45 @@ const MAX_RUN_ATTEMPTS: u32 = 10;
 const PLACEMENT_GRACE_SECONDS: u64 = 120;
 
 /// Whether a failed attempt is worth repeating on a fresh machine.
+///
+/// This answers only for phases that run *before* the workload succeeds:
+/// placement, setup, and the task and validation commands themselves. A
+/// failure that arrives after the workload already succeeded — a transient
+/// guest read during artifact collection, a storage refusal, a timeout while
+/// storing what was read — must never re-run the workload on a fresh machine:
+/// the work is done, only its evidence failed to land, and a retry would
+/// execute non-idempotent side effects a second time while reporting the
+/// first attempt's results as the second's. Callers that need collection to
+/// succeed retry collection, not the run.
 fn is_retryable(error: &CoreError) -> bool {
     // The producer decides. A capacity refusal, a lease race and a database
     // deadlock all arrive as `Transient` because whoever raised them knows
     // whether asking again could work. Reading the message instead meant each
     // new transient failure was a new leak, discovered by a cluster running
     // dry rather than by a test.
-    matches!(
-        error,
-        CoreError::Transient(_) | CoreError::Unavailable(_) | CoreError::Backend(_)
-    )
+    //
+    // `Backend` is here because a transport read of the guest failed before
+    // the workload finished — not because collection failed afterwards.
+    // `collect_artifacts` wraps every read failure with the artifact's name
+    // (`artifact {name}: ...`), which is what keeps the two apart: anything
+    // carrying that prefix already ran the workload, and retrying it would
+    // re-execute the task on a fresh machine.
+    fn collection_prefixed(message: &str) -> bool {
+        // The name cannot contain a space or newline (it is a workspace path
+        // validated at intake), so the first `: ` ends the prefix. Matching
+        // the *last* colon broke on nested transport messages like
+        // `artifact proof.txt: worker transport: reset`, whose tail contains
+        // its own `: `.
+        message.strip_prefix("artifact ").is_some_and(|rest| {
+            rest.split_once(": ")
+                .is_some_and(|(before, _)| !before.is_empty() && !before.contains([' ', '\n']))
+        })
+    }
+    match error {
+        CoreError::Transient(_) | CoreError::Unavailable(_) => true,
+        CoreError::Backend(message) => !collection_prefixed(message),
+        _ => false,
+    }
 }
 
 /// Persists the run before any work starts.
@@ -1530,10 +1559,13 @@ impl aiec_core::storage::ArtifactSource for RunArtifactSource<'_> {
             Err(error) => {
                 self.read_failed = true;
                 return Err(match error {
-                    CoreError::NotFound(message) => CoreError::NotFound(format!(
-                        "could not read artifact {}: {message}",
-                        self.name
-                    )),
+                    // Every read failure carries the `artifact {name}:` prefix,
+                    // which is what keeps collection failures out of the run
+                    // retry set: the workload already succeeded by the time
+                    // this runs, so retrying would re-execute it.
+                    CoreError::NotFound(message) => {
+                        CoreError::NotFound(format!("artifact {}: {message}", self.name))
+                    }
                     CoreError::LimitExceeded(message) => {
                         CoreError::LimitExceeded(format!("artifact {}: {message}", self.name))
                     }
@@ -2103,6 +2135,28 @@ mod retry_policy {
             !is_retryable(&rejected),
             "a rejected artifact must not re-run a workload that already succeeded"
         );
+    }
+    /// A guest read that fails *during collection* must not re-run the
+    /// workload: the task already succeeded, so a retry would execute its side
+    /// effects a second time on a fresh machine. The prefix is load-bearing —
+    /// it is the only thing distinguishing a collection `Backend` from a
+    /// pre-success transport `Backend`, which still retries.
+    #[test]
+    fn a_collection_read_failure_is_not_worth_another_machine() {
+        for failure in [
+            CoreError::Backend("artifact proof.txt: worker transport: reset".into()),
+            CoreError::NotFound("artifact proof.txt: gone".into()),
+            CoreError::LimitExceeded("artifact proof.txt: file".into()),
+            CoreError::Conflict("artifact proof.txt: changed".into()),
+        ] {
+            assert!(
+                !is_retryable(&failure),
+                "{failure} already ran the workload and must fail once, not retry"
+            );
+        }
+        assert!(is_retryable(&CoreError::Backend(
+            "worker transport: connection reset".into()
+        )));
     }
 
     /// The set is closed. Anything not explicitly transient is fatal, so a new
