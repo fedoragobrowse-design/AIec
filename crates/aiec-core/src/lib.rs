@@ -244,16 +244,21 @@ pub struct CreateSandboxRequest {
     #[serde(default)]
     pub environment: EnvironmentSpec,
 }
-fn default_cpu() -> u32 {
+/// Default sandbox shape when the caller names none. Shared by the create
+/// path (via serde) and the restore path, so the two cannot drift apart.
+pub fn default_cpu() -> u32 {
     1
 }
-fn default_memory() -> u32 {
+/// Default sandbox memory in MiB when the caller names none.
+pub fn default_memory() -> u32 {
     512
 }
-fn default_disk() -> u32 {
+/// Default sandbox disk in MiB when the caller names none.
+pub fn default_disk() -> u32 {
     2048
 }
-fn default_timeout() -> u64 {
+/// Default sandbox lifetime in seconds when the caller names none.
+pub fn default_timeout() -> u64 {
     900
 }
 

@@ -2925,6 +2925,14 @@ async fn pause_sandbox(
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
+    // Checked before the guest is touched, like `start_sandbox`: without this
+    // the runtime pause fires on a machine that is not Running and the durable
+    // swap then fails, stopping a guest whose row never moved.
+    if x.state != SandboxState::Running {
+        return Err(ApiFailure::from(CoreError::Conflict(
+            "sandbox is not running".into(),
+        )));
+    }
     s.runtime_for(&x)?
         .pause(&x)
         .await
@@ -3864,6 +3872,13 @@ async fn restore_snapshot(
         None => stored.image_id.clone(),
     };
     let now = Utc::now();
+    // Sized exactly like a create that names nothing: the snapshot row keeps
+    // the source image but no shape fields, so unnamed sizing here must be the
+    // same `default_cpu/memory/disk/timeout` a create uses rather than a
+    // second literal set that can drift from it. A restore that forgets to grow
+    // with the workload still drops into whatever the source wrote, but that
+    // is the workspace bytes being smaller than the disk, not the machine
+    // being smaller than the source shape the caller asked to keep.
     let mut x = Sandbox {
         id: new_id(),
         tenant_id: p.tenant_id,
@@ -3871,10 +3886,10 @@ async fn restore_snapshot(
         image_id,
         state: SandboxState::Restoring,
         runtime,
-        cpu: r.cpu.unwrap_or(1),
-        memory_mb: r.memory_mb.unwrap_or(512),
-        disk_mb: r.disk_mb.unwrap_or(2048),
-        timeout_seconds: 900,
+        cpu: r.cpu.unwrap_or_else(aiec_core::default_cpu),
+        memory_mb: r.memory_mb.unwrap_or_else(aiec_core::default_memory),
+        disk_mb: r.disk_mb.unwrap_or_else(aiec_core::default_disk),
+        timeout_seconds: aiec_core::default_timeout(),
         network: NetworkPolicy::default(),
         environment: Default::default(),
         created_at: now,
@@ -7119,6 +7134,7 @@ mod tests {
         /// the second is told nothing is in the way any more.
         destroy_failures: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<CoreError>>>,
         start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pause_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RunRuntime {
@@ -7160,6 +7176,8 @@ mod tests {
             Ok(())
         }
         async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.pause_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
@@ -8315,6 +8333,62 @@ mod tests {
                 .expect("row")
                 .state,
             SandboxState::Running
+        );
+    }
+
+    /// A pause on a machine that is not Running must be refused before the
+    /// guest is touched. The handler called `runtime.pause()` first and then
+    /// failed the durable swap, stopping a guest whose row never moved.
+    #[tokio::test]
+    async fn pause_on_a_stopped_sandbox_touches_no_guest() {
+        use std::sync::atomic::Ordering;
+        let runtime = std::sync::Arc::new(RunRuntime::default());
+        let fixture = RunFixture::with_runtime(runtime.clone());
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Stopped,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        fixture
+            .store
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("seed stopped sandbox");
+        let response = app(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(format!("/v1/sandboxes/{}/pause", sandbox.id))
+                    .header("authorization", format!("Bearer {}", fixture.key))
+                    .body(Body::empty())
+                    .expect("pause request"),
+            )
+            .await
+            .expect("pause response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(runtime.pause_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .expect("row")
+                .state,
+            SandboxState::Stopped
         );
     }
 
