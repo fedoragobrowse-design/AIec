@@ -2633,6 +2633,7 @@ async fn delete_artifact(
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
+    let key = artifact_key(p.tenant_id, id, &name)?;
     let store = s.artifact_store().ok_or_else(|| {
         ApiFailure::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -2640,10 +2641,19 @@ async fn delete_artifact(
             "artifact storage is not configured",
         )
     })?;
-    store
-        .delete(&artifact_key(p.tenant_id, id, &name)?)
+    // Tombstone the ledger row before the bytes go. Without this the row
+    // stays `available` after the delete: the name is reserved forever
+    // (keys cannot be reused after deletion) while pointing at nothing, and
+    // a later re-upload of the same name is refused as expired. A delete
+    // that finds no row to mark deletes no bytes, and one that loses the
+    // row to another owner or to the sweeper's claim is refused rather than
+    // retiring someone else's bytes. The tombstone also stops the GC from
+    // ever claiming a key the user already removed.
+    s.repository()
+        .delete_artifact_upload(p.tenant_id, None, &key)
         .await
         .map_err(ApiFailure::from)?;
+    store.delete(&key).await.map_err(ApiFailure::from)?;
     Ok(Json(json!({"status": "deleted"})))
 }
 

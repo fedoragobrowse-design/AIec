@@ -179,6 +179,33 @@ impl MemoryRepository {
         }
         Ok(())
     }
+    pub(crate) async fn delete_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        if run.is_some() {
+            return Err(CoreError::Unsupported("memory Run storage".into()));
+        }
+        let mut data = self.data.write().await;
+        let object = data
+            .artifact_objects
+            .get_mut(key)
+            .filter(|object| object.tenant == tenant)
+            .ok_or_else(|| CoreError::NotFound("upload ownership not found".into()))?;
+        if matches!(object.state, ObjectState::Deleting | ObjectState::Deleted) {
+            return Err(CoreError::Conflict(
+                "object key belongs to another owner or has expired".into(),
+            ));
+        }
+        object.state = ObjectState::Deleted;
+        object.claim = None;
+        object.lease_until = None;
+        object.updated_at = Utc::now();
+        object.retry_at = object.updated_at;
+        Ok(())
+    }
 
     pub(crate) async fn claim_artifact_deletions(
         &self,
@@ -630,6 +657,62 @@ mod tests {
         assert_eq!(
             claims(&repository, now + Duration::hours(1)).await[0].key,
             "archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_delete_tombstones_the_row_so_the_gc_never_claims_it() {
+        let repository = MemoryRepository::new();
+        let owner = tenant(&repository).await;
+        let other = tenant(&repository).await;
+        let now = Utc::now();
+        repository
+            .reserve_artifact_upload(owner, None, "doomed")
+            .await
+            .unwrap();
+        repository
+            .complete_artifact_upload(owner, None, "doomed")
+            .await
+            .unwrap();
+        // A foreign tenant loses the row to the owner: no tombstone, no bytes.
+        assert!(
+            repository
+                .delete_artifact_upload(other, None, "doomed")
+                .await
+                .is_err()
+        );
+        repository
+            .delete_artifact_upload(owner, None, "doomed")
+            .await
+            .unwrap();
+        // A row nobody wrote is `NotFound`, not a deletion of nothing.
+        assert!(
+            repository
+                .delete_artifact_upload(owner, None, "missing")
+                .await
+                .is_err()
+        );
+        // The tombstone keeps the name reserved and stays out of the sweep.
+        assert!(
+            repository
+                .reserve_artifact_upload(owner, None, "doomed")
+                .await
+                .is_err()
+        );
+        age(&repository, now).await;
+        assert!(claims(&repository, now).await.is_empty());
+        // A late producer acknowledgement rearms deletion rather than
+        // restoring the retired key: it still errors, and the row becomes
+        // claimable again instead of referenceable.
+        assert!(
+            repository
+                .complete_artifact_upload(owner, None, "doomed")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            claims(&repository, now + Duration::hours(1)).await[0].key,
+            "doomed"
         );
     }
 }

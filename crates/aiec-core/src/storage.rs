@@ -1386,6 +1386,20 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), CoreError> {
         Err(CoreError::Unsupported("artifact lifecycle storage".into()))
     }
+    /// Records an explicit user delete before the bytes are removed. Unlike
+    /// the GC claim path, which only touches expired rows, a user delete of a
+    /// live row would otherwise leave it `available` after the bytes are
+    /// gone: the row keeps the name reserved forever (keys cannot be reused
+    /// after deletion) while pointing at nothing. Marking it `deleted` first
+    /// keeps the reservation the row implies and lets the bytes go.
+    async fn delete_artifact_upload(
+        &self,
+        _tenant: TenantId,
+        _run: Option<Uuid>,
+        _key: &str,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Unsupported("artifact lifecycle storage".into()))
+    }
     /// Expires at most `limit` terminal Runs and leases at most `limit` safe deletions.
     /// All reference checks and ownership changes happen atomically; no object I/O occurs here.
     async fn claim_artifact_deletions(

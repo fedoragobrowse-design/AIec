@@ -5211,6 +5211,16 @@ impl MetadataStore for PostgresRepository {
             .await
             .map_err(core_error)
     }
+    async fn delete_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), CoreError> {
+        Self::delete_artifact_upload(self, tenant, run, key)
+            .await
+            .map_err(core_error)
+    }
     async fn claim_artifact_deletions(
         &self,
         now: DateTime<Utc>,

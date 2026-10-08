@@ -122,6 +122,46 @@ impl PostgresRepository {
         }
         Ok(())
     }
+    /// Marks a user-deleted key as expired before the bytes are removed, so
+    /// the ledger stops advertising bytes that are about to disappear. A
+    /// missing row is `NotFound`; a row owned by another tenant or Run, or
+    /// one already claimed by the sweeper, is `Conflict`, so a delete can
+    /// neither retire someone else's bytes nor race a deletion claim. The
+    /// tombstone keeps the name reserved: keys cannot be reused after
+    /// deletion, and a delete that finds no row to mark deletes no bytes.
+    pub(crate) async fn delete_artifact_upload(
+        &self,
+        tenant: Uuid,
+        run: Option<Uuid>,
+        key: &str,
+    ) -> Result<(), StoreError> {
+        crate::object_store::validate_object_key(key)?;
+        let result = sqlx::query(
+            "UPDATE artifact_objects SET state='deleted',claim=NULL,lease_until=NULL,retry_at=now(),updated_at=now() \
+             WHERE object_key=$1 AND tenant_id=$2 AND owner_run_id IS NOT DISTINCT FROM $3 \
+             AND state IN ('pending','available')",
+        )
+        .bind(key)
+        .bind(tenant)
+        .bind(run)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 0 {
+            let exists = sqlx::query("SELECT 1 FROM artifact_objects WHERE object_key=$1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(database_error)?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            return Err(StoreError::Conflict(
+                "object key belongs to another owner or has expired".into(),
+            ));
+        }
+        Ok(())
+    }
 
     pub(crate) async fn claim_artifact_deletions(
         &self,
@@ -1128,6 +1168,74 @@ mod tests {
             MetadataStore::put_run_artifacts(&fixture.repository, tenant, run, artifacts)
                 .await
                 .is_err()
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn user_delete_tombstones_the_row_and_hides_it_from_the_sweep() {
+        let Some(fixture) = Fixture::new().await else {
+            return;
+        };
+        let tenant = fixture.tenant().await;
+        let other_tenant = fixture.tenant().await;
+        let now = Utc::now();
+        let key = format!("tenants/{tenant}/report");
+        fixture
+            .repository
+            .reserve_artifact_upload(tenant, None, &key)
+            .await
+            .unwrap();
+        fixture
+            .repository
+            .complete_artifact_upload(tenant, None, &key)
+            .await
+            .unwrap();
+        // A foreign tenant loses the row to the owner: no tombstone, no bytes.
+        assert!(
+            fixture
+                .repository
+                .delete_artifact_upload(other_tenant, None, &key)
+                .await
+                .is_err()
+        );
+        fixture
+            .repository
+            .delete_artifact_upload(tenant, None, &key)
+            .await
+            .unwrap();
+        // A row nobody wrote is `NotFound`, not a deletion of nothing.
+        assert!(matches!(
+            fixture
+                .repository
+                .delete_artifact_upload(tenant, None, &format!("tenants/{tenant}/missing"))
+                .await,
+            Err(StoreError::NotFound)
+        ));
+        // The tombstone keeps the name reserved and stays out of the sweep.
+        assert!(
+            fixture
+                .repository
+                .reserve_artifact_upload(tenant, None, &key)
+                .await
+                .is_err()
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM artifact_objects WHERE object_key=$1")
+                .bind(&key)
+                .fetch_one(&fixture.repository.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "deleted");
+        fixture.age_objects(now).await;
+        let claims = fixture
+            .repository
+            .claim_artifact_deletions(now, 3600, 600, 100, 300)
+            .await
+            .unwrap();
+        assert!(
+            !claims.iter().any(|claim| claim.key == key),
+            "deleted row must stay out of the sweep"
         );
         fixture.close().await;
     }
