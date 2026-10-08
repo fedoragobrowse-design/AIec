@@ -3687,6 +3687,31 @@ impl FirecrackerRuntime {
         Ok(())
     }
 
+    /// One step of a multi-chunk file read: validates the chunk against the
+    /// request, pins the first chunk's version/size, and refuses a later chunk
+    /// that drifts — a same-size replacement landing between two completed chunks
+    /// passes per-chunk validation and would otherwise splice halves silently.
+    /// Returns the chunk's bytes and whether the read is complete.
+    fn assemble_chunk(
+        pinned: &mut Option<(String, u64)>,
+        request: &aiec_core::runtime::FileChunkRequest,
+        chunk: &aiec_core::runtime::FileChunk,
+    ) -> Result<(bytes::Bytes, bool), RuntimeError> {
+        request.validate_chunk(chunk)?;
+        match &pinned {
+            None => *pinned = Some((chunk.version.clone(), chunk.size_bytes)),
+            Some((version, size)) => {
+                if chunk.version != *version || chunk.size_bytes != *size {
+                    return Err(aiec_core::CoreError::Conflict(
+                        "file changed while reading".into(),
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok((chunk.bytes.clone(), chunk.eof))
+    }
+
     async fn get_file(&self, sandbox: &Sandbox, path: &str) -> Result<FileContent, RuntimeError> {
         use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunkRequest};
         // Before the read, not after it: a configured canary must be able to
@@ -3701,12 +3726,18 @@ impl FirecrackerRuntime {
         // be readable on the way out.
         let mut content = Vec::new();
         let mut offset = 0u64;
+        // The first chunk's version and size pin every later one: without the
+        // pin a same-size replacement landing between two completed chunks
+        // passes per-chunk validation and splices halves silently — the
+        // hazard documented for unpinned bursts in aiec-core. The artifact
+        // path pins the same way (RunArtifactSource::accept).
+        let mut pinned: Option<(String, u64)> = None;
         loop {
             let request = FileChunkRequest {
                 path: path.to_owned(),
                 offset,
                 length: FILE_CHUNK_BYTES,
-                expected_version: None,
+                expected_version: pinned.as_ref().map(|(version, _)| version.clone()),
             };
             let eof = match self
                 .guest_call(
@@ -3730,9 +3761,10 @@ impl FirecrackerRuntime {
                         version,
                         eof,
                     };
-                    request.validate_chunk(&chunk)?;
-                    content.extend_from_slice(&chunk.bytes);
-                    eof
+                    let (bytes, done) = Self::assemble_chunk(&mut pinned, &request, &chunk)?;
+                    content.extend_from_slice(&bytes);
+                    offset += bytes.len() as u64;
+                    done
                 }
                 _ => {
                     return Err(RuntimeError::Unavailable(
@@ -3743,7 +3775,6 @@ impl FirecrackerRuntime {
             if eof {
                 break;
             }
-            offset += FILE_CHUNK_BYTES as u64;
         }
         use base64::Engine;
         Ok(FileContent {
@@ -6699,8 +6730,93 @@ mod tests {
         runtime.vms.lock().await.remove(&id);
         let _ = std::fs::remove_dir_all(&root);
     }
-}
 
+    /// A same-size replacement landing between two chunks used to splice
+    /// halves silently: per-chunk validation passes on a stable file, so the
+    /// pin on the first chunk's version is what refuses the splice.
+    #[test]
+    fn a_same_size_replacement_mid_read_is_refused_not_spliced() {
+        use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunk, FileChunkRequest};
+        let mut pinned = None;
+        let first = FileChunkRequest {
+            path: "/workspace/data.bin".into(),
+            offset: 0,
+            length: FILE_CHUNK_BYTES,
+            expected_version: None,
+        };
+        let first_chunk = FileChunk {
+            bytes: bytes::Bytes::from(vec![b'a'; FILE_CHUNK_BYTES]),
+            size_bytes: FILE_CHUNK_BYTES as u64 * 2,
+            version: "v1".into(),
+            eof: false,
+        };
+        let (bytes, done) = FirecrackerRuntime::assemble_chunk(&mut pinned, &first, &first_chunk)
+            .expect("the first chunk pins");
+        assert_eq!(bytes.len(), FILE_CHUNK_BYTES);
+        assert!(!done);
+        // The file is replaced with same-size different bytes: the guest
+        // reports a new version at the same size and offset.
+        let second = FileChunkRequest {
+            path: "/workspace/data.bin".into(),
+            offset: bytes.len() as u64,
+            length: FILE_CHUNK_BYTES,
+            expected_version: Some("v1".into()),
+        };
+        let swapped = FileChunk {
+            bytes: bytes::Bytes::from(vec![b'b'; FILE_CHUNK_BYTES]),
+            size_bytes: FILE_CHUNK_BYTES as u64 * 2,
+            version: "v2".into(),
+            eof: true,
+        };
+        let refused = FirecrackerRuntime::assemble_chunk(&mut pinned, &second, &swapped);
+        assert!(
+            matches!(
+                refused,
+                Err(RuntimeError::Core(aiec_core::CoreError::Conflict(_)))
+            ),
+            "a mid-read replacement must be refused, got {refused:?}"
+        );
+    }
+
+    /// The steady state still works: identical version and size across chunks
+    /// assembles, and the final chunk reports completion.
+    #[test]
+    fn a_stable_file_assembles_across_chunks() {
+        use aiec_core::runtime::{FILE_CHUNK_BYTES, FileChunk, FileChunkRequest};
+        let mut pinned = None;
+        let first = FileChunkRequest {
+            path: "/workspace/data.bin".into(),
+            offset: 0,
+            length: FILE_CHUNK_BYTES,
+            expected_version: None,
+        };
+        let first_chunk = FileChunk {
+            bytes: bytes::Bytes::from(vec![b'a'; FILE_CHUNK_BYTES]),
+            size_bytes: FILE_CHUNK_BYTES as u64 + 3,
+            version: "v1".into(),
+            eof: false,
+        };
+        let (head, done) = FirecrackerRuntime::assemble_chunk(&mut pinned, &first, &first_chunk)
+            .expect("stable first chunk");
+        assert!(!done);
+        let second = FileChunkRequest {
+            path: "/workspace/data.bin".into(),
+            offset: head.len() as u64,
+            length: FILE_CHUNK_BYTES,
+            expected_version: Some("v1".into()),
+        };
+        let tail = FileChunk {
+            bytes: bytes::Bytes::from(vec![b'b'; 3]),
+            size_bytes: FILE_CHUNK_BYTES as u64 + 3,
+            version: "v1".into(),
+            eof: true,
+        };
+        let (rest, done) = FirecrackerRuntime::assemble_chunk(&mut pinned, &second, &tail)
+            .expect("stable second chunk");
+        assert!(done);
+        assert_eq!(rest.len(), 3);
+    }
+}
 #[cfg(test)]
 mod artifact_cache_tests {
     use super::artifact_identity;
