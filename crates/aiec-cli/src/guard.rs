@@ -379,7 +379,87 @@ async fn authenticated(_url: &str, key: Option<String>) -> Result<reqwest::Clien
             );
             headers
         })
+        // The tenant key rides on every call. A redirect a compromised or
+        // misconfigured control plane (or a path-rewriting proxy) answers
+        // with would otherwise resend it to the target, the same class the
+        // worker and SDK clients already refuse. The routes never redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::authenticated;
+
+    /// The bearer must never ride a redirect. Axum answers the 302 and a
+    /// probe listener records any arrival: a request reaching it at all is
+    /// the client having followed a redirect it never meant to take.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_with_the_tenant_key() {
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a target listener");
+        let elsewhere_addr = elsewhere.local_addr().expect("a target address");
+        let arrivals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = arrivals.clone();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let counting = counting.clone();
+                async move {
+                    counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (axum::http::StatusCode::OK, "followed")
+                }
+            });
+            axum::serve(elsewhere, app).await.expect("a target server");
+        });
+        let redirect_to = format!("http://{elsewhere_addr}/v1/guard/redirect");
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an origin listener");
+        let origin_addr = origin.local_addr().expect("an origin address");
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/guard/proposals",
+                axum::routing::any(move || {
+                    let redirect_to = redirect_to.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::FOUND,
+                            [(axum::http::header::LOCATION, redirect_to)],
+                            axum::Json(serde_json::json!({"location": "elsewhere"})),
+                        )
+                    }
+                }),
+            );
+            axum::serve(origin, app).await.expect("an origin server");
+        });
+        let client = authenticated(
+            &format!("http://{origin_addr}"),
+            Some("guard-redirect-secret".to_owned()),
+        )
+        .await
+        .expect("a client");
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let response = client
+                .request(
+                    method.clone(),
+                    format!("http://{origin_addr}/v1/guard/proposals"),
+                )
+                .send()
+                .await
+                .expect("a reply");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::FOUND,
+                "{method}: the redirect must surface, not be followed"
+            );
+        }
+        assert_eq!(
+            arrivals.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the redirect target was contacted"
+        );
+    }
 }
 
 #[cfg(test)]
