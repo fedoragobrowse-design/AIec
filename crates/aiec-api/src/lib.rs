@@ -489,6 +489,22 @@ impl AppState {
             )
         })
     }
+    /// The same serialization for callers outside route handlers: the run
+    /// watchdog and run cleanup destroy through `destroy_with_retry`, and a
+    /// guard held only by the DELETE route would leave those paths racing
+    /// the guarded handlers. Contention waits on the per-sandbox mutex
+    /// rather than failing; the `Conflict` below only fires when the lock
+    /// table itself is flooded past its ceiling, and it surfaces as a
+    /// terminal destroy error rather than a rate limit.
+    pub(crate) async fn destroy_guard(
+        &self,
+        sandbox_id: Uuid,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, CoreError> {
+        self.lifecycle
+            .acquire(sandbox_id)
+            .await
+            .map_err(|busy| CoreError::Conflict(format!("sandbox lifecycle is busy: {busy}")))
+    }
 
     async fn secret_values(
         &self,
@@ -10141,6 +10157,174 @@ mod lifecycle_serialization {
             }
             other => panic!("an unexpected durable state after the race: {other:?}"),
         }
+    }
+    /// Two destroys racing the same sandbox must serialize to one runtime
+    /// side effect: the second waits on the lifecycle guard, then reads a
+    /// row the first already deleted and answers success without touching
+    /// the guest again. Without the guard both read Running before either
+    /// deletes, and the machine is destroyed twice.
+    #[tokio::test]
+    async fn concurrent_destroys_touch_the_guest_exactly_once() {
+        struct GatedDestroy {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            destroys: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl SandboxRuntime for GatedDestroy {
+            async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn exec(&self, _: &Sandbox, _: ExecRequest) -> Result<ExecResult, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: FileChunkRequest,
+            ) -> Result<FileChunk, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+                Ok(Vec::new())
+            }
+            async fn delete_file(
+                &self,
+                _: &Sandbox,
+                _: DeleteFileRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn make_directory(
+                &self,
+                _: &Sandbox,
+                _: MakeDirectoryRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn import_workspace_archive(
+                &self,
+                _: &Sandbox,
+                _: &[u8],
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+                // First destroy in blocks here; the racer must not enter
+                // until this one is released, which the guard guarantees.
+                self.destroys.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(())
+            }
+            async fn health(&self) -> RuntimeHealth {
+                RuntimeHealth::healthy()
+            }
+            fn capabilities(&self) -> RuntimeCapabilities {
+                RuntimeCapabilities::default()
+            }
+        }
+
+        let repository: Arc<dyn aiec_core::storage::MetadataStore> =
+            aiec_storage::MemoryRepository::new();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let destroys = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(GatedDestroy {
+            entered: entered.clone(),
+            release: release.clone(),
+            destroys: destroys.clone(),
+        });
+        let platform = Platform::builder()
+            .runtime(runtime.clone())
+            .runtime_registry(Arc::new(aiec_core::runtime::RuntimeRegistry::with_runtime(
+                RuntimeKind::Docker,
+                runtime.clone(),
+            )))
+            .metadata_store(repository.clone())
+            .scheduler(Arc::new(DevelopmentScheduler))
+            .artifact_store(Arc::new(aiec_storage::FilesystemObjectStore::new(
+                std::env::temp_dir().join(format!("af-destroy-{}", new_id())),
+            )))
+            .policy(Arc::new(DefaultPolicy))
+            .build()
+            .expect("platform");
+        let state = AppState::development(platform);
+
+        let tenant = new_id();
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: tenant,
+            node_id: Some(new_id()),
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        repository
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("create sandbox");
+
+        let id = sandbox.id;
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move { crate::runs::destroy_with_retry(&state, tenant, id).await })
+        };
+        // The first destroy is inside runtime.destroy; the second must wait
+        // on the lifecycle guard rather than entering teardown alongside.
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+            .await
+            .expect("the first destroy never entered the runtime");
+        // Give the racer every chance to slip past the guard, then release.
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move { crate::runs::destroy_with_retry(&state, tenant, id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            destroys.load(Ordering::SeqCst),
+            1,
+            "the second destroy entered the runtime while the first was mid-teardown"
+        );
+        release.notify_waiters();
+        let (first_outcome, second_outcome) = tokio::join!(first, second);
+        first_outcome.unwrap().expect("first destroy");
+        second_outcome
+            .unwrap()
+            .expect("second destroy answers success");
+        assert_eq!(
+            destroys.load(Ordering::SeqCst),
+            1,
+            "two destroys touched the guest twice for one machine"
+        );
     }
 
     async fn started_wait(started: &AtomicBool) {

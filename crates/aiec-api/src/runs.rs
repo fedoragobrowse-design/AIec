@@ -1774,6 +1774,12 @@ pub(crate) async fn destroy_with_retry(
     sandbox_id: Uuid,
 ) -> Result<(), CoreError> {
     const ATTEMPTS: usize = 4;
+    // Serialized against pause/stop/resume/start like every other lifecycle
+    // operation, and held across all attempts including the backoff sleeps:
+    // a second destroy arriving mid-backoff must wait rather than issuing a
+    // duplicate runtime.destroy, and a pause checking state mid-teardown
+    // must not act on a machine whose row is about to disappear.
+    let _lifecycle = state.destroy_guard(sandbox_id).await?;
     let mut last = CoreError::NotFound("sandbox was not destroyed".into());
     for attempt in 0..ATTEMPTS {
         // Through the shared teardown, not straight to the row. Calling the
