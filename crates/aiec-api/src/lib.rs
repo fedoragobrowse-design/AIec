@@ -3248,6 +3248,13 @@ async fn exec_sandbox(
     let injected = s.secret_values(p.tenant_id, id).await;
     let redactor = SecretRedactor::new(injected.values().cloned().collect());
     r.environment.extend(injected);
+    // The merged map is what the runtime actually receives, and the tenant's
+    // own secrets can push it past the intake gate: secret values allow 16 KiB
+    // each while exec values allow 4 KiB, and 32 secrets can exceed the 64 KiB
+    // total. Re-check rather than trust the pre-merge validation — without
+    // this, a large-but-legal secret turns a caller's valid exec into a
+    // runtime-boundary 400 on Docker while the other runtimes accept it.
+    validate_exec_environment(&r.environment).map_err(ApiFailure::from)?;
     let started = std::time::Instant::now();
     let outcome = s.runtime_for(&x)?.exec(&x, r).await;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -7901,6 +7908,142 @@ mod tests {
                 .expect("sandbox row")
                 .state,
             SandboxState::Destroyed
+        );
+    }
+    // The merged environment is what the runtime receives, and the tenant's
+    // own secrets can push it past the intake gate: secret values allow 16 KiB
+    // each while exec values allow 4 KiB. Without the post-merge re-check, a
+    // large-but-legal secret turned a valid exec into a runtime-boundary 400 on
+    // Docker while the other runtimes accepted it — same caller, same tenant
+    // state, different answer per backend.
+    #[tokio::test]
+    async fn an_exec_merged_with_a_large_secret_is_refused_at_intake() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct RecordingRuntime {
+            seen: std::sync::Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
+        }
+        #[async_trait::async_trait]
+        impl SandboxRuntime for RecordingRuntime {
+            async fn create(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn pause(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn resume(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn exec(
+                &self,
+                _: &Sandbox,
+                request: ExecRequest,
+            ) -> Result<ExecResult, CoreError> {
+                self.seen.lock().unwrap().push(request.environment);
+                Ok(ExecResult {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                    timed_out: false,
+                })
+            }
+            async fn put_file(&self, _: &Sandbox, _: PutFileRequest) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn get_file(&self, _: &Sandbox, _: &str) -> Result<FileContent, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn get_file_chunk(
+                &self,
+                _: &Sandbox,
+                _: aiec_core::runtime::FileChunkRequest,
+            ) -> Result<aiec_core::runtime::FileChunk, CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn list_files(&self, _: &Sandbox, _: &str) -> Result<Vec<FileEntry>, CoreError> {
+                Ok(Vec::new())
+            }
+            async fn delete_file(
+                &self,
+                _: &Sandbox,
+                _: DeleteFileRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn make_directory(
+                &self,
+                _: &Sandbox,
+                _: MakeDirectoryRequest,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn import_workspace_archive(
+                &self,
+                _: &Sandbox,
+                _: &[u8],
+            ) -> Result<(), CoreError> {
+                Err(CoreError::Backend("unused".into()))
+            }
+            async fn destroy(&self, _: &Sandbox) -> Result<(), CoreError> {
+                Ok(())
+            }
+            async fn health(&self) -> aiec_core::runtime::RuntimeHealth {
+                aiec_core::runtime::RuntimeHealth::healthy()
+            }
+            fn capabilities(&self) -> aiec_core::runtime::RuntimeCapabilities {
+                aiec_core::runtime::RuntimeCapabilities {
+                    exec: true,
+                    files: true,
+                    ..aiec_core::runtime::RuntimeCapabilities::default()
+                }
+            }
+        }
+        let runtime: std::sync::Arc<dyn SandboxRuntime> =
+            std::sync::Arc::new(RecordingRuntime { seen: seen.clone() });
+        let fixture = RunFixture::with_runtime(runtime);
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let (status, created) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                "/v1/sandboxes",
+                json!({ "image": "alpine:3.21" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "create: {created}");
+        let sandbox_id = created["id"].as_str().expect("sandbox id").to_owned();
+        // A legal secret (16 KiB values allowed) that the merged exec map
+        // cannot carry (4 KiB per value). Stored first, exactly as a tenant
+        // would before running a command that needs it.
+        let big = "s".repeat(8 * 1024);
+        let (status, stored) = fixture
+            .call_json(
+                axum::http::Method::PUT,
+                &format!("/v1/sandboxes/{sandbox_id}/secrets/TOKEN"),
+                json!({ "value": big }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "put secret: {stored}");
+        let (status, outcome) = fixture
+            .call_json(
+                axum::http::Method::POST,
+                &format!("/v1/sandboxes/{sandbox_id}/exec"),
+                json!({ "command": ["true"] }),
+            )
+            .await;
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::PAYLOAD_TOO_LARGE,
+            "a merged map past the gate must be refused at intake, not at the runtime: {status} {outcome}"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the refused exec must never reach the runtime"
         );
     }
 

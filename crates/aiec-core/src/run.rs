@@ -267,6 +267,12 @@ impl WorkloadSpec {
                 ));
             }
         }
+        // The run path merges this map with resolved secrets at exec time
+        // without re-checking (the merge itself only refuses collisions), so
+        // an unbounded map here reaches the guest through the back door while
+        // the /exec route refuses the same map at intake. Validated once, at
+        // submission, with the same gate.
+        crate::validate_exec_environment(&self.environment)?;
         Ok(())
     }
 }
@@ -947,6 +953,19 @@ mod tests {
         }
         assert!(!RunState::Queued.can_transition_to(RunState::Succeeded));
         assert!(!RunState::Running.can_transition_to(RunState::Succeeded));
+    }
+    // The run path merges this map with secrets at exec time without
+    // re-checking, so without this the same oversized map refused by /exec
+    // reaches the guest through a run submission.
+    #[test]
+    fn a_workload_environment_beyond_the_exec_gate_is_refused_at_submission() {
+        let mut workload = WorkloadSpec {
+            command: vec!["true".into()],
+            ..WorkloadSpec::default()
+        };
+        workload.validate().expect("a plain workload is legal");
+        workload.environment.insert("OK".into(), "x".repeat(4097));
+        assert!(workload.validate().is_err());
     }
 
     #[test]
