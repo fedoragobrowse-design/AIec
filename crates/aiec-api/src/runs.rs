@@ -301,11 +301,19 @@ pub(crate) async fn execute_created(
         } else {
             RunState::Failed
         };
+        // Scrubbed like the run's own reason: the same transport error quoting
+        // the environment lands here when the attempt fails before `execute`
+        // records anything.
+        let attempt_scrubber = state
+            .run_secrets()
+            .resolve(tenant, &request.workload.secrets)
+            .await
+            .map(|resolved| resolved.redactor())
+            .unwrap_or_default();
         evidence.failure_reason = error
             .as_ref()
-            .map(ToString::to_string)
+            .map(|error| attempt_scrubber.redact_text_uncapped(&error.to_string()))
             .or_else(|| current.failure_reason.clone());
-        evidence.completed_at = Some(Utc::now());
         evidence.placement = current.placement.clone();
         evidence.results = current.results.clone();
         store.complete_run_attempt(tenant, evidence).await?;
@@ -630,9 +638,22 @@ async fn execute(
     let succeeded = attempt.is_ok()
         && results.task.as_ref().is_some_and(|task| task.ok)
         && results.validations.iter().all(|validation| validation.ok);
-    // Retention must see task and validation failures, not just transport errors.
+    // Scrubbed against the values the workload was given, because command
+    // output is where secrets land: `run_command` redacts its stored streams,
+    // but a transport error quoting the environment survives as the attempt
+    // error, and `error.to_string()` here made it the run's `failure_reason`
+    // verbatim. Re-resolving here reads the same file `run_command` reads; a
+    // value rotated mid-run scrubs against the new value rather than the one
+    // that leaked, but it closes the hole with the freshest values available,
+    // and a resolution failure leaves the reason intact rather than failing.
+    let scrubber = state
+        .run_secrets()
+        .resolve(tenant, &request.workload.secrets)
+        .await
+        .map(|resolved| resolved.redactor())
+        .unwrap_or_default();
     run.failure_reason = match &attempt {
-        Err(error) => Some(error.to_string()),
+        Err(error) => Some(scrubber.redact_text_uncapped(&error.to_string())),
         Ok(()) if !succeeded => Some(
             if results.task.as_ref().is_some_and(|task| !task.ok) {
                 "the task did not succeed"
@@ -2157,6 +2178,23 @@ mod retry_policy {
         assert!(is_retryable(&CoreError::Backend(
             "worker transport: connection reset".into()
         )));
+    }
+    /// A transport error that quotes the environment must not reach the run's
+    /// `failure_reason` verbatim: the values it quotes are the workload's
+    /// secrets, and the reason is stored and returned. The reason path now
+    /// scrubs through the same `SecretRedactor` the command path uses — before
+    /// the fix the value survived into the stored string.
+    #[test]
+    fn a_failure_reason_quoting_secrets_is_scrubbed() {
+        use crate::run_secrets::SecretRedactor;
+        let redactor = SecretRedactor::new(vec!["s3cr3t-value".to_owned()]);
+        let leaked =
+            CoreError::Backend("worker transport: reset with env TOKEN=s3cr3t-value".into());
+        let reason = redactor.redact_text_uncapped(&leaked.to_string());
+        assert!(
+            !reason.contains("s3cr3t-value") && reason.contains("[redacted]"),
+            "failure_reason leaked the secret value: {reason}"
+        );
     }
 
     /// The set is closed. Anything not explicitly transient is fatal, so a new
