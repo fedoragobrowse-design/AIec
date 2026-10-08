@@ -836,12 +836,22 @@ fn exec_status(exit_code: Option<i64>, running: Option<bool>) -> Result<Option<i
     }
 }
 
+// A non-zero exit means the *guest* refused the operation: the container ran the
+// helper but `mkdir`/`cat`/`chmod`/`rm` failed inside it (read-only mount, disk
+// full, a path that cannot be written). That is a backend refusal, not an IO
+// fault — and `Io` surfaces as a 500 `internal` while `Backend` surfaces as a
+// 500 `backend`, so the class decides what the caller is told to blame. Either
+// way the retried-then-abandoned alternative is worse: two attempts at a `cat`
+// write can leave a partial file, so this stays fail-fast with a carry-through
+// message rather than becoming a retry.
 fn ensure_success(result: ExecResult) -> Result<(), aiec_core::CoreError> {
     if result.exit_code == 0 {
         Ok(())
     } else {
-        Err(aiec_core::CoreError::Io(std::io::Error::other(
-            result.stderr,
+        Err(aiec_core::CoreError::Backend(format!(
+            "the sandbox refused the file operation (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim(),
         )))
     }
 }
@@ -2944,6 +2954,38 @@ mod tests {
             exec_status(None, Some(false)).is_err(),
             "finished without a code must not be a success"
         );
+    }
+    // A helper that exits non-zero inside the container means the *guest*
+    // refused the operation — not a transport fault. `Io` surfaces as a 500
+    // `internal`; `Backend` surfaces as a 500 `backend`, so the class decides
+    // what the caller is told happened. Pin the class, not just the refusal.
+    #[test]
+    fn a_guest_refusal_is_a_backend_error_not_an_io_error() {
+        let failed = ExecResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "mkdir: cannot create directory: Permission denied".into(),
+            duration_ms: 3,
+            timed_out: false,
+        };
+        match ensure_success(failed) {
+            Err(aiec_core::CoreError::Backend(message)) => {
+                assert!(message.contains("exit 1"), "carry-through exit: {message}");
+                assert!(
+                    message.contains("Permission denied"),
+                    "carry-through cause: {message}"
+                );
+            }
+            other => panic!("a guest refusal must be Backend, got {other:?}"),
+        }
+        let ok = ExecResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 1,
+            timed_out: false,
+        };
+        assert!(ensure_success(ok).is_ok());
     }
 
     /// Standard input is delivered under the exec's own deadline. A command
