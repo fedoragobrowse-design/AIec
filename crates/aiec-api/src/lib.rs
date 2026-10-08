@@ -2942,8 +2942,18 @@ async fn start_sandbox(
         .get_sandbox(p.tenant_id, id)
         .await
         .map_err(ApiFailure::from)?;
+    // Checked before the guest is touched: without this the runtime side
+    // effect fires on a Running or Paused machine and the durable swap then
+    // fails, bouncing a guest whose row never moved.
+    if !matches!(
+        x.state,
+        SandboxState::Stopped | SandboxState::Failed | SandboxState::Creating
+    ) {
+        return Err(ApiFailure::from(CoreError::Conflict(
+            "sandbox is not startable".into(),
+        )));
+    }
     let old = x.state;
-    x.state = SandboxState::Starting;
     s.runtime_for(&x)?
         .start(&x)
         .await
@@ -7102,6 +7112,7 @@ mod tests {
         /// for: the first destroy refuses exactly as the real worker does and
         /// the second is told nothing is in the way any more.
         destroy_failures: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<CoreError>>>,
+        start_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RunRuntime {
@@ -7135,6 +7146,8 @@ mod tests {
             Ok(())
         }
         async fn start(&self, _: &Sandbox) -> Result<(), CoreError> {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn stop(&self, _: &Sandbox) -> Result<(), CoreError> {
@@ -8239,6 +8252,63 @@ mod tests {
                 .get(&run.id)
                 .is_some_and(|events| events.iter().any(|e| e.event_type == "run.failed")),
             "no failure event for a failure that was never durably recorded"
+        );
+    }
+
+    /// A start on a machine already running must be refused before the guest
+    /// is touched. The handler used to call `runtime.start()` first and swap
+    /// the durable state after, so a Running sandbox got its guest bounced and
+    /// then a 409 `invalid state transition` with no row change.
+    #[tokio::test]
+    async fn start_on_a_running_sandbox_touches_no_guest() {
+        use std::sync::atomic::Ordering;
+        let runtime = std::sync::Arc::new(RunRuntime::default());
+        let fixture = RunFixture::with_runtime(runtime.clone());
+        fixture.issue_key(fixture.tenant, &fixture.key).await;
+        let now = Utc::now();
+        let sandbox = Sandbox {
+            id: new_id(),
+            tenant_id: fixture.tenant,
+            node_id: None,
+            image_id: "alpine:3.21".into(),
+            state: SandboxState::Running,
+            runtime: RuntimeKind::Docker,
+            cpu: 1,
+            memory_mb: 128,
+            disk_mb: 512,
+            timeout_seconds: 60,
+            network: NetworkPolicy::Disabled,
+            environment: Default::default(),
+            created_at: now,
+            updated_at: now,
+            runtime_path: None,
+        };
+        fixture
+            .store
+            .create_sandbox(sandbox.clone())
+            .await
+            .expect("seed running sandbox");
+        let response = app(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(format!("/v1/sandboxes/{}/start", sandbox.id))
+                    .header("authorization", format!("Bearer {}", fixture.key))
+                    .body(Body::empty())
+                    .expect("start request"),
+            )
+            .await
+            .expect("start response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(runtime.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .store
+                .get_sandbox(fixture.tenant, sandbox.id)
+                .await
+                .expect("row")
+                .state,
+            SandboxState::Running
         );
     }
 

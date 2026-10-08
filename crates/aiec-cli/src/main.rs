@@ -202,6 +202,11 @@ enum SandboxCommand {
     },
     Exec {
         id: Uuid,
+        /// Seconds the server allows the command to run before killing it.
+        /// The API honors up to 3600; the flag only ever existed here as the
+        /// literal 60, so anything slower looked like a cluster limit.
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -1115,8 +1120,13 @@ async fn start_worker(
     };
     *startup_runtime = Some(runtime.clone());
     let capabilities = runtime.capabilities();
-    let mut client_builder =
-        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        // The worker posts its token to the control plane. A redirect that a
+        // compromised or misconfigured control plane (or a path-rewriting
+        // proxy) answers with would otherwise resend the Authorization header
+        // to the target, the same class the SDK client already refuses.
+        .redirect(reqwest::redirect::Policy::none());
     let ca_cert = std::env::var("AIEC_TLS_CA_CERT").ok();
     if let Some(path) = ca_cert.as_deref() {
         let pem = std::fs::read(path).with_context(|| format!("read {path}"))?;
@@ -2030,7 +2040,11 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
             "{}",
             serde_json::to_string_pretty(&c.get_sandbox(id).await?)?
         ),
-        SandboxCommand::Exec { id, command } => {
+        SandboxCommand::Exec {
+            id,
+            timeout_seconds,
+            command,
+        } => {
             let result = c
                 .exec(
                     id,
@@ -2038,7 +2052,7 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
                         command,
                         working_directory: None,
                         environment: BTreeMap::new(),
-                        timeout_seconds: 60,
+                        timeout_seconds,
                         stdin: None,
                     },
                 )

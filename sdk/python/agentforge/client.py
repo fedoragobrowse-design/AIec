@@ -431,7 +431,13 @@ class Sandbox:
     data: dict
 
     def __getattr__(self, name: str) -> Any:
-        return self.data[name]
+        # `__getattr__` only runs when normal lookup failed, so a missing key
+        # must raise AttributeError, not KeyError: KeyError breaks hasattr()
+        # and getattr-with-default, which callers rely on for optional fields.
+        try:
+            return self.data[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
 
     def __enter__(self) -> "Sandbox":
         return self

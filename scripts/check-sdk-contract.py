@@ -57,7 +57,15 @@ for path in documented:
                 "but the SDK module is `agentforge`"
             )
 
-    for names in re.findall(rf"from\s+agentforge\s+import\s+({NAME_LIST})", text):
+    # Parenthesized imports span lines (`from agentforge import (\n AIec,\n)`),
+    # so collapse the parens first: without this a typo inside them is never
+    # examined and the contract still prints ok.
+    collapsed = re.sub(
+        r"from\s+agentforge\s+import\s*\(([^)]*)\)",
+        lambda m: "from agentforge import " + m.group(1).replace("\n", " "),
+        text,
+    )
+    for names in re.findall(rf"from\s+agentforge\s+import\s+({NAME_LIST})", collapsed):
         for name in (n.strip() for n in names.split(",")):
             if name and name not in exported:
                 problems.append(
@@ -80,7 +88,7 @@ for path in documented:
         continue
     text = html.unescape(path.read_text(encoding="utf-8"))
     text = re.sub(r"<[^>]+>", "", text)
-    for image in re.findall(r'image="([^"]+)"', text):
+    for image in re.findall(r"image=[\"']([^\"']+)[\"']", text):
         if image not in RESOLVABLE:
             problems.append(
                 f"{path.relative_to(root)} uses image `{image}`, "

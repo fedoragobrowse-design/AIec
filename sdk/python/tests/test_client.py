@@ -334,6 +334,16 @@ class SandboxTeardownTest(unittest.TestCase):
             with sandbox:
                 pass
 
+    def test_a_missing_field_raises_attribute_error_not_key_error(self):
+        # `__getattr__` returned `self.data[name]` bare, so a missing field
+        # raised KeyError: hasattr() and getattr-with-default both broke.
+        sandbox = Sandbox(a_client(), {"id": "sandbox-1"})
+        with self.assertRaises(AttributeError):
+            sandbox.no_such_field
+        self.assertFalse(hasattr(sandbox, "no_such_field"))
+        self.assertEqual(getattr(sandbox, "no_such_field", "fallback"), "fallback")
+        self.assertEqual(sandbox.id, "sandbox-1")
+
 
 class TransportFailureTest(unittest.TestCase):
     """`except AIecError` is the documented contract, so it has to hold."""
