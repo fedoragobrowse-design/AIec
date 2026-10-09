@@ -305,9 +305,11 @@ impl Client {
     /// Anthropic Messages API. Same [`Reply`] surface as OpenAI: text plus
     /// tool calls, so the agent loop never learns which provider answered.
     ///
-    /// Auth is the subscriber's own credential: `ANTHROPIC_API_KEY`, or an
-    /// OAuth token from `claude login` (`ANTHROPIC_OAUTH_TOKEN`), sent as
-    /// `x-api-key`. `AIEC_AGENT_API_KEY` wins when set, so one task can pin a
+    /// Auth is the subscriber's own credential: `ANTHROPIC_API_KEY` as
+    /// `x-api-key`, or an OAuth token from `claude login`
+    /// (`ANTHROPIC_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) as
+    /// `Authorization: Bearer` with the OAuth beta header.
+    /// `AIEC_AGENT_API_KEY` wins when set, so one task can pin a
     /// different key without clearing the ambient subscription.
     async fn try_anthropic(
         &self,
@@ -315,46 +317,7 @@ impl Client {
         tools: &[ToolSchema],
         max_output_tokens: u32,
     ) -> Result<Reply, HarnessError> {
-        let wire = context.as_wire();
-        // The harness emits a leading system message; Messages takes it as a
-        // top-level `system` string, not a conversation turn. Anything else
-        // with a system role is folded into the first user turn: inventing a
-        // second system block would misstate the contract.
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut messages: Vec<serde_json::Value> = Vec::new();
-        for entry in &wire {
-            let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = entry
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_owned();
-            if role == "system" {
-                system_parts.push(content);
-            } else if role == "assistant" {
-                messages.push(serde_json::json!({"role": "assistant", "content": content}));
-            } else {
-                // Tool results ride as `tool` role in the harness wire; on
-                // Messages they are user turns carrying `tool_result` blocks
-                // keyed by the call id the model was given.
-                if entry.get("role").and_then(|r| r.as_str()) == Some("tool") {
-                    let tool_call_id = entry
-                        .get("tool_call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": tool_call_id,
-                            "content": content,
-                        }],
-                    }));
-                } else {
-                    messages.push(serde_json::json!({"role": "user", "content": content}));
-                }
-            }
-        }
+        let (system_parts, messages) = anthropic_wire(&context.as_wire());
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": max_output_tokens,
@@ -391,16 +354,23 @@ impl Client {
             .header("content-type", "application/json")
             .header("anthropic-version", "2023-06-01");
         // Subscriber OAuth first would silently bill the wrong account when
-        // both are set; explicit key env wins, OAuth is the fallback.
-        let oauth = std::env::var("ANTHROPIC_OAUTH_TOKEN")
-            .ok()
+        // both are set; explicit key env wins, OAuth is the fallback. OAuth
+        // tokens ride as `Authorization: Bearer` with the OAuth beta header,
+        // not `x-api-key`: the endpoint rejects a subscription token sent as
+        // an API key. `CLAUDE_CODE_OAUTH_TOKEN` is honored alongside the
+        // plain name, since that is what the Claude Code harness exports.
+        let oauth = ["ANTHROPIC_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
             .filter(|v| !v.trim().is_empty());
         match (&self.api_key, oauth) {
             (Some(key), _) => {
                 request = request.header("x-api-key", key.as_str());
             }
             (None, Some(token)) => {
-                request = request.header("x-api-key", token);
+                request = request
+                    .bearer_auth(token.trim())
+                    .header("anthropic-beta", "oauth-2025-04-20");
             }
             (None, None) => {}
         }
@@ -608,6 +578,72 @@ fn parse_anthropic_reply(text: &str) -> Result<Reply, HarnessError> {
     })
 }
 
+/// Maps the harness wire to Anthropic Messages shapes.
+///
+/// Split out so the multi-turn round-trip is unit-testable without a
+/// network: assistant `tool_calls` the OpenAI wire carries as a sidecar
+/// array must reappear as `tool_use` content blocks, or the following
+/// `tool_result` turns dangle and Messages answers 400.
+fn anthropic_wire(wire: &[serde_json::Value]) -> (Vec<String>, Vec<serde_json::Value>) {
+    // The harness emits a leading system message; Messages takes it as a
+    // top-level `system` string, not a conversation turn.
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    for entry in wire {
+        let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let content = entry
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        if role == "system" {
+            system_parts.push(content);
+        } else if role == "assistant" {
+            let mut blocks: Vec<serde_json::Value> = Vec::new();
+            if !content.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": content}));
+            }
+            if let Some(calls) = entry.get("tool_calls").and_then(|c| c.as_array()) {
+                for call in calls {
+                    let function = call.get("function");
+                    let name = function
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default();
+                    let input: serde_json::Value = function
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": call.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                        "name": name,
+                        "input": input,
+                    }));
+                }
+            }
+            messages.push(serde_json::json!({"role": "assistant", "content": blocks}));
+        } else if role == "tool" {
+            let tool_call_id = entry
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                }],
+            }));
+        } else {
+            messages.push(serde_json::json!({"role": "user", "content": content}));
+        }
+    }
+    (system_parts, messages)
+}
+
 fn first_env(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -683,6 +719,64 @@ mod tests {
         assert!(reply.tool_calls[0].arguments.contains("a.rs"));
         assert_eq!(reply.usage.input_tokens, 7);
         assert_eq!(reply.usage.cached_input_tokens, 2);
+    }
+
+    #[test]
+    fn an_anthropic_second_turn_keeps_tool_use_ids_matched() {
+        // The exact multi-turn shape: assistant text + sidecar tool_calls,
+        // then the tool result. What the test asserts is that every
+        // `tool_result` id has a preceding `tool_use` id, which is what
+        // Messages requires and what the first cut silently dropped.
+        let wire = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "read a.rs"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "reading now",
+                "tool_calls": [{
+                    "id": "tu1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"a.rs\"}"},
+                }],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "tu1",
+                "name": "read",
+                "content": "contents",
+            }),
+        ];
+        let (system, messages) = anthropic_wire(&wire);
+        assert_eq!(system, vec!["sys".to_owned()]);
+        assert_eq!(messages.len(), 3);
+        let assistant = &messages[1];
+        let blocks = assistant
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("assistant content blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].get("type").and_then(|t| t.as_str()), Some("text"));
+        assert_eq!(
+            blocks[1].get("type").and_then(|t| t.as_str()),
+            Some("tool_use")
+        );
+        assert_eq!(blocks[1].get("id").and_then(|v| v.as_str()), Some("tu1"));
+        assert_eq!(
+            blocks[1]
+                .get("input")
+                .and_then(|v| v.get("path"))
+                .and_then(|v| v.as_str()),
+            Some("a.rs")
+        );
+        let result = &messages[2];
+        let result_blocks = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("tool result blocks");
+        assert_eq!(
+            result_blocks[0].get("tool_use_id").and_then(|v| v.as_str()),
+            Some("tu1")
+        );
     }
 
     #[test]
