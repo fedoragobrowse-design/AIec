@@ -28,17 +28,18 @@
     </div>
 <!-- /block:rail -->
 
+<h1>Disposable virtual machines for AI&nbsp;agents.</h1>
+<p class="lead">AIec hands an AI agent a Firecracker microVM to work in, records
+what it did, and then destroys the machine. Nothing to clean up between runs —
+and the evidence outlives the VM.</p>
+
 <div class="terminal terminal--hero">
   <div class="terminal__bar"><span class="terminal__dots" aria-hidden="true"></span><span class="terminal__title">set up everything in one line</span></div>
   <pre class="terminal__body"><code><span class="c-prompt">$</span> curl -fsSL https://aiec.gobrowse.dev/quickstart.sh | bash</code></pre>
 </div>
-<p class="lead">One line sets up everything: the control plane, a worker, the
+<p class="subhero">One line sets up everything: the control plane, a worker, the
 MCP server, and the Python SDK. A minute later an agent is running code in a
 disposable machine on your host. Prefer pieces? <a href="#how">Start below</a>.</p>
-
-<p class="lead">AIec hands an AI agent a Firecracker microVM to work in, records
-what it did, and then destroys the machine. Nothing to clean up between runs —
-and the evidence outlives the VM.</p>
 
 <p>A container gives an agent a filesystem and a process. AIec gives it a
 virtual machine: its own kernel, its own network namespace, its own CPU and
