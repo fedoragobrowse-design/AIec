@@ -547,6 +547,12 @@ a { text-underline-offset: 2px; }
   border: 1px solid var(--rule);
   background: var(--surface);
 }
+/* The hero terminal is the first thing on the page: larger, tighter to the
+ * headline, and carrying the one command the visitor came for. */
+.terminal--hero {
+  margin: 22px 0 0;
+  font-size: 15px;
+}
 .terminal__bar {
   display: flex;
   align-items: center;

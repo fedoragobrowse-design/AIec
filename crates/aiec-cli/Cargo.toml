@@ -26,8 +26,9 @@ hex.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tokio.workspace = true
-rustls.workspace = true
 uuid.workspace = true
+rustls.workspace = true
+rand.workspace = true
 zeroize.workspace = true
 libc.workspace = true
 

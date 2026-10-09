@@ -3,8 +3,16 @@
 <!-- prose -->
 
 <h1>Docs</h1>
-<p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL,
-S3-compatible storage, and a configured control plane and worker.</p>
+<div class="terminal terminal--hero">
+  <div class="terminal__bar"><span class="terminal__dots" aria-hidden="true"></span><span class="terminal__title">set up everything in one line</span></div>
+  <pre class="terminal__body"><code><span class="c-prompt">$</span> curl -fsSL https://aiec.gobrowse.dev/quickstart.sh | bash</code></pre>
+</div>
+<p class="lead">One line sets up everything: the control plane, a worker, the
+MCP server, and the Python SDK. It checks prerequisites, clones, builds,
+writes <code>.env.local</code> (fresh secrets, mode 0600), starts services,
+and proves the path with a real sandboxed exec. Prefer control?
+<code>aiec setup</code> does the checks and writes the env file;
+<code>bash scripts/quickstart.sh --no-mcp --runtime docker</code> picks the pieces.</p>
 
 <h2 id="reference">The full documentation</h2>
 <p>The reference documents below are the same files the repository ships,

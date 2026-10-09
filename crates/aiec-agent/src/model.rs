@@ -1,9 +1,12 @@
 //! Talking to a model, without hardcoding a company.
 //!
-//! One wire format is implemented - the OpenAI-compatible chat completions shape,
-//! which is what nearly every provider and every local inference server
-//! speaks - and the abstraction is expressed as *capabilities* rather than as
-//! provider names. A provider that does not stream, or has no prompt caching, or
+//! Two wire formats are implemented. The default is the OpenAI-compatible
+//! chat completions shape, which is what nearly every provider and every
+//! local inference server speaks. Anything naming Anthropic/Claude - by
+//! model name, provider name, or base URL - speaks the Anthropic Messages
+//! API instead (`POST {base}/v1/messages`, `x-api-key` or OAuth Bearer).
+//! The abstraction is expressed as *capabilities* rather than as provider
+//! names. A provider that does not stream, or has no prompt caching, or
 //! cannot return token usage, is configured by declaring that, not by being
 //! named in a match arm.
 //!
@@ -125,7 +128,11 @@ pub struct Client {
 
 /// Environment variables the harness reads, in priority order.
 const KEY_VARS: &[&str] = &["AIEC_AGENT_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"];
-const BASE_VARS: &[&str] = &["AIEC_AGENT_BASE_URL", "OPENAI_BASE_URL"];
+const BASE_VARS: &[&str] = &[
+    "AIEC_AGENT_BASE_URL",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+];
 const MODEL_VARS: &[&str] = &["AIEC_AGENT_MODEL", "OPENAI_MODEL", "ANTHROPIC_MODEL"];
 
 impl Client {
@@ -346,7 +353,12 @@ impl Client {
             body["tools"] = serde_json::Value::Array(advertised);
         }
 
-        let url = format!("{}/v1/messages", self.base_url);
+        // Anthropic's documented base carries `/v1`; the harness default and
+        // most proxies do not. Appending blindly turns the documented form
+        // into `/v1/v1/messages` and a 404, so strip one trailing `/v1` (and
+        // any slashes) before appending the path.
+        let root = self.base_url.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{root}/v1/messages");
         let mut request = self
             .http
             .post(url)
@@ -800,6 +812,26 @@ mod tests {
             detect_provider("gpt-4o", "https://example.com/v1"),
             Provider::OpenAi
         );
+    }
+
+    #[test]
+    fn an_anthropic_base_with_v1_does_not_double_it() {
+        // The documented canonical base carries `/v1`; the harness default
+        // does not. Both spellings must reach `/v1/messages`, not `/v1/v1`.
+        for base in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+        ] {
+            let root = base.trim_end_matches('/').trim_end_matches("/v1");
+            assert_eq!(
+                format!("{root}/v1/messages"),
+                "https://api.anthropic.com/v1/messages",
+                "{base}"
+            );
+        }
+        assert!(BASE_VARS.contains(&"ANTHROPIC_BASE_URL"));
     }
 
     /// An endpoint that answers every request with `status`, and counts them.

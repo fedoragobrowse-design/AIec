@@ -68,8 +68,16 @@
 <!-- prose -->
 
 <h1>Docs</h1>
-<p class="lead">Run it yourself. You need a Linux host with KVM, PostgreSQL,
-S3-compatible storage, and a configured control plane and worker.</p>
+<div class="terminal terminal--hero">
+  <div class="terminal__bar"><span class="terminal__dots" aria-hidden="true"></span><span class="terminal__title">set up everything in one line</span></div>
+  <pre class="terminal__body"><code><span class="c-prompt">$</span> curl -fsSL https://aiec.gobrowse.dev/quickstart.sh | bash</code></pre>
+</div>
+<p class="lead">One line sets up everything: the control plane, a worker, the
+MCP server, and the Python SDK. It checks prerequisites, clones, builds,
+writes <code>.env.local</code> (fresh secrets, mode 0600), starts services,
+and proves the path with a real sandboxed exec. Prefer control?
+<code>aiec setup</code> does the checks and writes the env file;
+<code>bash scripts/quickstart.sh --no-mcp --runtime docker</code> picks the pieces.</p>
 
 <h2 id="reference">The full documentation</h2>
 <p>The reference documents below are the same files the repository ships,
@@ -81,7 +89,7 @@ go straight to <a href="/docs/guard/">Guard operations</a> or the page for what
 you are changing.</p>
 
 <div class="docgroup"><h2 id="start">Start here</h2><p class="docgroup__blurb">Get a cluster running and drive your first sandbox through it.</p><dl class="doclist">
-<dt><a href="/docs/deployment/">Production deployment</a></dt><dd>Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards. <span class="doclist__meta">16 min read</span></dd>
+<dt><a href="/docs/deployment/">Production deployment</a></dt><dd>Host prerequisites, the systemd units, TLS and credential bindings, and the acceptance checks to run afterwards. <span class="doclist__meta">17 min read</span></dd>
 <dt><a href="/docs/api/">REST API</a></dt><dd>Every route, its status codes and its error body, base path /v1. <span class="doclist__meta">13 min read</span></dd>
 <dt><a href="/docs/mcp/">AIec Local MCP</a></dt><dd>The local MCP server: how an agent is given a disposable machine, and what it may do with one. <span class="doclist__meta">8 min read</span></dd>
 </dl></div>

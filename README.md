@@ -7,6 +7,14 @@ edit files, run tests and collect the diff. Firecracker provides the guest
 kernel; Guard governs network access and model credentials outside the guest.
 You run the control plane, workers, PostgreSQL and object storage yourself.
 
+```sh
+curl -fsSL https://aiec.gobrowse.dev/quickstart.sh | bash
+```
+
+One line sets up everything (control plane, worker, MCP server, Python SDK).
+Prefer control? `aiec setup` checks prerequisites and writes `.env.local`;
+`bash scripts/quickstart.sh --no-mcp --runtime docker` picks the pieces.
+
 ```python
 from agentforge import AIec
 
