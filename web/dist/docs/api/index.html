@@ -91,7 +91,11 @@ Rust SDK: <code>AIecClient::<wbr>pause(id)</code> (crate <code>aiec-client</code
 </li>
 <li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files?path=/<wbr>workspace</code> — list.</p>
 </li>
-<li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files/<wbr>content?path=/<wbr>workspace/<wbr>x</code> — download.</p>
+<li><p><code>GET /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files/<wbr>content?path=/<wbr>workspace/<wbr>x</code> — download.
+Downloads preserve the file's exact bytes; they do not redact secrets.
+<code>sandboxes:<wbr>read</code> therefore grants access to credentials a command writes
+into the workspace. Exec/diff output redaction limits accidental disclosure
+through evidence and logs, not access by an authorized file reader.</p>
 </li>
 <li><p><code>POST /<wbr>v1/<wbr>sandboxes/<wbr>{id}/<wbr>files/<wbr>mkdir</code> — create directory.</p>
 </li>

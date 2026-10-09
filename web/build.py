@@ -1028,6 +1028,11 @@ def copy_assets() -> int:
             continue
         (target / path.name).write_bytes(path.read_bytes())
         copied += 1
+    # The one-line installer the hero advertises: `curl $SITE/quickstart.sh`.
+    # Copied from the repo root so the published bytes are always this
+    # checkout's script, never a stale copy.
+    (DIST / "quickstart.sh").write_bytes((ROOT / ".." / "scripts" / "quickstart.sh").read_bytes())
+    copied += 1
     return copied
 
 

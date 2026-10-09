@@ -64,7 +64,7 @@
   </nav>
   <main class="docmain">
 <h1 id="production-deployment">Production deployment</h1>
-<p class="docmeta"><span>16 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md" rel="noopener noreferrer">docs/DEPLOYMENT.md</a></p>
+<p class="docmeta"><span>17 min read</span><a href="https://github.com/fedoragobrowse-design/AIec/blob/main/docs/DEPLOYMENT.md" rel="noopener noreferrer">docs/DEPLOYMENT.md</a></p>
 <h2 id="host-prerequisites">Host prerequisites<a class="anchor" href="#host-prerequisites" aria-label="Link to this section: Host prerequisites">#</a></h2>
 <p>Use dedicated Linux worker hosts with:</p>
 <ul>
@@ -134,6 +134,33 @@ while the Rust client keeps working. Note that <code>openssl req -x509</code> ac
 <code>-addext</code> but rejects <code>-extfile</code>.</p>
 <h2 id="postgresql-and-s3">PostgreSQL and S3<a class="anchor" href="#postgresql-and-s3" aria-label="Link to this section: PostgreSQL and S3">#</a></h2>
 <p>The production server runs committed SQLx migrations and refuses to start without <code>DATABASE_URL</code>. Use TLS, backups, least privilege, and migration rollback procedures. Configure a private bucket through <code>AIEC_S3_ENDPOINT</code>, region, bucket, prefix, and credentials. S3 requests use AWS Signature V4 and SHA-256 checksums; the bucket must not be public.</p>
+<h3 id="backup-and-restore-drills">Backup and restore drills<a class="anchor" href="#backup-and-restore-drills" aria-label="Link to this section: Backup and restore drills">#</a></h3>
+<p>Run <code>bash scripts/<wbr>backup-restore-drill.sh</code> only in an isolated staging
+environment. Provide <code>DATABASE_URL</code> through private configuration;
+<code>AIEC_DRILL_ADMIN_URL</code> optionally selects the destination server and creation
+credentials. Restored and recovery URLs use that admin connection, not the
+source connection.</p>
+<p>Use one unambiguous transport in each PostgreSQL URL. The helpers refuse
+socket-then-TCP overrides and conflicting <code>hostaddr</code>/<code>host</code> destinations because
+SQLx and libpq can select different servers from those forms. A TCP-to-socket
+acceptance relay preserves the effective database TLS hostname; keep certificate
+verification enabled.</p>
+<p>Targets default to a unique acceptance-run name. <code>AIEC_DRILL_DB</code> may select a
+plain identifier of at most 54 ASCII characters, leaving room for <code>_recovery</code>.
+Neither target may name the source, admin, or a protected database. The drill
+claims targets with <code>CREATE DATABASE</code>, refuses existing targets, and cleans up
+only acknowledged creations. A forcibly killed process or an ambiguous DDL
+connection failure still needs a manual census of its unique targets.</p>
+<p>Without server options, the drill verifies dump, restore, migration history,
+and a second recovery copy at the database level. To check the restored API,
+set both <code>AIEC_DRILL_BIND</code> and <code>AIEC_DRILL_CA</code>, supply the normal API/TLS
+configuration, and build <code>aiec-server</code> first. Binary discovery honors
+<code>CARGO_TARGET_DIR</code>; readiness verifies the supplied CA without an insecure TLS
+fallback.</p>
+<p>A restored database retains worker addresses and object-store references.
+The API starts maintenance and Guard reaping: isolate those dependencies and
+use test credentials before starting it. Database restore and <code>/<wbr>ready</code> do not
+prove guest recovery, artifact recovery, or power-loss durability.</p>
 <h2 id="api-server">API server<a class="anchor" href="#api-server" aria-label="Link to this section: API server">#</a></h2>
 <p>Required configuration:</p>
 <div class="code"><span class="code__lang">bash</span><pre><code>export AIEC_RUNTIME=firecracker
@@ -416,7 +443,7 @@ Firecracker snapshot memory and VM-state files reference the disk path active wh
 <aside class="doctoc" aria-label="On this page">
 <h2 class="doctoc__title">On this page</h2>
     <ol class="doctoc__list">
-      <li class="doctoc__item doctoc__item--2"><a href="#host-prerequisites">Host prerequisites</a></li><li class="doctoc__item doctoc__item--2"><a href="#guard-on-a-worker">Guard on a worker</a></li><li class="doctoc__item doctoc__item--2"><a href="#tls-certificates">TLS certificates</a></li><li class="doctoc__item doctoc__item--2"><a href="#postgresql-and-s3">PostgreSQL and S3</a></li><li class="doctoc__item doctoc__item--2"><a href="#api-server">API server</a></li><li class="doctoc__item doctoc__item--2"><a href="#firecracker-workers">Firecracker workers</a></li><li class="doctoc__item doctoc__item--3"><a href="#long-running-http-requests">Long-running HTTP requests</a></li><li class="doctoc__item doctoc__item--2"><a href="#host-pressure-and-reserves">Host pressure and reserves</a></li><li class="doctoc__item doctoc__item--3"><a href="#the-boot-re-checks-the-host">The boot re-checks the host</a></li><li class="doctoc__item doctoc__item--3"><a href="#failure-behaviour">Failure behaviour</a></li><li class="doctoc__item doctoc__item--3"><a href="#aggregate-admission-across-workers-on-one-host">Aggregate admission across workers on one host</a></li><li class="doctoc__item doctoc__item--3"><a href="#re-checking-immediately-before-vm-create">Re-checking immediately before VM create</a></li><li class="doctoc__item doctoc__item--2"><a href="#snapshots-and-restore">Snapshots and restore</a></li><li class="doctoc__item doctoc__item--2"><a href="#network-policy">Network policy</a></li><li class="doctoc__item doctoc__item--2"><a href="#production-gate">Production gate</a></li>
+      <li class="doctoc__item doctoc__item--2"><a href="#host-prerequisites">Host prerequisites</a></li><li class="doctoc__item doctoc__item--2"><a href="#guard-on-a-worker">Guard on a worker</a></li><li class="doctoc__item doctoc__item--2"><a href="#tls-certificates">TLS certificates</a></li><li class="doctoc__item doctoc__item--2"><a href="#postgresql-and-s3">PostgreSQL and S3</a></li><li class="doctoc__item doctoc__item--3"><a href="#backup-and-restore-drills">Backup and restore drills</a></li><li class="doctoc__item doctoc__item--2"><a href="#api-server">API server</a></li><li class="doctoc__item doctoc__item--2"><a href="#firecracker-workers">Firecracker workers</a></li><li class="doctoc__item doctoc__item--3"><a href="#long-running-http-requests">Long-running HTTP requests</a></li><li class="doctoc__item doctoc__item--2"><a href="#host-pressure-and-reserves">Host pressure and reserves</a></li><li class="doctoc__item doctoc__item--3"><a href="#the-boot-re-checks-the-host">The boot re-checks the host</a></li><li class="doctoc__item doctoc__item--3"><a href="#failure-behaviour">Failure behaviour</a></li><li class="doctoc__item doctoc__item--3"><a href="#aggregate-admission-across-workers-on-one-host">Aggregate admission across workers on one host</a></li><li class="doctoc__item doctoc__item--3"><a href="#re-checking-immediately-before-vm-create">Re-checking immediately before VM create</a></li><li class="doctoc__item doctoc__item--2"><a href="#snapshots-and-restore">Snapshots and restore</a></li><li class="doctoc__item doctoc__item--2"><a href="#network-policy">Network policy</a></li><li class="doctoc__item doctoc__item--2"><a href="#production-gate">Production gate</a></li>
     </ol>
   </aside>
 </div>
