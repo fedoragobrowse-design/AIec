@@ -345,6 +345,11 @@ const STANDARD_REFERENCES: &[&str] = &[
     "rust:stable",
     "ubuntu:24.04",
     "alpine:3.21",
+    // Prebuilt GUI variants of the docker/bwrap-dev guest (see
+    // guest/Dockerfile.gui): same content-id derivation, no new mechanism.
+    "aiec/gui-browser",
+    "aiec/gui-desktop",
+    "aiec/gui-playwright",
 ];
 
 /// Resolves AIec's standard image names to stable content-derived IDs.
@@ -406,8 +411,8 @@ impl ImageResolver for StandardImageResolver {
 /// Resolves an administrator-signed rootfs for Firecracker and standard OCI
 /// references for container runtimes.
 ///
-/// The manifest is authenticated once, when the resolver is built, and is then
-/// immutable owned data: nothing can change the reference or the expected
+/// Each manifest is authenticated once, when the resolver is built, and is
+/// then immutable owned data: nothing can change a reference or an expected
 /// digest behind a resolver's back. Re-deriving the HMAC on every resolution
 /// therefore re-proves a fact that cannot have changed, while the check that
 /// *can* change - whether the bytes on disk are still the signed bytes - is
@@ -416,25 +421,37 @@ impl ImageResolver for StandardImageResolver {
 /// The signing secret is not retained. It has no use after construction, and
 /// holding it for the life of the process would put it in every core dump,
 /// every `Debug` print and every heap snapshot taken while the resolver lives.
+///
+/// A resolver holds one entry per signed reference (the base plus any `-gui`
+/// variants): each entry carries its own rootfs path and its own expected
+/// digest, verified independently. A single-manifest resolver is just a map
+/// with one entry; its behavior is unchanged.
 #[derive(Clone)]
 pub struct SignedImageResolver {
-    rootfs: Arc<str>,
-    manifest: SignedImageManifest,
+    manifests: Vec<SignedEntry>,
     /// Shared with every clone of this resolver, so concurrent resolutions of
     /// the same image read it once.
     verified: VerifiedDigestCache,
     standard: StandardImageResolver,
 }
 
+/// One signed reference: the manifest the operator signed plus the rootfs it
+/// vouches for. The rootfs lives beside the manifest entry rather than in a
+/// single shared field so variants can point at different ext4 files.
+#[derive(Clone)]
+struct SignedEntry {
+    rootfs: Arc<str>,
+    manifest: SignedImageManifest,
+}
+
 impl fmt::Debug for SignedImageResolver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SignedImageResolver")
-            .field("rootfs", &self.rootfs)
-            .field("reference", &self.manifest.reference)
-            .field("rootfs_sha256", &self.manifest.rootfs_sha256)
-            .field("verified", &self.verified)
-            .finish()
+        let mut debug = formatter.debug_struct("SignedImageResolver");
+        for entry in &self.manifests {
+            debug.field("reference", &entry.manifest.reference);
+            debug.field("rootfs", &entry.rootfs);
+        }
+        debug.field("verified", &self.verified).finish()
     }
 }
 
@@ -444,30 +461,62 @@ impl SignedImageResolver {
         manifest_path: impl AsRef<Path>,
         secret: impl AsRef<[u8]>,
     ) -> Result<Self, CoreError> {
-        let rootfs = rootfs.into();
+        Self::from_manifests(
+            [(rootfs.into(), manifest_path.as_ref().to_path_buf())],
+            secret,
+        )
+    }
+
+    /// Builds a resolver from several (rootfs, manifest) pairs - the base
+    /// plus any `-gui` variants the operator signed. Every pair is
+    /// authenticated and identity-checked exactly as the single-manifest path
+    /// was; duplicate references are refused so a later manifest cannot shadow
+    /// an earlier one.
+    pub fn from_manifests(
+        pairs: impl IntoIterator<Item = (String, std::path::PathBuf)>,
+        secret: impl AsRef<[u8]>,
+    ) -> Result<Self, CoreError> {
         let secret = secret.as_ref();
-        let manifest_bytes = std::fs::read(manifest_path).map_err(CoreError::Io)?;
-        let manifest: SignedImageManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|error| CoreError::Backend(error.to_string()))?;
         if secret.len() < 32 {
             return Err(CoreError::InvalidRequest(
                 "image manifest secret must contain at least 32 bytes".into(),
             ));
         }
-        manifest.verify(secret)?;
-        let rootfs = Arc::<str>::from(rootfs.clone());
-        // Read through the same identity check a resolution uses, so a rootfs
-        // that is missing, unreadable or not a regular file is refused here
-        // with the message it would get later rather than at first use.
-        RootfsIdentity::read(&rootfs).map_err(|error| match error {
-            CoreError::Io(_) => CoreError::Unavailable("signed image rootfs is missing".into()),
-            other => other,
-        })?;
+        let mut manifests = Vec::new();
+        for (rootfs, manifest_path) in pairs {
+            let manifest_bytes = std::fs::read(&manifest_path).map_err(CoreError::Io)?;
+            let manifest: SignedImageManifest = serde_json::from_slice(&manifest_bytes)
+                .map_err(|error| CoreError::Backend(error.to_string()))?;
+            manifest.verify(secret)?;
+            let rootfs = Arc::<str>::from(rootfs.clone());
+            // Read through the same identity check a resolution uses, so a rootfs
+            // that is missing, unreadable or not a regular file is refused here
+            // with the message it would get later rather than at first use.
+            RootfsIdentity::read(&rootfs).map_err(|error| match error {
+                CoreError::Io(_) => CoreError::Unavailable("signed image rootfs is missing".into()),
+                other => other,
+            })?;
+            if manifests
+                .iter()
+                .any(|e: &SignedEntry| e.manifest.reference == manifest.reference)
+            {
+                return Err(CoreError::InvalidRequest(format!(
+                    "duplicate signed image reference: {}",
+                    manifest.reference
+                )));
+            }
+            manifests.push(SignedEntry { rootfs, manifest });
+        }
+        if manifests.is_empty() {
+            return Err(CoreError::InvalidRequest(
+                "no image manifests supplied".into(),
+            ));
+        }
+        let standard = StandardImageResolver::new(manifests[0].rootfs.as_ref());
         Ok(Self {
-            standard: StandardImageResolver::new(rootfs.as_ref()),
-            rootfs,
-            manifest,
+            manifests,
             verified: VerifiedDigestCache::new(),
+            standard,
         })
     }
 }
@@ -475,21 +524,25 @@ impl SignedImageResolver {
 #[async_trait]
 impl ImageResolver for SignedImageResolver {
     async fn resolve(&self, reference: &ImageReference) -> Result<ResolvedImage, CoreError> {
-        if self.manifest.reference != reference.as_str() {
+        let entry = self
+            .manifests
+            .iter()
+            .find(|e| e.manifest.reference == reference.as_str());
+        let Some(entry) = entry else {
             return self.standard.resolve(reference).await;
-        }
-        // Every resolution of the signed reference passes through here. A
+        };
+        // Every resolution of a signed reference passes through here. A
         // resolution answered from the cache was answered for these exact bytes
         // under this exact expected digest; anything else is hashed, and the
         // hash is checked for stability either side of the read.
         let verified = self
             .verified
-            .resolve(&self.rootfs, &self.manifest.rootfs_sha256)
+            .resolve(&entry.rootfs, &entry.manifest.rootfs_sha256)
             .await?;
         Ok(ResolvedImage {
             reference: reference.clone(),
             image_id: image_id(reference.as_str()),
-            rootfs: self.rootfs.to_string(),
+            rootfs: entry.rootfs.to_string(),
             digest: verified.digest,
             size_bytes: verified.identity.len,
             architecture: None,
@@ -563,6 +616,87 @@ mod tests {
         );
         let _ = std::fs::remove_file(root);
         let _ = std::fs::remove_file(manifest_path);
+    }
+
+    /// Two signed references resolve to their own rootfs files: the base
+    /// keeps its bytes and a `-gui` variant resolves beside it, each through
+    /// its own digest check. A duplicate reference is refused at load so a
+    /// later manifest cannot shadow an earlier one.
+    #[tokio::test]
+    async fn signed_resolver_serves_base_and_gui_variant() {
+        let secret = b"image-test-secret-32-bytes-long!";
+        let write_pair = |name: &str, bytes: &[u8], reference: &str| {
+            let root =
+                std::env::temp_dir().join(format!("aiec-image-{}-{name}", uuid::Uuid::now_v7()));
+            std::fs::write(&root, bytes).unwrap();
+            let digest = hex::encode(Sha256::digest(bytes));
+            let manifest = SignedImageManifest {
+                reference: reference.into(),
+                rootfs_sha256: digest,
+                signature: aiec_core::image_manifest_signature(
+                    secret,
+                    reference,
+                    &hex::encode(Sha256::digest(bytes)),
+                ),
+            };
+            let path = root.with_extension("manifest.json");
+            std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            (root.to_string_lossy().into_owned(), path)
+        };
+        let (base_root, base_manifest) = write_pair("base", b"base-rootfs", "aiec/firecracker");
+        let (gui_root, gui_manifest) =
+            write_pair("gui", b"gui-rootfs", "aiec/firecracker-gui-browser");
+        let resolver = SignedImageResolver::from_manifests(
+            [
+                (base_root.clone(), base_manifest.clone()),
+                (gui_root.clone(), gui_manifest.clone()),
+            ],
+            secret,
+        )
+        .unwrap();
+        let base = resolver
+            .resolve(&ImageReference::new("aiec/firecracker").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(base.rootfs, base_root);
+        let gui = resolver
+            .resolve(&ImageReference::new("aiec/firecracker-gui-browser").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(gui.rootfs, gui_root);
+        assert_ne!(base.digest.as_str(), gui.digest.as_str());
+        // Same reference twice is a load error, not a silent shadow.
+        assert!(
+            SignedImageResolver::from_manifests(
+                [
+                    (base_root.clone(), base_manifest.clone()),
+                    (base_root.clone(), base_manifest.clone()),
+                ],
+                secret,
+            )
+            .is_err()
+        );
+        for path in [base_root, gui_root] {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(base_manifest);
+        let _ = std::fs::remove_file(gui_manifest);
+    }
+
+    #[tokio::test]
+    async fn gui_docker_references_resolve_to_content_ids() {
+        let resolver = StandardImageResolver::new("/images/rootfs.ext4");
+        for reference in [
+            "aiec/gui-browser",
+            "aiec/gui-desktop",
+            "aiec/gui-playwright",
+        ] {
+            let image = resolver
+                .resolve(&ImageReference::new(reference).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(image.image_id, image_id(reference));
+        }
     }
 
     #[test]

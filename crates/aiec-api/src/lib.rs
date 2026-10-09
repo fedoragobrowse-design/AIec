@@ -644,7 +644,9 @@ pub fn router(state: AppState) -> Router {
     // Signup is deliberately outside the auth layer: it is how a stranger
     // obtains a credential in the first place. It is invite-gated, and rate
     // limited like everything else.
-    let public = Router::new().route("/account", post(signup));
+    let public = Router::new()
+        .route("/account", post(signup))
+        .route("/versions", get(versions));
     let protected = protected_routes(&state).route("/account", get(current_account));
     let workers = worker_routes().layer(middleware::from_fn_with_state(state.clone(), worker_auth));
     Router::new()
@@ -1700,6 +1702,75 @@ async fn authenticate_request(
 /// database blip does not get the process killed.
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}))
+}
+
+/// The versions one deployment runs, as one document.
+///
+/// Unauthenticated and unthrottled like `/health`: `aiec upgrade --check`
+/// needs the answer before it has a credential to present, and the answer is
+/// not tenant data - it is the deployment telling every caller what it is.
+/// The `recommended_*` values are notify-only: no binary here modifies
+/// itself, the CLI suggests and the operator (or the installer) acts.
+async fn versions() -> Json<Value> {
+    Json(json!({
+        "api": env!("CARGO_PKG_VERSION"),
+        "harness_protocol": aiec_core::protocol::PROTOCOL_VERSION,
+        "recommended_harness": std::env::var("AIEC_RECOMMENDED_HARNESS")
+            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned()),
+        "recommended_guest_artifact": std::env::var("AIEC_RECOMMENDED_GUEST_ARTIFACT")
+            .unwrap_or_else(|_| "1.0.0".to_owned()),
+        "minimum_cli": std::env::var("AIEC_MINIMUM_CLI")
+            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned()),
+    }))
+}
+
+#[cfg(test)]
+mod versions_tests {
+    use super::versions;
+
+    /// The versions document names every side the upgrade check compares.
+    /// A missing key here is a `None` in the CLI that reads as "unknown",
+    /// which degrades to silence instead of a warning.
+    #[tokio::test]
+    async fn versions_document_names_every_compared_side() {
+        let document = versions().await;
+        let value = serde_json::to_value(&document.0).expect("serializable");
+        for key in [
+            "api",
+            "harness_protocol",
+            "recommended_harness",
+            "recommended_guest_artifact",
+            "minimum_cli",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(
+            value["recommended_guest_artifact"].as_str(),
+            Some("1.0.0"),
+            "guest artifact version tracks the guest protocol the runtime verifies"
+        );
+    }
+
+    /// The recommendation is an operator knob, not a build constant: a fleet
+    /// held on an older harness sets `AIEC_RECOMMENDED_HARNESS` and the CLI
+    /// warns instead of demanding a version nobody can deploy yet.
+    #[tokio::test]
+    async fn versions_honors_operator_overrides() {
+        // SAFETY: single-threaded test runtime; no other test in this module
+        // touches these two keys while this one holds them.
+        unsafe {
+            std::env::set_var("AIEC_RECOMMENDED_HARNESS", "9.9.9-test");
+            std::env::set_var("AIEC_MINIMUM_CLI", "9.9.8-test");
+        }
+        let document = versions().await;
+        unsafe {
+            std::env::remove_var("AIEC_RECOMMENDED_HARNESS");
+            std::env::remove_var("AIEC_MINIMUM_CLI");
+        }
+        let value = serde_json::to_value(&document.0).expect("serializable");
+        assert_eq!(value["recommended_harness"].as_str(), Some("9.9.9-test"));
+        assert_eq!(value["minimum_cli"].as_str(), Some("9.9.8-test"));
+    }
 }
 
 /// Readiness: the control plane can actually accept new workloads.

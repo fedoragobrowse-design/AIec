@@ -1,15 +1,18 @@
 //! Guest image artifact metadata and integrity verification.
 //!
 //! The guest image build writes a `guest-capabilities.json` document next to the
-//! root filesystem it produced. The runtime refuses to advertise capabilities it
-//! cannot prove, so a missing document is simply "no metadata" while a present
+//! root filesystem it produced. GUI variants (`AIEC_GUEST_GUI=browser|desktop|
+//! playwright`) write their own `guest-capabilities-gui-<profile>.json` beside
+//! their own `rootfs-gui-<profile>.ext4`, so a variant never overwrites the
+//! base document. The runtime refuses to advertise capabilities it cannot
+//! prove, so a missing document is simply "no metadata" while a present
 //! document with a root filesystem that does not match it is a hard failure.
 
 use crate::RuntimeError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Metadata document written by the guest image build.
 pub const GUEST_ARTIFACT_FILE: &str = "guest-capabilities.json";
@@ -19,6 +22,33 @@ pub const CODING_PROFILE: &str = "coding";
 
 /// Capability a coding-capable guest must advertise.
 pub const CAPABILITY_GIT: &str = "git";
+
+/// Prefix of the GUI capability profiles. A `coding-gui-*` guest is the coding
+pub const CODING_GUI_PREFIX: &str = "coding-gui-";
+
+/// Reports whether `profile` is a coding-capable guest profile: `coding` or
+/// any `coding-gui-*` variant.
+pub fn is_coding_profile(profile: &str) -> bool {
+    profile == CODING_PROFILE || profile.starts_with(CODING_GUI_PREFIX)
+}
+
+/// Metadata document for the image at `rootfs` in `dir`.
+///
+/// The base image keeps the historical `guest-capabilities.json`; a
+/// `rootfs-gui-<suffix>.ext4` resolves to its sibling
+/// `guest-capabilities-gui-<suffix>.json`. Deriving from the rootfs filename
+/// is what keeps a GUI rootfs from verifying against the base document (whose
+/// digest it can never match) and vice versa.
+pub fn artifact_path_for_rootfs(dir: &Path, rootfs: &Path) -> PathBuf {
+    if let Some(name) = rootfs.file_name().and_then(|name| name.to_str())
+        && let Some(suffix) = name
+            .strip_prefix("rootfs-gui-")
+            .map(|rest| rest.strip_suffix(".ext4").unwrap_or(rest))
+    {
+        return dir.join(format!("guest-capabilities-gui-{suffix}.json"));
+    }
+    dir.join(GUEST_ARTIFACT_FILE)
+}
 
 /// Capability a coding-capable guest must advertise to validate TLS.
 pub const CAPABILITY_CA_CERTIFICATES: &str = "ca-certificates";
@@ -64,9 +94,11 @@ impl GuestArtifact {
         Ok(())
     }
 
-    /// Reports whether the artifact describes a coding-capable guest.
+    /// Reports whether the artifact describes a coding-capable guest. A
+    /// `coding-gui-*` profile is the coding image plus a screen path, so it
+    /// stays a coding guest.
     pub fn is_coding_guest(&self) -> bool {
-        self.profile == CODING_PROFILE
+        is_coding_profile(&self.profile)
             && self
                 .capabilities
                 .iter()
@@ -108,7 +140,11 @@ pub fn verify_guest_artifact(
     rootfs: &Path,
     kernel: &Path,
 ) -> Result<GuestArtifact, RuntimeError> {
-    let artifact = load_guest_artifact(&dir.join(GUEST_ARTIFACT_FILE))?;
+    // The document is the rootfs's sibling, not always the base name: a
+    // `rootfs-gui-*.ext4` verifies against `guest-capabilities-gui-*.json`.
+    // Reading the base document for a variant rootfs would always fail its
+    // digest check, so this derivation is load-bearing, not cosmetic.
+    let artifact = load_guest_artifact(&artifact_path_for_rootfs(dir, rootfs))?;
     verify_digest(rootfs, &artifact.rootfs_sha256, "root filesystem")?;
     if let Some(expected) = &artifact.kernel_sha256 {
         verify_digest(kernel, expected, "kernel image")?;
@@ -192,6 +228,31 @@ mod tests {
         assert!(artifact.is_coding_guest());
         assert_eq!(artifact.capabilities.len(), 3);
         assert!(artifact.kernel_sha256.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A GUI rootfs verifies against its sibling document, not the base name:
+    /// the directory holds `guest-capabilities-gui-browser.json` and no
+    /// `guest-capabilities.json`, which is exactly what the build writes.
+    #[test]
+    fn gui_variant_verifies_against_its_sibling_document() {
+        let dir = artifact_dir("gui");
+        let rootfs = dir.join("rootfs-gui-browser.ext4");
+        let kernel = dir.join("vmlinux");
+        std::fs::write(&rootfs, b"gui root filesystem bytes").expect("rootfs");
+        std::fs::write(&kernel, b"kernel bytes").expect("kernel");
+        let digest = file_sha256(&rootfs).expect("digest");
+        std::fs::write(
+            dir.join("guest-capabilities-gui-browser.json"),
+            format!(
+                r#"{{"artifact_version":"1.0.0","base":"debian-12","profile":"coding-gui-browser","capabilities":["git","ca-certificates","chromium","chromedriver"],"git_version":"git version 2.39.5","guest_agent_version":"0.1.0","guest_protocol_version":2,"rootfs_sha256":"{digest}"}}"#
+            ),
+        )
+        .expect("artifact metadata");
+        let artifact = verify_guest_artifact(&dir, &rootfs, &kernel).expect("verified artifact");
+        assert!(artifact.is_coding_guest());
+        assert_eq!(artifact.profile, "coding-gui-browser");
+        assert!(artifact.capabilities.iter().any(|c| c == "chromium"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -284,9 +345,41 @@ mod tests {
         assert!(!no_git.is_coding_guest());
         let wrong_profile = GuestArtifact {
             profile: "minimal".into(),
-            ..coding
+            ..coding.clone()
         };
         assert!(!wrong_profile.is_coding_guest());
+        // GUI variants are the coding image plus a screen path, so they stay
+        // coding guests; anything else under the prefix without git is not.
+        for profile in [
+            "coding-gui-browser",
+            "coding-gui-desktop",
+            "coding-gui-playwright",
+        ] {
+            let gui = GuestArtifact {
+                profile: profile.into(),
+                ..coding.clone()
+            };
+            assert!(gui.is_coding_guest(), "{profile}");
+            assert!(is_coding_profile(profile));
+            let no_git = GuestArtifact {
+                capabilities: vec![CAPABILITY_CA_CERTIFICATES.into()],
+                profile: profile.into(),
+                ..coding.clone()
+            };
+            assert!(!no_git.is_coding_guest(), "{profile}");
+        }
+        assert!(!is_coding_profile("minimal"));
+        // A GUI rootfs resolves to its sibling document, the base keeps the
+        // historical name.
+        let dir = Path::new("/images");
+        assert_eq!(
+            artifact_path_for_rootfs(dir, Path::new("/images/rootfs-gui-browser.ext4")),
+            PathBuf::from("/images/guest-capabilities-gui-browser.json")
+        );
+        assert_eq!(
+            artifact_path_for_rootfs(dir, Path::new("/images/aiec-rootfs.ext4")),
+            PathBuf::from("/images/guest-capabilities.json")
+        );
     }
 
     #[test]

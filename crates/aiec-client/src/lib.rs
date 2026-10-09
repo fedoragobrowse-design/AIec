@@ -423,6 +423,12 @@ impl AIecClient {
         self.send(self.request(reqwest::Method::GET, "/ready"))
             .await
     }
+    /// The deployment's version document. No credential needed: `upgrade
+    /// --check` asks what it is before it can authenticate as anyone.
+    pub async fn versions(&self) -> Result<serde_json::Value, ClientError> {
+        self.send(self.request(reqwest::Method::GET, "/v1/versions"))
+            .await
+    }
     pub async fn create_sandbox(
         &self,
         request: &CreateSandboxRequest,

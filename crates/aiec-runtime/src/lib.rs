@@ -1366,8 +1366,14 @@ pub struct FirecrackerConfig {
 /// runtime instead of at startup, which is exactly when nobody is watching.
 fn load_guest_artifact_metadata(
     dir: &Path,
+    rootfs: Option<&Path>,
 ) -> Result<Option<guest_artifact::GuestArtifact>, RuntimeError> {
-    let path = dir.join(guest_artifact::GUEST_ARTIFACT_FILE);
+    // The rootfs selects its sibling document when it names a variant; without
+    // it (only some tests call this way) the base name is the fallback.
+    let path = match rootfs {
+        Some(rootfs) => guest_artifact::artifact_path_for_rootfs(dir, rootfs),
+        None => dir.join(guest_artifact::GUEST_ARTIFACT_FILE),
+    };
     if !path.is_file() {
         return Ok(None);
     }
@@ -1459,7 +1465,7 @@ impl FirecrackerConfig {
         // moment an operator is not watching.
         let guest_artifact = match guest_artifact_dir.as_deref() {
             None => None,
-            Some(dir) => Some(load_guest_artifact_metadata(dir)?),
+            Some(dir) => Some(load_guest_artifact_metadata(dir, Some(&rootfs))?),
         }
         .flatten();
         // The same variables `aiec worker` reads for the reserve it publishes
@@ -1691,7 +1697,7 @@ impl FirecrackerConfig {
                         .into(),
                 ));
             };
-            if artifact.profile != guest_artifact::CODING_PROFILE {
+            if !guest_artifact::is_coding_profile(&artifact.profile) {
                 return Err(RuntimeError::Unavailable(format!(
                     "AIEC_REQUIRE_CODING_GUEST=1 requires the {} profile, artifact {} declares {}",
                     guest_artifact::CODING_PROFILE,
@@ -1910,7 +1916,11 @@ fn artifact_identity(
     // keep the success recorded against the old one, which is the same
     // "verified sometime earlier" failure one level down.
     let manifest = match (artifact, artifact_dir) {
-        (Some(_), Some(dir)) => describe_file(&dir.join(guest_artifact::GUEST_ARTIFACT_FILE))?.0,
+        // The sibling document for this rootfs: a GUI verdict must not ride on
+        // the base file's identity or share one cache key with it.
+        (Some(_), Some(dir)) => {
+            describe_file(&guest_artifact::artifact_path_for_rootfs(dir, rootfs))?.0
+        }
         _ => "no-manifest".to_string(),
     };
     Ok(ArtifactIdentity {
@@ -6086,7 +6096,7 @@ mod tests {
 
         // No document at all: a deployment without guest metadata is fine.
         assert!(
-            load_guest_artifact_metadata(&dir)
+            load_guest_artifact_metadata(&dir, None)
                 .expect("an absent document is not an error")
                 .is_none()
         );
@@ -6096,7 +6106,7 @@ mod tests {
         std::fs::write(dir.join("vmlinux"), b"kernel bytes").expect("kernel");
         write_artifact_metadata(&dir, &rootfs, r#"["git","ca-certificates"]"#, "coding");
         assert!(
-            load_guest_artifact_metadata(&dir)
+            load_guest_artifact_metadata(&dir, Some(&rootfs))
                 .expect("a good document loads")
                 .is_some()
         );
@@ -6110,14 +6120,14 @@ mod tests {
         );
         assert_ne!(stale, current, "metadata must record the protocol revision");
         std::fs::write(&path, stale).expect("older metadata");
-        let error = load_guest_artifact_metadata(&dir)
+        let error = load_guest_artifact_metadata(&dir, Some(&rootfs))
             .expect_err("an older guest protocol must fail closed, not vanish");
         assert!(error.to_string().contains("protocol 1"), "{error}");
 
         // And a corrupt document is refused for the same reason.
         std::fs::write(&path, b"{ not json").expect("malformed metadata");
         assert!(
-            load_guest_artifact_metadata(&dir).is_err(),
+            load_guest_artifact_metadata(&dir, Some(&rootfs)).is_err(),
             "malformed metadata must not read as absent"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -51,14 +51,24 @@ if [ ! -x "$AGENT" ]; then
   exec /bin/sh
 fi
 
-start_agent() {
-  # Agent stderr goes to the console as well as the log: the console is the
-  # only channel the host can read when the control path is the thing that is
+start_xvfb() {
+  # Desktop profile only: the build stamps /etc/aiec-xvfb when Xvfb is
+  # installed, and the base image carries no X server and must never try.
+  # DISPLAY :99 matches what the desktop harness tool expects.
+  [ -e /etc/aiec-xvfb ] || return 0
+  [ -x /usr/bin/Xvfb ] || { log "WARN: /etc/aiec-xvfb present but Xvfb missing"; return 0; }
+  DISPLAY=:99 /usr/bin/Xvfb :99 -screen 0 1280x1024x24 >/run/aiec-xvfb.log 2>&1 &
+  echo $! >/run/aiec-xvfb.pid
+  log "Xvfb started on :99 (pid $(cat /run/aiec-xvfb.pid))"
+}
+
+ start_agent() {
   # broken, and a guest agent that dies silently is undiagnosable.
   "$AGENT" >>/run/aiec-guest.log 2>>/dev/console &
   echo $! >/run/aiec-guest.pid
 }
 
+start_xvfb
 start_agent
 log "aiec-guest started (pid $(cat /run/aiec-guest.pid)), control port 1024"
 while :; do

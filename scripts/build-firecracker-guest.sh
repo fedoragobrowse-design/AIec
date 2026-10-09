@@ -8,7 +8,11 @@
 #   AIEC_KERNEL              uncompressed kernel (default .aiec/images/vmlinux)
 #   AIEC_GUEST_BASE_IMAGE    default debian:bookworm-slim
 #   AIEC_GUEST_ROOTFS_SIZE   default 4G
-# Positional arg 1 is the output directory (default .aiec/images).
+#   AIEC_GUEST_GUI           default none (none|browser|desktop|playwright);
+#                            browser adds chromium + chromedriver, desktop adds
+#                            those plus Xvfb/xdotool/x11vnc/scrot, playwright
+#                            adds the browser set plus python3-playwright using
+#                            the system chromium (never a downloaded browser).
 # Exit code 2 means the rootfs was built but no kernel was found.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,6 +25,14 @@ fi
 BASE_IMAGE=${AIEC_GUEST_BASE_IMAGE:-debian:bookworm-slim}
 KERNEL=${AIEC_KERNEL:-$ROOT/.aiec/images/vmlinux}
 ROOTFS_SIZE=${AIEC_GUEST_ROOTFS_SIZE:-4G}
+# The default `none` path must stay byte-identical to the old build: every
+# GUI line below is gated on this variable, and when it is `none` the package
+# list, profile, capabilities and filenames are exactly what they were.
+GUI=${AIEC_GUEST_GUI:-none}
+case "$GUI" in
+  none|browser|desktop|playwright) ;;
+  *) fail "AIEC_GUEST_GUI must be none, browser, desktop or playwright (got $GUI)" ;;
+esac
 # `cargo` is only needed when this script compiles the guest itself. The whole
 # point of AIEC_GUEST_BINARY is a host that has no Rust toolchain at all, so
 # demanding cargo before consulting the override makes the escape hatch
@@ -127,12 +139,25 @@ CONTAINER="aiec-guest-build-$$"
 docker_cmd rm -f "$CONTAINER" >/dev/null 2>&1 || true
 docker_cmd run -d --name "$CONTAINER" "$BASE_IMAGE" sleep infinity >/dev/null
 step "installing guest packages in $CONTAINER"
-cat > "$TMP/provision.sh" <<'PROVISION'
+# GUI package sets are appended, never substituted: the base list below is the
+# current image byte-for-byte, and each profile only adds its own names.
+GUI_PACKAGES=""
+case "$GUI" in
+  browser|desktop|playwright) GUI_PACKAGES="chromium chromium-driver" ;;
+esac
+case "$GUI" in
+  desktop) GUI_PACKAGES="$GUI_PACKAGES xvfb xdotool x11vnc scrot" ;;
+  playwright) GUI_PACKAGES="$GUI_PACKAGES python3-playwright" ;;
+esac
+# The package list is spliced into the heredoc below by the outer shell, so
+# the provision script itself stays quoted and inert: `$GUI_PACKAGES` expands
+# here, nothing inside the container's script expands there.
+GUI_LINE="git ca-certificates curl python3 tar gzip coreutils util-linux hostname iproute2 $GUI_PACKAGES"
+cat > "$TMP/provision.sh" <<PROVISION
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=3 update
-apt-get install -y --no-install-recommends \
-  git ca-certificates curl python3 tar gzip coreutils util-linux hostname iproute2
+apt-get install -y --no-install-recommends $GUI_LINE
 apt-get clean
 rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/*
 rm -rf /tmp/* /var/tmp/* /root/.cache
@@ -186,11 +211,30 @@ rm -f "$TMP/rootfs/etc/resolv.conf"
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$TMP/rootfs/etc/resolv.conf"
 mkdir -p "$TMP/rootfs/usr/local/bin" "$TMP/rootfs/workspace" "$TMP/rootfs/proc" "$TMP/rootfs/sys" "$TMP/rootfs/dev" "$TMP/rootfs/run" "$TMP/rootfs/dev/pts"
 install -m 0755 "$ROOT/target/x86_64-unknown-linux-musl/release/aiec-guest" "$TMP/rootfs/usr/local/bin/aiec-guest"
-printf '%s' "$SECRET" > "$TMP/rootfs/etc/aiec-guest-secret"
-chmod 0600 "$TMP/rootfs/etc/aiec-guest-secret"
-ln -sf /sbin/init "$TMP/rootfs/init"
+# `aiec-screenshot` arrives through the skeleton overlay above
+# (guest/rootfs/usr/local/bin/aiec-screenshot): one helper for every GUI
+# profile, so the script carries no second copy to drift. The none image
+# deletes it - a text-only guest offers no screen path - and desktop stamps
+# the marker the guest init starts Xvfb on.
+if [ "$GUI" = none ]; then
+  rm -f "$TMP/rootfs/usr/local/bin/aiec-screenshot"
+elif [ "$GUI" = desktop ]; then
+  # The guest init starts Xvfb when this marker exists; the base image has no
+  # X server and must never try.
+  touch "$TMP/rootfs/etc/aiec-xvfb"
+fi
 
-ROOTFS="$OUT/aiec-rootfs.ext4"
+PROFILE=coding
+CAPS='["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"]'
+ROOTFS_NAME=aiec-rootfs.ext4
+CAPS_NAME=guest-capabilities.json
+case "$GUI" in
+  browser) PROFILE=coding-gui-browser; CAPS='["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3","chromium","chromedriver"]'; ROOTFS_NAME=rootfs-gui-browser.ext4; CAPS_NAME=guest-capabilities-gui-browser.json ;;
+  desktop) PROFILE=coding-gui-desktop; CAPS='["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3","chromium","chromedriver","xvfb","xdotool","screenshot"]'; ROOTFS_NAME=rootfs-gui-desktop.ext4; CAPS_NAME=guest-capabilities-gui-desktop.json ;;
+  playwright) PROFILE=coding-gui-playwright; CAPS='["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3","chromium","chromedriver","playwright"]'; ROOTFS_NAME=rootfs-gui-playwright.ext4; CAPS_NAME=guest-capabilities-gui-playwright.json ;;
+esac
+
+ROOTFS="$OUT/$ROOTFS_NAME"
 rm -f "$ROOTFS"
 truncate -s "$ROOTFS_SIZE" "$ROOTFS"
 step "building $ROOTFS ($(du -h "$ROOTFS" | cut -f1))"
@@ -207,11 +251,20 @@ else
   KERNEL_SHA_JSON="null"
 fi
 BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-cat > "$OUT/guest-capabilities.json" <<EOF
-{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"coding","capabilities":["sh","coreutils","git","ca-certificates","dns","https","tar","gzip","curl","python3"],"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","guest_agent_sha256":"$GUEST_AGENT_SHA","guest_protocol_version":$GUEST_PROTOCOL_VERSION,"rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
+cat > "$OUT/$CAPS_NAME" <<EOF
+{"schema":1,"artifact_version":"1.0.0","base":"$BASE_DIGEST","profile":"$PROFILE","capabilities":$CAPS,"git_version":"$GIT_VERSION","guest_agent_version":"$GUEST_AGENT_VERSION","guest_agent_sha256":"$GUEST_AGENT_SHA","guest_protocol_version":$GUEST_PROTOCOL_VERSION,"rootfs_sha256":"$ROOTFS_SHA","kernel_sha256":$KERNEL_SHA_JSON,"built_at":"$BUILT_AT"}
 EOF
 if command -v python3 >/dev/null 2>&1; then
-  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/guest-capabilities.json" || fail "guest-capabilities.json is not valid JSON"
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/$CAPS_NAME" || fail "$CAPS_NAME is not valid JSON"
+fi
+
+# Variant outputs keep their own names: a GUI build must never overwrite the
+# base image's manifest, checksums or capabilities in the same OUT directory.
+MANIFEST_NAME=manifest.json
+SUMS_NAME=SHA256SUMS
+if [ "$GUI" != none ]; then
+  MANIFEST_NAME="manifest-gui-$GUI.json"
+  SUMS_NAME="SHA256SUMS-gui-$GUI"
 fi
 
 if [ ! -f "$KERNEL" ]; then
@@ -219,8 +272,8 @@ if [ ! -f "$KERNEL" ]; then
   echo "kernel not built: set AIEC_KERNEL to an uncompressed Linux kernel or bzImage with virtio, vsock and ext4 support"
   exit 2
 fi
-sha256sum "$ROOTFS" "$KERNEL" > "$OUT/SHA256SUMS"
-cat > "$OUT/manifest.json" <<EOF
+sha256sum "$ROOTFS" "$KERNEL" > "$OUT/$SUMS_NAME"
+cat > "$OUT/$MANIFEST_NAME" <<EOF
 {"schema":1,"rootfs":"$(basename "$ROOTFS")","kernel":"$(basename "$KERNEL")","control_port":1024,"guest_cid":3}
 EOF
 
@@ -236,4 +289,4 @@ printf '  kernel sha256   %s\n' "$KERNEL_SHA"
 printf '  rootfs size     %s (%s)\n' "$(stat -c %s "$ROOTFS")" "$(du -h "$ROOTFS" | cut -f1)"
 printf '  artifacts       %s\n' "$OUT"
 echo "built $ROOTFS"
-cat "$OUT/SHA256SUMS"
+cat "$OUT/$SUMS_NAME"

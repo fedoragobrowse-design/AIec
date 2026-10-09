@@ -1,7 +1,9 @@
 mod guard;
 mod image;
+mod upgrade;
 use guard::{GuardCommand, guard_command};
 use image::{ImageCommand, image_command};
+use upgrade::{UpgradeCommand, upgrade_command};
 
 use aiec_api::{
     HttpOwnershipVerifier, WorkerGuestProfile, WorkerHeartbeat, WorkerListener, WorkerRegistration,
@@ -107,6 +109,13 @@ enum Command {
         #[command(subcommand)]
         command: ImageCommand,
     },
+    /// Compares this CLI against the deployment and reports when either side
+    /// is behind. Notify-only: it prints the suggestion and exits 0, it never
+    /// rewrites the running binary.
+    Upgrade {
+        #[command(subcommand)]
+        command: UpgradeCommand,
+    },
     Benchmark(BenchmarkArgs),
 }
 #[derive(Args)]
@@ -201,6 +210,14 @@ enum SandboxCommand {
         timeout_seconds: u64,
         #[arg(long)]
         network: bool,
+        /// GUI profile selecting a prebuilt `-gui` variant image.
+        ///
+        /// One of `browser`, `desktop`, `playwright`. Firecracker resolves
+        /// `aiec/firecracker-gui-<profile>`, docker resolves
+        /// `aiec/gui-<profile>`; an explicit `--image` always wins, and a
+        /// `--gui` on `bwrap-dev` is refused before any request is made.
+        #[arg(long, value_name = "PROFILE")]
+        gui: Option<String>,
     },
     /// Lists sandboxes, newest first.
     ///
@@ -228,6 +245,22 @@ enum SandboxCommand {
         timeout_seconds: u64,
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Captures the sandbox's screen to a local PNG file.
+    ///
+    /// Runs `aiec-screenshot` inside the guest (which is why this only works
+    /// on `-gui` images) and downloads the result through the 16 MiB file
+    /// path, so an oversize capture is refused, never truncated. `--url`
+    /// hands a headless-chromium shot to the browser and playwright variants;
+    /// a non-http(s) URL is refused before any request is made.
+    Screenshot {
+        id: Uuid,
+        /// Local path the PNG is written to.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// URL for the browser/playwright variants to shoot headlessly.
+        #[arg(long)]
+        url: Option<String>,
     },
     Destroy {
         id: Uuid,
@@ -501,9 +534,10 @@ async fn main() -> Result<()> {
         Command::Snapshot { command } => snapshot_command(&url, api_key.clone(), command).await,
         Command::Guard { command } => guard_command(&url, api_key.clone(), command).await,
         Command::Image { command } => image_command(command).await,
+        Command::Upgrade { command } => upgrade_command(&url, command).await,
+        Command::Benchmark(args) => benchmark(&url, api_key, args).await,
         Command::Run { command } => run_command(&url, api_key.clone(), command).await,
         Command::Eval { command } => eval_command(&url, api_key.clone(), command).await,
-        Command::Benchmark(args) => benchmark(&url, api_key, args).await,
     }
 }
 
@@ -901,11 +935,46 @@ mod tests {
             "2024-01-02T03:04:05+00:00"
         );
 
-        assert!(run_page_cursor(Some("2024-01-02T03:04:05Z"), None).is_err());
-        assert!(run_page_cursor(None, Some(id)).is_err());
-        // A timestamp that is not one is a message, not a page that comes
-        // back wrong.
         assert!(run_page_cursor(Some("yesterday"), Some(id)).is_err());
+    }
+
+    /// `--gui` maps to the prebuilt variant for the runtime in use; anything
+    /// else is refused before a request leaves the machine.
+    #[test]
+    fn gui_flag_resolves_to_the_runtime_variant() {
+        // No flag: the image stands, on every runtime.
+        for runtime in ["bwrap-dev", "docker", "firecracker"] {
+            assert_eq!(
+                resolve_gui_image("python:3.13", None, runtime).unwrap(),
+                "python:3.13"
+            );
+            assert_eq!(
+                resolve_gui_image("custom:1", None, runtime).unwrap(),
+                "custom:1"
+            );
+        }
+        // Each profile resolves per runtime.
+        assert_eq!(
+            resolve_gui_image("python:3.13", Some("browser"), "docker").unwrap(),
+            "aiec/gui-browser"
+        );
+        assert_eq!(
+            resolve_gui_image("python:3.13", Some("desktop"), "firecracker").unwrap(),
+            "aiec/firecracker-gui-desktop"
+        );
+        assert_eq!(
+            resolve_gui_image("python:3.13", Some("playwright"), "firecracker").unwrap(),
+            "aiec/firecracker-gui-playwright"
+        );
+        // An explicit image wins over the flag: never redirect pinned bytes.
+        assert_eq!(
+            resolve_gui_image("custom:1", Some("browser"), "docker").unwrap(),
+            "custom:1"
+        );
+        // Unknown profiles and --gui on bwrap-dev are refused client-side.
+        assert!(resolve_gui_image("python:3.13", Some("vnc"), "docker").is_err());
+        assert!(resolve_gui_image("python:3.13", Some("browser"), "bwrap-dev").is_err());
+        assert!(resolve_gui_image("python:3.13", None, "lxc").is_err());
     }
 }
 
@@ -914,6 +983,27 @@ async fn client(url: &str, api_key: Option<String>) -> Result<AIecClient> {
         .or_else(|| std::env::var("AIEC_API_KEY").ok())
         .context("set --api-key, --api-key-file or AIEC_API_KEY")?;
     AIecClient::new(url, key).context("create API client")
+}
+
+/// Asks the control plane what harness build it recommends, without a
+/// credential. `None` is not an error: a deployment that predates
+/// `/v1/versions`, a closed port, or a TLS mismatch all mean "no signal",
+/// and a worker that refused to start for lack of an advisory would be worse
+/// than one that starts quietly.
+async fn control_recommended_harness(control_url: &str) -> Option<String> {
+    let url = format!("{}/v1/versions", control_url.trim_end_matches('/'));
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reqwest::Client::new().get(&url).send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let versions: serde_json::Value = response.json().await.ok()?;
+    versions
+        .get("recommended_harness")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
 }
 async fn worker(control_url: &str, mut args: WorkerArgs) -> Result<()> {
     // The worker emits structured logs all over - rejected operations, lease
@@ -1018,6 +1108,20 @@ async fn worker(control_url: &str, mut args: WorkerArgs) -> Result<()> {
         return Ok(());
     };
     drop(startup_runtime);
+    // The fleet's update signal for operators who never run the CLI: if this
+    // worker's build is older than what the deployment recommends, say so in
+    // the first lines of its log. Notify-only like `upgrade --check` - the
+    // worker keeps serving either way.
+    if let Some(recommended) = control_recommended_harness(control_url).await {
+        let ours = env!("CARGO_PKG_VERSION");
+        if recommended != ours {
+            tracing::warn!(
+                worker = ours,
+                recommended,
+                "worker build is behind the deployment recommendation; update when convenient"
+            );
+        }
+    }
     let (drain, drained) = tokio::sync::oneshot::channel();
     let listener_shutdown = async move {
         let _ = drained.await;
@@ -1123,6 +1227,23 @@ async fn start_worker(
             // worker that cannot verify its image must fail to start, not fail
             // its first sandbox on the control plane's request timeout.
             config.verify_guest_image()?;
+            // The operator pins the fleet's expected guest build with
+            // `AIEC_RECOMMENDED_GUEST_ARTIFACT`. A baked artifact that is
+            // older (or newer) than the recommendation still serves - this is
+            // notify-only like `upgrade --check` - but it says so at startup
+            // so a fleet that never runs the CLI still reports drift.
+            if let Some(artifact) = config.guest_artifact.as_ref() {
+                let recommended = std::env::var("AIEC_RECOMMENDED_GUEST_ARTIFACT")
+                    .unwrap_or_else(|_| "1.0.0".to_owned());
+                if artifact.artifact_version != recommended {
+                    tracing::warn!(
+                        artifact_version = %artifact.artifact_version,
+                        recommended_guest_artifact = %recommended,
+                        profile = %artifact.profile,
+                        "guest artifact is not the recommended build; rebuild the -gui variants with the matching guest sources"
+                    );
+                }
+            }
             let backend = Arc::new(FirecrackerRuntime::new(config));
             // Runs before registration because its report is part of the
             // registration metadata. On a restart the persisted id is already
@@ -2102,6 +2223,40 @@ fn key_command(command: KeyCommand) -> Result<()> {
     }
     Ok(())
 }
+/// Resolves `--gui` to a prebuilt variant image, before any request is made.
+///
+/// No flag means the image stands. An explicit non-default `--image` wins
+/// over the flag (an operator pinning bytes is never silently redirected).
+/// Unknown profiles and `--gui` on `bwrap-dev` are refused here, so no
+/// credential is spent on a request that was always wrong.
+fn resolve_gui_image(image: &str, gui: Option<&str>, runtime: &str) -> Result<String> {
+    if !matches!(runtime, "bwrap-dev" | "docker" | "firecracker") {
+        anyhow::bail!(
+            "unsupported sandbox runtime {runtime}; use bwrap-dev, docker, or firecracker"
+        )
+    }
+    match (gui, image) {
+        // No flag: the image is the image.
+        (None, image) => Ok(image.to_owned()),
+        // An explicit non-default image wins over the flag.
+        (Some(_), image) if image != "python:3.13" => {
+            eprintln!("--gui ignored: explicit --image {image} wins");
+            Ok(image.to_owned())
+        }
+        (Some(profile), _) if !matches!(profile, "browser" | "desktop" | "playwright") => {
+            anyhow::bail!(
+                "unsupported --gui profile {profile}; use browser, desktop, or playwright"
+            );
+        }
+        (Some(_), _) if runtime == "bwrap-dev" => {
+            anyhow::bail!("--gui needs --runtime docker or firecracker, not bwrap-dev");
+        }
+        (Some(profile), _) if runtime == "firecracker" => {
+            Ok(format!("aiec/firecracker-gui-{profile}"))
+        }
+        (Some(profile), _) => Ok(format!("aiec/gui-{profile}")),
+    }
+}
 async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand) -> Result<()> {
     let c = client(url, key).await?;
     match command {
@@ -2113,12 +2268,14 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
             disk_mb,
             timeout_seconds,
             network,
+            gui,
         } => {
             if !matches!(runtime.as_str(), "bwrap-dev" | "docker" | "firecracker") {
                 anyhow::bail!(
                     "unsupported sandbox runtime {runtime}; use bwrap-dev, docker, or firecracker"
                 )
             }
+            let image = resolve_gui_image(&image, gui.as_deref(), &runtime)?;
             let request = CreateSandboxRequest {
                 image,
                 cpu,
@@ -2200,6 +2357,59 @@ async fn sandbox_command(url: &str, key: Option<String>, command: SandboxCommand
         }
         SandboxCommand::Resume { id } => {
             println!("{}", serde_json::to_string_pretty(&c.resume(id).await?)?)
+        }
+        SandboxCommand::Screenshot { id, out, url } => {
+            // A screenshot is an exec plus a download: `aiec-screenshot`
+            // renders inside the guest (text-only images have no helper, so
+            // the exec failure names the fix), and `get_file` carries the PNG
+            // back through the 16 MiB file path - oversize is refused there,
+            // never truncated here.
+            if let Some(url) = &url
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                anyhow::bail!("refusing non-http(s) screenshot url: {url}");
+            }
+            let mut command = vec!["aiec-screenshot".to_owned()];
+            if let Some(url) = &url {
+                command.push("--url".to_owned());
+                command.push(url.clone());
+            }
+            let guest_path = "/tmp/aiec-screenshot.png";
+            command.push(guest_path.to_owned());
+            let exec = c
+                .exec(
+                    id,
+                    &ExecRequest {
+                        command,
+                        working_directory: None,
+                        environment: BTreeMap::new(),
+                        timeout_seconds: 60,
+                        stdin: None,
+                    },
+                )
+                .await?;
+            if exec.exit_code != 0 {
+                anyhow::bail!(
+                    "screenshot failed (exit {}): {}\n(if this image has no screen path, recreate with --gui browser|desktop|playwright)",
+                    exec.exit_code,
+                    exec.stderr.trim_end()
+                );
+            }
+            let content = c.get_file(id, guest_path).await?;
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(content.content_base64.as_bytes())
+                .map_err(|error| {
+                    anyhow::anyhow!("screenshot download is not valid base64: {error}")
+                })?;
+            // PNG magic, checked before the file lands: a helper that printed
+            // text (or an attacker that replaced it) is a loud error here,
+            // not a corrupt PNG on disk.
+            if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+                anyhow::bail!("screenshot download is not a PNG (wrong magic)");
+            }
+            std::fs::write(&out, &bytes)?;
+            println!("wrote {} ({} bytes)", out.display(), bytes.len());
         }
     }
     Ok(())

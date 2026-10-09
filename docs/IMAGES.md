@@ -172,3 +172,43 @@ resolver:
   computed from the file, or one whose file identity provably still matches, is
   ever returned. The signing secret is no longer retained for the process
   lifetime, and `Debug` does not carry it.
+
+- **Opt-in GUI variants.** Three prebuilt profiles sit beside the base image:
+  `browser` (chromium + chromedriver, page driving and screenshots),
+  `desktop` (the browser set plus Xvfb, xdotool, x11vnc, scrot on `DISPLAY
+  :99`), `playwright` (system chromium via `executable_path`, never a
+  downloaded browser). The control plane picks them with `sandbox create
+  --gui <profile>`: firecracker resolves `aiec/firecracker-gui-<profile>`,
+  docker resolves `aiec/gui-<profile>`, an explicit `--image` always wins,
+  and `--gui` on `bwrap-dev` is refused before any request is made. Base
+  images are untouched: every GUI line in the firecracker build script is
+  gated on `AIEC_GUEST_GUI`, and `none` keeps packages, profile,
+  capabilities, filenames, manifest and sums byte-identical.
+
+  Build and publish (operator signs each variant with the existing
+  `aiec image sign` flow; `aiec image verify` is unchanged):
+
+  ```sh
+  # Firecracker rootfs + manifest per profile:
+  AIEC_GUEST_GUI=browser ./scripts/build-firecracker-guest.sh
+  AIEC_GUEST_GUI=desktop ./scripts/build-firecracker-guest.sh
+  AIEC_GUEST_GUI=playwright ./scripts/build-firecracker-guest.sh
+  # Docker tags:
+  docker build -f guest/Dockerfile.gui --target browser -t aiec/gui-browser .
+  docker build -f guest/Dockerfile.gui --target desktop -t aiec/gui-desktop .
+  docker build -f guest/Dockerfile.gui --target playwright -t aiec/gui-playwright .
+  ```
+
+  Each firecracker variant ships its own capabilities document
+  (`guest-capabilities-gui-<profile>.json`) beside its own rootfs, and the
+  runtime verifies each rootfs against its sibling document - a GUI rootfs
+  never verifies against the base manifest and vice versa. `sandbox
+  screenshot <id> --out shot.png` execs `aiec-screenshot` in the guest and
+  downloads through the 16 MiB file path (oversize refused, never truncated);
+  screenshots are PNG-checked before write and hint at `recreate with --gui`
+  when the helper is missing. `GET /v1/versions` publishes
+  `{api, harness_protocol, recommended_harness, recommended_guest_artifact,
+  minimum_cli}` (operator-overridable via `AIEC_RECOMMENDED_HARNESS`,
+  `AIEC_RECOMMENDED_GUEST_ARTIFACT`, `AIEC_MINIMUM_CLI`); `aiec upgrade
+  --check` and the worker startup warning are notify-only and never modify a
+  binary.

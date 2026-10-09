@@ -1,0 +1,54 @@
+# Prebuilt GUI variants of the docker/bwrap-dev sandbox guest.
+#
+# Three profiles, one file, `--target` selects:
+#   docker build -f guest/Dockerfile.gui --target browser -t aiec/gui-browser .
+#   docker build -f guest/Dockerfile.gui --target desktop -t aiec/gui-desktop .
+#   docker build -f guest/Dockerfile.gui --target playwright -t aiec/gui-playwright .
+#
+# Package sets mirror scripts/build-firecracker-guest.sh's AIEC_GUEST_GUI
+# profiles exactly: the same names the harness probes for (chromedriver +
+# chromium for browser, Xvfb + xdotool for desktop) are what each image
+# installs, so a tool that registers is a tool the guest can back. The
+# playwright stage uses the system chromium (never a downloaded browser),
+# matching the firecracker variant. Base images without a GUI suffix are
+# untouched by this file.
+
+FROM debian:bookworm-slim AS base
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git ca-certificates curl python3 tar gzip coreutils util-linux hostname iproute2 \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/* \
+ && rm -rf /tmp/* /var/tmp/* /root/.cache
+WORKDIR /workspace
+
+# Browser: page driving plus screenshots through chromedriver's WebDriver HTTP
+# API, which is what the harness `browser` tool speaks.
+FROM base AS browser
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends chromium chromium-driver \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/*
+COPY guest/rootfs/usr/local/bin/aiec-screenshot /usr/local/bin/aiec-screenshot
+
+# Desktop: the browser set plus a virtual display and input synthesis for the
+# harness `desktop` tool (DISPLAY :99 is what it expects).
+FROM browser AS desktop
+ENV DISPLAY=:99
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends xvfb xdotool x11vnc scrot \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/*
+COPY guest/rootfs/usr/local/bin/aiec-screenshot /usr/local/bin/aiec-screenshot
+
+# Playwright: the browser set plus the Python bindings driving the system
+# chromium. No `playwright install` download: system chromium keeps the image
+# reproducible offline.
+FROM browser AS playwright
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-playwright python3-pip \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /var/cache/apt/*
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+COPY guest/rootfs/usr/local/bin/aiec-screenshot /usr/local/bin/aiec-screenshot

@@ -1,0 +1,23 @@
+#!/bin/sh
+# One screen path for every GUI guest: the CLI's `screenshot` subcommand calls
+# exactly this. Desktop screenshots the Xvfb display; browser and playwright
+# shells headless chromium for a --url argument. The firecracker build
+# installs the desktop or the headless spelling per profile; the docker GUI
+# images install this file, which dispatches on its arguments.
+#
+# Usage:
+#   aiec-screenshot <output.png>                  (desktop: shot of :99)
+#   aiec-screenshot [--url <http(s)://..>] <out>  (headless chromium shot)
+set -u
+url=""
+if [ "${1:-}" = --url ]; then
+  url=${2:?usage: aiec-screenshot [--url <url>] <output.png>}
+  shift 2
+fi
+out=${1:?usage: aiec-screenshot [--url <url>] <output.png>}
+if [ -n "$url" ]; then
+  case "$url" in http://*|https://*) ;; *) echo "refusing non-http(s) url: $url" >&2; exit 1 ;; esac
+  exec chromium --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --screenshot="$out" "$url"
+fi
+export DISPLAY=${DISPLAY:-:99}
+exec scrot --overwrite "$out"
