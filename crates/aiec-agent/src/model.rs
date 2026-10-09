@@ -90,6 +90,26 @@ pub struct Reply {
     pub usage: Usage,
 }
 
+/// Which wire format to speak. OpenAI-compatible chat completions is the
+/// default; anything naming Anthropic/Claude speaks the Messages API, so a
+/// Claude subscriber's key works without naming a base URL. Detection is by
+/// model or base URL, never by key presence: an `ANTHROPIC_API_KEY` sitting
+/// in the environment alongside an OpenAI model choice must not reroute it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    OpenAi,
+    Anthropic,
+}
+
+fn detect_provider(model: &str, base_url: &str) -> Provider {
+    let haystack = format!("{model} {base_url}").to_lowercase();
+    if haystack.contains("anthropic") || haystack.contains("claude") {
+        Provider::Anthropic
+    } else {
+        Provider::OpenAi
+    }
+}
+
 /// A configured endpoint.
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -100,6 +120,7 @@ pub struct Client {
     capabilities: Capabilities,
     /// Opaque to the harness, passed through when the provider understands it.
     reasoning: Option<String>,
+    provider: Provider,
 }
 
 /// Environment variables the harness reads, in priority order.
@@ -119,11 +140,25 @@ impl Client {
                     "no model configured: set AIEC_AGENT_MODEL or pass one in the task".to_owned(),
                 )
             })?;
-        let base_url = chosen
+        let provider_name = chosen
             .and_then(|c| c.provider.clone())
+            .filter(|value| !value.trim().is_empty());
+        let base_url = provider_name
+            .clone()
             .filter(|value| value.starts_with("http"))
             .or_else(|| first_env(BASE_VARS))
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
+            .unwrap_or_else(|| {
+                // The provider name doubles as a hint: `provider: "anthropic"`
+                // with no URL still means the Messages API. The model name
+                // covers the other direction (`model: "claude-..."` with no
+                // provider), so either spelling selects Anthropic alone.
+                let hint = provider_name.as_deref().unwrap_or_default();
+                if detect_provider(&format!("{model} {hint}"), "") == Provider::Anthropic {
+                    "https://api.anthropic.com".to_owned()
+                } else {
+                    "https://api.openai.com/v1".to_owned()
+                }
+            });
         let api_key = first_env(KEY_VARS).map(zeroize::Zeroizing::new);
         let reasoning = chosen.and_then(|c| c.reasoning.clone());
 
@@ -134,10 +169,12 @@ impl Client {
             .user_agent(concat!("aiec-agent/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| HarnessError::Model(format!("http client: {error}")))?;
-
+        let base_url = base_url.trim_end_matches('/').to_owned();
+        let named = provider_name.as_deref().unwrap_or_default();
+        let provider = detect_provider(&format!("{model} {named}"), &base_url);
         Ok(Self {
             http,
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base_url,
             api_key,
             model,
             capabilities: Capabilities {
@@ -147,6 +184,7 @@ impl Client {
                 reasoning: reasoning.is_some(),
             },
             reasoning,
+            provider,
         })
     }
 
@@ -186,6 +224,18 @@ impl Client {
     }
 
     async fn try_once(
+        &self,
+        context: &Context,
+        tools: &[ToolSchema],
+        max_output_tokens: u32,
+    ) -> Result<Reply, HarnessError> {
+        match self.provider {
+            Provider::OpenAi => self.try_openai(context, tools, max_output_tokens).await,
+            Provider::Anthropic => self.try_anthropic(context, tools, max_output_tokens).await,
+        }
+    }
+
+    async fn try_openai(
         &self,
         context: &Context,
         tools: &[ToolSchema],
@@ -250,6 +300,129 @@ impl Client {
             });
         }
         parse_reply(&text)
+    }
+
+    /// Anthropic Messages API. Same [`Reply`] surface as OpenAI: text plus
+    /// tool calls, so the agent loop never learns which provider answered.
+    ///
+    /// Auth is the subscriber's own credential: `ANTHROPIC_API_KEY`, or an
+    /// OAuth token from `claude login` (`ANTHROPIC_OAUTH_TOKEN`), sent as
+    /// `x-api-key`. `AIEC_AGENT_API_KEY` wins when set, so one task can pin a
+    /// different key without clearing the ambient subscription.
+    async fn try_anthropic(
+        &self,
+        context: &Context,
+        tools: &[ToolSchema],
+        max_output_tokens: u32,
+    ) -> Result<Reply, HarnessError> {
+        let wire = context.as_wire();
+        // The harness emits a leading system message; Messages takes it as a
+        // top-level `system` string, not a conversation turn. Anything else
+        // with a system role is folded into the first user turn: inventing a
+        // second system block would misstate the contract.
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        for entry in &wire {
+            let role = entry.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = entry
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            if role == "system" {
+                system_parts.push(content);
+            } else if role == "assistant" {
+                messages.push(serde_json::json!({"role": "assistant", "content": content}));
+            } else {
+                // Tool results ride as `tool` role in the harness wire; on
+                // Messages they are user turns carrying `tool_result` blocks
+                // keyed by the call id the model was given.
+                if entry.get("role").and_then(|r| r.as_str()) == Some("tool") {
+                    let tool_call_id = entry
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": content,
+                        }],
+                    }));
+                } else {
+                    messages.push(serde_json::json!({"role": "user", "content": content}));
+                }
+            }
+        }
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": max_output_tokens,
+            "system": system_parts.join("\n"),
+            "messages": messages,
+        });
+        // Anthropic reasoning is a thinking budget in tokens, not an effort
+        // word: forward it only when it parses, rather than sending a value
+        // the endpoint would reject over a guess.
+        if let Some(effort) = &self.reasoning
+            && let Ok(budget) = effort.as_str().parse::<u32>()
+        {
+            body["thinking"] = serde_json::json!({"type": "enabled", "budget_tokens": budget});
+        }
+        if self.capabilities.tools && !tools.is_empty() {
+            let advertised: Vec<_> = tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(advertised);
+        }
+
+        let url = format!("{}/v1/messages", self.base_url);
+        let mut request = self
+            .http
+            .post(url)
+            .json(&body)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01");
+        // Subscriber OAuth first would silently bill the wrong account when
+        // both are set; explicit key env wins, OAuth is the fallback.
+        let oauth = std::env::var("ANTHROPIC_OAUTH_TOKEN")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        match (&self.api_key, oauth) {
+            (Some(key), _) => {
+                request = request.header("x-api-key", key.as_str());
+            }
+            (None, Some(token)) => {
+                request = request.header("x-api-key", token);
+            }
+            (None, None) => {}
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| HarnessError::Model(format!("request failed: {error}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| HarnessError::Model(format!("reading reply: {error}")))?;
+        if !status.is_success() {
+            let detail = format!("provider returned {status}: {}", crate::clip(&text, 300));
+            return Err(if worth_retrying(status) {
+                HarnessError::Model(detail)
+            } else {
+                HarnessError::ModelRefused(detail)
+            });
+        }
+        parse_anthropic_reply(&text)
     }
 }
 
@@ -352,6 +525,89 @@ fn parse_reply(text: &str) -> Result<Reply, HarnessError> {
     })
 }
 
+/// Anthropic Messages response shapes. `content` is a heterogeneous block
+/// list: `text` blocks join into the reply, `tool_use` blocks become tool
+/// calls. Anything else (thinking, redacted) is skipped, not failed: the
+/// agent loses reasoning detail, not the turn.
+#[derive(Deserialize, Default)]
+struct AnthropicReply {
+    #[serde(default)]
+    content: Vec<AnthropicBlock>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize, Default)]
+struct AnthropicBlock {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+fn parse_anthropic_reply(text: &str) -> Result<Reply, HarnessError> {
+    let wire: AnthropicReply = serde_json::from_str(text)
+        .map_err(|error| HarnessError::Model(format!("unreadable reply: {error}")))?;
+    if wire.content.is_empty() {
+        return Err(HarnessError::Model(
+            "the provider returned no content".to_owned(),
+        ));
+    }
+    let mut reply_text: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for block in wire.content {
+        match block.kind.as_str() {
+            "text" => {
+                if let Some(text) = block.text {
+                    reply_text.push(text);
+                }
+            }
+            "tool_use" => {
+                tool_calls.push(ToolCall {
+                    id: block.id.unwrap_or_default(),
+                    name: block.name.unwrap_or_default(),
+                    arguments: block
+                        .input
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_owned()),
+                });
+            }
+            _ => {}
+        }
+    }
+    let usage = wire.usage.map_or(Usage::default(), |u| Usage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cached_input_tokens: u.cache_read_input_tokens,
+        requests: 0,
+    });
+    Ok(Reply {
+        text: if reply_text.is_empty() {
+            None
+        } else {
+            Some(reply_text.join(""))
+        },
+        tool_calls,
+        usage,
+    })
+}
+
 fn first_env(names: &[&str]) -> Option<String> {
     names
         .iter()
@@ -412,6 +668,44 @@ mod tests {
             arguments: "{\"path\":\"b\"}".to_owned(),
         };
         assert_ne!(first.signature(), second.signature());
+    }
+    #[test]
+    fn an_anthropic_text_and_tool_reply_is_parsed() {
+        let text = r#"{"content":[
+            {"type":"text","text":"reading now"},
+            {"type":"tool_use","id":"tu1","name":"read","input":{"path":"a.rs"}}],
+            "usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2}}"#;
+        let reply = parse_anthropic_reply(text).expect("parsed");
+        assert_eq!(reply.text.as_deref(), Some("reading now"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "tu1");
+        assert_eq!(reply.tool_calls[0].name, "read");
+        assert!(reply.tool_calls[0].arguments.contains("a.rs"));
+        assert_eq!(reply.usage.input_tokens, 7);
+        assert_eq!(reply.usage.cached_input_tokens, 2);
+    }
+
+    #[test]
+    fn an_anthropic_empty_reply_is_an_error_not_a_panic() {
+        assert!(parse_anthropic_reply(r#"{"content":[]}"#).is_err());
+        assert!(parse_anthropic_reply("not json").is_err());
+    }
+
+    #[test]
+    fn provider_detection_is_by_model_not_key_presence() {
+        assert_eq!(
+            detect_provider("claude-opus-4-6", "https://api.openai.com/v1"),
+            Provider::Anthropic
+        );
+        assert_eq!(
+            detect_provider("gpt-4o", "https://api.openai.com/v1"),
+            Provider::OpenAi
+        );
+        // An Anthropic key sitting next to an OpenAI model must not reroute.
+        assert_eq!(
+            detect_provider("gpt-4o", "https://example.com/v1"),
+            Provider::OpenAi
+        );
     }
 
     /// An endpoint that answers every request with `status`, and counts them.
