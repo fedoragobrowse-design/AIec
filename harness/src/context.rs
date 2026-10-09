@@ -107,6 +107,11 @@ impl TaskState {
 const PROGRESS_BYTE_CAP: u64 = 8_000;
 const MIN_LAST_MESSAGE_TOKENS: u64 = 256;
 
+/// Ceiling on base64 screenshot bytes one tool result may carry. Base64 must
+/// never be truncated — a cut payload is a corrupt image — so oversize is a
+/// tool error at the call site rather than a crop here.
+pub const MAX_SCREENSHOT_BASE64: usize = 1_048_576;
+
 /// Bounds a single message that is too large to keep whole.
 ///
 /// The head and the tail survive, because for a tool observation those are the
@@ -126,10 +131,12 @@ fn squeeze_message(message: &Message, limit: usize) -> Message {
             call_id,
             name,
             content,
+            images,
         } => Message::Tool {
             call_id: call_id.clone(),
             name: name.clone(),
             content: compress_output(content, limit),
+            images: images.clone(),
         },
     }
 }
@@ -141,6 +148,7 @@ pub struct ToolResult {
     pub call_id: String,
     pub name: String,
     pub content: String,
+    pub images: Vec<crate::model::ImageBlock>,
     pub ok: bool,
 }
 
@@ -326,6 +334,7 @@ impl Context {
                 call_id: result.call_id.clone(),
                 name: result.name.clone(),
                 content: result.content.clone(),
+                images: result.images.clone(),
             });
         }
 
@@ -469,7 +478,19 @@ fn message_tokens(message: &Message) -> u64 {
                     .map(|c| estimate_tokens(&c.signature()))
                     .sum::<u64>()
         }
-        Message::Tool { content, name, .. } => estimate_tokens(content) + estimate_tokens(name),
+        Message::Tool {
+            content,
+            name,
+            images,
+            ..
+        } => {
+            estimate_tokens(content)
+                + estimate_tokens(name)
+                + images
+                    .iter()
+                    .map(|i| i.data_base64.len() as u64 / 4)
+                    .sum::<u64>()
+        }
     }
 }
 

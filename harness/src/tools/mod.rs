@@ -1,10 +1,13 @@
 //! Tools: the whole set the model can reach, and the boundary that keeps it
 //! inside the repository.
 //!
-//! Nine tools. Each one is cheap to describe and expensive to omit, which is the
-//! whole selection criterion: usefulness per token of schema.
+//! Nine text tools always, plus two GUI tools when the guest can back them:
+//! usefulness per token of schema is still the selection criterion, and a
+//! schema for a binary that is not installed is pure waste.
 
 pub mod bash;
+pub mod browser;
+pub mod desktop;
 pub mod edit;
 pub mod git;
 pub mod read;
@@ -19,6 +22,29 @@ use serde_json::Value;
 use crate::ToolFailure;
 use crate::model::ToolCall;
 
+/// One screenshot, base64-encoded. Kept beside the text it accompanies rather
+/// than inside it: base64 must never pass through `compress_output`, which
+/// would corrupt the bytes, so images ride in their own field end to end.
+#[derive(Debug, Clone, Default)]
+pub struct ToolImage {
+    /// Only `image/png` or `image/jpeg`; anything else is refused at
+    /// construction because a provider wire format has no third shape.
+    pub media_type: &'static str,
+    pub data_base64: String,
+}
+
+impl ToolImage {
+    pub fn new(media_type: &'static str, data_base64: String) -> Option<Self> {
+        match media_type {
+            "image/png" | "image/jpeg" => Some(Self {
+                media_type,
+                data_base64,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// What a tool hands back to the loop.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
@@ -26,6 +52,9 @@ pub struct ToolOutput {
     pub content: String,
     /// Bytes the tool actually moved, for the metrics in the result.
     pub bytes: u64,
+    /// Screenshots the model sees. Never compressed: truncating base64
+    /// corrupts the image, so the size cap is enforced as a refusal instead.
+    pub images: Vec<ToolImage>,
 }
 
 impl ToolOutput {
@@ -34,6 +63,7 @@ impl ToolOutput {
         Self {
             bytes: content.len() as u64,
             content,
+            images: Vec::new(),
         }
     }
 
@@ -41,7 +71,15 @@ impl ToolOutput {
         Self {
             content: content.into(),
             bytes,
+            images: Vec::new(),
         }
+    }
+
+    /// Attaches screenshots. A tool returning more than the cap is a tool
+    /// error at the call site, not a silent crop here: this only records.
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
+        self
     }
 }
 
@@ -182,9 +220,11 @@ impl Registry {
         ctx: &ToolContext,
     ) -> std::result::Result<ToolOutput, ToolFailure> {
         let Some(&index) = self.by_name.get(&call.name) else {
+            let mut names: Vec<&str> = self.by_name.keys().map(String::as_str).collect();
+            names.sort_unstable();
             return Err(ToolFailure {
                 name: call.name.clone(),
-                message: format!("no such tool; available: {}", list_tools().join(", ")),
+                message: format!("no such tool; available: {}", names.join(", ")),
             });
         };
 
@@ -236,8 +276,52 @@ pub fn field_usize(args: &Value, name: &str, default: usize) -> usize {
     }
 }
 
-/// The full set, wired up.
+/// The full set, wired up. GUI tools join only when the guest has the
+/// binaries to back them: a schema for a missing binary wastes context and
+/// invites a call that can only fail.
 pub fn registry() -> Registry {
+    registry_for(crate::task::GuiMode::Off)
+}
+
+/// What the guest can actually back, probed from PATH. `chromedriver` plus a
+/// chromium binary means `browser`; Xvfb plus xdotool means `desktop`.
+pub fn gui_available() -> GuiAvail {
+    GuiAvail {
+        browser: has_bin("chromedriver") && has_chromium(),
+        desktop: has_bin("Xvfb") && has_bin("xdotool"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiAvail {
+    pub browser: bool,
+    pub desktop: bool,
+}
+
+fn has_bin(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| has_bin_on(&path, name))
+}
+
+/// The PATH-parameterized core of [`has_bin`]: pure over its inputs, so tests
+/// pin the registration matrix against fixture PATHs without mutating the
+/// process environment out from under sibling threads.
+fn has_bin_on(path: &std::ffi::OsStr, name: &str) -> bool {
+    std::env::split_paths(path).any(|dir| dir.join(name).is_file())
+}
+
+fn has_chromium() -> bool {
+    ["chromium", "chromium-browser", "google-chrome"]
+        .iter()
+        .any(|n| has_bin(n))
+}
+
+fn has_chromium_on(path: &std::ffi::OsStr) -> bool {
+    ["chromium", "chromium-browser", "google-chrome"]
+        .iter()
+        .any(|n| has_bin_on(path, n))
+}
+
+pub fn registry_for(mode: crate::task::GuiMode) -> Registry {
     let mut r = Registry::new();
     r.register(Box::new(read::Read));
     r.register(Box::new(write::Write));
@@ -248,6 +332,41 @@ pub fn registry() -> Registry {
     r.register(Box::new(bash::Bash));
     r.register(Box::new(git::Status));
     r.register(Box::new(git::Diff));
+    let avail = gui_available();
+    register_gui(r, mode, avail)
+}
+
+/// The `PATH`-parameterized core of [`registry_for`]: same policy, fixture
+/// PATH instead of the process one. The live path stays a two-liner so the
+/// policy cannot drift between production and test.
+pub fn registry_for_on(mode: crate::task::GuiMode, path: &std::ffi::OsStr) -> Registry {
+    let mut r = Registry::new();
+    r.register(Box::new(read::Read));
+    r.register(Box::new(write::Write));
+    r.register(Box::new(edit::Edit));
+    r.register(Box::new(search::Grep));
+    r.register(Box::new(search::Find));
+    r.register(Box::new(search::Glob));
+    r.register(Box::new(bash::Bash));
+    r.register(Box::new(git::Status));
+    r.register(Box::new(git::Diff));
+    let avail = GuiAvail {
+        browser: has_bin_on(path, "chromedriver") && has_chromium_on(path),
+        desktop: has_bin_on(path, "Xvfb") && has_bin_on(path, "xdotool"),
+    };
+    register_gui(r, mode, avail)
+}
+
+fn register_gui(mut r: Registry, mode: crate::task::GuiMode, avail: GuiAvail) -> Registry {
+    // Playwright tasks drive the page through `bash` (python + playwright),
+    // which needs no harness tool — but screenshots still go through
+    // `browser`, so it registers there too.
+    if avail.browser && mode != crate::task::GuiMode::Off {
+        r.register(Box::new(browser::Browser));
+    }
+    if avail.desktop && mode == crate::task::GuiMode::Desktop {
+        r.register(Box::new(desktop::Desktop));
+    }
     r
 }
 

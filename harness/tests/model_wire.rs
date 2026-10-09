@@ -87,11 +87,13 @@ fn conversation() -> Vec<Message> {
             call_id: "call_1".to_owned(),
             name: "read".to_owned(),
             content: "contents of a".to_owned(),
+            images: Vec::new(),
         },
         Message::Tool {
             call_id: "call_2".to_owned(),
             name: "read".to_owned(),
             content: "contents of b".to_owned(),
+            images: Vec::new(),
         },
     ]
 }
@@ -1144,4 +1146,82 @@ fn a_hostile_or_truncated_stream_does_not_panic() {
         // The only requirement is that it returns rather than unwinds.
         let _ = openai::parse_response(body, 0);
     }
+}
+
+#[test]
+fn a_tool_result_with_a_screenshot_renders_on_both_wires() {
+    use aiec_harness::model::ImageBlock;
+    let shot = ImageBlock {
+        media_type: "image/png".to_owned(),
+        data_base64: "iVBORw0KGgo=".to_owned(),
+    };
+    let messages = vec![Message::Tool {
+        call_id: "shot_1".to_owned(),
+        name: "browser".to_owned(),
+        content: "page loaded".to_owned(),
+        images: vec![shot],
+    }];
+    let completion = Completion {
+        messages,
+        tools: vec![],
+        model: "test-model".to_owned(),
+        reasoning: Reasoning::Off,
+        max_output_tokens: 4096,
+    };
+    let config = openai_config("http://127.0.0.1:1");
+    let openai_body = openai::build_request_body(&config, &completion);
+    let tool = openai_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| m.first())
+        .expect("one message");
+    assert_eq!(tool.get("role").and_then(Value::as_str), Some("tool"));
+    let parts = tool
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("array content");
+    assert_eq!(parts.len(), 2);
+    assert_eq!(
+        parts[1].pointer("/image_url/url").and_then(Value::as_str),
+        Some("data:image/png;base64,iVBORw0KGgo=")
+    );
+
+    let aconfig = anthropic_config("http://127.0.0.1:1");
+    let anthropic_body = anthropic::build_request_body(&aconfig, &completion);
+    let user = anthropic_body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| m.first())
+        .expect("one message");
+    let blocks = user
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("blocks");
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(
+        blocks[0].get("type").and_then(Value::as_str),
+        Some("tool_result")
+    );
+    assert_eq!(
+        blocks[1].pointer("/source/data").and_then(Value::as_str),
+        Some("iVBORw0KGgo=")
+    );
+}
+
+#[test]
+fn a_tool_result_without_images_keeps_the_old_string_shape() {
+    // The images field defaults to empty on the wire, so text-only results
+    // serialize exactly as before: a string, not a one-element array.
+    let completion = completion();
+    let config = openai_config("http://127.0.0.1:1");
+    let body = openai::build_request_body(&config, &completion);
+    let first = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| {
+            m.iter()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        })
+        .expect("a tool message");
+    assert!(first.get("content").and_then(Value::as_str).is_some());
 }

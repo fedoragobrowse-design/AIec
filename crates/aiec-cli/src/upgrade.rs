@@ -22,6 +22,28 @@ pub async fn upgrade_command(url: &str, command: UpgradeCommand) -> Result<()> {
         UpgradeCommand::Check => check(url).await,
     }
 }
+/// Orders dotted-numeric versions (`1.10.0` > `1.9.0`), falling back to plain
+/// string order for anything non-numeric. `minimum_cli` is a floor, not a
+/// pin: a CLI newer than the floor clears it, so equality would warn a caller
+/// that is already fine.
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let numeric = |side: &str| {
+        side.split('.')
+            .map(|part| part.parse::<u64>().ok())
+            .collect::<Vec<_>>()
+    };
+    let (left_parts, right_parts) = (numeric(left), numeric(right));
+    if left_parts.iter().all(|part| part.is_some()) && right_parts.iter().all(|part| part.is_some())
+    {
+        let (left_parts, right_parts): (Vec<u64>, Vec<u64>) = (
+            left_parts.into_iter().flatten().collect(),
+            right_parts.into_iter().flatten().collect(),
+        );
+        left_parts.cmp(&right_parts)
+    } else {
+        left.cmp(right)
+    }
+}
 async fn check(url: &str) -> Result<()> {
     // No credential on purpose: the versions endpoint is public so a caller
     // can ask what the deployment is before it can authenticate as anyone.
@@ -56,11 +78,13 @@ async fn check(url: &str) -> Result<()> {
     // A newer CLI against an older deployment warns the other way round, so an
     // operator who upgraded the laptop first still learns the fleet is behind.
     let mut current = true;
-    if minimum_cli != "unknown" && cli != minimum_cli {
-        println!("behind: deployment wants CLI {minimum_cli}, this is {cli}");
+    if minimum_cli != "unknown" && version_cmp(cli, minimum_cli) == std::cmp::Ordering::Less {
+        println!("behind: deployment wants CLI at least {minimum_cli}, this is {cli}");
         current = false;
     }
-    if recommended_harness != "unknown" && cli != recommended_harness {
+    if recommended_harness != "unknown"
+        && version_cmp(cli, recommended_harness) == std::cmp::Ordering::Less
+    {
         println!("behind: deployment recommends harness {recommended_harness}, this CLI is {cli}");
         current = false;
     }
@@ -74,4 +98,19 @@ async fn check(url: &str) -> Result<()> {
         println!("current");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_cmp;
+    use std::cmp::Ordering;
+
+    /// The floor is a floor: newer clears it, older warns, equal is current.
+    /// Plain string order would call `1.10.0` older than `1.9.0`.
+    #[test]
+    fn version_floor_orders_numerically() {
+        assert_eq!(version_cmp("1.10.0", "1.9.0"), Ordering::Greater);
+        assert_eq!(version_cmp("0.1.0", "99.0-minimum"), Ordering::Less);
+        assert_eq!(version_cmp("0.1.0", "0.1.0"), Ordering::Equal);
+    }
 }

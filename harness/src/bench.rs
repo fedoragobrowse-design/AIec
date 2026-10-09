@@ -19,6 +19,7 @@ fn tool_result(content: String, ok: bool) -> ToolResult {
         call_id: "bench".to_owned(),
         name: "bench".to_owned(),
         content,
+        images: Vec::new(),
         ok,
     }
 }

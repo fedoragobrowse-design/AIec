@@ -730,3 +730,87 @@ async fn every_advertised_name_dispatches_through_the_registry() {
         }
     }
 }
+
+/// GUI registration is conditional on two independent facts: the task asked
+/// (mode) and the guest can back it (binaries). The matrix below pins the
+/// corners against fixture PATHs — never the process environment, which
+/// sibling threads share — so a refactor that registers unbacked tools, or
+/// drops backed ones, fails loudly.
+#[test]
+fn gui_tools_register_only_when_asked_and_backed() {
+    use aiec_harness::task::GuiMode;
+    use aiec_harness::tools::registry_for_on;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn touch(dir: &std::path::Path, name: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("fixture binary");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("fixture binary executable");
+    }
+    fn names(mode: GuiMode, path: &std::ffi::OsStr) -> Vec<String> {
+        registry_for_on(mode, path)
+            .specs()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
+    }
+    let modes = [
+        GuiMode::Off,
+        GuiMode::Browser,
+        GuiMode::Desktop,
+        GuiMode::Playwright,
+    ];
+
+    // Nothing on the fixture PATH: no GUI tool anywhere, whatever is asked.
+    let empty = tempfile::tempdir().expect("tempdir");
+    for mode in modes {
+        let got = names(mode, empty.path().as_os_str());
+        assert!(
+            !got.contains(&"browser".to_owned()),
+            "{mode:?} registered browser unbacked"
+        );
+        assert!(
+            !got.contains(&"desktop".to_owned()),
+            "{mode:?} registered desktop unbacked"
+        );
+    }
+    // Full GUI guest: browser everywhere except Off, desktop only on Desktop.
+    let full = tempfile::tempdir().expect("tempdir");
+    for bin in ["chromedriver", "chromium", "Xvfb", "xdotool"] {
+        touch(full.path(), bin);
+    }
+    let full_path = full.path().as_os_str().to_owned();
+    assert!(!names(GuiMode::Off, &full_path).contains(&"browser".to_owned()));
+    assert!(!names(GuiMode::Off, &full_path).contains(&"desktop".to_owned()));
+    assert!(names(GuiMode::Browser, &full_path).contains(&"browser".to_owned()));
+    assert!(!names(GuiMode::Browser, &full_path).contains(&"desktop".to_owned()));
+    assert!(names(GuiMode::Desktop, &full_path).contains(&"browser".to_owned()));
+    assert!(names(GuiMode::Desktop, &full_path).contains(&"desktop".to_owned()));
+    assert!(names(GuiMode::Playwright, &full_path).contains(&"browser".to_owned()));
+    assert!(!names(GuiMode::Playwright, &full_path).contains(&"desktop".to_owned()));
+    // Browser binaries but no X stack: desktop never registers.
+    let browser_only = tempfile::tempdir().expect("tempdir");
+    for bin in ["chromedriver", "chromium"] {
+        touch(browser_only.path(), bin);
+    }
+    let browser_path = browser_only.path().as_os_str().to_owned();
+    assert!(names(GuiMode::Desktop, &browser_path).contains(&"browser".to_owned()));
+    assert!(!names(GuiMode::Desktop, &browser_path).contains(&"desktop".to_owned()));
+}
+
+#[test]
+fn gui_digest_differs_across_modes() {
+    // A result earned with a browser must never verify against a text-only
+    // task: the mode joins the digest, so swapping it changes the hash.
+    use aiec_harness::task::Task;
+    let raw = |gui: &str| {
+        format!(r#"{{"instruction": "click the button", "workspace": "/tmp", "gui": "{gui}"}}"#)
+    };
+    let off = Task::parse(&raw("off")).expect("off parses").digest;
+    let browser = Task::parse(&raw("browser")).expect("browser parses").digest;
+    let desktop = Task::parse(&raw("desktop")).expect("desktop parses").digest;
+    assert_ne!(off, browser);
+    assert_ne!(browser, desktop);
+    assert_ne!(off, desktop);
+}

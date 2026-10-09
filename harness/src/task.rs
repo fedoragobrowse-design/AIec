@@ -17,6 +17,18 @@ impl Validation {
     }
 }
 
+/// Which GUI profile the guest carries, if any. Defaults to Off: a task that
+/// does not ask for a screen gets the nine text tools and nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuiMode {
+    #[default]
+    Off,
+    Browser,
+    Desktop,
+    Playwright,
+}
+
 /// Hard ceilings. The caller's numbers are treated as a request; the ones the
 /// harness itself imposes can only ever be lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +97,11 @@ pub struct Task {
     #[serde(default)]
     pub limits: Limits,
 
+    /// Which GUI profile the guest carries, if any. Defaults to Off: a task
+    /// that does not ask for a screen gets the nine text tools and nothing else.
+    #[serde(default)]
+    pub gui: GuiMode,
+
     /// Computed by the harness, never read from the document.
     ///
     /// This is deliberately not a required field. The digest is derived FROM
@@ -150,6 +167,10 @@ impl Task {
                 hasher.update(b"\x1f");
             }
         }
+        // The mode decides which tools exist, so a result earned with a
+        // browser must never verify against a text-only task.
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", self.gui).as_bytes());
         Ok(hasher.finish_hex())
     }
 }

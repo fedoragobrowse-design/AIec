@@ -416,6 +416,7 @@ fn a_hostile_observation_never_grows_the_state_without_bound() {
                 call_id: "c1".into(),
                 name: "bash".into(),
                 content: blob,
+                images: Vec::new(),
                 ok: rng.below(2) == 0,
             }],
         );

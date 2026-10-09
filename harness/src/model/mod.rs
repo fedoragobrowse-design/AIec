@@ -231,12 +231,24 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
     },
-    /// A tool's result, tied to the call it answers.
+    /// A tool's result, tied to the call it answers. Screenshots ride beside
+    /// the text, never inside it: base64 truncated by compression is a corrupt
+    /// image, so images skip `compress_output` end to end.
     Tool {
         call_id: String,
         name: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageBlock>,
     },
+}
+
+/// One screenshot in the neutral shape. Both providers accept base64 PNG or
+/// JPEG, so the media type is exactly one of those two strings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageBlock {
+    pub media_type: String,
+    pub data_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

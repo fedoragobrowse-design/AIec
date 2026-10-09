@@ -220,25 +220,39 @@ fn messages(input: &[Message]) -> Vec<Value> {
                 out.push(json!({ "role": "assistant", "content": blocks }));
             }
             Message::Tool {
-                call_id, content, ..
+                call_id,
+                content,
+                images,
+                ..
             } => {
-                let result = json!({
+                // Images ride as sibling image blocks beside the tool_result,
+                // never nested inside its content: the API takes content blocks.
+                let mut blocks = vec![json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
                     "content": content,
-                });
+                })];
+                blocks.extend(images.iter().map(|image| {
+                    json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.media_type,
+                            "data": image.data_base64,
+                        },
+                    })
+                }));
                 // A tool result is a *user* turn on this API, and two user
                 // turns in a row are an error. Results for calls the model made
                 // in parallel arrive back to back, so they have to be merged
                 // into one message or a perfectly good turn is refused.
                 match out.last_mut() {
                     Some(last) if role_of(last) == Some("user") => {
-                        if let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut)
-                        {
-                            blocks.push(result);
+                        if let Some(prior) = last.get_mut("content").and_then(Value::as_array_mut) {
+                            prior.extend(blocks);
                         }
                     }
-                    _ => out.push(json!({ "role": "user", "content": [result] })),
+                    _ => out.push(json!({ "role": "user", "content": blocks })),
                 }
             }
         }

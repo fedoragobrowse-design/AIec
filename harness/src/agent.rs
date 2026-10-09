@@ -19,7 +19,7 @@ use crate::result::{
 };
 use crate::session::SessionState;
 use crate::task::{Limits, Task, Validation};
-use crate::tools::{Phase, ToolContext, registry};
+use crate::tools::{Phase, ToolContext};
 use crate::{HarnessError, prompt};
 
 /// Everything the loop needs, assembled once at startup.
@@ -158,7 +158,39 @@ impl<'a> Agent<'a> {
             dirty: false,
         });
 
-        let tools = registry();
+        let mode = self.task.gui;
+        // Fail fast when the task asks for a screen the guest cannot back:
+        // running blind wastes the whole model budget on calls that fail.
+        // `run` returns a result, not a Result, so the refusal is a terminal
+        // error result through the existing `for_error` path.
+        let avail = crate::tools::gui_available();
+        let missing = match mode {
+            crate::task::GuiMode::Off => None,
+            crate::task::GuiMode::Browser | crate::task::GuiMode::Playwright => {
+                if avail.browser {
+                    None
+                } else {
+                    Some(
+                        "task requests a browser-capable guest (chromedriver + chromium) \
+                         but the guest has neither; rebuild with a GUI browser profile",
+                    )
+                }
+            }
+            crate::task::GuiMode::Desktop => {
+                if avail.browser && avail.desktop {
+                    None
+                } else {
+                    Some(
+                        "task requests a desktop guest (chromedriver + chromium + Xvfb + xdotool) \
+                         but the guest is missing them; rebuild with the desktop GUI profile",
+                    )
+                }
+            }
+        };
+        if let Some(reason) = missing {
+            return RunResult::for_error(&self.task.task_id, self.provenance(), reason);
+        }
+        let tools = crate::tools::registry_for(mode);
         let tool_specs = tools.specs();
         let mut guard = LoopGuard::new(4);
         let mut last_text: Option<String> = None;
@@ -356,7 +388,7 @@ impl<'a> Agent<'a> {
                 .or_insert(0) += 1;
 
             let outcome = tools.dispatch(call, &ctx).await;
-            let (text, ok) = match outcome {
+            let (text, images, ok) = match outcome {
                 Ok(output) => {
                     // Bounded here as well as in the tool: a tool that forgets is
                     // still not allowed to fill the context.
@@ -364,18 +396,40 @@ impl<'a> Agent<'a> {
                         &output.content,
                         self.task.limits.max_tool_output_bytes,
                     );
-                    self.metrics.bytes_read += output.bytes;
-                    (bounded, true)
+                    // Images never compress: base64 truncated is a corrupt
+                    // image. Oversize is refused at the tool; the cap check
+                    // here is the backstop for a tool that forgot.
+                    let total: usize = output.images.iter().map(|i| i.data_base64.len()).sum();
+                    if total > crate::context::MAX_SCREENSHOT_BASE64 {
+                        self.metrics.tool_failures += 1;
+                        let text = format!(
+                            "screenshots refused: {} bytes exceeds the {} byte cap; retake at lower quality",
+                            total,
+                            crate::context::MAX_SCREENSHOT_BASE64,
+                        );
+                        (text, Vec::new(), false)
+                    } else {
+                        let images = output
+                            .images
+                            .into_iter()
+                            .map(|i| crate::model::ImageBlock {
+                                media_type: i.media_type.to_owned(),
+                                data_base64: i.data_base64,
+                            })
+                            .collect();
+                        self.metrics.bytes_read += output.bytes;
+                        (bounded, images, true)
+                    }
                 }
                 Err(failure) => {
                     self.metrics.tool_failures += 1;
                     (
                         format!("{} failed: {}", failure.name, failure.message),
+                        Vec::new(),
                         false,
                     )
                 }
             };
-
             self.context.note_tool_output(text.len() as u64);
             self.metrics.bytes_written += text.len() as u64;
             self.events.emit(Event::ToolFinished {
@@ -389,6 +443,7 @@ impl<'a> Agent<'a> {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 content: text,
+                images,
                 ok,
             });
         }

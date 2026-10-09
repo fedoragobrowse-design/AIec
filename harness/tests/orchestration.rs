@@ -21,6 +21,7 @@ fn result(content: &str, ok: bool) -> aiec_harness::context::ToolResult {
         call_id: "c1".to_owned(),
         name: "read".to_owned(),
         content: content.to_owned(),
+        images: Vec::new(),
         ok,
     }
 }

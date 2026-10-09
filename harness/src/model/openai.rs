@@ -202,9 +202,22 @@ fn messages(input: &[Message]) -> Vec<Value> {
                 Value::Object(map)
             }
             Message::Tool {
-                call_id, content, ..
+                call_id, content, images, ..
             } => {
-                json!({ "role": "tool", "tool_call_id": call_id, "content": content })
+                if images.is_empty() {
+                    json!({ "role": "tool", "tool_call_id": call_id, "content": content })
+                } else {
+                    let mut parts = vec![json!({ "type": "text", "text": content })];
+                    parts.extend(images.iter().map(|image| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.media_type, image.data_base64),
+                            },
+                        })
+                    }));
+                    json!({ "role": "tool", "tool_call_id": call_id, "content": parts })
+                }
             }
         });
     }

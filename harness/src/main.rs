@@ -327,19 +327,27 @@ fn fallback_provenance() -> Provenance {
 }
 
 fn capabilities() -> ExitCode {
+    let avail = aiec_harness::tools::gui_available();
+    let mut features = vec![
+        "tool_calling",
+        "structured_result",
+        "jsonl_events",
+        "session_resume",
+        "task_budget",
+        "context_compaction",
+        "loop_detection",
+        "steering",
+    ];
+    if avail.browser {
+        features.push("gui_browser");
+    }
+    if avail.desktop {
+        features.push("gui_desktop");
+    }
     let document = serde_json::json!({
         "protocol": aiec_harness::PROTOCOL_VERSION,
         "version": aiec_harness::VERSION,
-        "features": [
-            "tool_calling",
-            "structured_result",
-            "jsonl_events",
-            "session_resume",
-            "task_budget",
-            "context_compaction",
-            "loop_detection",
-            "steering"
-        ],
+        "features": features,
         "tools": aiec_harness::tools::list_tools(),
         "providers": ["openai-compatible", "openrouter", "anthropic"],
     });
