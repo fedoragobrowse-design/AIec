@@ -392,8 +392,12 @@ impl<'a> Agent<'a> {
                 Ok(output) => {
                     // Bounded here as well as in the tool: a tool that forgets is
                     // still not allowed to fill the context.
+                    // Scrubbed before anything else sees it: the bounded text
+                    // below becomes the model's next-turn context, so a secret
+                    // here would be sent to the provider on the next request.
+                    let scrubbed = crate::redaction::scrub(&output.content);
                     let bounded = crate::context::compress_output(
-                        &output.content,
+                        &scrubbed,
                         self.task.limits.max_tool_output_bytes,
                     );
                     // Images never compress: base64 truncated is a corrupt

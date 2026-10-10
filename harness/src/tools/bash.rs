@@ -220,6 +220,28 @@ fn argv(args: &Value) -> Result<Vec<String>, ToolFailure> {
                 format!("`command[{i}]` contains a null byte"),
             ));
         }
+        // Operator secrets are never legitimate tool arguments: the harness
+        // runs as the operator, so ~/.config/aiec, ~/.ssh, and key files are
+        // readable, and a model that names one gets the secret in stdout. The
+        // argv boundary is the only place to stop it — scrub downstream only
+        // hides the leak after the model already saw it.
+        for secret in [
+            ".config/aiec",
+            ".ssh/",
+            "api-key",
+            "openrouter-key",
+            "mcp-token",
+            "key.txt",
+        ] {
+            if s.contains(secret) {
+                return Err(tool_error(
+                    "command",
+                    format!(
+                        "`command[{i}]` names an operator secret path ({secret}); use task-provided credentials, never files"
+                    ),
+                ));
+            }
+        }
         out.push(s.to_owned());
     }
     Ok(out)

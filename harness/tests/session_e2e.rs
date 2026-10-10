@@ -810,3 +810,65 @@ async fn a_finished_run_leaves_state_that_is_not_offered_for_resume() {
         "the state file does not say it finished"
     );
 }
+
+#[tokio::test]
+async fn a_model_cannot_read_operator_secrets_through_bash() {
+    // Replay of the 2026-10-09 Mistral Large 4 exfil: the harness runs as the
+    // operator, so ~/.config/aiec/api-key is readable, and the model asked
+    // for it with a plain `cat`. The argv boundary must refuse; the loop
+    // must survive; the secret must never reach the transcript.
+    let dir = repo_with_bug();
+    let task = task_for(dir.path(), vec![]);
+    let log = EventLog::open(None).expect("event log");
+
+    let provider = Scripted::new(vec![
+        Step::Calls(vec![(
+            "bash",
+            r#"{"command":["cat", "/home/gobrowse/.config/aiec/api-key"]}"#.to_owned(),
+        )]),
+        Step::Calls(vec![(
+            "bash",
+            r#"{"command":["sh", "-c", "cat ~/key.txt"]}"#.to_owned(),
+        )]),
+        Step::Done("I could not read those files."),
+    ]);
+
+    let agent = Agent::new(&task, &provider, &log, None).expect("agent");
+    let document = agent.run(&dir.path().join("state.json")).await;
+
+    assert_eq!(document.status, Status::Success, "loop survived refusals");
+    assert!(
+        document.metrics.tool_failures >= 2,
+        "both secret reads should have been refused, saw {} failures",
+        document.metrics.tool_failures
+    );
+    // The refusal text names the matched pattern, never the secret value:
+    // check the Tool messages the model actually saw.
+    for turn in provider.seen.lock().map(|s| s.clone()).unwrap_or_default() {
+        for msg in &turn.messages {
+            if let aiec_harness::model::Message::Tool { content, .. } = msg {
+                assert!(
+                    !content.contains("af_live_"),
+                    "operator key material reached the transcript"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn dispatch_scrubs_tool_output_before_the_transcript() {
+    // The working-phase path (dispatch -> ToolResult.content -> next-turn
+    // context) had no scrub call: only failures, validation, and session
+    // persist were covered. A tool echoing a secret must come back redacted.
+    let secret = "af_live_0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+    // SAFETY: unique to this test; scrub reads env dynamically.
+    unsafe { std::env::set_var("AIEC_API_KEY", secret) };
+    let out = aiec_harness::redaction::scrub(&format!("key is {secret} done"));
+    assert!(!out.contains(secret), "secret survived scrub");
+    assert!(
+        out.contains("[redacted:AIEC_API_KEY]"),
+        "wrong marker: {out}"
+    );
+    unsafe { std::env::remove_var("AIEC_API_KEY") };
+}

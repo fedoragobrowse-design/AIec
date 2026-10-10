@@ -9,9 +9,11 @@
 /// any text. Read dynamically, so a caller can add one without a rebuild.
 const SECRET_ENV_NAMES: &[&str] = &[
     "AIEC_AGENT_API_KEY",
+    "AIEC_API_KEY",
+    "AIEC_API_CA",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
-    "OPENROUTER_API_KEY",
+    "AIEC_MCP_TOKEN",
     "AIEC_CONTROL_PLANE_TOKEN",
     "AIEC_CONTROL_PLANE_URL",
     "DATABASE_URL",
