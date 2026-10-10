@@ -31,13 +31,15 @@ enum Command {
         /// Resume state. Defaults to `<workspace>/.aiec-agent/session.json`.
         #[arg(long)]
         state: Option<PathBuf>,
-        #[arg(long)]
+        /// Provider override. Otherwise taken from the environment.
+        #[arg(long, env = "AIEC_AGENT_PROVIDER")]
         provider: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "AIEC_AGENT_MODEL")]
         model: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "AIEC_AGENT_BASE_URL")]
         base_url: Option<String>,
-        #[arg(long, default_value_t = false)]
+        /// Resume a previous incomplete session if one matches this task.
+        #[arg(long)]
         resume: bool,
         /// Operator context: facts the model cannot discover itself (target
         /// ids, API bases, scope). Rendered once into the opening turn.
