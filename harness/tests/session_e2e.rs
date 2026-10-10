@@ -668,6 +668,23 @@ async fn a_steering_note_lands_in_the_next_request_and_is_then_consumed() {
     // Two turns, so the note was checked at least once between them.
     assert_eq!(provider.turns(), 2);
 
+    // The note reaches the model on the first turn, not the one after: the
+    // request is built after the steering push, so turn 1 already carries it.
+    let first = provider.seen.lock().map(|s| s.clone()).unwrap_or_default();
+    let turn_one_has_steering = first.first().map(|turn| {
+        turn.messages.iter().any(|m| match m {
+            aiec_harness::model::Message::User { content } => {
+                content.contains("focus on the failing test")
+            }
+            _ => false,
+        })
+    });
+    assert_eq!(
+        turn_one_has_steering,
+        Some(true),
+        "steering missed the in-flight request"
+    );
+
     // It was consumed, not left to be re-applied forever.
     assert_eq!(
         std::fs::read_to_string(&steer).expect("read back"),

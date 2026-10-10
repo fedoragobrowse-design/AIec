@@ -203,6 +203,17 @@ impl<'a> Agent<'a> {
                 }
             };
 
+            // A note dropped by the caller since the last turn joins the
+            // conversation before the request is built, so it reaches the
+            // model on this turn rather than the next one.
+            if let Some(note) = crate::events::take_steering(&self.steer_path) {
+                self.events
+                    .emit(Event::SteeringApplied { turn, note: &note });
+                self.context.messages.push(Message::User {
+                    content: crate::prompt::steering_turn(&note),
+                });
+            }
+
             let request = Completion {
                 messages: self.build_messages(&last_text),
                 tools: tool_specs.clone(),
@@ -216,17 +227,6 @@ impl<'a> Agent<'a> {
                 context_tokens: self.context.tokens(),
                 message_count: request.messages.len(),
             });
-
-            // A note dropped by the caller since the last turn becomes part of
-            // this request, so steering lands before the next model call rather
-            // than after it.
-            if let Some(note) = crate::events::take_steering(&self.steer_path) {
-                self.events
-                    .emit(Event::SteeringApplied { turn, note: &note });
-                self.context.messages.push(Message::User {
-                    content: crate::prompt::steering_turn(&note),
-                });
-            }
 
             self.budget.record_request();
             let before_cpu = cpu_time_ms();
