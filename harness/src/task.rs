@@ -79,6 +79,11 @@ impl Default for Limits {
     }
 }
 
+/// Largest operator context the harness will feed the model. Context is a
+/// startup fact sheet, not a document dump: past the cap it is a caller
+/// mistake, refused rather than silently truncated.
+pub const MAX_CONTEXT_BYTES: usize = 8 * 1024;
+
 /// What the caller wants done, where, and how it will be judged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -97,11 +102,17 @@ pub struct Task {
     #[serde(default)]
     pub limits: Limits,
 
+    /// Operator context: facts the model cannot reliably discover itself
+    /// (target ids, API bases, scope, credentials already in env). Rendered
+    /// once into the opening turn as `<operator-context>`. Optional so old
+    /// task files keep parsing; empty means no extra turn.
+    #[serde(default)]
+    pub context: String,
+
     /// Which GUI profile the guest carries, if any. Defaults to Off: a task
     /// that does not ask for a screen gets the nine text tools and nothing else.
     #[serde(default)]
     pub gui: GuiMode,
-
     /// Computed by the harness, never read from the document.
     ///
     /// This is deliberately not a required field. The digest is derived FROM
@@ -126,7 +137,6 @@ impl Task {
     pub fn parse(raw: &str) -> Result<Self, crate::HarnessError> {
         let mut task: Task = serde_json::from_str(raw)
             .map_err(|e| crate::HarnessError::invalid("task document", e.to_string()))?;
-
         if task.instruction.trim().is_empty() {
             return Err(crate::HarnessError::invalid("task", "instruction is empty"));
         }
@@ -141,13 +151,26 @@ impl Task {
                 ));
             }
         }
+        if task.context.len() > MAX_CONTEXT_BYTES {
+            return Err(crate::HarnessError::invalid(
+                "task",
+                "context exceeds 8 KiB; pass a file path via --context-file is the same cap, keep it a fact sheet",
+            ));
+        }
         // The digest is computed over the fields that determine the work, so a
         // result can be checked against the task that produced it.
         task.digest = task.compute_digest()?;
         Ok(task)
     }
 
-    /// The workspace, canonicalised once, so path checks compare real prefixes.
+    /// Re-derives the digest after a caller-side mutation (CLI `--context`
+    /// override). The parse path covers the file; this covers everything
+    /// after it, so a result still verifies against the task that ran it.
+    pub fn refresh_digest(&mut self) -> Result<(), crate::HarnessError> {
+        self.digest = self.compute_digest()?;
+        Ok(())
+    }
+
     pub fn workspace_root(&self) -> Result<PathBuf, crate::HarnessError> {
         std::fs::canonicalize(&self.workspace)
             .map_err(|e| crate::HarnessError::io(self.workspace.display().to_string(), e))
@@ -168,9 +191,12 @@ impl Task {
             }
         }
         // The mode decides which tools exist, so a result earned with a
-        // browser must never verify against a text-only task.
+        // browser must never verify against a text-only task. Context steers
+        // the model, so it is covered for the same reason.
         hasher.update(b"\0");
         hasher.update(format!("{:?}", self.gui).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.context.as_bytes());
         Ok(hasher.finish_hex())
     }
 }

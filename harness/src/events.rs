@@ -169,6 +169,12 @@ pub fn default_steer_path(workspace: &Path) -> PathBuf {
 /// Returns the notes concatenated, or `None` when there are none. Errors are
 /// swallowed: a caller that cannot write the file has not broken the session,
 /// and failing the run over a missing optional hint would be absurd.
+///
+/// Notes are capped at 8 KiB and scrubbed: the steering file is
+/// operator-writable and model-adjacent, so a note bigger than the cap is a
+/// caller mistake refused here, and any secret the caller pasted is redacted
+/// before the model sees it. Cap lives in `MAX_STEERING_BYTES`.
+pub const MAX_STEERING_BYTES: usize = 8 * 1024;
 pub fn take_steering(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     // Truncate first, then use: a note is consumed once, and a caller that
@@ -178,5 +184,8 @@ pub fn take_steering(path: &Path) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.to_owned())
+    if trimmed.len() > MAX_STEERING_BYTES {
+        return None;
+    }
+    Some(crate::redaction::scrub(trimmed))
 }

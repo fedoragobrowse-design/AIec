@@ -186,6 +186,21 @@ pub fn resolve(root: &Path, raw: &str) -> std::result::Result<PathBuf, ToolFailu
             }
         }
     }
+    // `.aiec-agent/` is the operator's channel: state, events, steering. A
+    // model that can write there can steer itself or corrupt resume state,
+    // so all model paths under it are refused at the single choke point
+    if resolved
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+        == Some(".aiec-agent")
+    {
+        return Err(ToolFailure {
+            name: "path".into(),
+            message: format!("`{raw}` is inside .aiec-agent, which the model cannot write or read"),
+        });
+    }
     Ok(resolved)
 }
 

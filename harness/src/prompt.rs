@@ -41,11 +41,17 @@ pub fn opening_turn(instruction: &str) -> &str {
     instruction
 }
 
+/// Operator context: facts the caller hands the model that it cannot reliably
+/// discover itself — target ids, API bases, scope, credentials already in env.
+/// Rendered once into the opening turn, so it is present from turn 1 rather
+/// than arriving as mid-session steering the model may never have needed.
+pub fn context_turn(context: &str) -> String {
+    format!("<operator-context>\n{context}\n</operator-context>")
+}
 /// A steering note injected mid-session, without restarting anything.
 pub fn steering_turn(note: &str) -> String {
     format!("<steering>\n{note}\n</steering>")
 }
-
 /// Told to the model when it claims completion, so the session does not end on
 /// an assertion the caller then has to check anyway.
 pub const DONE_CONTRACT: &str = "\

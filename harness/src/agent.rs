@@ -350,6 +350,14 @@ impl<'a> Agent<'a> {
         messages.push(Message::User {
             content: prompt::opening_turn(&self.task.instruction).to_owned(),
         });
+        // Operator context lands in the opening turn, not as mid-session
+        // steering: facts the model needs from turn 1 (target ids, API bases,
+        // scope) do no good arriving at turn 10 after it already guessed.
+        if !self.task.context.trim().is_empty() {
+            messages.push(Message::User {
+                content: prompt::context_turn(self.task.context.trim()),
+            });
+        }
         messages.extend(self.context.messages.iter().cloned());
         if let Some(text) = last_text {
             messages.push(Message::Assistant {

@@ -31,16 +31,22 @@ enum Command {
         /// Resume state. Defaults to `<workspace>/.aiec-agent/session.json`.
         #[arg(long)]
         state: Option<PathBuf>,
-        /// Provider override. Otherwise taken from the environment.
-        #[arg(long, env = "AIEC_AGENT_PROVIDER")]
-        provider: Option<String>,
-        #[arg(long, env = "AIEC_AGENT_MODEL")]
-        model: Option<String>,
-        #[arg(long, env = "AIEC_AGENT_BASE_URL")]
-        base_url: Option<String>,
-        /// Resume a previous incomplete session if one matches this task.
         #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long, default_value_t = false)]
         resume: bool,
+        /// Operator context: facts the model cannot discover itself (target
+        /// ids, API bases, scope). Rendered once into the opening turn.
+        /// Overrides the task file's `context` when both are given.
+        #[arg(long)]
+        context: Option<String>,
+        /// Same, read from a file. Refused together with `--context`.
+        #[arg(long)]
+        context_file: Option<PathBuf>,
     },
     /// Machine-readable capability handshake, so a host can decide whether
     /// this guest is usable before it starts a run.
@@ -81,6 +87,8 @@ fn main() -> ExitCode {
             model: model_name,
             base_url,
             resume,
+            context,
+            context_file,
         } => run(RunArgs {
             task,
             result,
@@ -90,6 +98,8 @@ fn main() -> ExitCode {
             model: model_name,
             base_url,
             resume,
+            context,
+            context_file,
         }),
         Command::Capabilities => capabilities(),
         Command::Bench { iterations } => {
@@ -123,6 +133,8 @@ struct RunArgs {
     model: Option<String>,
     base_url: Option<String>,
     resume: bool,
+    context: Option<String>,
+    context_file: Option<PathBuf>,
 }
 
 fn run(args: RunArgs) -> ExitCode {
@@ -147,13 +159,46 @@ async fn run_async(args: RunArgs, started: Instant) -> ExitCode {
 
     // The task is read first and on its own: if it is malformed there is no
     // session, no result worth much, and no reason to start anything.
-    let task = match Task::load(&args.task) {
+    let mut task = match Task::load(&args.task) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("[error] {e}");
             return ExitCode::FAILURE;
         }
     };
+    // CLI context wins over the task file: the file is written ahead of time,
+    // the flag knows what this particular launch needs (target ids, scope).
+    // Both at once is a caller mistake, refused rather than merged.
+    match (&args.context, &args.context_file) {
+        (Some(_), Some(_)) => {
+            eprintln!("[error] --context and --context-file are mutually exclusive");
+            return ExitCode::FAILURE;
+        }
+        (Some(text), None) => {
+            task.context = text.clone();
+            if let Err(e) = task.refresh_digest() {
+                eprintln!("[error] {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(text) => {
+                task.context = text;
+                if let Err(e) = task.refresh_digest() {
+                    eprintln!("[error] {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[error] could not read context file {}: {e}",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => {}
+    }
 
     let root = match task.workspace_root() {
         Ok(r) => r,
